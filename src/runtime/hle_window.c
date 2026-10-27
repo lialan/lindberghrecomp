@@ -167,6 +167,9 @@ static void cabinet_autostart(void)
     }
 }
 
+/* Win32 reads the keyboard state directly, so there is nothing latched. */
+void host_cabinet_switches_read(void) {}
+
 void host_cabinet_input(CabinetInput *out)
 {
     cabinet_autostart();

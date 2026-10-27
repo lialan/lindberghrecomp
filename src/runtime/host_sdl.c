@@ -87,6 +87,11 @@ void host_mouse_state(int *x, int *y, int *buttons)
 
 /* ---- the cabinet ---- */
 static CabinetInput g_cab;
+/* Presses not yet seen by the I/O board. Events are drained once a frame and
+ * the board is read once a frame, so a quick tap can go down and up inside
+ * one drain; latching it until the next read means no tap is lost. */
+static unsigned g_cab_latch;
+static int      g_mouse_latch;
 
 static void cabinet_key(int vk, int down)
 {
@@ -100,7 +105,7 @@ static void cabinet_key(int vk, int down)
     case 'S': bit = CAB_SERVICE;    break;
     default: return;
     }
-    if (down) g_cab.buttons |= bit; else g_cab.buttons &= ~bit;
+    if (down) { g_cab.buttons |= bit; g_cab_latch |= bit; } else g_cab.buttons &= ~bit;
 }
 
 /* LINDBERGH_AUTOSTART=1: a coin at frame 240, then start pressed every two
@@ -142,7 +147,17 @@ void host_cabinet_input(CabinetInput *out)
     g_cab.buttons &= ~(CAB_P1_TRIGGER | CAB_P1_RELOAD);
     if (g_buttons & 1) g_cab.buttons |= CAB_P1_TRIGGER;
     if (g_buttons & 4) g_cab.buttons |= CAB_P1_RELOAD;
+    if (g_mouse_latch & 1) g_cab.buttons |= CAB_P1_TRIGGER;
+    if (g_mouse_latch & 4) g_cab.buttons |= CAB_P1_RELOAD;
     *out = g_cab;
+    out->buttons |= g_cab_latch;
+}
+
+/* The board has reported the switches: latched taps have been seen. */
+void host_cabinet_switches_read(void)
+{
+    g_cab_latch = 0;
+    g_mouse_latch = 0;
 }
 
 /* SDL keysym -> Win32 virtual key: letters upper case, digits as themselves. */
@@ -185,7 +200,7 @@ static void pump(void)
             int b = button_of(e.button.button), down = e.type == SDL_MOUSEBUTTONDOWN;
             g_mouse_x = e.button.x;
             g_mouse_y = e.button.y;
-            if (down) g_buttons |= 1 << b; else g_buttons &= ~(1 << b);
+            if (down) { g_buttons |= 1 << b; g_mouse_latch |= 1 << b; } else g_buttons &= ~(1 << b);
             in_push(HOST_IN_MOUSE, b, down ? 0 : 1, g_mouse_x, g_mouse_y);
             break;
         }
@@ -278,6 +293,25 @@ void host_pump(void) { pump(); }
 /* LINDBERGH_SHOT=file.ppm writes the frame numbered LINDBERGH_SHOT_FRAME (or
  * every LINDBERGH_SHOT_EVERY frames, numbered); LINDBERGH_EXIT_AFTER=N exits
  * cleanly after N frames. Both exist to check a run without watching it. */
+/* LINDBERGH_PEEK=addr,len[,every]: hex dump of guest memory each `every`
+ * frames (default 30), with the cabinet's buttons - for finding where the
+ * game keeps what it made of its inputs. */
+static void maybe_peek(void)
+{
+    static int on = -1; static uint32_t addr, len, every;
+    if (on < 0) {
+        const char *v = getenv("LINDBERGH_PEEK");
+        on = v && *v;
+        if (on) { char *e; addr = (uint32_t)strtoul(v, &e, 16); len = *e ? (uint32_t)strtoul(e + 1, &e, 0) : 16;
+                  every = *e ? (uint32_t)strtoul(e + 1, NULL, 0) : 30; if (len > 256) len = 256; if (!every) every = 30; }
+    }
+    if (!on || g_frame % every) return;
+    char line[1024]; int at = snprintf(line, sizeof line, "[peek] f%u btn %#x:", g_frame, g_cab.buttons);
+    for (uint32_t i = 0; i < len && at < 1000; i++)
+        at += snprintf(line + at, sizeof line - at, "%s%02x", i % 4 ? "" : " ", ((unsigned char *)G2H(addr))[i]);
+    fprintf(stderr, "%s\n", line);
+}
+
 static void maybe_screenshot(void)
 {
     const char *path = getenv("LINDBERGH_SHOT");
@@ -315,6 +349,7 @@ static void maybe_screenshot(void)
 void host_swap(void)
 {
     maybe_screenshot();
+    maybe_peek();
     g_frame++;
     if (g_win.win) {
         /* Present the window's own framebuffer whatever the game left bound:

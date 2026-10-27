@@ -227,6 +227,7 @@ typedef struct {
 
 void       guest_install_thread_handlers(void);
 void       host_cabinet_input(CabinetInput *out);
+void       host_cabinet_switches_read(void);
 int        host_input_pop(HostInput *out);
 void       host_mouse_state(int *x, int *y, int *buttons);
 

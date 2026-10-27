@@ -102,7 +102,8 @@ unsigned guest_depth_max(void) { return g_depth_max; }
  * dispatched. The question comes up constantly during bring-up - a branch went
  * the wrong way and something that should have run did not - and it is not
  * answerable from a backtrace, which only shows what DID run. */
-static void watch_check(CPU *c, uint32_t va)
+extern unsigned g_frame;
+static int watch_check(CPU *c, uint32_t va)
 {
     static uint32_t list[16];
     static int n = -1, nargs;
@@ -122,6 +123,11 @@ static void watch_check(CPU *c, uint32_t va)
     for (int i = 0; i < n; i++)
         if (list[i] == va && hit[i] < (unsigned)(nargs ? nargs : 1)) {
             hit[i]++;
+            /* LINDBERGH_WATCH_MEM=addr adds that guest dword to each report */
+            static int wm = -1; static uint32_t wma;
+            if (wm < 0) { const char *m = getenv("LINDBERGH_WATCH_MEM"); wm = m && *m; if (wm) wma = (uint32_t)strtoul(m, NULL, 16); }
+            if (nargs && wm)
+                fprintf(stderr, "[watch] %#010x mem[%#x]=%#x frame %u\n", va, wma, rd32(wma), g_frame);
             if (nargs)
                 fprintf(stderr, "[watch] %#010x(%#x, %#x, %#x, %#x) from %#010x\n", va,
                         rd32(c->esp + 4), rd32(c->esp + 8), rd32(c->esp + 12),
@@ -129,7 +135,9 @@ static void watch_check(CPU *c, uint32_t va)
             else
                 fprintf(stderr, "[watch] reached %#010x\n", va);
             fflush(stderr);
+            return nargs != 0;
         }
+    return 0;
 }
 
 static int gl_token_call_entry(CPU *c, uint32_t va)
@@ -144,7 +152,7 @@ static int gl_token_call_entry(CPU *c, uint32_t va)
 void dispatch(CPU *c, uint32_t va)
 {
     guest_trace_dispatch(va);
-    watch_check(c, va);
+    int watched = watch_check(c, va);
 
     if (++g_depth > g_depth_max) g_depth_max = g_depth;
     if (g_depth > DEPTH_LIMIT) {
@@ -170,10 +178,14 @@ void dispatch(CPU *c, uint32_t va)
     /* A host body standing in for a guest function. Checked first, so it wins
      * over the lifted version; the range test costs two compares. */
     HleHandler ov = guest_find_override(va);
-    if (ov) { (void)pop32(c); ov(c); g_depth--; return; }
+    if (ov) { (void)pop32(c); ov(c); g_depth--;
+              if (watched) fprintf(stderr, "[watch] %#010x -> %#x\n", va, c->eax);
+              return; }
 
     void (*fn)(CPU *) = find(va);
-    if (fn) { fn(c); g_depth--; return; }
+    if (fn) { fn(c); g_depth--;
+              if (watched) fprintf(stderr, "[watch] %#010x -> %#x\n", va, c->eax);
+              return; }
 
     /* An import reached indirectly. The stack here is one slot off from a
      * `call <stub>` site: esp points at the return address with the arguments

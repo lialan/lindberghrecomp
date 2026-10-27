@@ -174,6 +174,7 @@ static void jvs_command(const unsigned char *p)
             ack_byte(b0);
             ack_zeros(bytes > 1 ? bytes - 1 : 0);
         }
+        host_cabinet_switches_read();
         break;
     }
     case 0x21: {                                 /* coins */
