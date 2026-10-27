@@ -567,6 +567,9 @@ void host_swap(void)
             t0 = now; f0 = g_frame;
         }
     }
+#if defined(__APPLE__)
+    if (g_frame % 60u == 0) host_menu_install();
+#endif
     pump();
 }
 

@@ -100,16 +100,22 @@ static NSMenu *add_menu(NSString *title)
     return m;
 }
 
+/* SDL builds its own menu bar when Cocoa finishes launching, which can come
+ * after the window is open and replaces whatever was there. So this is
+ * called every so often and puts the menus back if they are gone. */
 void host_menu_install(void)
 {
     @autoreleasepool {
-        if (g_target || !NSApp) return;
+        if (!NSApp) return;
         if (!NSApp.mainMenu) NSApp.mainMenu = [[NSMenu alloc] init];
-        g_target = [[LindberghMenu alloc] init];
+        if ([NSApp.mainMenu indexOfItemWithTitle:@"Controls"] >= 0) return;
+        if (!g_target) g_target = [[LindberghMenu alloc] init];
         g_controls = add_menu(@"Controls");
         g_aim      = add_menu(@"Aim");
         g_sound    = add_menu(@"Sound");
         g_lang     = add_menu(@"Language");
-        fprintf(stderr, "[menu] Controls, Aim, Sound and Language added to the menu bar\n");
+        NSMutableArray *names = [NSMutableArray array];
+        for (NSMenuItem *i in NSApp.mainMenu.itemArray) [names addObject:i.title.length ? i.title : @"(app)"];
+        fprintf(stderr, "[menu] menu bar: %s\n", [[names componentsJoinedByString:@", "] UTF8String]);
     }
 }
