@@ -28,6 +28,7 @@
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -1032,6 +1033,7 @@ static GLuint compile(GLenum type, const char *src, int stage, GLuint id)
     return sh;
 }
 
+static struct timespec g_link_t0;
 static Linked *link_pair(GLuint vid, GLuint fid)
 {
     ArbProg *vp = vid ? prog_get(0, vid, 0) : NULL;
@@ -1041,6 +1043,7 @@ static Linked *link_pair(GLuint vid, GLuint fid)
         Linked *l = &g_linked[i];
         if (l->vid == vid && l->fid == fid && l->vgen == vgen && l->fgen == fgen) return l;
     }
+    clock_gettime(CLOCK_MONOTONIC, &g_link_t0);    /* translate, compile and link */
     if (g_nlinked >= MAX_LINKED) {          /* full: start over */
         for (int i = 0; i < g_nlinked; i++) if (g_linked[i].prog) glDeleteProgram(g_linked[i].prog);
         g_nlinked = 0;
@@ -1089,6 +1092,13 @@ static Linked *link_pair(GLuint vid, GLuint fid)
     for (int st = 0; st < 2; st++) if (sh[st]) glDeleteShader(sh[st]);
     GLint ok = 0;
     glGetProgramiv(l->prog, GL_LINK_STATUS, &ok);
+    if (getenv("LINDBERGH_LATENCY")) {        /* linking waits on the driver */
+        static double total; static unsigned n;
+        struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
+        double ms = (t1.tv_sec - g_link_t0.tv_sec) * 1e3 + (t1.tv_nsec - g_link_t0.tv_nsec) / 1e6;
+        total += ms; n++;
+        if (ms > 5) fprintf(stderr, "[lat] linking v%u/f%u took %.0f ms (%u links, %.0f ms so far)\n", vid, fid, ms, n, total);
+    }
     if (!ok) {
         char log[2048] = "";
         glGetProgramInfoLog(l->prog, sizeof log, NULL, log);

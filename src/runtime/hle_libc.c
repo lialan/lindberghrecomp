@@ -315,11 +315,26 @@ static void h_isprint(CPU *c) { uint32_t ch = A32(0); RET(ch >= 0x20 && ch < 0x7
 static void h_nanosleep(CPU *c)
 {
     uint32_t req = A32(0);
-    if (req) {
-        uint32_t sec = rd32(req), nsec = rd32(req + 4);
-        DWORD ms = sec * 1000u + nsec / 1000000u;
-        Sleep(ms ? ms : 1);
+    if (!req) { RET(-1); return; }
+    int32_t sec = (int32_t)rd32(req), nsec = (int32_t)rd32(req + 4);
+    /* Linux refuses a negative time or nanoseconds out of 0..999999999 with
+     * EINVAL and does not sleep at all. The game's own sleep helper can hand
+     * over such values; sleeping them as unsigned stalled its threads for
+     * seconds at a time. */
+    if (sec < 0 || nsec < 0 || nsec > 999999999) {
+        static unsigned shown;
+        if (shown++ < 5)
+            fprintf(stderr, "[libc] nanosleep(%d s, %d ns) refused, as Linux does\n", sec, nsec);
+        RET(-1);
+        return;
     }
+#ifdef _WIN32
+    DWORD ms = (DWORD)sec * 1000u + (DWORD)nsec / 1000000u;
+    Sleep(ms ? ms : 1);
+#else
+    struct timespec ts = { sec, nsec };
+    nanosleep(&ts, NULL);
+#endif
     RET(0);
 }
 static void h_memalign(CPU *c) { RET(gmalloc(A32(1), A32(0))); }

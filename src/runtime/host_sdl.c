@@ -97,6 +97,8 @@ static unsigned g_held;       /* cabinet buttons held down right now */
  * the board is read once a frame, so a quick tap can go down and up inside
  * one drain; latching it until the next read means no tap is lost. */
 static unsigned g_cab_latch;
+/* LINDBERGH_LATENCY: when the trigger went down, until the board reports it */
+static Uint64 g_lat_t; static unsigned g_lat_f;
 static unsigned g_auto;       /* buttons driven by LINDBERGH_AUTOSTART/AUTOGUN */
 static int      g_scripted;   /* the gun is scripted: real input is ignored */
 
@@ -126,6 +128,7 @@ static void cabinet_action(HostAction a, int down)
     unsigned bit = CAB_OF[a];
     if (!bit) return;
     if (down) { g_held |= bit; g_cab_latch |= bit; } else g_held &= ~bit;
+    if (down && bit == CAB_P1_TRIGGER && !g_lat_t) { g_lat_t = SDL_GetPerformanceCounter(); g_lat_f = g_frame; }
 }
 
 /* A key (SDL keycode) or mouse button (MOUSE_BIND) went down or up. Returns
@@ -287,6 +290,18 @@ void host_cabinet_input(CabinetInput *out)
 /* The board has reported the switches: latched taps have been seen. */
 void host_cabinet_switches_read(void)
 {
+    static int lat = -1; static Uint64 last; static unsigned reads;
+    if (lat < 0) lat = env_int("LINDBERGH_LATENCY", 0);
+    if (lat) {
+        Uint64 now = SDL_GetPerformanceCounter(), hz = SDL_GetPerformanceFrequency();
+        double gap = last ? (now - last) * 1000.0 / hz : 0; last = now; reads++;
+        if (gap > 40) fprintf(stderr, "[lat] frame %u: switch reads %.0f ms apart\n", g_frame, gap);
+        if (g_lat_t) {
+            fprintf(stderr, "[lat] trigger: board reported it %.1f ms / %u frames after the click\n",
+                    (now - g_lat_t) * 1000.0 / hz, g_frame - g_lat_f);
+            g_lat_t = 0;
+        }
+    }
     g_cab_latch = 0;
 }
 
@@ -334,6 +349,15 @@ static void fake_keys(void)
                 SDL_PushEvent(&e);
                 e.window.event = SDL_WINDOWEVENT_ENTER; SDL_PushEvent(&e);
                 fprintf(stderr, "[keys] pointer out and back at frame %u\n", f);
+                while (*p == ',') p++;
+                continue;
+            }
+            if (k == '@') {                  /* a left click where the pointer is */
+                e.type = SDL_MOUSEBUTTONDOWN; e.button.button = SDL_BUTTON_LEFT;
+                e.button.x = g_mouse_x; e.button.y = g_mouse_y;
+                SDL_PushEvent(&e);
+                e.type = SDL_MOUSEBUTTONUP; SDL_PushEvent(&e);
+                fprintf(stderr, "[keys] clicked at frame %u\n", f);
                 while (*p == ',') p++;
                 continue;
             }
@@ -563,6 +587,11 @@ void host_swap(void)
             fprintf(stderr, "[window] LINDBERGH_EXIT_AFTER: %u frames done\n", g_frame);
             exit(0);
         }
+    }
+    {   /* LINDBERGH_LATENCY: frames that took far longer than 1/60 s */
+        static Uint64 prev; Uint64 now = SDL_GetPerformanceCounter();
+        double ms = prev ? (now - prev) * 1000.0 / SDL_GetPerformanceFrequency() : 0; prev = now;
+        if (ms > 40 && env_int("LINDBERGH_LATENCY", 0)) fprintf(stderr, "[lat] frame %u took %.0f ms\n", g_frame, ms);
     }
     {   /* frame rate, every 5 seconds */
         static Uint32 t0; static unsigned f0;

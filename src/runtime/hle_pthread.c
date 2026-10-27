@@ -608,6 +608,10 @@ static void h_sem_init(CPU *c)
     HostSem *s = SEM(0);
     pthread_mutex_lock(&s->m);
     s->count = A32(2);
+    /* The game's I/O thread can reach its first sem_wait before the main
+     * thread has initialised the semaphore; it must be woken by the count
+     * set here, or it sleeps for good and the I/O board is never polled. */
+    pthread_cond_broadcast(&s->cv);
     pthread_mutex_unlock(&s->m);
     RET(0);
 }
@@ -624,7 +628,17 @@ static void h_sem_wait(CPU *c)
 {
     HostSem *s = SEM(0);
     pthread_mutex_lock(&s->m);
-    while (!s->count) pthread_cond_wait(&s->cv, &s->m);
+    int waited = 0;
+    while (!s->count) {
+        /* A thread that has waited seconds on a semaphore has usually lost
+         * a post; say which one, so a stalled game thread can be traced. */
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += 2;
+        if (pthread_cond_timedwait(&s->cv, &s->m, &ts) == ETIMEDOUT && !waited++)
+            fprintf(stderr, "[pthread] sem_wait(%#x) blocked over 2 s\n", A32(0));
+    }
+    if (waited) fprintf(stderr, "[pthread] sem_wait(%#x) went through after %d s\n", A32(0), waited * 2);
     s->count--;
     pthread_mutex_unlock(&s->m);
     RET(0);
