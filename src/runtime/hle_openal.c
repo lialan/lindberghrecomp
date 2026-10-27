@@ -85,14 +85,14 @@ static void h_alIsBuffer(CPU *c)     { RET(alIsBuffer(A32(0))); }
 static void h_alIsSource(CPU *c)     { RET(alIsSource(A32(0))); }
 /* ---- mute ----
  * The whole mix goes through the listener, so its gain is the master volume.
- * M toggles it; LINDBERGH_MUTE=1, or any unattended run (LINDBERGH_EXIT_AFTER),
- * starts muted. Muting also uploads silence in place of each buffer. */
+ * M toggles it. Runs start muted - this is a development build - unless
+ * LINDBERGH_MUTE=0. Muting also uploads silence in place of each buffer. */
 static int g_muted = -1;
 static void apply_mute(void)
 {
     if (g_muted < 0) {
-        const char *m = getenv("LINDBERGH_MUTE");
-        g_muted = (m && *m && *m != '0') || getenv("LINDBERGH_EXIT_AFTER");
+        const char *m = getenv("LINDBERGH_MUTE");     /* muted unless =0 */
+        g_muted = !(m && *m == '0');
     }
     if (alcGetCurrentContext()) alListenerf(AL_GAIN, g_muted ? 0.0f : 1.0f);
 }
