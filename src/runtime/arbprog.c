@@ -1,0 +1,1342 @@
+/*
+ * arbprog.c - ARB / NV assembly programs, translated to GLSL.
+ *
+ * A Lindbergh game draws with ARB_vertex_program and ARB_fragment_program
+ * text, and Ghost Squad Evolution's lighting programs add
+ * OPTION NV_vertex_program2 - branches, subroutines and condition codes -
+ * which only NVIDIA's driver ever ran. Apple's driver accepts that text and
+ * then refuses every draw with it; GLES (the Quest) has no assembly programs
+ * at all. So the runtime owns the assembly-program state instead of the
+ * driver: which program is bound and enabled per stage, the env and local
+ * parameters, and the source. Before each draw, the enabled pair is
+ * translated to a GLSL program (once, cached), bound, and its parameters and
+ * matrices uploaded as uniforms.
+ *
+ * The translation is direct: every TEMP, ATTRIB, PARAM and OUTPUT becomes a
+ * vec4, every instruction one GLSL statement on vec4s with the same swizzle,
+ * write-mask, negate and saturate rules. Matrices are computed on the CPU from
+ * the GL matrix stacks and uploaded as rows, so nothing depends on GLSL's
+ * compatibility built-ins for them. Programs with control flow (NV BRA, CAL,
+ * RET) become a loop over basic blocks with a program counter and a call
+ * stack, which keeps the original's arbitrary jumps exact.
+ *
+ * Anything the translator does not understand fails the translation with a
+ * reason, once, and that program falls back to the driver's own path.
+ */
+
+#include <ctype.h>
+#include <math.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "gl_posix.h"
+#include "arbprog.h"
+
+#ifndef GL_MATRIX0_ARB
+#define GL_MATRIX0_ARB 0x88C0
+#endif
+#ifndef GL_CURRENT_MATRIX_ARB
+#define GL_CURRENT_MATRIX_ARB 0x8641
+#endif
+
+#define MAX_IDS   4096
+#define MAX_ENV   256
+#define MAX_LOCAL 96
+
+/* ------------------------------------------------------------------------ */
+/* program state the driver no longer holds                                  */
+/* ------------------------------------------------------------------------ */
+
+typedef struct {
+    char    *src;
+    unsigned gen;                /* bumps on every new source */
+    float    local[MAX_LOCAL][4];
+    unsigned local_gen;
+    int      failed;             /* translation failed: use the driver */
+} ArbProg;
+
+static ArbProg *g_prog[2][MAX_IDS];       /* [0] vertex, [1] fragment */
+static GLuint   g_bound[2];
+static int      g_enabled[2];
+static float    g_env[2][MAX_ENV][4];
+static unsigned g_env_gen[2];
+static GLuint   g_game_glsl;              /* the game's own GLSL program, if any */
+
+static int stage_of(GLenum target)
+{
+    if (target == GL_VERTEX_PROGRAM_ARB) return 0;
+    if (target == GL_FRAGMENT_PROGRAM_ARB) return 1;
+    return -1;
+}
+
+static ArbProg *prog_get(int st, GLuint id, int create)
+{
+    if (id == 0 || id >= MAX_IDS) return NULL;
+    if (!g_prog[st][id] && create) g_prog[st][id] = (ArbProg *)calloc(1, sizeof(ArbProg));
+    return g_prog[st][id];
+}
+
+/* ------------------------------------------------------------------------ */
+/* the translator                                                            */
+/* ------------------------------------------------------------------------ */
+
+typedef struct { char *p; size_t n, cap; } Buf;
+
+static void bput(Buf *b, const char *fmt, ...)
+{
+    va_list ap;
+    for (;;) {
+        va_start(ap, fmt);
+        int need = vsnprintf(b->p ? b->p + b->n : NULL, b->p ? b->cap - b->n : 0, fmt, ap);
+        va_end(ap);
+        if (b->p && b->n + (size_t)need < b->cap) { b->n += (size_t)need; return; }
+        b->cap = (b->cap + (size_t)need + 1) * 2;
+        b->p = (char *)realloc(b->p, b->cap);
+        if (!b->n) b->p[0] = 0;
+    }
+}
+
+enum { SYM_TEMP, SYM_ADDR, SYM_EXPR, SYM_ARRAY, SYM_OUT };
+
+typedef struct {
+    char name[64];
+    int  kind;
+    char expr[160];       /* SYM_EXPR / SYM_OUT: a vec4 lvalue/rvalue; SYM_ARRAY: array base */
+    int  base;            /* SYM_ARRAY: offset into the base array */
+    int  len;
+} Sym;
+
+/* A matrix the program reads: computed on the CPU and uploaded as 4 rows. */
+typedef struct { int which, index, mod; } MatRef;   /* mod: 0 plain 1 inverse 2 transpose 3 invtrans */
+enum { MAT_MVP, MAT_MODELVIEW, MAT_PROJECTION, MAT_TEXTURE, MAT_PROGRAM };
+
+typedef struct {
+    int     stage;
+    Sym     sym[256];
+    int     nsym;
+    MatRef  mat[16];
+    int     nmat;
+    int     env_hi, local_hi;          /* highest index read, -1 none */
+    int     tex_target[16];            /* 0 none, else 1=1D 2=2D 3=3D 4=CUBE 5=RECT */
+    int     attrib_used[16];
+    int     pos_invariant, fog_mode;   /* fog: 0 none 1 linear 2 exp 3 exp2 */
+    int     writes_depth;
+    char    err[200];
+    Buf     decl, body;
+    /* control flow */
+    char    label[64][64];
+    int     nlabel;
+    int     has_flow;
+    int     block;                     /* current block number when has_flow */
+} Tr;
+
+static int fail(Tr *t, const char *fmt, ...)
+{
+    if (!t->err[0]) {
+        va_list ap;
+        va_start(ap, fmt);
+        vsnprintf(t->err, sizeof t->err, fmt, ap);
+        va_end(ap);
+    }
+    return 0;
+}
+
+static Sym *sym_find(Tr *t, const char *name)
+{
+    for (int i = 0; i < t->nsym; i++)
+        if (strcmp(t->sym[i].name, name) == 0) return &t->sym[i];
+    return NULL;
+}
+
+static Sym *sym_add(Tr *t, const char *name, int kind)
+{
+    if (t->nsym >= 256) { fail(t, "too many symbols"); return NULL; }
+    Sym *s = &t->sym[t->nsym++];
+    memset(s, 0, sizeof *s);
+    snprintf(s->name, sizeof s->name, "%s", name);
+    s->kind = kind;
+    return s;
+}
+
+static char *trim(char *s)
+{
+    while (isspace((unsigned char)*s)) s++;
+    char *e = s + strlen(s);
+    while (e > s && isspace((unsigned char)e[-1])) *--e = 0;
+    return s;
+}
+
+static int mat_slot(Tr *t, int which, int index, int mod)
+{
+    for (int i = 0; i < t->nmat; i++)
+        if (t->mat[i].which == which && t->mat[i].index == index && t->mat[i].mod == mod) return i;
+    if (t->nmat >= 16) return fail(t, "too many matrices"), 0;
+    t->mat[t->nmat].which = which; t->mat[t->nmat].index = index; t->mat[t->nmat].mod = mod;
+    return t->nmat++;
+}
+
+/* "state.matrix.X[.mod][.row[a..b]]" -> uniform rows. Sets arr to the
+ * GLSL array base and lo and hi to the rows. */
+static int parse_matrix(Tr *t, const char *s, char *arr, size_t arrn, int *lo, int *hi)
+{
+    const char *p = s + strlen("state.matrix.");
+    int which, index = 0;
+    if      (!strncmp(p, "mvp", 3))        { which = MAT_MVP; p += 3; }
+    else if (!strncmp(p, "modelview", 9))  { which = MAT_MODELVIEW; p += 9; }
+    else if (!strncmp(p, "projection", 10)){ which = MAT_PROJECTION; p += 10; }
+    else if (!strncmp(p, "texture", 7))    { which = MAT_TEXTURE; p += 7; }
+    else if (!strncmp(p, "program", 7))    { which = MAT_PROGRAM; p += 7; }
+    else return fail(t, "matrix %s", s);
+    if (*p == '[') { index = atoi(p + 1); p = strchr(p, ']'); if (!p) return fail(t, "matrix %s", s); p++; }
+    int mod = 0;
+    if      (!strncmp(p, ".invtrans", 9))  { mod = 3; p += 9; }
+    else if (!strncmp(p, ".inverse", 8))   { mod = 1; p += 8; }
+    else if (!strncmp(p, ".transpose", 10)){ mod = 2; p += 10; }
+    *lo = 0; *hi = 3;
+    if (!strncmp(p, ".row[", 5)) {
+        p += 5;
+        *lo = *hi = atoi(p);
+        const char *dd = strstr(p, "..");
+        const char *rb = strchr(p, ']');
+        if (dd && rb && dd < rb) *hi = atoi(dd + 2);
+        p = rb ? rb + 1 : p + strlen(p);
+    }
+    if (*p) return fail(t, "matrix suffix %s", p);
+    int slot = mat_slot(t, which, index, mod);
+    snprintf(arr, arrn, "%s_m%d", t->stage ? "f" : "v", slot);
+    return 1;
+}
+
+/* One binding -> one vec4 GLSL rvalue. For array bindings (env ranges and
+ * whole matrices) see parse_array_binding. */
+static int binding_expr(Tr *t, const char *b, char *out, size_t n)
+{
+    const char *P = t->stage ? "f" : "v";
+    int i;
+    char c;
+    if (sscanf(b, "program.env[%d%c", &i, &c) == 2 && c == ']') {
+        if (i > t->env_hi) t->env_hi = i;
+        snprintf(out, n, "%s_env[%d]", P, i); return 1;
+    }
+    if (sscanf(b, "program.local[%d%c", &i, &c) == 2 && c == ']') {
+        if (i > t->local_hi) t->local_hi = i;
+        snprintf(out, n, "%s_loc[%d]", P, i); return 1;
+    }
+    if (!strncmp(b, "state.matrix.", 13)) {
+        char arr[32]; int lo, hi;
+        if (!parse_matrix(t, b, arr, sizeof arr, &lo, &hi)) return 0;
+        if (lo != hi) return fail(t, "matrix used as a single vector: %s", b);
+        snprintf(out, n, "%s[%d]", arr, lo); return 1;
+    }
+    if (!strcmp(b, "state.fog.color")) { snprintf(out, n, "gl_Fog.color"); return 1; }
+    if (!strcmp(b, "state.fog.params")) {
+        snprintf(out, n, "vec4(gl_Fog.density, gl_Fog.start, gl_Fog.end, gl_Fog.scale)"); return 1;
+    }
+    if (t->stage == 0) {
+        if (!strcmp(b, "vertex.position")) { snprintf(out, n, "gl_Vertex"); return 1; }
+        if (!strcmp(b, "vertex.normal"))   { snprintf(out, n, "vec4(gl_Normal, 1.0)"); return 1; }
+        if (!strcmp(b, "vertex.color") || !strcmp(b, "vertex.color.primary")) { snprintf(out, n, "gl_Color"); return 1; }
+        if (!strcmp(b, "vertex.color.secondary")) { snprintf(out, n, "gl_SecondaryColor"); return 1; }
+        if (!strcmp(b, "vertex.fogcoord")) { snprintf(out, n, "vec4(gl_FogCoord, 0.0, 0.0, 1.0)"); return 1; }
+        if (!strcmp(b, "vertex.texcoord")) { snprintf(out, n, "gl_MultiTexCoord0"); return 1; }
+        if (sscanf(b, "vertex.texcoord[%d%c", &i, &c) == 2 && c == ']' && i < 8) {
+            snprintf(out, n, "gl_MultiTexCoord%d", i); return 1;
+        }
+        if (sscanf(b, "vertex.attrib[%d%c", &i, &c) == 2 && c == ']' && i < 16) {
+            if (i == 0) { snprintf(out, n, "gl_Vertex"); return 1; }
+            t->attrib_used[i] = 1;
+            snprintf(out, n, "va_%d", i); return 1;
+        }
+    } else {
+        if (!strcmp(b, "fragment.color") || !strcmp(b, "fragment.color.primary")) { snprintf(out, n, "gl_Color"); return 1; }
+        if (!strcmp(b, "fragment.color.secondary")) { snprintf(out, n, "gl_SecondaryColor"); return 1; }
+        if (!strcmp(b, "fragment.fogcoord")) { snprintf(out, n, "vec4(gl_FogFragCoord, 0.0, 0.0, 1.0)"); return 1; }
+        if (!strcmp(b, "fragment.position")) { snprintf(out, n, "gl_FragCoord"); return 1; }
+        if (!strcmp(b, "fragment.texcoord")) { snprintf(out, n, "gl_TexCoord[0]"); return 1; }
+        if (sscanf(b, "fragment.texcoord[%d%c", &i, &c) == 2 && c == ']' && i < 8) {
+            snprintf(out, n, "gl_TexCoord[%d]", i); return 1;
+        }
+    }
+    /* literals */
+    char *end;
+    double v = strtod(b, &end);
+    if (end != b && !*trim(end)) { snprintf(out, n, "vec4(%.9g)", v); return 1; }
+    if (b[0] == '{') {
+        double f[4] = { 0, 0, 0, 1 };
+        int k = 0;
+        const char *q = b + 1;
+        while (k < 4) {
+            f[k] = strtod(q, &end);
+            if (end == q) break;
+            k++;
+            q = end;
+            while (*q == ' ' || *q == ',' || *q == '\t' || *q == '\n') q++;
+        }
+        /* fewer than four: y and z default to 0, w to 1 */
+        snprintf(out, n, "vec4(%.9g, %.9g, %.9g, %.9g)", f[0], f[1], f[2], f[3]); return 1;
+    }
+    return fail(t, "binding %s", b);
+}
+
+/* result.* -> an lvalue vec4 (temporaries copied to the built-ins at the end) */
+static int output_expr(Tr *t, const char *b, char *out, size_t n)
+{
+    int i; char c;
+    if (t->stage == 0) {
+        if (!strcmp(b, "result.position")) { snprintf(out, n, "gl_Position"); return 1; }
+        if (!strcmp(b, "result.color") || !strcmp(b, "result.color.primary") ||
+            !strcmp(b, "result.color.front") || !strcmp(b, "result.color.front.primary")) {
+            snprintf(out, n, "gl_FrontColor"); return 1; }
+        if (!strcmp(b, "result.color.secondary") || !strcmp(b, "result.color.front.secondary")) {
+            snprintf(out, n, "gl_FrontSecondaryColor"); return 1; }
+        if (!strcmp(b, "result.color.back") || !strcmp(b, "result.color.back.primary")) {
+            snprintf(out, n, "gl_BackColor"); return 1; }
+        if (!strcmp(b, "result.color.back.secondary")) { snprintf(out, n, "gl_BackSecondaryColor"); return 1; }
+        if (!strcmp(b, "result.fogcoord")) { snprintf(out, n, "o_fog"); return 1; }
+        if (!strcmp(b, "result.pointsize")) { snprintf(out, n, "o_psize"); return 1; }
+        if (!strcmp(b, "result.texcoord")) { snprintf(out, n, "gl_TexCoord[0]"); return 1; }
+        if (sscanf(b, "result.texcoord[%d%c", &i, &c) == 2 && c == ']' && i < 8) {
+            snprintf(out, n, "gl_TexCoord[%d]", i); return 1; }
+    } else {
+        if (!strcmp(b, "result.color")) { snprintf(out, n, "o_col"); return 1; }
+        if (!strcmp(b, "result.depth")) { t->writes_depth = 1; snprintf(out, n, "o_dep"); return 1; }
+    }
+    return fail(t, "output %s", b);
+}
+
+/* PARAM name[N] = { ... } : alias a contiguous env range or a single matrix,
+ * otherwise build a local array. */
+static int declare_param_array(Tr *t, const char *name, const char *init)
+{
+    char tmp[1024];
+    snprintf(tmp, sizeof tmp, "%s", init);
+    char *s = trim(tmp);
+    if (*s == '{') s++;
+    char *e = s + strlen(s);
+    if (e > s && e[-1] == '}') e[-1] = 0;
+    s = trim(s);
+    /* the whole list is one item? */
+    int lo, hi; char c;
+    if (!strchr(s, ',') && sscanf(s, "program.env[%d..%d%c", &lo, &hi, &c) == 3 && c == ']') {
+        Sym *y = sym_add(t, name, SYM_ARRAY);
+        if (!y) return 0;
+        snprintf(y->expr, sizeof y->expr, "%s_env", t->stage ? "f" : "v");
+        y->base = lo; y->len = hi - lo + 1;
+        if (hi > t->env_hi) t->env_hi = hi;
+        return 1;
+    }
+    if (!strchr(s, ',') && !strncmp(s, "state.matrix.", 13)) {
+        char arr[32];
+        if (!parse_matrix(t, s, arr, sizeof arr, &lo, &hi)) return 0;
+        Sym *y = sym_add(t, name, SYM_ARRAY);
+        if (!y) return 0;
+        snprintf(y->expr, sizeof y->expr, "%s", arr);
+        y->base = lo; y->len = hi - lo + 1;
+        return 1;
+    }
+    /* general list: a local array */
+    Sym *y = sym_add(t, name, SYM_ARRAY);
+    if (!y) return 0;
+    snprintf(y->expr, sizeof y->expr, "pa_%s", name);
+    y->base = 0;
+    int k = 0;
+    Buf init_code = {0};
+    char *save = NULL;
+    for (char *item = strtok_r(s, ",", &save); item; item = strtok_r(NULL, ",", &save)) {
+        item = trim(item);
+        if (sscanf(item, "program.env[%d..%d%c", &lo, &hi, &c) == 3 && c == ']') {
+            for (int j = lo; j <= hi; j++) {
+                bput(&init_code, "  pa_%s[%d] = %s_env[%d];\n", name, k++, t->stage ? "f" : "v", j);
+                if (j > t->env_hi) t->env_hi = j;
+            }
+        } else if (!strncmp(item, "state.matrix.", 13)) {
+            char arr[32];
+            if (!parse_matrix(t, item, arr, sizeof arr, &lo, &hi)) return 0;
+            for (int j = lo; j <= hi; j++) bput(&init_code, "  pa_%s[%d] = %s[%d];\n", name, k++, arr, j);
+        } else {
+            char ex[160];
+            if (!binding_expr(t, item, ex, sizeof ex)) return 0;
+            bput(&init_code, "  pa_%s[%d] = %s;\n", name, k++, ex);
+        }
+    }
+    y->len = k;
+    bput(&t->decl, "vec4 pa_%s[%d];\n", name, k ? k : 1);
+    /* initialised at the top of main */
+    bput(&t->body, "%s", init_code.p ? init_code.p : "");
+    free(init_code.p);
+    return 1;
+}
+
+/* ---- operands ---- */
+
+static int swz_index(char c)
+{
+    switch (c) {
+    case 'x': case 'r': return 0;
+    case 'y': case 'g': return 1;
+    case 'z': case 'b': return 2;
+    case 'w': case 'a': return 3;
+    }
+    return -1;
+}
+
+/* Split "name[idx].sw" into name, index text and swizzle text. */
+static void split_ref(char *s, char **name, char **idx, char **sw)
+{
+    *idx = NULL; *sw = NULL; *name = s;
+    char *lb = strchr(s, '[');
+    char *last_dot = strrchr(s, '.');
+    if (lb) {
+        char *rb = strchr(lb, ']');
+        if (rb) {
+            *lb = 0; *rb = 0; *idx = lb + 1;
+            if (rb[1] == '.') *sw = rb + 2;
+            return;
+        }
+    }
+    /* trailing ".xyzw"-style suffix on a plain name */
+    if (last_dot) {
+        int ok = 1;
+        for (char *q = last_dot + 1; *q; q++) if (swz_index(*q) < 0) ok = 0;
+        size_t L = strlen(last_dot + 1);
+        if (ok && L >= 1 && L <= 4) { *last_dot = 0; *sw = last_dot + 1; }
+    }
+}
+
+static int index_expr(Tr *t, const char *idx, int base, char *out, size_t n)
+{
+    char tmp[128];
+    snprintf(tmp, sizeof tmp, "%s", idx);
+    char *s = trim(tmp);
+    if (isdigit((unsigned char)*s)) { snprintf(out, n, "%d", base + atoi(s)); return 1; }
+    /* addr.x [+|- k] */
+    char a[64]; char comp = 'x'; int k = 0;
+    char *dot = strchr(s, '.');
+    if (!dot) return fail(t, "index %s", idx);
+    snprintf(a, sizeof a, "%.*s", (int)(dot - s), s);
+    comp = dot[1];
+    const char *rest = dot + 2;
+    while (*rest == ' ') rest++;
+    if (*rest == '+') k = atoi(rest + 1);
+    else if (*rest == '-') k = -atoi(rest + 1);
+    Sym *y = sym_find(t, trim(a));
+    if (!y || y->kind != SYM_ADDR) return fail(t, "address register %s", a);
+    snprintf(out, n, "(%d + a_%s.%c)", base + k, y->name, comp);
+    return 1;
+}
+
+/* A source operand -> a vec4 expression. */
+static int src_expr(Tr *t, const char *src_in, char *out, size_t n)
+{
+    char buf[256];
+    snprintf(buf, sizeof buf, "%s", src_in);
+    char *s = trim(buf);
+    int neg = 0, absv = 0;
+    if (*s == '-') { neg = 1; s = trim(s + 1); }
+    else if (*s == '+') s = trim(s + 1);
+    if (*s == '|') {
+        absv = 1; s++;
+        char *e = strrchr(s, '|');
+        if (e) *e = 0;
+        s = trim(s);
+    }
+    char base[200];
+    char *nm, *idx, *sw;
+    if (*s == '{' || isdigit((unsigned char)*s) || *s == '.') {
+        if (!binding_expr(t, s, base, sizeof base)) return 0;
+        sw = NULL;
+    } else if (!strncmp(s, "vertex.", 7) || !strncmp(s, "fragment.", 9) ||
+               !strncmp(s, "program.", 8) || !strncmp(s, "state.", 6)) {
+        /* inline binding, maybe with a swizzle after it */
+        char *dot = strrchr(s, '.');
+        sw = NULL;
+        if (dot) {          /* a last segment made only of swizzle letters is a swizzle */
+            int ok = 1; size_t L = strlen(dot + 1);
+            for (char *q = dot + 1; *q; q++) if (swz_index(*q) < 0) ok = 0;
+            if (ok && L >= 1 && L <= 4) { *dot = 0; sw = dot + 1; }
+        }
+        if (!binding_expr(t, s, base, sizeof base)) return 0;
+    } else {
+        split_ref(s, &nm, &idx, &sw);
+        Sym *y = sym_find(t, trim(nm));
+        if (!y) return fail(t, "unknown name %s", nm);
+        if (y->kind == SYM_ARRAY) {
+            if (!idx) return fail(t, "array %s without index", nm);
+            char ie[128];
+            if (!index_expr(t, idx, y->base, ie, sizeof ie)) return 0;
+            snprintf(base, sizeof base, "%s[%s]", y->expr, ie);
+        } else if (y->kind == SYM_TEMP) {
+            snprintf(base, sizeof base, "t_%s", y->name);
+        } else if (y->kind == SYM_EXPR || y->kind == SYM_OUT) {
+            snprintf(base, sizeof base, "%s", y->expr);
+        } else return fail(t, "%s used as a source", nm);
+    }
+    char e[256];
+    if (sw && *sw) {
+        size_t L = strlen(sw);
+        char s4[5];
+        for (int k = 0; k < 4; k++) s4[k] = "xyzw"[swz_index(sw[k < (int)L ? k : (int)L - 1])];
+        s4[4] = 0;
+        snprintf(e, sizeof e, "(%s).%s", base, s4);
+    } else snprintf(e, sizeof e, "(%s)", base);
+    if (absv) { char a[300]; snprintf(a, sizeof a, "abs%s", e); snprintf(e, sizeof e, "%s", a); }
+    if (neg) snprintf(out, n, "(-%s)", e); else snprintf(out, n, "%s", e);
+    return 1;
+}
+
+/* Destination: name[.mask] [(cond)] */
+typedef struct { char lv[200]; char mask[5]; char cond[16]; char condsw[5]; int addr; } Dst;
+
+static int dst_parse(Tr *t, const char *d_in, Dst *d)
+{
+    char buf[256];
+    snprintf(buf, sizeof buf, "%s", d_in);
+    char *s = trim(buf);
+    memset(d, 0, sizeof *d);
+    char *lp = strchr(s, '(');
+    if (lp) {
+        char *rp = strchr(lp, ')');
+        if (rp) *rp = 0;
+        char *cs = trim(lp + 1);
+        char *dot = strchr(cs, '.');
+        if (dot) { *dot = 0; snprintf(d->condsw, sizeof d->condsw, "%s", dot + 1); }
+        snprintf(d->cond, sizeof d->cond, "%s", cs);
+        *lp = 0;
+        s = trim(s);
+    }
+    char *nm, *idx, *sw;
+    if (!strncmp(s, "result.", 7)) {
+        char *dot = strrchr(s, '.');
+        sw = NULL;
+        if (dot) {
+            int ok = 1; size_t L = strlen(dot + 1);
+            for (char *q = dot + 1; *q; q++) if (!strchr("xyzw", *q)) ok = 0;
+            if (ok && L >= 1 && L <= 4) { *dot = 0; sw = dot + 1; }
+        }
+        if (!output_expr(t, s, d->lv, sizeof d->lv)) return 0;
+    } else {
+        split_ref(s, &nm, &idx, &sw);
+        Sym *y = sym_find(t, trim(nm));
+        if (!y) return fail(t, "unknown destination %s", nm);
+        if (y->kind == SYM_TEMP) snprintf(d->lv, sizeof d->lv, "t_%s", y->name);
+        else if (y->kind == SYM_OUT) snprintf(d->lv, sizeof d->lv, "%s", y->expr);
+        else if (y->kind == SYM_ADDR) { snprintf(d->lv, sizeof d->lv, "a_%s", y->name); d->addr = 1; }
+        else return fail(t, "cannot write %s", nm);
+    }
+    snprintf(d->mask, sizeof d->mask, "%s", sw && *sw ? sw : "xyzw");
+    for (char *q = d->mask; *q; q++) { int k = swz_index(*q); if (k < 0) return fail(t, "mask %s", d->mask); *q = "xyzw"[k]; }
+    return 1;
+}
+
+static void cond_test(const char *cond, const char *csw, char *out, size_t n)
+{
+    const char *op = !strcmp(cond, "EQ") ? "==" : !strcmp(cond, "NE") ? "!=" :
+                     !strcmp(cond, "LT") ? "<"  : !strcmp(cond, "LE") ? "<=" :
+                     !strcmp(cond, "GT") ? ">"  : !strcmp(cond, "GE") ? ">=" : NULL;
+    char s4[5] = "xyzw";
+    if (csw && *csw) {
+        size_t L = strlen(csw);
+        for (int k = 0; k < 4; k++) s4[k] = "xyzw"[swz_index(csw[k < (int)L ? k : (int)L - 1])];
+    }
+    if (!strcmp(cond, "TR")) snprintf(out, n, "bvec4(true)");
+    else if (!strcmp(cond, "FL")) snprintf(out, n, "bvec4(false)");
+    else snprintf(out, n, "bvec4(cc.%c %s 0.0, cc.%c %s 0.0, cc.%c %s 0.0, cc.%c %s 0.0)",
+                  s4[0], op, s4[1], op, s4[2], op, s4[3], op);
+}
+
+/* ---- instructions ---- */
+
+static const char *const k_ops[] = {
+    "ABS","ADD","ARL","ARR","ARA","BRA","CAL","CMP","COS","DP3","DP4","DPH","DST","EX2",
+    "EXP","FLR","FRC","KIL","LG2","LIT","LOG","LRP","MAD","MAX","MIN","MOV","MUL","POW",
+    "RCC","RCP","RET","RSQ","SCS","SEQ","SFL","SGE","SGT","SIN","SLE","SLT","SNE","SSG",
+    "STR","SUB","SWZ","TEX","TXB","TXP","XPD","END", NULL
+};
+
+static void block_split(Tr *t)
+{
+    if (!t->has_flow) return;
+    t->block++;
+    bput(&t->body, "    } else if (pc == %d) {\n", t->block);
+}
+
+static int label_index(Tr *t, const char *name)
+{
+    for (int i = 0; i < t->nlabel; i++) if (!strcmp(t->label[i], name)) return i;
+    return -1;
+}
+
+/* Block number for each label, computed in a first pass. */
+static int g_label_block[64];
+
+static int emit_instr(Tr *t, char *stmt)
+{
+    char *s = trim(stmt);
+    char opw[32];
+    int k = 0;
+    while (s[k] && !isspace((unsigned char)s[k]) && k < 31) { opw[k] = s[k]; k++; }
+    opw[k] = 0;
+    char *args = trim(s + k);
+
+    /* opcode, C (condition-update) suffix, _SAT */
+    int sat = 0, setcc = 0;
+    char op[32];
+    snprintf(op, sizeof op, "%s", opw);
+    char *us = strstr(op, "_SAT");
+    if (us) { sat = 1; *us = 0; }
+    int known = 0;
+    for (int i = 0; k_ops[i]; i++) if (!strcmp(op, k_ops[i])) known = 1;
+    if (!known && strlen(op) > 3 && op[strlen(op) - 1] == 'C') {
+        op[strlen(op) - 1] = 0;
+        for (int i = 0; k_ops[i]; i++) if (!strcmp(op, k_ops[i])) known = 1;
+        if (known) setcc = 1;
+    }
+    if (!known) return fail(t, "opcode %s", opw);
+
+    if (!strcmp(op, "END")) {
+        if (t->has_flow) bput(&t->body, "      pc = -1;\n");
+        return 1;
+    }
+
+    /* arguments: comma separated, but not inside {} or [] or () */
+    char *a[6] = {0};
+    int na = 0, depth = 0;
+    char *start = args;
+    for (char *q = args; ; q++) {
+        if (*q == '{' || *q == '[' || *q == '(') depth++;
+        else if (*q == '}' || *q == ']' || *q == ')') depth--;
+        if ((*q == ',' && depth == 0) || !*q) {
+            int end = !*q;
+            *q = 0;
+            if (na < 6) a[na++] = trim(start);
+            if (end) break;
+            start = q + 1;
+        }
+    }
+
+    /* control flow */
+    if (!strcmp(op, "BRA") || !strcmp(op, "CAL") || !strcmp(op, "RET")) {
+        char lab[64] = "", cond[16] = "TR", csw[5] = "";
+        char *x = a[0] ? a[0] : (char *)"";
+        char *lp = strchr(x, '(');
+        if (lp) {
+            char *rp = strchr(lp, ')'); if (rp) *rp = 0;
+            char *cs = trim(lp + 1);
+            char *dot = strchr(cs, '.');
+            if (dot) { *dot = 0; snprintf(csw, sizeof csw, "%s", dot + 1); }
+            snprintf(cond, sizeof cond, "%s", cs);
+            *lp = 0;
+        }
+        snprintf(lab, sizeof lab, "%s", trim(x));
+        char test[200];
+        cond_test(cond, csw, test, sizeof test);
+        int next = t->block + 1;
+        if (!strcmp(op, "RET")) {
+            bput(&t->body, "      if (any(%s)) { if (sp > 0) { sp--; pc = stk[sp]; } else pc = -1; } else pc = %d;\n",
+                 test, next);
+        } else {
+            int li = label_index(t, lab);
+            if (li < 0) return fail(t, "label %s", lab);
+            if (!strcmp(op, "BRA"))
+                bput(&t->body, "      if (any(%s)) pc = %d; else pc = %d;\n", test, g_label_block[li], next);
+            else
+                bput(&t->body, "      if (any(%s)) { stk[sp] = %d; sp++; pc = %d; } else pc = %d;\n",
+                     test, next, g_label_block[li], next);
+        }
+        block_split(t);
+        return 1;
+    }
+
+    if (!strcmp(op, "KIL")) {
+        char e0[300];
+        if (!src_expr(t, a[0], e0, sizeof e0)) return 0;
+        bput(&t->body, "      if (any(lessThan(%s, vec4(0.0)))) discard;\n", e0);
+        return 1;
+    }
+
+    Dst d;
+    if (!a[0] || !dst_parse(t, a[0], &d)) return fail(t, "destination in %s", s);
+
+    char e[4][300] = {{0}};
+    int nsrc = na - 1;
+    int is_tex = !strcmp(op, "TEX") || !strcmp(op, "TXP") || !strcmp(op, "TXB");
+    int is_swz = !strcmp(op, "SWZ");
+    for (int i = 0; i < nsrc && i < 4; i++) {
+        if (is_tex && i >= 1) break;
+        if (is_swz && i >= 1) break;
+        if (!src_expr(t, a[i + 1], e[i], sizeof e[i])) return 0;
+    }
+    char r[1200];
+#define X(i) e[i]
+    if      (!strcmp(op, "MOV")) snprintf(r, sizeof r, "%s", X(0));
+    else if (!strcmp(op, "ABS")) snprintf(r, sizeof r, "abs(%s)", X(0));
+    else if (!strcmp(op, "ADD")) snprintf(r, sizeof r, "%s + %s", X(0), X(1));
+    else if (!strcmp(op, "SUB")) snprintf(r, sizeof r, "%s - %s", X(0), X(1));
+    else if (!strcmp(op, "MUL")) snprintf(r, sizeof r, "%s * %s", X(0), X(1));
+    else if (!strcmp(op, "MAD")) snprintf(r, sizeof r, "%s * %s + %s", X(0), X(1), X(2));
+    else if (!strcmp(op, "MIN")) snprintf(r, sizeof r, "min(%s, %s)", X(0), X(1));
+    else if (!strcmp(op, "MAX")) snprintf(r, sizeof r, "max(%s, %s)", X(0), X(1));
+    else if (!strcmp(op, "DP3")) snprintf(r, sizeof r, "vec4(dot(%s.xyz, %s.xyz))", X(0), X(1));
+    else if (!strcmp(op, "DP4")) snprintf(r, sizeof r, "vec4(dot(%s, %s))", X(0), X(1));
+    else if (!strcmp(op, "DPH")) snprintf(r, sizeof r, "vec4(dot(%s.xyz, %s.xyz) + %s.w)", X(0), X(1), X(1));
+    else if (!strcmp(op, "DST")) snprintf(r, sizeof r, "vec4(1.0, %s.y * %s.y, %s.z, %s.w)", X(0), X(1), X(0), X(1));
+    else if (!strcmp(op, "SLT")) snprintf(r, sizeof r, "vec4(lessThan(%s, %s))", X(0), X(1));
+    else if (!strcmp(op, "SGE")) snprintf(r, sizeof r, "vec4(greaterThanEqual(%s, %s))", X(0), X(1));
+    else if (!strcmp(op, "SGT")) snprintf(r, sizeof r, "vec4(greaterThan(%s, %s))", X(0), X(1));
+    else if (!strcmp(op, "SLE")) snprintf(r, sizeof r, "vec4(lessThanEqual(%s, %s))", X(0), X(1));
+    else if (!strcmp(op, "SEQ")) snprintf(r, sizeof r, "vec4(equal(%s, %s))", X(0), X(1));
+    else if (!strcmp(op, "SNE")) snprintf(r, sizeof r, "vec4(notEqual(%s, %s))", X(0), X(1));
+    else if (!strcmp(op, "SFL")) snprintf(r, sizeof r, "vec4(0.0)");
+    else if (!strcmp(op, "STR")) snprintf(r, sizeof r, "vec4(1.0)");
+    else if (!strcmp(op, "SSG")) snprintf(r, sizeof r, "sign(%s)", X(0));
+    else if (!strcmp(op, "FLR")) snprintf(r, sizeof r, "floor(%s)", X(0));
+    else if (!strcmp(op, "FRC")) snprintf(r, sizeof r, "fract(%s)", X(0));
+    else if (!strcmp(op, "RCP")) snprintf(r, sizeof r, "vec4(1.0 / %s.x)", X(0));
+    else if (!strcmp(op, "RCC")) snprintf(r, sizeof r,
+        "vec4(sign(%s.x) * clamp(1.0 / abs(%s.x), 1.884467e-19, 5.42101e+19))", X(0), X(0));
+    else if (!strcmp(op, "RSQ")) snprintf(r, sizeof r, "vec4(inversesqrt(abs(%s.x)))", X(0));
+    else if (!strcmp(op, "EX2")) snprintf(r, sizeof r, "vec4(exp2(%s.x))", X(0));
+    else if (!strcmp(op, "LG2")) snprintf(r, sizeof r, "vec4(log2(abs(%s.x)))", X(0));
+    else if (!strcmp(op, "POW")) snprintf(r, sizeof r, "vec4(pow(%s.x, %s.x))", X(0), X(1));
+    else if (!strcmp(op, "COS")) snprintf(r, sizeof r, "vec4(cos(%s.x))", X(0));
+    else if (!strcmp(op, "SIN")) snprintf(r, sizeof r, "vec4(sin(%s.x))", X(0));
+    else if (!strcmp(op, "SCS")) snprintf(r, sizeof r, "vec4(cos(%s.x), sin(%s.x), 0.0, 0.0)", X(0), X(0));
+    else if (!strcmp(op, "EXP")) snprintf(r, sizeof r,
+        "vec4(exp2(floor(%s.x)), fract(%s.x), exp2(%s.x), 1.0)", X(0), X(0), X(0));
+    else if (!strcmp(op, "LOG")) snprintf(r, sizeof r,
+        "vec4(floor(log2(abs(%s.x))), abs(%s.x) / exp2(floor(log2(abs(%s.x)))), log2(abs(%s.x)), 1.0)",
+        X(0), X(0), X(0), X(0));
+    else if (!strcmp(op, "LIT")) snprintf(r, sizeof r,
+        "arb_lit(%s)", X(0));
+    else if (!strcmp(op, "LRP")) snprintf(r, sizeof r, "mix(%s, %s, %s)", X(2), X(1), X(0));
+    else if (!strcmp(op, "CMP")) snprintf(r, sizeof r,
+        "mix(%s, %s, vec4(lessThan(%s, vec4(0.0))))", X(2), X(1), X(0));
+    else if (!strcmp(op, "XPD")) snprintf(r, sizeof r, "vec4(cross(%s.xyz, %s.xyz), 1.0)", X(0), X(1));
+    else if (!strcmp(op, "ARL") || !strcmp(op, "ARR") || !strcmp(op, "ARA")) {
+        if (!d.addr) return fail(t, "%s to a non-address register", op);
+        const char *fn = !strcmp(op, "ARR") ? "floor(%s + 0.5)" : "floor(%s)";
+        char inner[400];
+        snprintf(inner, sizeof inner, fn, X(0));
+        if (!strcmp(op, "ARA")) return fail(t, "ARA");
+        for (const char *m = d.mask; *m; m++)
+            bput(&t->body, "      %s.%c = int((%s).%c);\n", d.lv, *m, inner, *m);
+        return 1;
+    } else if (is_swz) {
+        /* SWZ dst, src, c0, c1, c2, c3 - each -?[xyzw01] */
+        char comp[4][64];
+        for (int i = 0; i < 4; i++) {
+            const char *c = a[i + 2] ? trim(a[i + 2]) : "0";
+            int neg = *c == '-'; if (*c == '-' || *c == '+') c++;
+            if (*c == '0' || *c == '1') snprintf(comp[i], sizeof comp[i], "%s%c.0", neg ? "-" : "", *c);
+            else snprintf(comp[i], sizeof comp[i], "%s%s.%c", neg ? "-" : "", X(0), "xyzw"[swz_index(*c) < 0 ? 0 : swz_index(*c)]);
+        }
+        snprintf(r, sizeof r, "vec4(%s, %s, %s, %s)", comp[0], comp[1], comp[2], comp[3]);
+    } else if (is_tex) {
+        /* TEX dst, coord, texture[n], 2D */
+        int unit = 0;
+        const char *tx = a[2] ? a[2] : "texture[0]";
+        if (sscanf(tx, " texture[%d]", &unit) != 1) unit = 0;
+        const char *tg = a[3] ? a[3] : "2D";
+        int target = !strcmp(tg, "1D") ? 1 : !strcmp(tg, "2D") ? 2 : !strcmp(tg, "3D") ? 3 :
+                     !strcmp(tg, "CUBE") ? 4 : !strcmp(tg, "RECT") ? 5 : 0;
+        if (!target || unit < 0 || unit >= 16) return fail(t, "texture %s %s", tx, tg);
+        if (t->tex_target[unit] && t->tex_target[unit] != target)
+            return fail(t, "texture unit %d used with two targets", unit);
+        t->tex_target[unit] = target;
+        int proj = !strcmp(op, "TXP"), bias = !strcmp(op, "TXB");
+        static const char *const fnb[] = { "", "texture1D", "texture2D", "texture3D", "textureCube", "texture2DRect" };
+        static const char *const sw[] = { "", ".x", ".xy", ".xyz", ".xyz", ".xy" };
+        static const char *const sm[] = { "", "s1_", "s2_", "s3_", "sc_", "sr_" };
+        if (proj && target != 4)
+            snprintf(r, sizeof r, "%sProj(%s%d, %s)", fnb[target], sm[target], unit, X(0));
+        else if (bias)
+            snprintf(r, sizeof r, "%s(%s%d, %s%s, %s.w)", fnb[target], sm[target], unit, X(0), sw[target], X(0));
+        else
+            snprintf(r, sizeof r, "%s(%s%d, %s%s)", fnb[target], sm[target], unit, X(0), sw[target]);
+    } else return fail(t, "opcode %s not translated", op);
+#undef X
+
+    bput(&t->body, "      r = %s%s%s;\n", sat ? "clamp(" : "", r, sat ? ", 0.0, 1.0)" : "");
+    if (d.cond[0]) {
+        char test[200];
+        cond_test(d.cond, d.condsw, test, sizeof test);
+        bput(&t->body, "      m = %s;\n", test);
+        for (const char *m = d.mask; *m; m++)
+            bput(&t->body, "      if (m.%c) %s.%c = r.%c;\n", *m, d.lv, *m, *m);
+    } else {
+        bput(&t->body, "      %s.%s = r.%s;\n", d.lv, d.mask, d.mask);
+    }
+    if (setcc) bput(&t->body, "      cc.%s = r.%s;\n", d.mask, d.mask);
+    return 1;
+}
+
+/* Split the program into statements with their labels, comments removed. */
+typedef struct { char *labels[4]; int nl; char *text; } Stmt;
+
+static int split_program(char *src, Stmt *st, int maxst)
+{
+    /* strip comments */
+    for (char *p = src; *p; p++) {
+        if (*p == '#') { while (*p && *p != '\n') *p++ = ' '; if (!*p) break; }
+    }
+    int n = 0;
+    char *save = NULL;
+    for (char *s = strtok_r(src, ";", &save); s && n < maxst; s = strtok_r(NULL, ";", &save)) {
+        Stmt *x = &st[n];
+        memset(x, 0, sizeof *x);
+        s = trim(s);
+        /* leading labels "name:" */
+        for (;;) {
+            char *colon = strchr(s, ':');
+            if (!colon) break;
+            int ident = colon > s;
+            for (char *q = s; q < colon; q++) if (!isalnum((unsigned char)*q) && *q != '_') ident = 0;
+            if (!ident || x->nl >= 4) break;
+            *colon = 0;
+            x->labels[x->nl++] = s;
+            s = trim(colon + 1);
+        }
+        x->text = s;
+        n++;
+    }
+    return n;
+}
+
+static int is_decl(const char *s, const char *kw)
+{
+    size_t L = strlen(kw);
+    return !strncmp(s, kw, L) && isspace((unsigned char)s[L]);
+}
+
+/* Translate one program to a GLSL shader. Returns malloc'd source or NULL. */
+static char *translate(int stage, const char *src_in, Tr *t)
+{
+    memset(t, 0, sizeof *t);
+    t->stage = stage;
+    t->env_hi = t->local_hi = -1;
+    char *src = strdup(src_in);
+    char *p = src;
+    while (*p && *p != '\n') p++;              /* drop the !!ARBxp1.0 line */
+    static Stmt st[4096];
+    int n = split_program(p, st, 4096);
+
+    /* pass 1: declarations, options, labels and the block layout */
+    int block = 0;
+    for (int i = 0; i < n; i++) {
+        char *s = st[i].text;
+        for (int l = 0; l < st[i].nl; l++) {
+            if (t->nlabel >= 64) { fail(t, "too many labels"); goto out; }
+            snprintf(t->label[t->nlabel], 64, "%s", st[i].labels[l]);
+            t->has_flow = 1;
+            t->nlabel++;
+        }
+        if (!strncmp(s, "BRA", 3) || !strncmp(s, "CAL", 3) || !strncmp(s, "RET", 3)) t->has_flow = 1;
+    }
+    /* label -> block number: a block starts at each labelled statement and
+     * after each branch, call or return */
+    if (t->has_flow) {
+        int li = 0;
+        block = 0;
+        int started = 1;      /* block 0 started at the top */
+        for (int i = 0; i < n; i++) {
+            if (st[i].nl) {
+                if (!started) block++;
+                for (int l = 0; l < st[i].nl; l++) g_label_block[li++] = block;
+            }
+            started = 0;
+            const char *s = st[i].text;
+            if (!strncmp(s, "BRA", 3) || !strncmp(s, "CAL", 3) || !strncmp(s, "RET", 3)) {
+                block++;
+                started = 1;
+            }
+        }
+    }
+
+    bput(&t->body, "");
+    for (int i = 0; i < n; i++) {
+        char *s = st[i].text;
+        if (!*s) continue;
+        if (is_decl(s, "OPTION")) {
+            char *o = trim(s + 6);
+            if (!strcmp(o, "ARB_position_invariant")) t->pos_invariant = 1;
+            else if (!strcmp(o, "ARB_fog_linear")) t->fog_mode = 1;
+            else if (!strcmp(o, "ARB_fog_exp")) t->fog_mode = 2;
+            else if (!strcmp(o, "ARB_fog_exp2")) t->fog_mode = 3;
+            continue;    /* precision hints and NV_vertex_program2 need nothing */
+        }
+        if (is_decl(s, "TEMP") || is_decl(s, "ADDRESS")) {
+            int addr = s[0] == 'A';
+            char *save = NULL;
+            for (char *nm = strtok_r(s + (addr ? 7 : 4), ",", &save); nm; nm = strtok_r(NULL, ",", &save)) {
+                nm = trim(nm);
+                if (!sym_add(t, nm, addr ? SYM_ADDR : SYM_TEMP)) goto out;
+                bput(&t->decl, addr ? "ivec4 a_%s = ivec4(0);\n" : "vec4 t_%s = vec4(0.0);\n", nm);
+            }
+            continue;
+        }
+        if (is_decl(s, "ATTRIB") || is_decl(s, "PARAM") || is_decl(s, "OUTPUT") || is_decl(s, "ALIAS")) {
+            int kind = s[0] == 'O' ? 2 : s[0] == 'A' && s[1] == 'L' ? 3 : s[0] == 'P' ? 1 : 0;
+            char *eq = strchr(s, '=');
+            if (!eq) { fail(t, "declaration %s", s); goto out; }
+            *eq = 0;
+            char *nm = trim(s + (kind == 0 ? 6 : kind == 1 ? 5 : kind == 2 ? 6 : 5));
+            char *val = trim(eq + 1);
+            char *br = strchr(nm, '[');
+            if (kind == 1 && br) {
+                *br = 0;
+                if (!declare_param_array(t, trim(nm), val)) goto out;
+                continue;
+            }
+            if (kind == 1 && !strncmp(val, "state.matrix.", 13) && !strstr(val, ".row[")) {
+                if (!declare_param_array(t, nm, val)) goto out;
+                continue;
+            }
+            if (kind == 3) {
+                Sym *o = sym_find(t, val);
+                if (!o) { fail(t, "alias of %s", val); goto out; }
+                Sym *y = sym_add(t, nm, o->kind);
+                if (!y) goto out;
+                Sym keep = *o;
+                snprintf(keep.name, sizeof keep.name, "%s", nm);
+                *y = keep;
+                if (o->kind == SYM_TEMP || o->kind == SYM_ADDR) {
+                    /* aliases of temps share storage: point at the original name */
+                    y->kind = SYM_OUT;
+                    snprintf(y->expr, sizeof y->expr, "%s_%s", o->kind == SYM_TEMP ? "t" : "a", o->name);
+                }
+                continue;
+            }
+            Sym *y = sym_add(t, nm, kind == 2 ? SYM_OUT : SYM_EXPR);
+            if (!y) goto out;
+            if (kind == 2) { if (!output_expr(t, val, y->expr, sizeof y->expr)) goto out; }
+            else if (!binding_expr(t, val, y->expr, sizeof y->expr)) goto out;
+            continue;
+        }
+        /* an instruction: pass 2. Declarations may follow it, so keep going. */
+    }
+    if (t->err[0]) goto out;
+
+    /* pass 2: instructions */
+    if (t->has_flow) bput(&t->body, "  for (int it = 0; it < 4096; it++) {\n    if (pc < 0) break;\n    if (pc == 0) {\n");
+    for (int i = 0; i < n; i++) {
+        char *s = st[i].text;
+        if (st[i].nl && t->has_flow) {
+            /* this statement starts a block if the previous one did not just end one */
+            int want = g_label_block[label_index(t, st[i].labels[0])];
+            if (want != t->block) {
+                bput(&t->body, "      pc = %d;\n", want);
+                t->block = want - 1;
+                block_split(t);
+            }
+        }
+        if (!*s || is_decl(s, "OPTION") || is_decl(s, "TEMP") || is_decl(s, "ADDRESS") ||
+            is_decl(s, "ATTRIB") || is_decl(s, "PARAM") || is_decl(s, "OUTPUT") || is_decl(s, "ALIAS"))
+            continue;
+        if (!emit_instr(t, s)) goto out;
+    }
+    if (t->has_flow) bput(&t->body, "      pc = -1;\n    }\n  }\n");
+
+    /* assemble */
+    {
+        Buf g = {0};
+        bput(&g, "#version 120\n");
+        int rect = 0;
+        for (int u = 0; u < 16; u++) if (t->tex_target[u] == 5) rect = 1;
+        if (rect) bput(&g, "#extension GL_ARB_texture_rectangle : enable\n");
+        const char *P = stage ? "f" : "v";
+        if (t->env_hi >= 0) bput(&g, "uniform vec4 %s_env[%d];\n", P, t->env_hi + 1);
+        if (t->local_hi >= 0) bput(&g, "uniform vec4 %s_loc[%d];\n", P, t->local_hi + 1);
+        for (int m = 0; m < t->nmat; m++) bput(&g, "uniform vec4 %s_m%d[4];\n", P, m);
+        static const char *const sty[] = { "", "sampler1D s1_", "sampler2D s2_", "sampler3D s3_",
+                                           "samplerCube sc_", "sampler2DRect sr_" };
+        for (int u = 0; u < 16; u++) if (t->tex_target[u]) bput(&g, "uniform %s%d;\n", sty[t->tex_target[u]], u);
+        for (int a = 1; a < 16; a++) if (t->attrib_used[a]) bput(&g, "attribute vec4 va_%d;\n", a);
+        bput(&g, "vec4 arb_lit(vec4 s) {\n"
+                 "  float d = max(s.x, 0.0), sp = max(s.y, 0.0), e = clamp(s.w, -128.0, 128.0);\n"
+                 "  return vec4(1.0, d, s.x > 0.0 ? (sp > 0.0 ? pow(sp, e) : 0.0) : 0.0, 1.0);\n}\n");
+        bput(&g, "%s", t->decl.p ? t->decl.p : "");
+        bput(&g, "void main() {\n  vec4 r = vec4(0.0), cc = vec4(0.0);\n  bvec4 m = bvec4(false);\n");
+        if (t->has_flow) bput(&g, "  int pc = 0, sp = 0;\n  int stk[16];\n");
+        if (stage == 0) {
+            bput(&g, "  vec4 o_fog = vec4(0.0), o_psize = vec4(1.0);\n");
+            bput(&g, "  gl_FrontColor = vec4(0.0); gl_FrontSecondaryColor = vec4(0.0);\n"
+                     "  gl_BackColor = vec4(0.0); gl_BackSecondaryColor = vec4(0.0);\n");
+            if (t->pos_invariant) bput(&g, "  gl_Position = ftransform();\n");
+        } else {
+            bput(&g, "  vec4 o_col = vec4(0.0), o_dep = vec4(gl_FragCoord.z);\n");
+        }
+        bput(&g, "%s", t->body.p ? t->body.p : "");
+        if (stage == 0) {
+            bput(&g, "  gl_FogFragCoord = o_fog.x;\n  gl_PointSize = o_psize.x;\n");
+        } else {
+            if (t->fog_mode) {
+                const char *f = t->fog_mode == 1 ? "(gl_Fog.end - gl_FogFragCoord) * gl_Fog.scale" :
+                                t->fog_mode == 2 ? "exp(-gl_Fog.density * gl_FogFragCoord)" :
+                                "exp(-(gl_Fog.density * gl_FogFragCoord) * (gl_Fog.density * gl_FogFragCoord))";
+                bput(&g, "  o_col.rgb = mix(gl_Fog.color.rgb, o_col.rgb, clamp(%s, 0.0, 1.0));\n", f);
+            }
+            bput(&g, "  gl_FragColor = o_col;\n");
+            if (t->writes_depth) bput(&g, "  gl_FragDepth = o_dep.z;\n");
+        }
+        bput(&g, "}\n");
+        free(src);
+        free(t->decl.p); free(t->body.p);
+        t->decl.p = t->body.p = NULL;
+        return g.p;
+    }
+out:
+    free(src);
+    free(t->decl.p); free(t->body.p);
+    t->decl.p = t->body.p = NULL;
+    if (!t->err[0]) snprintf(t->err, sizeof t->err, "unknown");
+    return NULL;
+}
+
+/* ------------------------------------------------------------------------ */
+/* linked programs, cached per (vertex, fragment) pair                       */
+/* ------------------------------------------------------------------------ */
+
+typedef struct {
+    GLuint vid, fid; unsigned vgen, fgen;
+    GLuint prog;
+    int    ok;
+    MatRef mat[2][16]; int nmat[2];
+    int    env_hi[2], local_hi[2];
+    GLint  u_env[2], u_loc[2], u_mat[2][16];
+    unsigned up_env[2], up_loc[2];      /* generations last uploaded */
+} Linked;
+
+#define MAX_LINKED 1024
+static Linked g_linked[MAX_LINKED];
+static int g_nlinked;
+
+static int g_dump = -1;
+
+static GLuint compile(GLenum type, const char *src, int stage, GLuint id)
+{
+    GLuint sh = glCreateShader(type);
+    glShaderSource(sh, 1, &src, NULL);
+    glCompileShader(sh);
+    GLint ok = 0;
+    glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[4096] = "";
+        glGetShaderInfoLog(sh, sizeof log, NULL, log);
+        fprintf(stderr, "[arb] %s program %u: translated GLSL does not compile:\n%s\n----\n%s\n----\n",
+                stage ? "fragment" : "vertex", id, log, src);
+        glDeleteShader(sh);
+        return 0;
+    }
+    return sh;
+}
+
+static Linked *link_pair(GLuint vid, GLuint fid)
+{
+    ArbProg *vp = vid ? prog_get(0, vid, 0) : NULL;
+    ArbProg *fp = fid ? prog_get(1, fid, 0) : NULL;
+    unsigned vgen = vp ? vp->gen : 0, fgen = fp ? fp->gen : 0;
+    for (int i = 0; i < g_nlinked; i++) {
+        Linked *l = &g_linked[i];
+        if (l->vid == vid && l->fid == fid && l->vgen == vgen && l->fgen == fgen) return l;
+    }
+    if (g_nlinked >= MAX_LINKED) {          /* full: start over */
+        for (int i = 0; i < g_nlinked; i++) if (g_linked[i].prog) glDeleteProgram(g_linked[i].prog);
+        g_nlinked = 0;
+    }
+    Linked *l = &g_linked[g_nlinked++];
+    memset(l, 0, sizeof *l);
+    l->vid = vid; l->fid = fid; l->vgen = vgen; l->fgen = fgen;
+    l->up_env[0] = l->up_env[1] = l->up_loc[0] = l->up_loc[1] = ~0u;
+    if (g_dump < 0) { const char *d = getenv("LINDBERGH_ARB_DUMP"); g_dump = d && *d && *d != '0'; }
+
+    GLuint sh[2] = { 0, 0 };
+    ArbProg *pp[2] = { vp, fp };
+    GLuint ids[2] = { vid, fid };
+    for (int st = 0; st < 2; st++) {
+        if (!pp[st]) continue;
+        if (pp[st]->failed || !pp[st]->src) { l->ok = 0; return l; }
+        static Tr t;
+        char *glsl = translate(st, pp[st]->src, &t);
+        if (!glsl) {
+            pp[st]->failed = 1;
+            fprintf(stderr, "[arb] %s program %u not translated (%s); using the driver's path\n",
+                    st ? "fragment" : "vertex", ids[st], t.err);
+            l->ok = 0;
+            return l;
+        }
+        if (g_dump) fprintf(stderr, "[arb] %s program %u ->\n%s\n", st ? "fragment" : "vertex", ids[st], glsl);
+        sh[st] = compile(st ? GL_FRAGMENT_SHADER : GL_VERTEX_SHADER, glsl, st, ids[st]);
+        free(glsl);
+        if (!sh[st]) { pp[st]->failed = 1; l->ok = 0; return l; }
+        memcpy(l->mat[st], t.mat, sizeof t.mat);
+        l->nmat[st] = t.nmat;
+        l->env_hi[st] = t.env_hi;
+        l->local_hi[st] = t.local_hi;
+        if (st == 0) {
+            /* generic attributes at the indices the program named */
+            l->prog = l->prog ? l->prog : glCreateProgram();
+            for (int a = 1; a < 16; a++) if (t.attrib_used[a]) {
+                char nm[16]; snprintf(nm, sizeof nm, "va_%d", a);
+                glBindAttribLocation(l->prog, (GLuint)a, nm);
+            }
+        }
+    }
+    if (!l->prog) l->prog = glCreateProgram();
+    for (int st = 0; st < 2; st++) if (sh[st]) glAttachShader(l->prog, sh[st]);
+    glLinkProgram(l->prog);
+    for (int st = 0; st < 2; st++) if (sh[st]) glDeleteShader(sh[st]);
+    GLint ok = 0;
+    glGetProgramiv(l->prog, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char log[2048] = "";
+        glGetProgramInfoLog(l->prog, sizeof log, NULL, log);
+        fprintf(stderr, "[arb] pair v%u/f%u does not link: %s\n", vid, fid, log);
+        l->ok = 0;
+        return l;
+    }
+    GLint cur = 0;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &cur);
+    glUseProgram(l->prog);
+    for (int st = 0; st < 2; st++) {
+        const char *P = st ? "f" : "v";
+        char nm[32];
+        snprintf(nm, sizeof nm, "%s_env", P); l->u_env[st] = glGetUniformLocation(l->prog, nm);
+        snprintf(nm, sizeof nm, "%s_loc", P); l->u_loc[st] = glGetUniformLocation(l->prog, nm);
+        for (int m = 0; m < l->nmat[st]; m++) {
+            snprintf(nm, sizeof nm, "%s_m%d", P, m);
+            l->u_mat[st][m] = glGetUniformLocation(l->prog, nm);
+        }
+    }
+    static const char *const pre[] = { "s1_", "s2_", "s3_", "sc_", "sr_" };
+    for (int u = 0; u < 16; u++)
+        for (int k = 0; k < 5; k++) {
+            char nm[16]; snprintf(nm, sizeof nm, "%s%d", pre[k], u);
+            GLint loc = glGetUniformLocation(l->prog, nm);
+            if (loc >= 0) glUniform1i(loc, u);
+        }
+    glUseProgram((GLuint)cur);
+    l->ok = 1;
+    return l;
+}
+
+/* ---- matrices, from the GL stacks ---- */
+
+static void mat_mul(const float *a, const float *b, float *o)   /* column-major a*b */
+{
+    for (int c = 0; c < 4; c++)
+        for (int r = 0; r < 4; r++) {
+            float s = 0;
+            for (int k = 0; k < 4; k++) s += a[k * 4 + r] * b[c * 4 + k];
+            o[c * 4 + r] = s;
+        }
+}
+
+static int mat_inv(const float *m, float *o)
+{
+    float inv[16];
+    inv[0] = m[5]*m[10]*m[15]-m[5]*m[11]*m[14]-m[9]*m[6]*m[15]+m[9]*m[7]*m[14]+m[13]*m[6]*m[11]-m[13]*m[7]*m[10];
+    inv[4] = -m[4]*m[10]*m[15]+m[4]*m[11]*m[14]+m[8]*m[6]*m[15]-m[8]*m[7]*m[14]-m[12]*m[6]*m[11]+m[12]*m[7]*m[10];
+    inv[8] = m[4]*m[9]*m[15]-m[4]*m[11]*m[13]-m[8]*m[5]*m[15]+m[8]*m[7]*m[13]+m[12]*m[5]*m[11]-m[12]*m[7]*m[9];
+    inv[12] = -m[4]*m[9]*m[14]+m[4]*m[10]*m[13]+m[8]*m[5]*m[14]-m[8]*m[6]*m[13]-m[12]*m[5]*m[10]+m[12]*m[6]*m[9];
+    inv[1] = -m[1]*m[10]*m[15]+m[1]*m[11]*m[14]+m[9]*m[2]*m[15]-m[9]*m[3]*m[14]-m[13]*m[2]*m[11]+m[13]*m[3]*m[10];
+    inv[5] = m[0]*m[10]*m[15]-m[0]*m[11]*m[14]-m[8]*m[2]*m[15]+m[8]*m[3]*m[14]+m[12]*m[2]*m[11]-m[12]*m[3]*m[10];
+    inv[9] = -m[0]*m[9]*m[15]+m[0]*m[11]*m[13]+m[8]*m[1]*m[15]-m[8]*m[3]*m[13]-m[12]*m[1]*m[11]+m[12]*m[3]*m[9];
+    inv[13] = m[0]*m[9]*m[14]-m[0]*m[10]*m[13]-m[8]*m[1]*m[14]+m[8]*m[2]*m[13]+m[12]*m[1]*m[10]-m[12]*m[2]*m[9];
+    inv[2] = m[1]*m[6]*m[15]-m[1]*m[7]*m[14]-m[5]*m[2]*m[15]+m[5]*m[3]*m[14]+m[13]*m[2]*m[7]-m[13]*m[3]*m[6];
+    inv[6] = -m[0]*m[6]*m[15]+m[0]*m[7]*m[14]+m[4]*m[2]*m[15]-m[4]*m[3]*m[14]-m[12]*m[2]*m[7]+m[12]*m[3]*m[6];
+    inv[10] = m[0]*m[5]*m[15]-m[0]*m[7]*m[13]-m[4]*m[1]*m[15]+m[4]*m[3]*m[13]+m[12]*m[1]*m[7]-m[12]*m[3]*m[5];
+    inv[14] = -m[0]*m[5]*m[14]+m[0]*m[6]*m[13]+m[4]*m[1]*m[14]-m[4]*m[2]*m[13]-m[12]*m[1]*m[6]+m[12]*m[2]*m[5];
+    inv[3] = -m[1]*m[6]*m[11]+m[1]*m[7]*m[10]+m[5]*m[2]*m[11]-m[5]*m[3]*m[10]-m[9]*m[2]*m[7]+m[9]*m[3]*m[6];
+    inv[7] = m[0]*m[6]*m[11]-m[0]*m[7]*m[10]-m[4]*m[2]*m[11]+m[4]*m[3]*m[10]+m[8]*m[2]*m[7]-m[8]*m[3]*m[6];
+    inv[11] = -m[0]*m[5]*m[11]+m[0]*m[7]*m[9]+m[4]*m[1]*m[11]-m[4]*m[3]*m[9]-m[8]*m[1]*m[7]+m[8]*m[3]*m[5];
+    inv[15] = m[0]*m[5]*m[10]-m[0]*m[6]*m[9]-m[4]*m[1]*m[10]+m[4]*m[2]*m[9]+m[8]*m[1]*m[6]-m[8]*m[2]*m[5];
+    float det = m[0]*inv[0]+m[1]*inv[4]+m[2]*inv[8]+m[3]*inv[12];
+    if (det == 0) { memcpy(o, m, 64); return 0; }
+    for (int i = 0; i < 16; i++) o[i] = inv[i] / det;
+    return 1;
+}
+
+static void stack_matrix(int which, int index, float *m)
+{
+    GLint mode = 0, active = 0;
+    switch (which) {
+    case MAT_MODELVIEW:  glGetFloatv(GL_MODELVIEW_MATRIX, m); return;
+    case MAT_PROJECTION: glGetFloatv(GL_PROJECTION_MATRIX, m); return;
+    case MAT_MVP: {
+        float a[16], b[16];
+        glGetFloatv(GL_PROJECTION_MATRIX, a);
+        glGetFloatv(GL_MODELVIEW_MATRIX, b);
+        mat_mul(a, b, m);
+        return;
+    }
+    case MAT_TEXTURE:
+        glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+        glActiveTexture(GL_TEXTURE0 + (GLenum)index);
+        glGetFloatv(GL_TEXTURE_MATRIX, m);
+        glActiveTexture((GLenum)active);
+        return;
+    case MAT_PROGRAM:
+        glGetIntegerv(GL_MATRIX_MODE, &mode);
+        glMatrixMode(GL_MATRIX0_ARB + (GLenum)index);
+        glGetFloatv(GL_CURRENT_MATRIX_ARB, m);
+        glMatrixMode((GLenum)mode);
+        return;
+    }
+}
+
+static void upload(Linked *l)
+{
+    for (int st = 0; st < 2; st++) {
+        GLuint id = st ? l->fid : l->vid;
+        if (!id) continue;
+        if (l->u_env[st] >= 0 && l->up_env[st] != g_env_gen[st]) {
+            glUniform4fv(l->u_env[st], l->env_hi[st] + 1, &g_env[st][0][0]);
+            l->up_env[st] = g_env_gen[st];
+        }
+        ArbProg *p = prog_get(st, id, 0);
+        if (p && l->u_loc[st] >= 0 && l->up_loc[st] != p->local_gen) {
+            glUniform4fv(l->u_loc[st], l->local_hi[st] + 1, &p->local[0][0]);
+            l->up_loc[st] = p->local_gen;
+        }
+        for (int i = 0; i < l->nmat[st]; i++) {
+            if (l->u_mat[st][i] < 0) continue;
+            float m[16], o[16], rows[16];
+            stack_matrix(l->mat[st][i].which, l->mat[st][i].index, m);
+            int mod = l->mat[st][i].mod;
+            if (mod == 1 || mod == 3) { mat_inv(m, o); memcpy(m, o, 64); }
+            /* rows of M (or of its transpose) */
+            for (int r = 0; r < 4; r++)
+                for (int c = 0; c < 4; c++)
+                    rows[r * 4 + c] = (mod == 2 || mod == 3) ? m[r * 4 + c] : m[c * 4 + r];
+            glUniform4fv(l->u_mat[st][i], 4, rows);
+        }
+    }
+}
+
+/* ------------------------------------------------------------------------ */
+/* the hooks hle_gl_posix.c calls                                            */
+/* ------------------------------------------------------------------------ */
+
+static int g_arb_off = -1;      /* LINDBERGH_ARB_GLSL=0 leaves it all to the driver */
+
+int arb_active(void)
+{
+    if (g_arb_off < 0) { const char *v = getenv("LINDBERGH_ARB_GLSL"); g_arb_off = v && *v == '0'; }
+    return !g_arb_off;
+}
+
+void arb_bind(GLenum target, GLuint id)
+{
+    int st = stage_of(target);
+    if (st >= 0) g_bound[st] = id;
+}
+
+void arb_set_source(GLenum target, const char *src, int len)
+{
+    int st = stage_of(target);
+    if (st < 0 || !src || len <= 0) return;
+    ArbProg *p = prog_get(st, g_bound[st], 1);
+    if (!p) return;
+    free(p->src);
+    p->src = strndup(src, (size_t)len);
+    p->gen++;
+    p->failed = 0;
+}
+
+void arb_delete(GLenum target, GLuint id)
+{
+    (void)target;
+    for (int st = 0; st < 2; st++) {
+        ArbProg *p = prog_get(st, id, 0);
+        if (p) { free(p->src); free(p); g_prog[st][id] = NULL; }
+    }
+}
+
+void arb_env(GLenum target, GLuint index, const float *v)
+{
+    int st = stage_of(target);
+    if (st < 0 || index >= MAX_ENV) return;
+    memcpy(g_env[st][index], v, 16);
+    g_env_gen[st]++;
+}
+
+void arb_local(GLenum target, GLuint index, const float *v)
+{
+    int st = stage_of(target);
+    if (st < 0 || index >= MAX_LOCAL) return;
+    ArbProg *p = prog_get(st, g_bound[st], 1);
+    if (!p) return;
+    memcpy(p->local[index], v, 16);
+    p->local_gen++;
+}
+
+/* glEnable / glDisable / glIsEnabled for the two program targets. Returns 1
+ * when the cap is ours. */
+int arb_enable(GLenum cap, int on)
+{
+    int st = stage_of(cap);
+    if (st < 0 || !arb_active()) return 0;
+    g_enabled[st] = on;
+    return 1;
+}
+
+int arb_is_enabled(GLenum cap, int *out)
+{
+    int st = stage_of(cap);
+    if (st < 0 || !arb_active()) return 0;
+    *out = g_enabled[st];
+    return 1;
+}
+
+/* glPushAttrib(GL_ENABLE_BIT) saves the enables the driver no longer sees. */
+static int g_attr_stack[64][2], g_attr_sp;
+void arb_push_attrib(GLbitfield mask)
+{
+    if (g_attr_sp < 64) {
+        g_attr_stack[g_attr_sp][0] = (mask & GL_ENABLE_BIT) ? g_enabled[0] | 2 : -1;
+        g_attr_stack[g_attr_sp][1] = (mask & GL_ENABLE_BIT) ? g_enabled[1] | 2 : -1;
+    }
+    g_attr_sp++;
+}
+void arb_pop_attrib(void)
+{
+    if (g_attr_sp <= 0) return;
+    g_attr_sp--;
+    if (g_attr_sp < 64)
+        for (int st = 0; st < 2; st++)
+            if (g_attr_stack[g_attr_sp][st] >= 0) g_enabled[st] = g_attr_stack[g_attr_sp][st] & 1;
+}
+
+void arb_use_glsl(GLuint prog) { g_game_glsl = prog; }
+
+/* Before every draw: the game's own GLSL program wins, as it does in GL;
+ * otherwise the enabled assembly stages, translated. */
+void arb_before_draw(void)
+{
+    if (!arb_active()) return;
+    if (g_game_glsl) { glUseProgram(g_game_glsl); return; }
+    GLuint vid = g_enabled[0] ? g_bound[0] : 0;
+    GLuint fid = g_enabled[1] ? g_bound[1] : 0;
+    if (!vid && !fid) { glUseProgram(0); glDisable(GL_VERTEX_PROGRAM_ARB); glDisable(GL_FRAGMENT_PROGRAM_ARB); return; }
+    Linked *l = link_pair(vid, fid);
+    if (l && l->ok) {
+        glDisable(GL_VERTEX_PROGRAM_ARB);
+        glDisable(GL_FRAGMENT_PROGRAM_ARB);
+        glUseProgram(l->prog);
+        upload(l);
+        return;
+    }
+    /* not translatable: the driver's own assembly path, as before */
+    glUseProgram(0);
+    if (vid) glEnable(GL_VERTEX_PROGRAM_ARB); else glDisable(GL_VERTEX_PROGRAM_ARB);
+    if (fid) glEnable(GL_FRAGMENT_PROGRAM_ARB); else glDisable(GL_FRAGMENT_PROGRAM_ARB);
+}
+
+const char *arb_get_source(GLenum target, GLuint id)
+{
+    int st = stage_of(target);
+    ArbProg *p = st >= 0 ? prog_get(st, id, 0) : NULL;
+    return p ? p->src : NULL;
+}

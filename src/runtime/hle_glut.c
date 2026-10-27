@@ -18,8 +18,12 @@
 #include <stdio.h>
 #include <string.h>
 
+#ifdef _WIN32
 #include <windows.h>
 #include <GL/gl.h>
+#else
+#include "gl_posix.h"
+#endif
 
 #include "lindbergh_rt.h"
 
@@ -131,7 +135,7 @@ static void h_glutInitWindowSize(CPU *c)
  * matters, because the game will draw at it regardless. */
 static void h_glutGameModeString(CPU *c)
 {
-    const char *sp = A32(0) ? (const char *)(uintptr_t)A32(0) : NULL;
+    const char *sp = A32(0) ? (const char *)GP(A32(0)) : NULL;
     int w = 0, h = 0;
     if (sp && sscanf(sp, "%dx%d", &w, &h) == 2) {
         fprintf(stderr, "[glut] game mode string \"%s\" -> %dx%d\n", sp, w, h);
@@ -146,7 +150,7 @@ static void h_glutGameModeString(CPU *c)
  * worse than one you can alt-tab away from. */
 static void h_glutCreateWindow(CPU *c)
 {
-    const char *title = A32(0) ? (const char *)(uintptr_t)A32(0) : "lindberghrecomp";
+    const char *title = A32(0) ? (const char *)GP(A32(0)) : "lindberghrecomp";
     if (!host_window_open(title) || !host_gl_context()) { RET(0); return; }
     RET(1);
 }
@@ -204,7 +208,7 @@ static void h_glutGet(CPU *c)
  * the driver underneath actually reports. */
 static void h_glutExtensionSupported(CPU *c)
 {
-    const char *want = (const char *)(uintptr_t)A32(0);
+    const char *want = (const char *)GP(A32(0));
     const char *have = (const char *)glGetString(GL_EXTENSIONS);
     RET(want && have && strstr(have, want) ? 1 : 0);
 }

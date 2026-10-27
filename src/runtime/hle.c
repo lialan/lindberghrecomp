@@ -18,7 +18,7 @@
 #include "lindbergh_rt.h"
 
 #define HLE_NAME(id, name) name,
-static const char *const g_names[] = { HLE_IMPORTS(HLE_NAME) };
+static const char *const g_names[] = { HLE_IMPORTS(HLE_NAME) SOLIB_IMPORTS(HLE_NAME) };
 #undef HLE_NAME
 
 const char *hle_name(HleId id)
@@ -53,6 +53,8 @@ void hle_register_all(void)
     hle_register_scan();
     hle_register_gl();
     hle_register_cg();
+    hle_register_zlib();
+    hle_register_openal();
 }
 
 /* Survey mode. Aborting on the first unimplemented import is the right default
@@ -101,6 +103,11 @@ static void maybe_break(CPU *c, HleId id)
         at = (v && *v) ? atol(v) : 0;
     }
     if (!at) return;
+    /* LINDBERGH_HLE_BREAK_NAME=nanosleep counts only that import, so the
+     * break lands on the thread that makes it. */
+    static const char *only = (const char *)-1;
+    if (only == (const char *)-1) only = getenv("LINDBERGH_HLE_BREAK_NAME");
+    if (only && *only && strcmp(hle_name(id), only) != 0) return;
     if (++counter >= at) {
         fprintf(stderr, "[break] import call #%ld is %s\n", counter, hle_name(id));
         guest_report_state("deliberate break");
@@ -112,7 +119,10 @@ void hle_call(CPU *c, HleId id)
 {
     maybe_break(c, id);
     if (tracing()) {
-        fprintf(stderr, "[call] %s\n", hle_name(id));
+        static int next_tid;
+        static __thread int tid;
+        if (!tid) tid = __sync_add_and_fetch(&next_tid, 1);
+        fprintf(stderr, "[call] t%d %s\n", tid, hle_name(id));
         fflush(stderr);
     }
     if ((unsigned)id < HLE_COUNT && g_hle_handlers[id]) {

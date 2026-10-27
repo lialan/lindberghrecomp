@@ -20,14 +20,22 @@
 #include "recomp_funcs_list.h"
 #include "recomp_plt.h"
 
+#ifndef SOLIB_FUNCS
+#define SOLIB_FUNCS(X)
+#define SOLIB_PLT(X)
+#define SOLIB_ALIASES(X)
+#endif
+
 #define DECL(a) void L_##a(CPU *c);
 LIFTED_FUNCS(DECL)
+SOLIB_FUNCS(DECL)
 #undef DECL
 
 typedef struct { uint32_t va; void (*fn)(CPU *); } Entry;
 
 #define ENT(a) { 0x##a##u, L_##a },
-static const Entry g_table[] = { LIFTED_FUNCS(ENT) };
+/* the libraries sit above the image, so appending keeps the table sorted */
+static const Entry g_table[] = { LIFTED_FUNCS(ENT) SOLIB_FUNCS(ENT) };
 #undef ENT
 
 #define N (sizeof g_table / sizeof g_table[0])
@@ -52,7 +60,7 @@ static void (*find(uint32_t va))(CPU *)
 typedef struct { uint32_t va; HleId id; } PltEntry;
 
 #define PLT_ENT(a, id) { (a), (id) },
-static const PltEntry g_plt[] = { HLE_PLT(PLT_ENT) };
+static const PltEntry g_plt[] = { HLE_PLT(PLT_ENT) SOLIB_PLT(PLT_ENT) };
 #undef PLT_ENT
 
 #define NPLT (sizeof g_plt / sizeof g_plt[0])
@@ -94,11 +102,11 @@ unsigned guest_depth_max(void) { return g_depth_max; }
  * dispatched. The question comes up constantly during bring-up - a branch went
  * the wrong way and something that should have run did not - and it is not
  * answerable from a backtrace, which only shows what DID run. */
-static void watch_check(uint32_t va)
+static void watch_check(CPU *c, uint32_t va)
 {
     static uint32_t list[16];
-    static int n = -1;
-    static unsigned char hit[16];
+    static int n = -1, nargs;
+    static unsigned hit[16];
     if (n < 0) {
         n = 0;
         const char *v = getenv("LINDBERGH_WATCH");
@@ -106,11 +114,20 @@ static void watch_check(uint32_t va)
             list[n++] = (uint32_t)strtoul(v, (char **)&v, 16);
             while (*v == ',' || *v == ' ') v++;
         }
+        /* LINDBERGH_WATCH_ARGS=N: report the first N hits of each, with
+         * their first four arguments (esp+0 is the return address here) */
+        const char *a = getenv("LINDBERGH_WATCH_ARGS");
+        nargs = a ? atoi(a) : 0;
     }
     for (int i = 0; i < n; i++)
-        if (list[i] == va && !hit[i]) {
-            hit[i] = 1;
-            fprintf(stderr, "[watch] reached %#010x\n", va);
+        if (list[i] == va && hit[i] < (unsigned)(nargs ? nargs : 1)) {
+            hit[i]++;
+            if (nargs)
+                fprintf(stderr, "[watch] %#010x(%#x, %#x, %#x, %#x) from %#010x\n", va,
+                        rd32(c->esp + 4), rd32(c->esp + 8), rd32(c->esp + 12),
+                        rd32(c->esp + 16), rd32(c->esp));
+            else
+                fprintf(stderr, "[watch] reached %#010x\n", va);
             fflush(stderr);
         }
 }
@@ -127,7 +144,7 @@ static int gl_token_call_entry(CPU *c, uint32_t va)
 void dispatch(CPU *c, uint32_t va)
 {
     guest_trace_dispatch(va);
-    watch_check(va);
+    watch_check(c, va);
 
     if (++g_depth > g_depth_max) g_depth_max = g_depth;
     if (g_depth > DEPTH_LIMIT) {
@@ -170,6 +187,13 @@ void dispatch(CPU *c, uint32_t va)
         hle_call(c, id);
         g_depth--;
         return;
+    }
+
+    /* A library's own PLT stub for a function another library defines. */
+    {
+#define ALIAS(stub, target) if (va == stub) { dispatch(c, target); g_depth--; return; }
+        SOLIB_ALIASES(ALIAS)
+#undef ALIAS
     }
 
     /* Neither lifted nor an import: a function the bounds missed, or a jump

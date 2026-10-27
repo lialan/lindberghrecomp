@@ -62,7 +62,7 @@ static void init_once(void)
  * mutexes and condition variables. */
 static void *obj_get(uint32_t va, size_t host_size, void (*ctor)(void *))
 {
-    GuestObj *g = (GuestObj *)(uintptr_t)va;
+    GuestObj *g = (GuestObj *)GP(va);
     if (g->magic == GUEST_MAGIC && g->host)
         return g->host;
 
@@ -98,7 +98,7 @@ static void h_mutex_trylock(CPU *c) { RET(TryEnterCriticalSection(MUTEX(0)) ? 0 
 
 static void h_mutex_destroy(CPU *c)
 {
-    GuestObj *g = (GuestObj *)(uintptr_t)A32(0);
+    GuestObj *g = (GuestObj *)GP(A32(0));
     if (g->magic == GUEST_MAGIC && g->host) {
         DeleteCriticalSection((CRITICAL_SECTION *)g->host);
         free(g->host);
@@ -146,7 +146,7 @@ static void h_cond_timedwait(CPU *c)
 
 static void h_cond_destroy(CPU *c)
 {
-    GuestObj *g = (GuestObj *)(uintptr_t)A32(0);
+    GuestObj *g = (GuestObj *)GP(A32(0));
     if (g->magic == GUEST_MAGIC && g->host) {            /* no destroy call exists */
         free(g->host);
         g->host = NULL;
@@ -172,7 +172,7 @@ typedef struct {
 
 static GuestAttr *attr_of(uint32_t va)
 {
-    GuestAttr *a = (GuestAttr *)(uintptr_t)va;
+    GuestAttr *a = (GuestAttr *)GP(va);
     if (a->magic != GUEST_MAGIC) {
         memset(a, 0, sizeof *a);
         a->magic = GUEST_MAGIC;
@@ -261,7 +261,7 @@ static void h_pthread_create(CPU *c)
 
 static void h_pthread_join(CPU *c)
 {
-    GuestThread *t = (GuestThread *)(uintptr_t)A32(0);
+    GuestThread *t = (GuestThread *)GP(A32(0));
     if (t && t->handle) {
         WaitForSingleObject(t->handle, INFINITE);
         CloseHandle(t->handle);
@@ -320,7 +320,7 @@ static void h_sem_post(CPU *c) { ReleaseSemaphore(*sem_of(A32(0)), 1, NULL); RET
 static void h_sem_wait(CPU *c) { WaitForSingleObject(*sem_of(A32(0)), INFINITE); RET(0); }
 static void h_sem_destroy(CPU *c)
 {
-    GuestObj *g = (GuestObj *)(uintptr_t)A32(0);
+    GuestObj *g = (GuestObj *)GP(A32(0));
     if (g->magic == GUEST_MAGIC && g->host) {
         HANDLE *h = (HANDLE *)g->host;
         if (*h) CloseHandle(*h);
@@ -377,5 +377,295 @@ void hle_register_pthread(void)
 }
 
 #else   /* !_WIN32 */
-void hle_register_pthread(void) { }
+
+/* POSIX, on a 64-bit host. The same shapes as above: a guest synchronisation
+ * object holds a GuestObj pointing at the host one, created on first use; a
+ * guest thread is a host thread with its own guest stack in the window. */
+#include <errno.h>
+#include <pthread.h>
+#include <time.h>
+
+static pthread_mutex_t g_init_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void *obj_get(uint32_t va, size_t host_size, void (*ctor)(void *))
+{
+    GuestObj *g = (GuestObj *)GP(va);
+    if (!g) return NULL;
+    if (g->magic == GUEST_MAGIC && g->host)
+        return g->host;
+    pthread_mutex_lock(&g_init_lock);
+    if (g->magic != GUEST_MAGIC || !g->host) {
+        void *h = calloc(1, host_size);
+        if (h) ctor(h);
+        g->host  = h;
+        g->magic = GUEST_MAGIC;
+    }
+    pthread_mutex_unlock(&g_init_lock);
+    return g->host;
+}
+
+static void obj_drop(uint32_t va, void (*dtor)(void *))
+{
+    GuestObj *g = (GuestObj *)GP(va);
+    if (g && g->magic == GUEST_MAGIC && g->host) {
+        if (dtor) dtor(g->host);
+        free(g->host);
+        g->host = NULL;
+        g->magic = 0;
+    }
+}
+
+/* Recursive, as on the Windows side: a CRITICAL_SECTION is, and the game was
+ * debugged against that. */
+static void ctor_mutex(void *p)
+{
+    pthread_mutexattr_t a;
+    pthread_mutexattr_init(&a);
+    pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init((pthread_mutex_t *)p, &a);
+    pthread_mutexattr_destroy(&a);
+}
+static void ctor_cond(void *p) { pthread_cond_init((pthread_cond_t *)p, NULL); }
+static void dtor_mutex(void *p) { pthread_mutex_destroy((pthread_mutex_t *)p); }
+static void dtor_cond(void *p)  { pthread_cond_destroy((pthread_cond_t *)p); }
+
+#define MUTEX(n) ((pthread_mutex_t *)obj_get(A32(n), sizeof(pthread_mutex_t), ctor_mutex))
+#define COND(n)  ((pthread_cond_t *)obj_get(A32(n), sizeof(pthread_cond_t), ctor_cond))
+
+static void h_mutex_init(CPU *c)    { (void)MUTEX(0); RET(0); }
+static void h_mutex_lock(CPU *c)    { RET(pthread_mutex_lock(MUTEX(0))); }
+static void h_mutex_unlock(CPU *c)  { RET(pthread_mutex_unlock(MUTEX(0))); }
+static void h_mutex_trylock(CPU *c) { RET(pthread_mutex_trylock(MUTEX(0)) ? 16 : 0); }
+static void h_mutex_destroy(CPU *c) { obj_drop(A32(0), dtor_mutex); RET(0); }
+
+static void h_cond_init(CPU *c)      { (void)COND(0); RET(0); }
+static void h_cond_signal(CPU *c)    { pthread_cond_signal(COND(0)); RET(0); }
+static void h_cond_broadcast(CPU *c) { pthread_cond_broadcast(COND(0)); RET(0); }
+static void h_cond_wait(CPU *c)      { pthread_cond_wait(COND(0), MUTEX(1)); RET(0); }
+static void h_cond_timedwait(CPU *c)
+{
+    uint32_t ts = A32(2);
+    if (!ts) { pthread_cond_wait(COND(0), MUTEX(1)); RET(0); return; }
+    struct timespec t = { (time_t)(int32_t)rd32(ts), (long)(int32_t)rd32(ts + 4) };
+    int r = pthread_cond_timedwait(COND(0), MUTEX(1), &t);
+    RET(r == ETIMEDOUT ? 110u : 0u);                    /* Linux ETIMEDOUT */
+}
+static void h_cond_destroy(CPU *c) { obj_drop(A32(0), dtor_cond); RET(0); }
+
+typedef struct {
+    uint32_t magic;
+    uint32_t stacksize;
+    int32_t  policy;
+    int32_t  priority;
+    int32_t  detached;
+} GuestAttr;
+
+#define GUEST_STACK_DEFAULT (2u << 20)
+
+static GuestAttr *attr_of(uint32_t va)
+{
+    GuestAttr *a = (GuestAttr *)GP(va);
+    if (a->magic != GUEST_MAGIC) {
+        memset(a, 0, sizeof *a);
+        a->magic = GUEST_MAGIC;
+        a->stacksize = GUEST_STACK_DEFAULT;
+    }
+    return a;
+}
+
+static void h_attr_init(CPU *c)         { (void)attr_of(A32(0)); RET(0); }
+static void h_attr_setstacksize(CPU *c) { attr_of(A32(0))->stacksize = A32(1); RET(0); }
+static void h_attr_setschedpolicy(CPU *c) { attr_of(A32(0))->policy = AI32(1); RET(0); }
+static void h_attr_setschedparam(CPU *c)
+{
+    if (A32(1)) attr_of(A32(0))->priority = (int32_t)rd32(A32(1));
+    RET(0);
+}
+static void h_sched_get_priority_max(CPU *c) { RET(0); }
+static void h_sched_get_priority_min(CPU *c) { RET(0); }
+static void h_mutexattr_init(CPU *c)    { if (A32(0)) wr32(A32(0), 0); RET(0); }
+static void h_mutexattr_settype(CPU *c) { RET(0); }   /* always recursive here */
+
+/* The GuestThread lives in guest memory, because its address IS the guest's
+ * pthread_t; its stack does too, because guest code addresses it. */
+typedef struct {
+    uint32_t  start;
+    uint32_t  arg;
+    void     *stack;
+    uint32_t  stacksize;
+    uint32_t  retval;
+    pthread_t handle;
+} GuestThread;
+
+/* Host stack for a guest thread. Every guest call is a host call, so deep guest
+ * recursion costs host stack; give it room. */
+#define HOST_THREAD_STACK (64u << 20)
+
+static void *thread_trampoline(void *p)
+{
+    GuestThread *t = (GuestThread *)p;
+    CPU cpu;
+    memset(&cpu, 0, sizeof cpu);
+    guest_set_current_cpu(&cpu);
+    guest_install_thread_handlers();
+    uint32_t top = H2G(t->stack) + t->stacksize - 64;
+    cpu.esp = top & ~15u;
+    uint32_t args[1] = { t->arg };
+    t->retval = guest_call(&cpu, t->start, args, 1);
+    return NULL;
+}
+
+static void h_pthread_create(CPU *c)
+{
+    uint32_t out = A32(0), attr = A32(1);
+    GuestThread *t = (GuestThread *)guest_alloc(sizeof *t, 16);
+    if (!t) { RET(11); return; }                          /* EAGAIN */
+    memset(t, 0, sizeof *t);
+    t->start     = A32(2);
+    t->arg       = A32(3);
+    t->stacksize = attr ? attr_of(attr)->stacksize : GUEST_STACK_DEFAULT;
+    if (t->stacksize < (256u << 10)) t->stacksize = 256u << 10;
+    t->stack = guest_alloc(t->stacksize, 64);
+    if (!t->stack) { guest_free(t); RET(11); return; }
+
+    pthread_attr_t a;
+    pthread_attr_init(&a);
+    pthread_attr_setstacksize(&a, HOST_THREAD_STACK);
+    int r = pthread_create(&t->handle, &a, thread_trampoline, t);
+    pthread_attr_destroy(&a);
+    if (r) { guest_free(t->stack); guest_free(t); RET(11); return; }
+
+    if (out) wr32(out, H2G(t));
+    fprintf(stderr, "[pthread] created thread at %#010x, %u KB stack\n",
+            t->start, t->stacksize >> 10);
+    RET(0);
+}
+
+static void h_pthread_join(CPU *c)
+{
+    GuestThread *t = (GuestThread *)GP(A32(0));
+    if (t) {
+        pthread_join(t->handle, NULL);
+        if (A32(1)) wr32(A32(1), t->retval);
+        guest_free(t->stack);
+        guest_free(t);
+    }
+    RET(0);
+}
+
+/* pthread_self has to agree with the pthread_t pthread_create handed out for
+ * the same thread, and be stable and non-zero for the main thread. */
+static __thread uint32_t g_self;
+static void h_pthread_self(CPU *c)
+{
+    if (!g_self) g_self = 0x54480000u | ((uint32_t)(uintptr_t)pthread_self() & 0xFFFFu);
+    RET(g_self);
+}
+static void h_pthread_detach(CPU *c) { RET(0); }
+static void h_pthread_equal(CPU *c)  { RET(A32(0) == A32(1)); }
+static void h_pthread_getschedparam(CPU *c) { RET(0); }
+static void h_pthread_setschedparam(CPU *c) { RET(0); }
+
+static void h_pthread_once(CPU *c)
+{
+    uint32_t flag = A32(0), fn = A32(1);
+    if (flag && !rd32(flag)) {
+        wr32(flag, 1);
+        guest_call(c, fn, NULL, 0);
+    }
+    RET(0);
+}
+
+static void h_key_create(CPU *c)
+{
+    pthread_key_t k;
+    if (pthread_key_create(&k, NULL)) { RET(12); return; }     /* ENOMEM */
+    if (A32(0)) wr32(A32(0), (uint32_t)k);
+    RET(0);
+}
+static void h_getspecific(CPU *c) { RET((uint32_t)(uintptr_t)pthread_getspecific((pthread_key_t)A32(0))); }
+static void h_setspecific(CPU *c) { pthread_setspecific((pthread_key_t)A32(0), (void *)(uintptr_t)A32(1)); RET(0); }
+
+/* A counting semaphore from a mutex and a condition: macOS has no unnamed
+ * sem_init. */
+typedef struct { pthread_mutex_t m; pthread_cond_t cv; uint32_t count; } HostSem;
+static void ctor_sem(void *p)
+{
+    HostSem *s = (HostSem *)p;
+    pthread_mutex_init(&s->m, NULL);
+    pthread_cond_init(&s->cv, NULL);
+}
+static void dtor_sem(void *p)
+{
+    HostSem *s = (HostSem *)p;
+    pthread_mutex_destroy(&s->m);
+    pthread_cond_destroy(&s->cv);
+}
+#define SEM(n) ((HostSem *)obj_get(A32(n), sizeof(HostSem), ctor_sem))
+
+static void h_sem_init(CPU *c)
+{
+    HostSem *s = SEM(0);
+    pthread_mutex_lock(&s->m);
+    s->count = A32(2);
+    pthread_mutex_unlock(&s->m);
+    RET(0);
+}
+static void h_sem_post(CPU *c)
+{
+    HostSem *s = SEM(0);
+    pthread_mutex_lock(&s->m);
+    s->count++;
+    pthread_cond_signal(&s->cv);
+    pthread_mutex_unlock(&s->m);
+    RET(0);
+}
+static void h_sem_wait(CPU *c)
+{
+    HostSem *s = SEM(0);
+    pthread_mutex_lock(&s->m);
+    while (!s->count) pthread_cond_wait(&s->cv, &s->m);
+    s->count--;
+    pthread_mutex_unlock(&s->m);
+    RET(0);
+}
+static void h_sem_destroy(CPU *c) { obj_drop(A32(0), dtor_sem); RET(0); }
+
+void hle_register_pthread(void)
+{
+    hle_bind("pthread_mutex_init", h_mutex_init);
+    hle_bind("pthread_mutex_lock", h_mutex_lock);
+    hle_bind("pthread_mutex_unlock", h_mutex_unlock);
+    hle_bind("pthread_mutex_trylock", h_mutex_trylock);
+    hle_bind("pthread_mutex_destroy", h_mutex_destroy);
+    hle_bind("pthread_mutexattr_init", h_mutexattr_init);
+    hle_bind("pthread_mutexattr_settype", h_mutexattr_settype);
+    hle_bind("pthread_cond_init", h_cond_init);
+    hle_bind("pthread_cond_signal", h_cond_signal);
+    hle_bind("pthread_cond_broadcast", h_cond_broadcast);
+    hle_bind("pthread_cond_wait", h_cond_wait);
+    hle_bind("pthread_cond_timedwait", h_cond_timedwait);
+    hle_bind("pthread_cond_destroy", h_cond_destroy);
+    hle_bind("pthread_attr_init", h_attr_init);
+    hle_bind("pthread_attr_setstacksize", h_attr_setstacksize);
+    hle_bind("pthread_attr_setschedpolicy", h_attr_setschedpolicy);
+    hle_bind("pthread_attr_setschedparam", h_attr_setschedparam);
+    hle_bind("sched_get_priority_max", h_sched_get_priority_max);
+    hle_bind("sched_get_priority_min", h_sched_get_priority_min);
+    hle_bind("pthread_create", h_pthread_create);
+    hle_bind("pthread_join", h_pthread_join);
+    hle_bind("pthread_detach", h_pthread_detach);
+    hle_bind("pthread_self", h_pthread_self);
+    hle_bind("pthread_equal", h_pthread_equal);
+    hle_bind("pthread_once", h_pthread_once);
+    hle_bind("pthread_getschedparam", h_pthread_getschedparam);
+    hle_bind("pthread_setschedparam", h_pthread_setschedparam);
+    hle_bind("pthread_key_create", h_key_create);
+    hle_bind("pthread_getspecific", h_getspecific);
+    hle_bind("pthread_setspecific", h_setspecific);
+    hle_bind("sem_init", h_sem_init);
+    hle_bind("sem_post", h_sem_post);
+    hle_bind("sem_wait", h_sem_wait);
+    hle_bind("sem_destroy", h_sem_destroy);
+}
 #endif

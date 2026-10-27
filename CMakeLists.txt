@@ -31,11 +31,28 @@ if(NOT EXISTS "${LINDBERGH_CPU_DIR}/cpu.h")
 endif()
 
 function(lindbergh_runtime target generated_dir)
-    if(CMAKE_SIZEOF_VOID_P EQUAL 8)
-        message(FATAL_ERROR
-            "${target} is being built 64-bit. Recompiled Lindbergh code holds "
-            "guest addresses in host registers and the game maps at 0x08048000, "
-            "so the host must be 32-bit: cmake -B build -A Win32")
+    if(WIN32)
+        if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+            message(FATAL_ERROR
+                "${target} is being built 64-bit. On Windows the recompiled code holds "
+                "guest addresses in host registers and the game maps at 0x08048000, "
+                "so the host must be 32-bit: cmake -B build -A Win32")
+        endif()
+        set(platform_sources
+            "${LINDBERGH_RUNTIME_DIR}/hle_window.c"
+            "${LINDBERGH_RUNTIME_DIR}/hle_gl.c"
+            "${LINDBERGH_RUNTIME_DIR}/hle_cg.c")
+    else()
+        # A 64-bit POSIX host (macOS, Android): guest addresses are offsets into
+        # one 4 GB window (guest_mem.c), and GL goes through typed thunks.
+        set(platform_sources
+            "${LINDBERGH_RUNTIME_DIR}/guest_mem.c"
+            "${LINDBERGH_RUNTIME_DIR}/host_sdl.c"
+            "${LINDBERGH_RUNTIME_DIR}/hle_gl_posix.c"
+            "${LINDBERGH_RUNTIME_DIR}/arbprog.c"
+            "${LINDBERGH_RUNTIME_DIR}/hle_openal.c"
+            "${LINDBERGH_RUNTIME_DIR}/solib.c")
+        target_compile_definitions(${target} PRIVATE RECOMP_GUEST_BASE=1)
     endif()
     target_sources(${target} PRIVATE
         "${LINDBERGH_RUNTIME_DIR}/guest.c"
@@ -43,17 +60,16 @@ function(lindbergh_runtime target generated_dir)
         "${LINDBERGH_RUNTIME_DIR}/hle.c"
         "${LINDBERGH_RUNTIME_DIR}/hle_libc.c"
         "${LINDBERGH_RUNTIME_DIR}/hle_pthread.c"
-        "${LINDBERGH_RUNTIME_DIR}/hle_window.c"
         "${LINDBERGH_RUNTIME_DIR}/hle_vidmode.c"
         "${LINDBERGH_RUNTIME_DIR}/hle_matrix.c"
         "${LINDBERGH_RUNTIME_DIR}/hle_sega.c"
         "${LINDBERGH_RUNTIME_DIR}/hle_glut.c"
+        "${LINDBERGH_RUNTIME_DIR}/hle_zlib.c"
         "${LINDBERGH_RUNTIME_DIR}/hle_cxx.c"
-        "${LINDBERGH_RUNTIME_DIR}/hle_gl.c"
-        "${LINDBERGH_RUNTIME_DIR}/hle_cg.c"
         "${LINDBERGH_RUNTIME_DIR}/overrides.c"
         "${LINDBERGH_RUNTIME_DIR}/dispatch.c"
         "${LINDBERGH_RUNTIME_DIR}/crash_report.c"
+        ${platform_sources}
     )
     target_include_directories(${target} PRIVATE
         "${LINDBERGH_RUNTIME_DIR}"
@@ -75,7 +91,20 @@ function(lindbergh_runtime target generated_dir)
         # and the guest can be laid out where it expects to be.
         target_link_options(${target} PRIVATE
             /DYNAMICBASE:NO /LARGEADDRESSAWARE /STACK:8388608)
-        target_link_libraries(${target} PRIVATE opengl32 gdi32 user32)
+        target_link_libraries(${target} PRIVATE opengl32 gdi32 user32 zlibstatic)
+    else()
+        target_compile_options(${target} PRIVATE
+            -Wno-unused-label -Wno-unused-variable -Wno-unused-but-set-variable
+            -Wno-parentheses-equality -Wno-deprecated-declarations
+            -Wno-constant-conversion -Wno-tautological-constant-out-of-range-compare
+            -fno-strict-aliasing -fwrapv)
+        find_package(SDL2 REQUIRED)
+        target_link_libraries(${target} PRIVATE SDL2::SDL2 z)
+        if(APPLE)
+            target_link_libraries(${target} PRIVATE "-framework OpenGL" "-framework AppKit" "-framework OpenAL" objc)
+            # Every guest call is a host call: give the main thread room.
+            target_link_options(${target} PRIVATE "LINKER:-stack_size,0x10000000")
+        endif()
     endif()
 endfunction()
 

@@ -42,7 +42,13 @@ uint32_t guest_symbol(const char *name)
 
 int guest_override(const char *name, HleHandler fn)
 {
-    uint32_t va = guest_symbol(name);
+    return guest_override_va(name, guest_symbol(name), fn);
+}
+
+/* The same for an address found some other way - a dlopened library's
+ * export, which the main ELF's symbol table does not list. */
+int guest_override_va(const char *name, uint32_t va, HleHandler fn)
+{
     if (!va) return 0;                       /* this game does not have it */
     if (g_ov_n >= MAX_OVERRIDES) {
         fprintf(stderr, "[override] table full, %s not installed\n", name);

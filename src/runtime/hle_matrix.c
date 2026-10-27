@@ -29,7 +29,7 @@ typedef struct { float m[4][4]; } Mat4;
 
 static void rd_rows(uint32_t va, float *out, int rows)
 {
-    memcpy(out, (const void *)(uintptr_t)va, (size_t)rows * 16);
+    memcpy(out, (const void *)GP(va), (size_t)rows * 16);
 }
 
 /* Running the same multiply in C reproduces the engine's zero row exactly, so
@@ -77,7 +77,7 @@ static void h_mul44(CPU *c)
         show("mul44 b", b, B, 4);
         show("mul44 =", dst, out, 4);
     }
-    memcpy((void *)(uintptr_t)dst, out, 64);
+    memcpy((void *)GP(dst), out, 64);
     RET(dst);
 }
 
@@ -101,8 +101,8 @@ static void h_mul34(CPU *c)
         show("mul34 b", b, B, 3);
         show("mul34 =", dst, out, 3);
     }
-    memcpy((void *)(uintptr_t)dst, out, 48);
-    memcpy((void *)(uintptr_t)(dst + 48), K, 16);
+    memcpy((void *)GP(dst), out, 48);
+    memcpy((void *)GP((dst + 48)), K, 16);
     RET(dst);
 }
 

@@ -153,7 +153,7 @@ static char *args_defines(CPU *c, uint32_t argv)
     for (int k = 0; k < 32 && argv; k++) {
         uint32_t p = rd32(argv + 4u * (uint32_t)k);
         if (!p) break;
-        const char *a = (const char *)(uintptr_t)p;
+        const char *a = (const char *)GP(p);
         size_t l = strlen(a);
         if (n + l >= sizeof buf) break;
         memcpy(buf + n, a, l);

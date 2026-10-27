@@ -281,12 +281,12 @@ static uint32_t str_new(const char *src, uint32_t n)
     SET_LEN(p, n);
     SET_CAP(p, n);
     SET_REF(p, 0);
-    if (src && n) memcpy((void *)(uintptr_t)p, src, n);
-    ((char *)(uintptr_t)p)[n] = 0;
+    if (src && n) memcpy((void *)GP(p), src, n);
+    ((char *)GP(p))[n] = 0;
     return p;
 }
 
-static uint32_t str_from(uint32_t data, uint32_t n) { return str_new((const char *)(uintptr_t)data, n); }
+static uint32_t str_from(uint32_t data, uint32_t n) { return str_new((const char *)GP(data), n); }
 
 /* Replace what `self` points at, freeing the old rep if this held the last
  * reference - the same test _M_dispose makes. */
@@ -294,13 +294,13 @@ static void str_set(uint32_t self, uint32_t newdata)
 {
     uint32_t old = rd32(self);
     wr32(self, newdata);
-    if (old && (int32_t)REP_REF(old) <= 0) free((void *)(uintptr_t)(old - 12));
+    if (old && (int32_t)REP_REF(old) <= 0) free((void *)GP((old - 12)));
 }
 
 /* basic_string(const char *s, const allocator &) */
 static void h_str_ctor_cstr(CPU *c)
 {
-    const char *s = A32(1) ? (const char *)(uintptr_t)A32(1) : "";
+    const char *s = A32(1) ? (const char *)GP(A32(1)) : "";
     wr32(A32(0), str_new(s, (uint32_t)strlen(s)));
     RET(A32(0));
 }
@@ -337,9 +337,9 @@ static void h_str_append_cstr(CPU *c)
     uint32_t cur = rd32(self), len = cur ? REP_LEN(cur) : 0;
     uint32_t out = str_new(NULL, len + n);
     if (out) {
-        if (len) memcpy((void *)(uintptr_t)out, (void *)(uintptr_t)cur, len);
-        if (n)   memcpy((void *)(uintptr_t)(out + len), (void *)(uintptr_t)add, n);
-        ((char *)(uintptr_t)out)[len + n] = 0;
+        if (len) memcpy((void *)GP(out), (void *)GP(cur), len);
+        if (n)   memcpy((void *)GP((out + len)), (void *)GP(add), n);
+        ((char *)GP(out))[len + n] = 0;
     }
     str_set(self, out);
     RET(self);
@@ -352,9 +352,9 @@ static void h_str_append_str(CPU *c)
     uint32_t cur = rd32(self), len = cur ? REP_LEN(cur) : 0;
     uint32_t out = str_new(NULL, len + n);
     if (out) {
-        if (len) memcpy((void *)(uintptr_t)out, (void *)(uintptr_t)cur, len);
-        if (n)   memcpy((void *)(uintptr_t)(out + len), (void *)(uintptr_t)add, n);
-        ((char *)(uintptr_t)out)[len + n] = 0;
+        if (len) memcpy((void *)GP(out), (void *)GP(cur), len);
+        if (n)   memcpy((void *)GP((out + len)), (void *)GP(add), n);
+        ((char *)GP(out))[len + n] = 0;
     }
     str_set(self, out);
     RET(self);
@@ -383,11 +383,11 @@ static void h_str_replace(CPU *c)
 
     uint32_t out = str_new(NULL, len - n1 + n2);
     if (out) {
-        char *o = (char *)(uintptr_t)out;
-        if (pos) memcpy(o, (void *)(uintptr_t)cur, pos);
-        if (n2)  memcpy(o + pos, (void *)(uintptr_t)s, n2);
+        char *o = (char *)GP(out);
+        if (pos) memcpy(o, (void *)GP(cur), pos);
+        if (n2)  memcpy(o + pos, (void *)GP(s), n2);
         if (len - pos - n1)
-            memcpy(o + pos + n2, (void *)(uintptr_t)(cur + pos + n1), len - pos - n1);
+            memcpy(o + pos + n2, (void *)GP((cur + pos + n1)), len - pos - n1);
         o[len - n1 + n2] = 0;
     }
     str_set(self, out);
@@ -396,7 +396,7 @@ static void h_str_replace(CPU *c)
 
 /* _Rep::_M_destroy(const allocator &) - `this` is the rep, twelve bytes
  * before the characters, and that is what was allocated. */
-static void h_rep_destroy(CPU *c) { if (A32(0)) free((void *)(uintptr_t)A32(0)); RET(0); }
+static void h_rep_destroy(CPU *c) { if (A32(0)) free((void *)GP(A32(0))); RET(0); }
 
 /* _Rep::_M_dispose(const allocator &) - the library decrements first and
  * destroys when the old value was already at or below zero. */
@@ -406,7 +406,7 @@ static void h_rep_dispose(CPU *c)
     if (!rep) { RET(0); return; }
     int32_t before = (int32_t)rd32(rep + 8);      /* refcount is the third word */
     wr32(rep + 8, (uint32_t)(before - 1));
-    if (before <= 0) free((void *)(uintptr_t)rep);
+    if (before <= 0) free((void *)GP(rep));
     RET(0);
 }
 
@@ -416,7 +416,7 @@ static void h_str_leak(CPU *c) { RET(0); }
 /* The SGI pool allocator these builds still use. A pool is an optimisation;
  * malloc is the thing it was optimising. */
 static void h_sgi_allocate(CPU *c)   { RET(malloc(A32(0) ? A32(0) : 1)); }
-static void h_sgi_deallocate(CPU *c) { if (A32(0)) free((void *)(uintptr_t)A32(0)); RET(0); }
+static void h_sgi_deallocate(CPU *c) { if (A32(0)) free((void *)GP(A32(0))); RET(0); }
 
 /* iostreams. Setting up cin, cout and cerr for a game that writes to a
  * console the cabinet does not have. */

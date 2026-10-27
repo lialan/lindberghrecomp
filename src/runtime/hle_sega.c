@@ -36,7 +36,7 @@
  * out what this board has to be able to answer. */
 static void jvs_dump(const char *tag, uint32_t pkt, unsigned off, unsigned len)
 {
-    const unsigned char *p = (const unsigned char *)(uintptr_t)pkt;
+    const unsigned char *p = (const unsigned char *)GP(pkt);
     char line[512];
     int at = snprintf(line, sizeof line, "[jvs] %s node %u len %u:", tag, p[0], len);
     for (unsigned i = 0; i < len && i < 40 && at < 470; i++)
@@ -225,8 +225,11 @@ static void jvs_command(const unsigned char *p)
 static void h_jvs_send(CPU *c)
 {
     uint32_t pkt = A32(0);
+    {   static unsigned calls;
+        if (getenv("LINDBERGH_JVS") && (++calls <= 4 || calls % 300 == 0))
+            fprintf(stderr, "[jvs] send #%u pkt %#x\n", calls, pkt); }
     if (!pkt) { RET(-7); return; }
-    const unsigned char *p = (const unsigned char *)(uintptr_t)pkt;
+    const unsigned char *p = (const unsigned char *)GP(pkt);
     const unsigned char *frame = p + 2;
 
     if (getenv("LINDBERGH_JVS")) jvs_dump("req", pkt, 2, p[1]);
@@ -251,7 +254,7 @@ static void h_jvs_recv(CPU *c)
 {
     uint32_t ack = A32(1);
     if (!ack || !g_ack_len) { RET(-6); return; }
-    unsigned char *a = (unsigned char *)(uintptr_t)ack;
+    unsigned char *a = (unsigned char *)GP(ack);
 
     memcpy(a + PKT_FRAME, g_ack, g_ack_len);
     a[PKT_FRAME_LEN] = (unsigned char)g_ack_len;
@@ -273,7 +276,7 @@ static void h_serial_id(CPU *c)
 {
     static const char id[] = "AAFE-01A00000000";
     uint32_t out = A32(0);
-    if (out) memcpy((void *)(uintptr_t)out, id, sizeof id);
+    if (out) memcpy((void *)GP(out), id, sizeof id);
     RET(AM_OK);
 }
 
@@ -340,7 +343,7 @@ static int nvram_copy(unsigned char *store, unsigned size, uint32_t guest,
 {
     nvram_load();
     if (!guest || addr > size || len > size - addr) return AM_BACKUP_FAIL;
-    void *g = (void *)(uintptr_t)guest;
+    void *g = (void *)GP(guest);
     if (writing) { memcpy(store + addr, g, len); nvram_save(); }
     else           memcpy(g, store + addr, len);
     return AM_OK;
@@ -426,7 +429,7 @@ static uint32_t rd32le(const unsigned char *p)
 
 static int find_error_globals(uint32_t va)
 {
-    const unsigned char *p = (const unsigned char *)(uintptr_t)va;
+    const unsigned char *p = (const unsigned char *)GP(va);
     for (unsigned i = 0; i < 24; i++) {
         if (!g_err_var && p[i] == 0xA1) g_err_var = rd32le(p + i + 1);
         if (!g_err_latch && p[i] == 0x80 && p[i + 1] == 0x3D)
@@ -454,8 +457,8 @@ static void h_set_error(CPU *c)
     /* Faithful otherwise: the original only stores while the latch is clear,
      * so that the first error to happen is the one that gets reported. */
     if (g_err_var &&
-        (!g_err_latch || *(const unsigned char *)(uintptr_t)g_err_latch == 0))
-        *(uint32_t *)(uintptr_t)g_err_var = (uint32_t)v;
+        (!g_err_latch || *(const unsigned char *)GP(g_err_latch) == 0))
+        *(uint32_t *)GP(g_err_var) = (uint32_t)v;
 
     if (getenv("LINDBERGH_ACPERR")) {
         fprintf(stderr, "[acp] setError(%d) from:\n", (int)v);

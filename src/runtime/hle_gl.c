@@ -545,7 +545,7 @@ static void gl_program_string(CPU *c)
             snprintf(path, sizeof path, "%s/%s_%03d.txt", dir,
                      A32(0) == 0x8804 ? "fp" : "vp", (int)id);
             FILE *f = fopen(path, "wb");
-            if (f) { fwrite((const void *)(uintptr_t)A32(3), 1, A32(2), f); fclose(f); }
+            if (f) { fwrite((const void *)GP(A32(3)), 1, A32(2), f); fclose(f); }
         }
     }
 
@@ -585,7 +585,7 @@ static void gl_program_string(CPU *c)
     if (pos >= 0 && complained < 5) {
         complained++;
         const char *why = (const char *)glGetString(GL_PROGRAM_ERROR_STRING_ARB);
-        const char *src = (const char *)(uintptr_t)A32(3);
+        const char *src = (const char *)GP(A32(3));
         fprintf(stderr, "[gl] program rejected at byte %d: %s\n", (int)pos,
                 why ? why : "(no message)");
         if (src) {
@@ -875,7 +875,7 @@ static void gl_env_params_watch(CPU *c)
                   if (strcmp(g_gl[i].name, "glProgramParameters4fvNV") == 0) e = &g_gl[i]; }
     if (shown < 24 && getenv("LINDBERGH_PARAMS")) {
         shown++;
-        const float *v = (const float *)(uintptr_t)A32(3);
+        const float *v = (const float *)GP(A32(3));
         unsigned n = A32(2) > 4 ? 4 : A32(2);
         char l[256]; int at = 0;
         at += snprintf(l + at, sizeof l - at, "[par] target 0x%X index %u count %u:",
@@ -901,7 +901,7 @@ static void gl_env_param_watch(CPU *c)
     const char *dbg = getenv("LINDBERGH_FBSTATS");
     if (shown < 12 && dbg && *dbg && *dbg != '0') {
         shown++;
-        const float *v = (const float *)(uintptr_t)A32(2);
+        const float *v = (const float *)GP(A32(2));
         if (v) fprintf(stderr, "[gl] env[%u] = %g %g %g %g\n", A32(1), v[0], v[1], v[2], v[3]);
     }
     if (e) gl_dispatch(c, e);
@@ -1019,7 +1019,7 @@ static void gl_compressed_tex(CPU *c)
         shown++;
         /* Is there anything IN the texture? A correct upload of an empty
          * buffer samples black, and the call itself reports success. */
-        const unsigned char *d = (const unsigned char *)(uintptr_t)A32(7);
+        const unsigned char *d = (const unsigned char *)GP(A32(7));
         unsigned nz = 0, n = A32(6) < 4096 ? A32(6) : 4096;
         if (d) for (unsigned i = 0; i < n; i++) if (d[i]) nz++;
         fprintf(stderr, "[gl] compressedTex level %u fmt 0x%X %ux%u size %u -> 0x%X, "

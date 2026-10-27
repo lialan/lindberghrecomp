@@ -47,10 +47,10 @@ enum {
     SYS_exit = 1, SYS_read = 3, SYS_write = 4, SYS_open = 5, SYS_close = 6,
     SYS_lseek = 19, SYS_getpid = 20, SYS_brk = 45, SYS_ioctl = 54,
     SYS_munmap = 91, SYS_gettimeofday = 78, SYS_mmap2 = 192,
-    SYS_exit_group = 252,
+    SYS_exit_group = 252, SYS_gettid = 224,
 };
 
-static void *gp(uint32_t va) { return (void *)(uintptr_t)va; }
+static void *gp(uint32_t va) { return GP(va); }
 
 /* The guest's O_* are Linux's, not the host's; only the low three bits and a
  * handful of flags ever appear, and a straight pass-through opens the wrong
@@ -94,6 +94,13 @@ void linux_syscall(CPU *c)
     case SYS_close:  r = (int32_t)close_((int)a); break;
     case SYS_lseek:  r = (int32_t)lseek_((int)a, (long)b, (int)d); break;
     case SYS_getpid: r = 1; break;
+    case SYS_gettid: {          /* distinct and stable per host thread */
+        static int next = 1;
+        static __thread int tid;
+        if (!tid) tid = __sync_add_and_fetch(&next, 1);
+        r = tid;
+        break;
+    }
     case SYS_brk:    r = (int32_t)guest_brk(a); break;
 
     case SYS_gettimeofday: {

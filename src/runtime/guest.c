@@ -39,7 +39,12 @@ uint32_t g_image_delta = 0;       /* cpu.h's GVA(): we map where it asked */
 
 static void *reserve(uint32_t addr, uint32_t size)
 {
-#ifdef _WIN32
+#ifdef RECOMP_GUEST_BASE
+    /* The whole window is already mapped read/write (guest_mem.c); a
+     * "reservation" is just a range inside it. */
+    (void)size;
+    return G2H(addr);
+#elif defined(_WIN32)
     return VirtualAlloc((LPVOID)(uintptr_t)addr, size,
                         MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
 #else
@@ -56,6 +61,9 @@ static uint32_t rd32le(const unsigned char *p) {
 
 int guest_load(const char *elf_path, int argc, char **argv)
 {
+#ifdef RECOMP_GUEST_BASE
+    if (guest_mem_init() != 0) return -1;
+#endif
     FILE *f = fopen(elf_path, "rb");
     if (!f) { perror(elf_path); return -1; }
     fseek(f, 0, SEEK_END);
@@ -101,12 +109,12 @@ int guest_load(const char *elf_path, int argc, char **argv)
         fprintf(stderr, "cannot map the image at %#x..%#x - is this a 32-bit build?\n", lo, hi);
         free(img); return -1;
     }
-    memset((void *)(uintptr_t)lo, 0, hi - lo);        /* .bss, and the gaps */
+    memset(G2H(lo), 0, hi - lo);        /* .bss, and the gaps */
 
     for (unsigned i = 0; i < phnum; i++) {
         const unsigned char *ph = img + phoff + (size_t)i * phentsize;
         if (rd32le(ph) != PT_LOAD) continue;
-        memcpy((void *)(uintptr_t)rd32le(ph + 8),     /* p_vaddr  */
+        memcpy(G2H(rd32le(ph + 8)),     /* p_vaddr  */
                img + rd32le(ph + 4),                  /* p_offset */
                rd32le(ph + 16));                      /* p_filesz */
     }
@@ -116,20 +124,20 @@ int guest_load(const char *elf_path, int argc, char **argv)
     if (!reserve((STACK_TOP - STACK_SZ) & ~(GRAN - 1), STACK_SZ)) {
         fprintf(stderr, "cannot map the guest stack\n"); return -1;
     }
-    memset((void *)(uintptr_t)(STACK_TOP - STACK_SZ), 0, STACK_SZ);
+    memset(G2H(STACK_TOP - STACK_SZ), 0, STACK_SZ);
 
     /* The initial stack, exactly as the kernel lays it out for _start:
      *   esp -> argc, argv[0..argc-1], NULL, envp[0..], NULL, auxv, AT_NULL
      * The strings go above it. The game's CRT walks this to find its own
      * argv and to read AT_PAGESZ etc, so a wrong shape crashes before main. */
-    char *strp = (char *)(uintptr_t)(STACK_TOP - 4096);
-    uint32_t *sp = (uint32_t *)(uintptr_t)(STACK_TOP - 8192);
+    char *strp = (char *)G2H(STACK_TOP - 4096);
+    uint32_t *sp = (uint32_t *)G2H(STACK_TOP - 8192);
     uint32_t *base = sp;
     *sp++ = (uint32_t)argc;
     for (int i = 0; i < argc; i++) {
         size_t n = strlen(argv[i]) + 1;
         memcpy(strp, argv[i], n);
-        *sp++ = (uint32_t)(uintptr_t)strp;
+        *sp++ = H2G(strp);
         strp += n;
     }
     *sp++ = 0;            /* argv terminator */
@@ -137,7 +145,7 @@ int guest_load(const char *elf_path, int argc, char **argv)
     *sp++ = 6; *sp++ = PAGE;   /* AT_PAGESZ */
     *sp++ = 0; *sp++ = 0;      /* AT_NULL */
 
-    g_stack_pointer = (uint32_t)(uintptr_t)base;
+    g_stack_pointer = H2G(base);
     return 0;
 }
 
@@ -156,6 +164,9 @@ uint32_t guest_brk(uint32_t newbrk)
     /* brk(0) queries; a grow commits more pages. The recompiled CRT uses this
      * before it ever reaches mmap, so it has to work from the first call. */
     if (newbrk > g_brk) {
+#ifdef RECOMP_GUEST_BASE
+        if (newbrk > 0x20000000u) return g_brk;   /* guest_alloc's heap starts here */
+#endif
         uint32_t lo = (g_brk + PAGE - 1) & ~(PAGE - 1);
         uint32_t hi = (newbrk + PAGE - 1) & ~(PAGE - 1);
         if (hi > lo && !reserve(lo, hi - lo)) return g_brk;

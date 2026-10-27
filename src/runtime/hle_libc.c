@@ -35,6 +35,8 @@
 #include <stdlib.h>
 #else
 #include <unistd.h>
+#include <dirent.h>
+#include <limits.h>
 #endif
 
 #include "lindbergh_rt.h"
@@ -104,7 +106,7 @@ static void *gmalloc(size_t n, size_t align)
         const char *v = getenv("LINDBERGH_HEAP_SLACK");
         slack = (v && *v) ? (size_t)strtoul(v, NULL, 0) : 0;
     }
-    void *base = malloc(n + align + hdr + slack);
+    void *base = guest_alloc(n + align + hdr + slack, 16);
     if (!base) {
         /* The guest has no way to report this and will dereference the null it
          * gets back, several frames later, as a fault with nothing to say what
@@ -145,7 +147,7 @@ static void gfree(void *p)
         return;
     }
     h->magic = 0;                       /* catch a double free as a bad pointer */
-    free(h->base);
+    guest_free(h->base);
 }
 
 static void *grealloc(void *p, size_t n)
@@ -183,7 +185,7 @@ static void alloc_log(const char *who, uint32_t n, uint32_t got)
 
 static void h_malloc(CPU *c)
 {
-    uint32_t n = A32(0), got = (uint32_t)(uintptr_t)gmalloc(n, GUEST_ALIGN);
+    uint32_t n = A32(0), got = H2G(gmalloc(n, GUEST_ALIGN));
     alloc_log("malloc", n, got);
     RET(got);
 }
@@ -241,7 +243,7 @@ static void h_sqrtf(CPU *c)  { RETF(sqrtf(guest_arg_f(c, 0))); }
 static void h_srand(CPU *c)  { srand(A32(0)); RET(0); }
 /* Guest pointers are checked before they reach a CRT function. A null here
  * is not a crash in the guest's world - it is on Windows, and a silent one. */
-static void h_clearerr(CPU *c) { if (APTR(0)) clearerr((FILE *)APTR(0)); RET(0); }
+static void h_clearerr(CPU *c) { if (AFILE(0)) clearerr(AFILE(0)); RET(0); }
 static void h_sysconf(CPU *c)  { RET(A32(0) == 30 ? 4096u : 1u); }  /* _SC_PAGESIZE */
 static void h_sleep(CPU *c)    { Sleep(A32(0) * 1000u); RET(0); }
 static void h_strcasecmp(CPU *c)
@@ -281,9 +283,9 @@ static void h_qsort(CPU *c)
     if (sz > 4096) { fprintf(stderr, "[libc] qsort element %u bytes, refusing\n", sz);
                      RET(0); return; }
 
-    unsigned char *tmp = (unsigned char *)malloc(sz);
+    unsigned char *tmp = (unsigned char *)guest_alloc(sz, 16);
     if (!tmp) { RET(0); return; }
-    unsigned char *a = (unsigned char *)(uintptr_t)base;
+    unsigned char *a = (unsigned char *)GP(base);
 
     for (uint32_t i = 1; i < n; i++) {
         memcpy(tmp, a + (size_t)i * sz, sz);
@@ -291,20 +293,20 @@ static void h_qsort(CPU *c)
         while (j > 0) {
             uint32_t args[2];
             args[0] = base + (uint32_t)((j - 1) * sz);
-            args[1] = (uint32_t)(uintptr_t)tmp;
+            args[1] = H2G(tmp);
             if ((int32_t)guest_call(c, cmp, args, 2) <= 0) break;
             memcpy(a + (size_t)j * sz, a + (size_t)(j - 1) * sz, sz);
             j--;
         }
         memcpy(a + (size_t)j * sz, tmp, sz);
     }
-    free(tmp);
+    guest_free(tmp);
     RET(0);
 }
 
 static void h_atanf(CPU *c) { RETF(atanf(guest_arg_f(c, 0))); }
 static void h_powf(CPU *c)  { RETF(powf(guest_arg_f(c, 0), guest_arg_f(c, 1))); }
-static void h_rewind(CPU *c) { if (APTR(0)) rewind((FILE *)APTR(0)); RET(0); }
+static void h_rewind(CPU *c) { if (AFILE(0)) rewind(AFILE(0)); RET(0); }
 static void h_isdigit(CPU *c){ uint32_t ch = A32(0); RET(ch >= '0' && ch <= '9'); }
 
 static void h_isprint(CPU *c) { uint32_t ch = A32(0); RET(ch >= 0x20 && ch < 0x7F); }
@@ -347,6 +349,7 @@ static void h_calloc(CPU *c)
 
 static int sane(const char *who, uint32_t va, uint32_t len)
 {
+    if (!len) return 1;                      /* touches nothing; memcpy(NULL, 0) is common */
     if (va < GUEST_LOW || len > GUEST_HUGE) {
         fprintf(stderr, "[libc] %s(%#010x, %u bytes) refused - bad pointer or size\n",
                 who, va, len);
@@ -358,17 +361,17 @@ static int sane(const char *who, uint32_t va, uint32_t len)
 
 static void h_memcpy(CPU *c)
 {
-    if (!sane("memcpy dst", A32(0), A32(2)) || !sane("memcpy src", A32(1), A32(2))) { RET(A32(0)); return; }
+    if (!A32(2) || !sane("memcpy dst", A32(0), A32(2)) || !sane("memcpy src", A32(1), A32(2))) { RET(A32(0)); return; }
     RET(memcpy(APTR(0), APTR(1), A32(2)));
 }
 static void h_memmove(CPU *c)
 {
-    if (!sane("memmove dst", A32(0), A32(2)) || !sane("memmove src", A32(1), A32(2))) { RET(A32(0)); return; }
+    if (!A32(2) || !sane("memmove dst", A32(0), A32(2)) || !sane("memmove src", A32(1), A32(2))) { RET(A32(0)); return; }
     RET(memmove(APTR(0), APTR(1), A32(2)));
 }
 static void h_memset(CPU *c)
 {
-    if (!sane("memset", A32(0), A32(2))) { RET(A32(0)); return; }
+    if (!A32(2) || !sane("memset", A32(0), A32(2))) { RET(A32(0)); return; }
     RET(memset(APTR(0), AI32(1), A32(2)));
 }
 static void h_memchr (CPU *c) { RET(memchr(APTR(0), AI32(1), A32(2))); }
@@ -384,7 +387,7 @@ static void h_strncmp (CPU *c) { RET(strncmp(ASTR(0), ASTR(1), A32(2))); }
 static void h_strchr  (CPU *c) { RET(strchr(ASTR(0), AI32(1))); }
 static void h_strrchr (CPU *c) { RET(strrchr(ASTR(0), AI32(1))); }
 static void h_strstr  (CPU *c) { RET(strstr(ASTR(0), ASTR(1))); }
-static void h_strerror(CPU *c) { RET(strerror(AI32(0))); }
+static void h_strerror(CPU *c) { RET(guest_strdup_static(strerror(AI32(0)))); }
 
 static void h_strdup(CPU *c)
 {
@@ -486,7 +489,7 @@ static int guest_format(char *out, size_t cap, const char *fmt, uint32_t argbase
             break;
         }
         case 's': {
-            const char *sv = (const char *)(uintptr_t)rd32(argbase + 4u * argi++);
+            const char *sv = (const char *)GP(rd32(argbase + 4u * argi++));
             snprintf(piece, sizeof piece, spec, sv ? sv : "(null)");
             break;
         }
@@ -524,7 +527,7 @@ static void h_printf(CPU *c)
 static void h_fprintf(CPU *c)
 {
     int n = guest_format(g_fmtbuf, sizeof g_fmtbuf, ASTR(1), c->esp + 8u);
-    fputs(g_fmtbuf, (FILE *)APTR(0));
+    fputs(g_fmtbuf, AFILE(0));
     RET(n);
 }
 static void h_sprintf(CPU *c)
@@ -550,18 +553,30 @@ static void h_snprintf(CPU *c)
 }
 
 /* ---- stdio ---- */
-static void h_fopen (CPU *c) { RET(fopen(ASTR(0), ASTR(1))); }
-static void h_fclose(CPU *c) { RET(fclose((FILE *)APTR(0))); }
-static void h_fread (CPU *c) { RET(fread(APTR(0), A32(1), A32(2), (FILE *)APTR(3))); }
-static void h_fwrite(CPU *c) { RET(fwrite(APTR(0), A32(1), A32(2), (FILE *)APTR(3))); }
-static void h_fseek (CPU *c) { RET(fseek((FILE *)APTR(0), AI32(1), AI32(2))); }
-static void h_ftell (CPU *c) { RET(ftell((FILE *)APTR(0))); }
-static void h_fflush(CPU *c) { RET(fflush(APTR(0) ? (FILE *)APTR(0) : NULL)); }
-static void h_feof  (CPU *c) { RET(feof((FILE *)APTR(0))); }
-static void h_ferror(CPU *c) { RET(ferror((FILE *)APTR(0))); }
-static void h_fgets (CPU *c) { RET(fgets(ASTR(0), AI32(1), (FILE *)APTR(2))); }
-static void h_fputs (CPU *c) { RET(fputs(ASTR(0), (FILE *)APTR(1))); }
-static void h_fputc (CPU *c) { RET(fputc(AI32(0), (FILE *)APTR(1))); }
+static void h_fopen (CPU *c)
+{
+    FILE *f = fopen(ASTR(0), ASTR(1));
+    if (getenv("LINDBERGH_OPENS") || !f)
+        fprintf(stderr, "[open] fopen(%s, %s) -> %s\n", ASTR(0), ASTR(1), f ? "ok" : "FAILED");
+    RET(guest_file_wrap(f));
+}
+static void h_fclose(CPU *c)
+{
+    FILE *f = AFILE(0);
+    int r = f ? fclose(f) : -1;
+    guest_file_release(A32(0));
+    RET(r);
+}
+static void h_fread (CPU *c) { RET(fread(APTR(0), A32(1), A32(2), AFILE(3))); }
+static void h_fwrite(CPU *c) { RET(fwrite(APTR(0), A32(1), A32(2), AFILE(3))); }
+static void h_fseek (CPU *c) { RET(fseek(AFILE(0), AI32(1), AI32(2))); }
+static void h_ftell (CPU *c) { RET(ftell(AFILE(0))); }
+static void h_fflush(CPU *c) { RET(fflush(A32(0) ? AFILE(0) : NULL)); }
+static void h_feof  (CPU *c) { RET(feof(AFILE(0))); }
+static void h_ferror(CPU *c) { RET(ferror(AFILE(0))); }
+static void h_fgets (CPU *c) { RET(fgets(ASTR(0), AI32(1), AFILE(2))); }
+static void h_fputs (CPU *c) { RET(fputs(ASTR(0), AFILE(1))); }
+static void h_fputc (CPU *c) { RET(fputc(AI32(0), AFILE(1))); }
 static void h_puts  (CPU *c) { RET(puts(ASTR(0))); }
 
 /* ---- process and environment ---- */
@@ -579,7 +594,7 @@ static void h_getenv(CPU *c)
     const char *v = getenv(k);
     fprintf(stderr, "[env] %s = %s\n", k, v ? v : "(unset)");
     fflush(stderr);
-    RET(v);
+    RET(guest_strdup_static(v));
 }
 static void h_getpid(CPU *c) { (void)c; RET(1); }
 static void h_rand  (CPU *c) { (void)c; RET(rand()); }
@@ -645,11 +660,24 @@ MATH1(cos,  cos)     MATH1F(cosf,  cosf)
 MATH1(sin,  sin)     MATH1F(sinf,  sinf)
 MATH1(tan,  tan)     MATH1F(tanf,  tanf)
 MATH1(cosh, cosh)    MATH1(sinh, sinh)    MATH1(tanh, tanh)
-MATH1(exp,  exp)     MATH1F(expf,  expf)
+static void h_exp(CPU *c)
+{
+    double x = guest_arg_d(c, 0), r = exp(x);
+    static int n;
+    if (getenv("LINDBERGH_MATHLOG") && n++ < 20) fprintf(stderr, "[math] exp(%g) = %g\n", x, r);
+    RETF(r);
+}
+MATH1F(expf,  expf)
 MATH1(log,  log)     MATH1F(logf,  logf)
 MATH1(log10, log10)
 
-static void h_pow(CPU *c) { RETF(pow(guest_arg_d(c, 0), guest_arg_d(c, 2))); }
+static void h_pow(CPU *c)
+{
+    double x = guest_arg_d(c, 0), y = guest_arg_d(c, 2), r = pow(x, y);
+    static int n;
+    if (getenv("LINDBERGH_MATHLOG") && n++ < 20) fprintf(stderr, "[math] pow(%g, %g) = %g\n", x, y, r);
+    RETF(r);
+}
 static void h_finitef(CPU *c) { RET(isfinite(guest_arg_f(c, 0)) ? 1 : 0); }
 
 static void h_frexp(CPU *c)
@@ -679,11 +707,9 @@ static void h_modf(CPU *c)
  * in the game's own headers that index straight out of it, so the double
  * indirection and the negative half both have to be there or the game reads
  * garbage and every character classification is wrong. */
-static unsigned short g_ctype_b[384];
-static int32_t g_ctype_lower[384], g_ctype_upper[384];
-static const unsigned short *g_ctype_b_p     = g_ctype_b + 128;
-static const int32_t        *g_ctype_lower_p = g_ctype_lower + 128;
-static const int32_t        *g_ctype_upper_p = g_ctype_upper + 128;
+static unsigned short *g_ctype_b;
+static int32_t *g_ctype_lower, *g_ctype_upper;
+static uint32_t *g_ctype_ptrs;          /* the three pointers, as guest addresses */
 
 static void ctype_init(void)
 {
@@ -692,6 +718,13 @@ static void ctype_init(void)
            ISdigit = 1 << 11, ISxdigit = 1 << 12, ISspace = 1 << 13,
            ISprint = 1 << 14, ISgraph = 1 << 15, ISblank = 1 << 0,
            IScntrl = 1 << 1, ISpunct = 1 << 2, ISalnum = 1 << 3 };
+    g_ctype_b     = (unsigned short *)guest_alloc(384 * sizeof *g_ctype_b, 16);
+    g_ctype_lower = (int32_t *)guest_alloc(384 * sizeof *g_ctype_lower, 16);
+    g_ctype_upper = (int32_t *)guest_alloc(384 * sizeof *g_ctype_upper, 16);
+    g_ctype_ptrs  = (uint32_t *)guest_alloc(3 * sizeof *g_ctype_ptrs, 16);
+    g_ctype_ptrs[0] = H2G(g_ctype_b + 128);
+    g_ctype_ptrs[1] = H2G(g_ctype_lower + 128);
+    g_ctype_ptrs[2] = H2G(g_ctype_upper + 128);
     for (int i = -128; i < 256; i++) {
         int ch = i & 0xFF;
         unsigned short f = 0;
@@ -713,12 +746,16 @@ static void ctype_init(void)
     }
 }
 
-static void h_ctype_b_loc      (CPU *c) { RET(&g_ctype_b_p); }
-static void h_ctype_tolower_loc(CPU *c) { RET(&g_ctype_lower_p); }
-static void h_ctype_toupper_loc(CPU *c) { RET(&g_ctype_upper_p); }
+static void h_ctype_b_loc      (CPU *c) { RET(&g_ctype_ptrs[0]); }
+static void h_ctype_tolower_loc(CPU *c) { RET(&g_ctype_ptrs[1]); }
+static void h_ctype_toupper_loc(CPU *c) { RET(&g_ctype_ptrs[2]); }
 
-static int32_t g_guest_errno;
-static void h_errno_location(CPU *c) { RET(&g_guest_errno); }
+static int32_t *g_guest_errno;
+static void h_errno_location(CPU *c)
+{
+    if (!g_guest_errno) g_guest_errno = (int32_t *)guest_alloc(4, 16);
+    RET(g_guest_errno);
+}
 
 /* libgcc's 64-bit division helpers. A 32-bit compiler emits calls to these
  * for any long long divide, so they turn up in ordinary game code. */
@@ -801,7 +838,7 @@ static void h_deregister_frame_info_bases(CPU *c) { RET(A32(0)); }
 static void h_libc_freeres(CPU *c) { (void)c; }
 
 /* The game only ever asks for the C locale, and that is the one we are in. */
-static void h_setlocale(CPU *c) { RET("C"); }
+static void h_setlocale(CPU *c) { RET(guest_strdup_static("C")); }
 
 /* ---- where the game thinks it is ----
  *
@@ -826,7 +863,16 @@ static void h_realpath(CPU *c)
      * guest supplies a buffer it must be PATH_MAX, which is what it passes. */
     RET(_fullpath(A32(1) ? ASTR(1) : NULL, ASTR(0), 260));
 #else
-    RET(realpath(ASTR(0), A32(1) ? ASTR(1) : NULL));
+    /* realpath(p, NULL) mallocs the result, and the guest frees it with its
+     * own free() - so it has to come from this file's allocator. */
+    if (A32(1)) { RET(realpath(ASTR(0), ASTR(1))); return; }
+    char *host = realpath(ASTR(0), NULL);
+    if (!host) { RET(0); return; }
+    size_t n = strlen(host) + 1;
+    char *p = (char *)gmalloc(n, GUEST_ALIGN);
+    if (p) memcpy(p, host, n);
+    free(host);
+    RET(p);
 #endif
 }
 
@@ -925,7 +971,7 @@ static void xstat_common(CPU *c, const char *path, uint32_t out)
     struct _stat64 st;
     if (!path || _stat64(path, &st) != 0) { RET(-1); return; }
     if (out) {
-        memset((void *)(uintptr_t)out, 0, 88);          /* sizeof(struct stat64) */
+        memset((void *)GP(out), 0, 88);          /* sizeof(struct stat64) */
         wr32(out + GST_mode, (uint32_t)st.st_mode);
         wr32(out + GST_size, (uint32_t)st.st_size);
     }
@@ -941,17 +987,30 @@ static void h_access(CPU *c) { RET(_access(ASTR(0), AI32(1))); }
 
 /* strtol and strtoul are exported under these names with a `group` argument
  * that only affects locale-specific digit grouping, which no game uses. */
+static void put_endptr(CPU *c, unsigned slot, const char *end)
+{
+    if (A32(slot)) wr32(A32(slot), H2G(end));
+}
 static void h_strtol_internal(CPU *c)
 {
-    RET(strtol(ASTR(0), (char **)(uintptr_t)A32(1), AI32(2)));
+    char *end;
+    long v = strtol(ASTR(0), &end, AI32(2));
+    put_endptr(c, 1, end);
+    RET((uint32_t)(int32_t)v);
 }
 static void h_strtoul_internal(CPU *c)
 {
-    RET(strtoul(ASTR(0), (char **)(uintptr_t)A32(1), AI32(2)));
+    char *end;
+    unsigned long v = strtoul(ASTR(0), &end, AI32(2));
+    put_endptr(c, 1, end);
+    RET((uint32_t)v);
 }
 static void h_strtod_internal(CPU *c)
 {
-    RETF(strtod(ASTR(0), (char **)(uintptr_t)A32(1)));
+    char *end;
+    double v = strtod(ASTR(0), &end);
+    put_endptr(c, 1, end);
+    RETF(v);
 }
 
 /* Wide characters. The game is in the C locale, where the conversions are the
@@ -1081,8 +1140,14 @@ static void h_putConsole(CPU *c)
     RET(0);
 }
 
+/* LINDBERGH_ATTRACT_SOUND=1: the operator setting "sound during attract mode",
+ * which a fresh cabinet has off. */
+static void h_attract_sound_on(CPU *c) { RET(1); }
+
 void hle_register_console(void)
 {
+    if (getenv("LINDBERGH_ATTRACT_SOUND"))
+        guest_override("_Z28is_config_advertise_sound_onv", h_attract_sound_on);
     if (!getenv("LINDBERGH_CONSOLE")) return;
     if (guest_override("_ZN7_sDebug10putConsoleEPKcz", h_putConsole))
         fprintf(stderr, "[console] engine console messages enabled\n");
@@ -1125,7 +1190,7 @@ static void h_vsnprintf(CPU *c)
 static void h_vfprintf(CPU *c)
 {
     int n = guest_format(g_fmtbuf, sizeof g_fmtbuf, ASTR(1), A32(2));
-    fputs(g_fmtbuf, (FILE *)APTR(0));
+    fputs(g_fmtbuf, AFILE(0));
     RET(n);
 }
 
@@ -1140,7 +1205,9 @@ static void h_vfprintf(CPU *c)
 
 static void h_dlopen(CPU *c)
 {
-    fprintf(stderr, "[dl] dlopen(%s)\n", A32(0) ? ASTR(0) : "(self)");
+    const char *path = A32(0) ? ASTR(0) : NULL;
+    int lifted = solib_dlopen(c, path);
+    fprintf(stderr, "[dl] dlopen(%s)%s\n", path ? path : "(self)", lifted ? " - lifted library" : "");
     RET(DL_HANDLE);
 }
 /* ---- symbols that live in a shared object we do not have ----
@@ -1203,15 +1270,19 @@ int hle_stub_call(CPU *c, uint32_t va)
         fprintf(stderr, "[dl] %s() is a stub - that library is not loaded\n",
                 g_dl_tok[i].name);
     }
-    if (!g_stub_objects[i]) g_stub_objects[i] = (unsigned char *)calloc(1, STUB_OBJECT_SIZE);
-    RET((uint32_t)(uintptr_t)g_stub_objects[i]);
+    if (!g_stub_objects[i]) {
+        g_stub_objects[i] = (unsigned char *)guest_alloc(STUB_OBJECT_SIZE, 16);
+        memset(g_stub_objects[i], 0, STUB_OBJECT_SIZE);
+    }
+    RET(g_stub_objects[i]);
     return 1;
 }
 
 static void h_dlsym(CPU *c)
 {
     const char *name = ASTR(1);
-    uint32_t va = hle_plt_address(name);
+    uint32_t va = solib_dlsym(name);
+    if (!va) va = hle_plt_address(name);
     if (!va) {
         va = dl_stub_for(name);
         static int shown;
@@ -1229,13 +1300,14 @@ static void h_dlerror(CPU *c) { (void)c; RET(0); }
  *
  * struct tm on i386 glibc: nine ints, then tm_gmtoff and tm_zone. The game
  * reads the date fields to stamp its logs. */
-static int32_t g_tm[11];
+static int32_t *g_tm;
 
 static void h_localtime(CPU *c)
 {
     time_t t = (time_t)(A32(0) ? rd32(A32(0)) : 0);
     struct tm lt;
     if (localtime_s(&lt, &t) != 0) { RET(0); return; }
+    if (!g_tm) g_tm = (int32_t *)guest_alloc(11 * 4, 16);
     g_tm[0] = lt.tm_sec;   g_tm[1] = lt.tm_min;   g_tm[2] = lt.tm_hour;
     g_tm[3] = lt.tm_mday;  g_tm[4] = lt.tm_mon;   g_tm[5] = lt.tm_year;
     g_tm[6] = lt.tm_wday;  g_tm[7] = lt.tm_yday;  g_tm[8] = lt.tm_isdst;
@@ -1245,8 +1317,30 @@ static void h_localtime(CPU *c)
 
 static void h_fscanf(CPU *c);   /* defined below, bound here */
 
+/* libgcc: double -> unsigned long long, returned in edx:eax */
+static void h_fixunsdfdi(CPU *c)
+{
+    uint64_t bits = (uint64_t)A32(0) | ((uint64_t)A32(1) << 32);
+    double d;
+    memcpy(&d, &bits, 8);
+    uint64_t r = d <= 0.0 ? 0 : (uint64_t)d;
+    c->eax = (uint32_t)r;
+    c->edx = (uint32_t)(r >> 32);
+}
+/* CPU affinity: the sound library pins its threads. One CPU set, all allowed. */
+static void h_sched_getaffinity(CPU *c)
+{
+    uint32_t sz = A32(1);
+    if (A32(2) && sz) { memset(APTR(2), 0, sz); *(unsigned char *)APTR(2) = 0xFF; }
+    RET(0);
+}
+static void h_sched_setaffinity(CPU *c) { RET(0); }
+
 void hle_register_libc3(void)
 {
+    hle_bind("__fixunsdfdi", h_fixunsdfdi);
+    hle_bind("sched_getaffinity", h_sched_getaffinity);
+    hle_bind("sched_setaffinity", h_sched_setaffinity);
     hle_bind("vsprintf", h_vsprintf);
     hle_bind("vsnprintf", h_vsnprintf);
     hle_bind("vfprintf", h_vfprintf);
@@ -1307,7 +1401,7 @@ static int guest_scan(FILE *f, const char *fmt, CPU *c, uint32_t argbase)
 
         if (suppress) { fscanf(f, spec); continue; }
 
-        void *dst = (void *)(uintptr_t)rd32(argbase + 4u * argi++);
+        void *dst = GP(rd32(argbase + 4u * argi++));
         if (!dst) break;
         if (fscanf(f, spec, dst) == 1) filled++;
         else break;                            /* a failed conversion ends it */
@@ -1317,7 +1411,7 @@ static int guest_scan(FILE *f, const char *fmt, CPU *c, uint32_t argbase)
 
 static void h_fscanf(CPU *c)
 {
-    RET(guest_scan((FILE *)APTR(0), ASTR(1), c, c->esp + 8u));
+    RET(guest_scan(AFILE(0), ASTR(1), c, c->esp + 8u));
 }
 
 /* ---- reading a directory ----
@@ -1334,6 +1428,7 @@ static void h_fscanf(CPU *c)
 #define DIRENT_NAME 11
 #define DIRENT_SIZE (DIRENT_NAME + 256)
 
+#ifdef _WIN32
 typedef struct {
     intptr_t     find;
     int          first;
@@ -1380,6 +1475,47 @@ static void h_closedir(CPU *c)
 
 /* The game changes into its own data directory and then opens files by
  * relative path, so this has to actually happen rather than be waved through. */
+#else
+typedef struct {
+    DIR          *dir;
+    unsigned char ent[DIRENT_SIZE];
+} GuestDir;
+
+/* The GuestDir lives in guest memory: readdir hands back a pointer into it. */
+static void h_opendir(CPU *c)
+{
+    const char *path = A32(0) ? ASTR(0) : NULL;
+    if (!path) { RET(0); return; }
+    DIR *dir = opendir(path);
+    if (!dir) { RET(0); return; }
+    GuestDir *d = (GuestDir *)guest_alloc(sizeof *d, 16);
+    memset(d, 0, sizeof *d);
+    d->dir = dir;
+    RET(d);
+}
+
+static void h_readdir(CPU *c)
+{
+    GuestDir *d = (GuestDir *)APTR(0);
+    if (!d) { RET(0); return; }
+    struct dirent *e = readdir(d->dir);
+    if (!e) { RET(0); return; }
+    memset(d->ent, 0, sizeof d->ent);
+    d->ent[8] = (unsigned char)DIRENT_SIZE;               /* d_reclen */
+    d->ent[10] = e->d_type == DT_DIR ? 4 : 8;             /* DT_DIR : DT_REG */
+    snprintf((char *)d->ent + DIRENT_NAME, 256, "%s", e->d_name);
+    RET(d->ent);
+}
+
+static void h_closedir(CPU *c)
+{
+    GuestDir *d = (GuestDir *)APTR(0);
+    if (d) { closedir(d->dir); guest_free(d); }
+    RET(0);
+}
+
+#endif
+
 static void h_chdir(CPU *c)
 {
     const char *path = A32(0) ? ASTR(0) : NULL;
@@ -1442,12 +1578,12 @@ static int guest_sscanf(const char *in, const char *fmt, CPU *c, uint32_t argbas
         if (!target) break;          /* a null destination is not ours to write */
         int got;
         if (conv == 'c' || conv == 's' || conv == '[')
-            got = sscanf(in + pos, one, (char *)(uintptr_t)target, &consumed);
+            got = sscanf(in + pos, one, (char *)GP(target), &consumed);
         else if (conv == 'e' || conv == 'E' || conv == 'f' ||
                  conv == 'g' || conv == 'G' || conv == 'a' || conv == 'A')
-            got = sscanf(in + pos, one, (float *)(uintptr_t)target, &consumed);
+            got = sscanf(in + pos, one, (float *)GP(target), &consumed);
         else
-            got = sscanf(in + pos, one, (int *)(uintptr_t)target, &consumed);
+            got = sscanf(in + pos, one, (int *)GP(target), &consumed);
 
         if (got != 1 || consumed < 0) break;
         pos += (size_t)consumed;

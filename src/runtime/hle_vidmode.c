@@ -87,7 +87,7 @@ static void h_GetModeLine(CPU *c)
     if (A32(2)) wr32(A32(2), DOTCLOCK);
     if (A32(3)) {
         uint32_t p = A32(3);
-        memset((void *)(uintptr_t)p, 0, 32);
+        memset((void *)GP(p), 0, 32);
         fill_modeline(p, w, h, 0);
     }
     RET(1);

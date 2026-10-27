@@ -17,6 +17,7 @@
  */
 
 #include <signal.h>
+#include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
 
@@ -267,7 +268,162 @@ void guest_install_crash_handler(void)
     AddVectoredExceptionHandler(1, on_exception);
 }
 #else
-void guest_install_crash_handler(void) { }
+/* POSIX: the same report from a signal handler. A fault in lifted code is a
+ * host SIGSEGV/SIGBUS at an address inside the guest window, so the address is
+ * reported in guest terms too. Runs on an alternate stack, so running out of
+ * host stack (deep guest recursion) is still reported rather than silent. */
+#include <unistd.h>
+#include <dlfcn.h>
+#if defined(__APPLE__)
+#include <execinfo.h>
+#include <sys/ucontext.h>
+#else
+#include <ucontext.h>
+#endif
+
+/* Which host function faulted: a fault inside a handler is a runtime bug, one
+ * inside L_xxxxxxxx is the guest. dladdr names it without a debugger. */
+static void host_report_pc(void *ucv)
+{
+    uintptr_t pc = 0, lr = 0;
+#if defined(__APPLE__) && defined(__aarch64__)
+    ucontext_t *uc = (ucontext_t *)ucv;
+    pc = (uintptr_t)uc->uc_mcontext->__ss.__pc;
+    lr = (uintptr_t)uc->uc_mcontext->__ss.__lr;
+#elif defined(__aarch64__)
+    ucontext_t *uc = (ucontext_t *)ucv;
+    pc = (uintptr_t)uc->uc_mcontext.pc;
+    lr = (uintptr_t)uc->uc_mcontext.regs[30];
+#endif
+    uintptr_t at[2] = { pc, lr };
+    const char *what[2] = { "host pc", "host lr" };
+    for (int i = 0; i < 2; i++) {
+        Dl_info di;
+        if (at[i] && dladdr((void *)at[i], &di) && di.dli_sname)
+            fprintf(stderr, "%s %p = %s+%#lx\n", what[i], (void *)at[i], di.dli_sname,
+                    (unsigned long)(at[i] - (uintptr_t)di.dli_saddr));
+        else if (at[i])
+            fprintf(stderr, "%s %p\n", what[i], (void *)at[i]);
+    }
+#if defined(__APPLE__)
+    void *bt[24];
+    int n = backtrace(bt, 24);
+    backtrace_symbols_fd(bt, n, 2);
+#endif
+}
+
+static void on_fault(int sig, siginfo_t *si, void *uc)
+{
+    (void)uc;
+    char why[200];
+    uintptr_t a = (uintptr_t)si->si_addr;
+#ifdef RECOMP_GUEST_BASE
+    extern uint8_t *g_guest_base;
+    uintptr_t base = (uintptr_t)g_guest_base;
+    if (a >= base && a - base < (1ull << 32))
+        snprintf(why, sizeof why, "signal %d (%s) at guest %#010x %s", sig,
+                 sig == SIGSEGV ? "SIGSEGV" : sig == SIGBUS ? "SIGBUS" :
+                 sig == SIGILL ? "SIGILL" : sig == SIGFPE ? "SIGFPE" : "?",
+                 (uint32_t)(a - base), region((uint32_t)(a - base)));
+    else
+#endif
+        snprintf(why, sizeof why, "signal %d at host address %p (outside the guest window)",
+                 sig, si->si_addr);
+    guest_report_state(why);
+    host_report_pc(uc);
+    signal(sig, SIG_DFL);                 /* let the default action (core) happen */
+    raise(sig);
+}
+
+static void on_abort_signal(int sig)
+{
+    (void)sig;
+    fprintf(stderr, "\n[abort] something called abort()\n");
+    guest_report_state("abort");
+    _exit(49);
+}
+
+static void on_exit_note(void)
+{
+    fprintf(stderr, "[exit] process is exiting\n");
+}
+
+void guest_install_thread_handlers(void)
+{
+    /* each thread gets its own alternate signal stack */
+    stack_t ss;
+    ss.ss_size = 1u << 20;
+    ss.ss_sp = malloc(ss.ss_size);
+    ss.ss_flags = 0;
+    if (ss.ss_sp) sigaltstack(&ss, NULL);
+}
+
+/* ---- the hang watchdog ----
+ * A game that stops presenting frames without crashing is the silent failure
+ * a crash handler never sees. Once the first frame is out, a host thread
+ * watches the frame counter; if it stalls for LINDBERGH_WATCHDOG seconds
+ * (default 10, 0 = off) the main thread is signalled and reports where it is -
+ * guest registers, ebp chain and host stack - from its own context. Once per
+ * stall; the game keeps running. */
+#include <pthread.h>
+extern unsigned g_frame;
+static pthread_t g_main_thread;
+
+static void on_watchdog_signal(int sig, siginfo_t *si, void *uc)
+{
+    (void)sig; (void)si;
+    guest_report_state("watchdog: no frame presented - main thread is here");
+    host_report_pc(uc);
+}
+
+static void *watchdog(void *arg)
+{
+    unsigned secs = (unsigned)(uintptr_t)arg, last = 0, still = 0, told = 0;
+    for (;;) {
+        sleep(1);
+        unsigned f = g_frame;
+        if (!f) continue;                       /* still loading */
+        if (f != last) { last = f; still = 0; told = 0; continue; }
+        if (++still >= secs && !told) {
+            told = 1;
+            fprintf(stderr, "\n[watchdog] frame %u has not advanced for %u s\n", f, still);
+            pthread_kill(g_main_thread, SIGUSR1);
+        }
+    }
+    return NULL;
+}
+
+void guest_install_crash_handler(void)
+{
+    setvbuf(stderr, NULL, _IONBF, 0);
+    atexit(on_exit_note);
+    guest_install_thread_handlers();
+    g_main_thread = pthread_self();
+    {
+        const char *v = getenv("LINDBERGH_WATCHDOG");
+        unsigned secs = v && *v ? (unsigned)atoi(v) : 10u;
+        if (secs) {
+            struct sigaction wa;
+            memset(&wa, 0, sizeof wa);
+            wa.sa_sigaction = on_watchdog_signal;
+            wa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESTART;
+            sigaction(SIGUSR1, &wa, NULL);
+            pthread_t t;
+            pthread_create(&t, NULL, watchdog, (void *)(uintptr_t)secs);
+            pthread_detach(t);
+        }
+    }
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = on_fault;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+    sigaction(SIGILL, &sa, NULL);
+    sigaction(SIGFPE, &sa, NULL);
+    signal(SIGABRT, on_abort_signal);
+}
 #endif
 
 /* An instruction the lifter could not translate, reached at run time.

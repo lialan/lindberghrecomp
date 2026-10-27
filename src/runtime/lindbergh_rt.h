@@ -18,6 +18,7 @@
  * declaration has to travel with the header the generated code includes. */
 #include <stdint.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 /* cpu.h defaults RECOMP_TODO to a bare abort(), and invites a consumer to
  * define its own first. Take the invitation: an abort() here raises
@@ -28,6 +29,7 @@ void lindbergh_todo(uint32_t va, const char *text);
 #define RECOMP_TODO(va, text) lindbergh_todo((va), (text))
 
 #include "cpu.h"
+#include "posix_compat.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -63,8 +65,16 @@ void linux_syscall(CPU *c);
  * generated from the ELF and lists them. */
 #include "recomp_imports.h"
 
+/* Imports of the dlopened libraries lifted by tools/recomp/solib.py that the
+ * main ELF does not import itself. */
+#if __has_include("recomp_solib.h")
+#include "recomp_solib.h"
+#else
+#define SOLIB_IMPORTS(X)
+#endif
+
 #define HLE_ENUM(id, name) id,
-typedef enum { HLE_IMPORTS(HLE_ENUM) HLE_COUNT } HleId;
+typedef enum { HLE_IMPORTS(HLE_ENUM) SOLIB_IMPORTS(HLE_ENUM) HLE_COUNT } HleId;
 #undef HLE_ENUM
 
 /* A library function's body. Reads its arguments off the guest stack and
@@ -108,10 +118,42 @@ void hle_register_window(void);
  * handler must not move esp - the caller's own `add esp, N` does that.
  */
 #define A32(n)   rd32(c->esp + 4u * (unsigned)(n))
-#define APTR(n)  ((void *)(uintptr_t)A32(n))
-#define ASTR(n)  ((char *)(uintptr_t)A32(n))
+/* Guest address -> host pointer, keeping 0 as NULL: handlers test what they
+ * were given for null, and 0 + base is not one. Lifted code uses plain G2H. */
+static inline void *GP(uint32_t a) { return a ? G2H(a) : NULL; }   /* evaluates a once */
+#define APTR(n)  ((void *)GP(A32(n)))
+#define ASTR(n)  ((char *)GP(A32(n)))
 #define AI32(n)  ((int32_t)A32(n))
-#define RET(v)   (c->eax = (uint32_t)(uintptr_t)(v))
+
+/* Host pointer -> guest address. On a 64-bit host only memory inside the guest
+ * window has a guest address; anything else is a host object leaking into the
+ * game, which stops the process naming the caller instead of truncating the
+ * pointer and failing somewhere else later. NULL maps to 0. */
+uint32_t guest_addr_of(const void *p, const char *file, int line);
+#define H2G(p)   guest_addr_of((const void *)(p), __FILE__, __LINE__)
+
+/* RET takes an integer or a pointer. A pointer goes through H2G, so a handler
+ * that returns what a host function returned is checked rather than truncated. */
+/* 5 is clang/GCC's pointer_type_class; arrays and string literals decay to it. */
+#define RET(v)   (c->eax = __builtin_classify_type(v) == 5 \
+                     ? H2G((const void *)(uintptr_t)(v)) : (uint32_t)(uintptr_t)(v))
+
+/* Memory the guest can see: the guest heap, in the window. Thread stacks,
+ * strings handed to the game and its malloc all come from here. */
+void    *guest_alloc(size_t n, size_t align);
+void     guest_free(void *p);
+size_t   guest_alloc_size(void *p);
+/* A copy of a host string in guest memory, interned: the same text returns the
+ * same address, so callers may treat it as static (strerror, getenv, GL). */
+uint32_t guest_strdup_static(const char *s);
+int      guest_mem_init(void);
+
+/* A host FILE* as the guest holds it: a small guest block that carries the
+ * host pointer. The guest never looks inside a FILE, it only passes it back. */
+uint32_t guest_file_wrap(FILE *f);
+FILE    *guest_file(uint32_t handle);
+void     guest_file_release(uint32_t handle);
+#define AFILE(n) guest_file(A32(n))
 
 /* A function returning float or double returns it in st(0) on i386 SysV, not
  * in an XMM register - the caller does `fstp` to take it. Every math import
@@ -148,6 +190,7 @@ void guest_backtrace(CPU *c);
  * PLT - libXxf86vm being the reason this exists. */
 uint32_t   guest_symbol(const char *name);
 int        guest_override(const char *name, HleHandler fn);
+int        guest_override_va(const char *name, uint32_t va, HleHandler fn);
 HleHandler guest_find_override(uint32_t va);
 void       hle_register_vidmode(void);
 void       hle_register_matrix(void);
@@ -194,6 +237,10 @@ int        host_gl_context(void);
 void       host_pump(void);
 void       host_swap(void);
 void       hle_register_gl(void);
+void       hle_register_zlib(void);
+void       hle_register_openal(void);
+int        solib_dlopen(CPU *c, const char *path);
+uint32_t   solib_dlsym(const char *name);
 
 /* A callable address for a GL entry point the game asks for by name but does
  * not import. gl_token_call routes one; dispatch() consults it. */
