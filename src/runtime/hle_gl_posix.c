@@ -113,8 +113,8 @@ static void h_glBindBufferARB(CPU *c)
 }
 
 /* glMapBuffer returns driver memory, which has no guest address. The guest
- * gets a shadow in its own window instead: filled from the buffer when it will
- * be read, written back on unmap when it was written. */
+ * gets a shadow in its own window instead: filled from the buffer, written
+ * back on unmap when it was written. */
 static struct { GLenum target; GLuint buffer; void *shadow; GLint size; GLenum access; } g_maps[4];
 
 static void h_glMapBufferARB(CPU *c)
@@ -128,8 +128,12 @@ static void h_glMapBufferARB(CPU *c)
         if (g_maps[i].shadow) continue;
         void *s = guest_alloc((size_t)size, 64);
         if (!s) break;
-        if (access != GL_WRITE_ONLY)
-            glGetBufferSubData(target, 0, size, s);
+        /* Even for GL_WRITE_ONLY: NVIDIA's driver hands back memory that still
+         * holds the buffer, and the game counts on it - its smoke rewrites
+         * position, colour and matrix index each frame and leaves the texture
+         * coordinates written at set-up where they are. A fresh shadow
+         * zeroed them, and every smoke quad sampled one texel. */
+        glGetBufferSubData(target, 0, size, s);
         g_maps[i].target = target; g_maps[i].buffer = *slot;
         g_maps[i].shadow = s; g_maps[i].size = size; g_maps[i].access = access;
         RET(s);

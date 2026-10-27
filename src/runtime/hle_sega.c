@@ -274,6 +274,9 @@ static void h_jvs_recv(CPU *c)
     RET(AM_OK);
 }
 
+static int g_country;
+static void h_country(CPU *c) { RET(g_country); }
+
 static void h_ok(CPU *c)   { RET(AM_OK); }
 static void h_true(CPU *c) { RET(1); }
 static void h_one(CPU *c)  { RET(1); }
@@ -570,6 +573,19 @@ void hle_register_sega(void)
         uint32_t va = guest_symbol("_ZN9acpSystem8setErrorEl");
         if (va && find_error_globals(va))
             n += guest_override("_ZN9acpSystem8setErrorEl", h_set_error);
+    }
+
+    /* The country, and with it the language: the game reads the region byte
+     * of the cabinet's system data (0, Japan, on a Japanese board) and shows
+     * Japanese for country 0, English otherwise. LINDBERGH_COUNTRY picks it;
+     * the default is 1, English. */
+    {
+        const char *v = getenv("LINDBERGH_COUNTRY");
+        g_country = v && *v ? atoi(v) : 1;
+        if (guest_override("_Z25get_arcade_region_countryv", h_country)) {
+            n++;
+            fprintf(stderr, "[sega] country %d (%s)\n", g_country, g_country ? "English" : "Japanese");
+        }
     }
 
     fprintf(stderr, "[sega] %d base board entry points answered\n", n);

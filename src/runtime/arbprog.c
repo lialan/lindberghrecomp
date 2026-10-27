@@ -1320,6 +1320,65 @@ void arb_before_draw(void)
     GLuint vid = g_enabled[0] ? g_bound[0] : 0;
     GLuint fid = g_enabled[1] ? g_bound[1] : 0;
     if (!vid && !fid) { glUseProgram(0); glDisable(GL_VERTEX_PROGRAM_ARB); glDisable(GL_FRAGMENT_PROGRAM_ARB); return; }
+    {   /* LINDBERGH_DUMP_VP=<id>: on the first draws with that vertex program,
+         * report the pipeline state and save texture unit 0 as a .ppm/.pgm
+         * pair (colour, alpha) in the working directory. */
+        static long want = -2; static int shots;
+        if (want == -2) { const char *v = getenv("LINDBERGH_DUMP_VP"); want = v ? strtol(v, NULL, 0) : -1; }
+        if (want >= 0 && (long)vid == want && shots < 3) {
+            GLint tex = 0, w = 0, h = 0, ifmt = 0, bs = 0, bd = 0, at = 0, bl = 0, tenv = 0, unit = 0;
+            glGetIntegerv(GL_ACTIVE_TEXTURE, &unit); glActiveTexture(GL_TEXTURE0);
+            glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
+            glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
+            glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &h);
+            glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_INTERNAL_FORMAT, &ifmt);
+            glGetIntegerv(GL_BLEND_SRC, &bs); glGetIntegerv(GL_BLEND_DST, &bd); bl = glIsEnabled(GL_BLEND);
+            at = glIsEnabled(GL_ALPHA_TEST); glGetTexEnviv(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, &tenv);
+            fprintf(stderr, "[dumpvp] vp %u fp %u (enabled %d/%d) tex0 %d %dx%d ifmt %#x blend %d %#x/%#x alphatest %d texenv %#x 2D %d\n",
+                    vid, fid, g_enabled[0], g_enabled[1], tex, w, h, ifmt, bl, bs, bd, at, tenv, glIsEnabled(GL_TEXTURE_2D));
+            if (w > 0 && h > 0 && w <= 2048 && h <= 2048) {
+                unsigned char *px = malloc((size_t)w * h * 4);
+                glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+                char nm[64]; snprintf(nm, sizeof nm, "dumpvp_%d.ppm", shots);
+                FILE *f = fopen(nm, "wb"); fprintf(f, "P6\n%d %d\n255\n", w, h);
+                for (int i = 0; i < w * h; i++) fwrite(px + 4 * i, 1, 3, f);
+                fclose(f);
+                snprintf(nm, sizeof nm, "dumpvp_%d_a.pgm", shots);
+                f = fopen(nm, "wb"); fprintf(f, "P5\n%d %d\n255\n", w, h);
+                for (int i = 0; i < w * h; i++) fwrite(px + 4 * i + 3, 1, 1, f);
+                fclose(f); free(px);
+            }
+            {
+                GLint cu = 0; glGetIntegerv(GL_CLIENT_ACTIVE_TEXTURE, &cu);
+                glClientActiveTexture(GL_TEXTURE0);
+                GLint te = glIsEnabled(GL_TEXTURE_COORD_ARRAY), ts = 0, tt = 0, tst = 0; GLvoid *tp = 0;
+                glGetIntegerv(GL_TEXTURE_COORD_ARRAY_SIZE, &ts); glGetIntegerv(GL_TEXTURE_COORD_ARRAY_TYPE, &tt);
+                glGetIntegerv(GL_TEXTURE_COORD_ARRAY_STRIDE, &tst); glGetPointerv(GL_TEXTURE_COORD_ARRAY_POINTER, &tp);
+                glClientActiveTexture((GLenum)cu);
+                GLint ve = glIsEnabled(GL_VERTEX_ARRAY), vs = 0, vt = 0, vst = 0; GLvoid *vp = 0;
+                glGetIntegerv(GL_VERTEX_ARRAY_SIZE, &vs); glGetIntegerv(GL_VERTEX_ARRAY_TYPE, &vt);
+                glGetIntegerv(GL_VERTEX_ARRAY_STRIDE, &vst); glGetPointerv(GL_VERTEX_ARRAY_POINTER, &vp);
+                GLint ce = glIsEnabled(GL_COLOR_ARRAY), a7 = 0, a7s = 0, a7t = 0, a7st = 0, vb = 0; GLvoid *a7p = 0;
+                glGetVertexAttribiv(7, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &a7); glGetVertexAttribiv(7, GL_VERTEX_ATTRIB_ARRAY_SIZE, &a7s);
+                glGetVertexAttribiv(7, GL_VERTEX_ATTRIB_ARRAY_TYPE, &a7t); glGetVertexAttribiv(7, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &a7st);
+                glGetVertexAttribPointerv(7, GL_VERTEX_ATTRIB_ARRAY_POINTER, &a7p); glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &vb);
+                fprintf(stderr, "[dumpvp]   vbo %d | vertex %d: %d x %#x stride %d @%p | tex0 %d: %d x %#x stride %d @%p | color %d | attr7 %d: %d x %#x stride %d @%p | client unit %#x\n",
+                        vb, ve, vs, vt, vst, vp, te, ts, tt, tst, tp, ce, a7, a7s, a7t, a7st, a7p, cu);
+                if (vb) {
+                    unsigned char vbuf[28 * 8];
+                    glGetBufferSubData(GL_ARRAY_BUFFER, 0, sizeof vbuf, vbuf);
+                    for (int k = 0; k < 8; k++) {
+                        float f[7]; memcpy(f, vbuf + 28 * k, 28);
+                        short mi; memcpy(&mi, vbuf + 28 * k + 24, 2);
+                        fprintf(stderr, "[dumpvp]   v%d pos %.3f %.3f %.3f col %08x uv %.4f %.4f idx %d\n", k, f[0], f[1], f[2],
+                                *(unsigned *)(vbuf + 28 * k + 12), f[4], f[5], mi);
+                    }
+                }
+            }
+            glActiveTexture((GLenum)unit);
+            shots++;
+        }
+    }
     Linked *l = link_pair(vid, fid);
     if (l && l->ok) {
         glDisable(GL_VERTEX_PROGRAM_ARB);
