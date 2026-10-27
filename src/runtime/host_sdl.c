@@ -131,8 +131,13 @@ static void cabinet_autostart(void)
     if (gun && coined) {
         double t = g_frame / 90.0;
         int w = g_win.w ? g_win.w : DEFAULT_W, h = g_win.h ? g_win.h : DEFAULT_H;
-        g_mouse_x = (int)(w / 2 + w / 3 * cos(t));
-        g_mouse_y = (int)(h / 2 + h / 3 * sin(t));
+        int ax, ay;     /* LINDBERGH_AIM=x,y holds the gun still instead */
+        const char *aim = getenv("LINDBERGH_AIM");
+        if (aim && sscanf(aim, "%d,%d", &ax, &ay) == 2) { g_mouse_x = ax; g_mouse_y = ay; }
+        else {
+            g_mouse_x = (int)(w / 2 + w / 3 * cos(t));
+            g_mouse_y = (int)(h / 2 + h / 3 * sin(t));
+        }
         if (g_frame % 60u < 30u) g_buttons |= 1; else g_buttons &= ~1;
     }
 }
@@ -140,8 +145,16 @@ static void cabinet_autostart(void)
 void host_cabinet_input(CabinetInput *out)
 {
     cabinet_autostart();
-    g_cab.gun_x = g_mouse_x;
-    g_cab.gun_y = g_mouse_y;
+    /* The game maps the gun through its own calibration, which stretches the
+     * raw range: measured, the sight lands at 1.14x + 21, 1.06y + 17. Undo
+     * that so the sight is where the pointer is. LINDBERGH_GUN_CAL=sx,ox,sy,oy
+     * overrides the measured values (1,0,1,0 sends the pointer unchanged). */
+    static double sx = 1.139, ox = 20.6, sy = 1.056, oy = 16.7;
+    static int cal = -1;
+    if (cal < 0) { const char *v = getenv("LINDBERGH_GUN_CAL"); cal = 1;
+                   if (v) sscanf(v, "%lf,%lf,%lf,%lf", &sx, &ox, &sy, &oy); }
+    g_cab.gun_x = (int)((g_mouse_x - ox) / sx);
+    g_cab.gun_y = (int)((g_mouse_y - oy) / sy);
     g_cab.screen_w = g_win.w ? g_win.w : 1;
     g_cab.screen_h = g_win.h ? g_win.h : 1;
     g_cab.buttons &= ~(CAB_P1_TRIGGER | CAB_P1_RELOAD);
@@ -182,9 +195,35 @@ static int button_of(Uint8 b)
     return b == SDL_BUTTON_LEFT ? 0 : b == SDL_BUTTON_MIDDLE ? 1 : 2;
 }
 
+/* LINDBERGH_KEYS="frame:key,frame:key...": push real SDL key events - a
+ * press at that frame, the release in the same drain (a fast tap) - so the
+ * keyboard path is tested exactly as a person drives it. */
+static void fake_keys(void)
+{
+    static const char *v = (const char *)1;
+    static unsigned done = ~0u;              /* events drain more than once a frame */
+    if (v == (const char *)1) v = getenv("LINDBERGH_KEYS");
+    if (!v || done == g_frame) return;
+    done = g_frame;
+    for (const char *p = v; p && *p; ) {
+        unsigned f = (unsigned)strtoul(p, (char **)&p, 10);
+        if (*p++ != ':' || !*p) break;
+        char k = *p++;
+        if (f == g_frame) {
+            SDL_Event e; memset(&e, 0, sizeof e);
+            e.type = SDL_KEYDOWN; e.key.keysym.sym = (SDL_Keycode)(k >= 'A' && k <= 'Z' ? k + 32 : k);
+            SDL_PushEvent(&e);
+            e.type = SDL_KEYUP; SDL_PushEvent(&e);
+            fprintf(stderr, "[keys] tapped %c at frame %u\n", k, f);
+        }
+        while (*p == ',') p++;
+    }
+}
+
 static void pump(void)
 {
     SDL_Event e;
+    fake_keys();
     while (SDL_PollEvent(&e)) {
         switch (e.type) {
         case SDL_QUIT:

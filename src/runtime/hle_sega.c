@@ -210,8 +210,14 @@ static void jvs_command(const unsigned char *p)
                 unsigned v = flat ? 0x8000u
                            : (ch == 0 || ch == 2) ? x
                            : (ch == 1 || ch == 3) ? y : 0x8000u;
+                /* The game keeps only the first byte: amJvspAckAnalogInput
+                 * copies the two bytes as they came and the game reads them
+                 * as a little-endian word scaled by 1/256, which is right
+                 * only when the second byte is zero - an 8-bit gun. A full
+                 * 16-bit value lands the low byte on top and the aim is
+                 * noise. */
                 ack_byte((unsigned char)(v >> 8));
-                ack_byte((unsigned char)(v & 0xFF));
+                ack_byte(0);
             }
         }
         break;
