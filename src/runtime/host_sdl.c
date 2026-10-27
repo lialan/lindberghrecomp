@@ -103,6 +103,7 @@ static void cabinet_key(int vk, int down)
     case '2': bit = CAB_P2_START;   break;
     case 'T': bit = CAB_TEST;       break;
     case 'S': bit = CAB_SERVICE;    break;
+    case 'M': if (down) host_audio_toggle_mute(); return;
     default: return;
     }
     if (down) { g_cab.buttons |= bit; g_cab_latch |= bit; } else g_cab.buttons &= ~bit;

@@ -69,7 +69,28 @@ static void h_alcDestroyContext(CPU *c)
     ALCcontext *x = ctx_of(A32(0));
     if (x) { alcDestroyContext(x); g_ctx[A32(0) & 0xFF] = NULL; }
 }
-static void h_alcMakeContextCurrent(CPU *c) { RET(alcMakeContextCurrent(ctx_of(A32(0)))); }
+/* ---- mute ----
+ * The whole mix goes through the listener, so its gain is the master volume.
+ * M toggles it; LINDBERGH_MUTE=1, or any unattended run (LINDBERGH_EXIT_AFTER),
+ * starts muted. */
+static int g_muted = -1;
+static void apply_mute(void)
+{
+    if (g_muted < 0) {
+        const char *m = getenv("LINDBERGH_MUTE");
+        g_muted = (m && *m && *m != '0') || getenv("LINDBERGH_EXIT_AFTER");
+    }
+    if (alcGetCurrentContext()) alListenerf(AL_GAIN, g_muted ? 0.0f : 1.0f);
+}
+void host_audio_toggle_mute(void)
+{
+    apply_mute();
+    g_muted = !g_muted;
+    apply_mute();
+    fprintf(stderr, "[al] sound %s\n", g_muted ? "muted" : "on");
+}
+
+static void h_alcMakeContextCurrent(CPU *c) { RET(alcMakeContextCurrent(ctx_of(A32(0)))); apply_mute(); }
 static void h_alcProcessContext(CPU *c)     { ALCcontext *x = ctx_of(A32(0)); if (x) alcProcessContext(x); }
 static void h_alcGetError(CPU *c)           { RET(alcGetError(dev_of(A32(0)))); }
 
