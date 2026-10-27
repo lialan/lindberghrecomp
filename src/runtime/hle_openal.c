@@ -22,6 +22,8 @@
 
 #include "lindbergh_rt.h"
 
+static void apply_mute(void);
+
 static float argf(CPU *c, unsigned i) { uint32_t b = A32(i); float f; memcpy(&f, &b, 4); return f; }
 
 /* ---- device and context handles ---- */
@@ -69,10 +71,22 @@ static void h_alcDestroyContext(CPU *c)
     ALCcontext *x = ctx_of(A32(0));
     if (x) { alcDestroyContext(x); g_ctx[A32(0) & 0xFF] = NULL; }
 }
+static void h_alcMakeContextCurrent(CPU *c) { RET(alcMakeContextCurrent(ctx_of(A32(0)))); apply_mute(); }
+static void h_alcProcessContext(CPU *c)     { ALCcontext *x = ctx_of(A32(0)); if (x) alcProcessContext(x); }
+static void h_alcGetError(CPU *c)           { RET(alcGetError(dev_of(A32(0)))); }
+
+/* ---- AL ---- */
+static void h_alGetError(CPU *c)     { RET(alGetError()); }
+static void h_alGenBuffers(CPU *c)   { alGenBuffers(AI32(0), (ALuint *)APTR(1)); }
+static void h_alGenSources(CPU *c)   { alGenSources(AI32(0), (ALuint *)APTR(1)); }
+static void h_alDeleteBuffers(CPU *c){ alDeleteBuffers(AI32(0), (const ALuint *)APTR(1)); }
+static void h_alDeleteSources(CPU *c){ alDeleteSources(AI32(0), (const ALuint *)APTR(1)); }
+static void h_alIsBuffer(CPU *c)     { RET(alIsBuffer(A32(0))); }
+static void h_alIsSource(CPU *c)     { RET(alIsSource(A32(0))); }
 /* ---- mute ----
  * The whole mix goes through the listener, so its gain is the master volume.
  * M toggles it; LINDBERGH_MUTE=1, or any unattended run (LINDBERGH_EXIT_AFTER),
- * starts muted. */
+ * starts muted. Muting also uploads silence in place of each buffer. */
 static int g_muted = -1;
 static void apply_mute(void)
 {
@@ -90,20 +104,17 @@ void host_audio_toggle_mute(void)
     fprintf(stderr, "[al] sound %s\n", g_muted ? "muted" : "on");
 }
 
-static void h_alcMakeContextCurrent(CPU *c) { RET(alcMakeContextCurrent(ctx_of(A32(0)))); apply_mute(); }
-static void h_alcProcessContext(CPU *c)     { ALCcontext *x = ctx_of(A32(0)); if (x) alcProcessContext(x); }
-static void h_alcGetError(CPU *c)           { RET(alcGetError(dev_of(A32(0)))); }
-
-/* ---- AL ---- */
-static void h_alGetError(CPU *c)     { RET(alGetError()); }
-static void h_alGenBuffers(CPU *c)   { alGenBuffers(AI32(0), (ALuint *)APTR(1)); }
-static void h_alGenSources(CPU *c)   { alGenSources(AI32(0), (ALuint *)APTR(1)); }
-static void h_alDeleteBuffers(CPU *c){ alDeleteBuffers(AI32(0), (const ALuint *)APTR(1)); }
-static void h_alDeleteSources(CPU *c){ alDeleteSources(AI32(0), (const ALuint *)APTR(1)); }
-static void h_alIsBuffer(CPU *c)     { RET(alIsBuffer(A32(0))); }
-static void h_alIsSource(CPU *c)     { RET(alIsSource(A32(0))); }
 static void h_alBufferData(CPU *c)
 {
+    /* Muted: the buffer goes in as silence. The listener gain alone did not
+     * reliably silence macOS's OpenAL, and this cannot fail. */
+    if (g_muted < 0) apply_mute();
+    if (g_muted && AI32(3) > 0) {
+        static void *zero; static int zlen;
+        if (AI32(3) > zlen) { free(zero); zlen = AI32(3); zero = calloc(1, (size_t)zlen); }
+        alBufferData(A32(0), A32(1), zero, AI32(3), AI32(4));
+        return;
+    }
     alBufferData(A32(0), A32(1), APTR(2), AI32(3), AI32(4));
     /* LINDBERGH_AL_LEVEL=1: peak level of the 16-bit audio per format and
      * rate, every 500 buffers of each - music and effects stream separately */
