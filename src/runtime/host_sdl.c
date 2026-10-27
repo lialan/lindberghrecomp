@@ -164,6 +164,19 @@ void host_cabinet_input(CabinetInput *out)
     if (g_mouse_latch & 4) g_cab.buttons |= CAB_P1_RELOAD;
     *out = g_cab;
     out->buttons |= g_cab_latch;
+    {   /* What the board reports, whenever it changes - and the gun, at most
+         * once a second - so a report of "nothing registers" can be checked
+         * against what the game was actually given. */
+        static unsigned lb = ~0u, lc0 = ~0u, n; static int lx = -1, ly = -1;
+        if (out->buttons != lb || out->coins[0] != lc0) {
+            fprintf(stderr, "[cab] frame %u: buttons %#x, coins %u\n", g_frame, out->buttons, out->coins[0]);
+            lb = out->buttons; lc0 = out->coins[0];
+        }
+        if (++n % 60 == 0 && (out->gun_x != lx || out->gun_y != ly)) {
+            fprintf(stderr, "[cab] frame %u: gun %d,%d (pointer %d,%d)\n", g_frame, out->gun_x, out->gun_y, g_mouse_x, g_mouse_y);
+            lx = out->gun_x; ly = out->gun_y;
+        }
+    }
 }
 
 /* The board has reported the switches: latched taps have been seen. */
@@ -229,6 +242,12 @@ static void pump(void)
         case SDL_QUIT:
             fprintf(stderr, "[window] closed by the user\n");
             exit(0);
+        case SDL_WINDOWEVENT:
+            if (e.window.event == SDL_WINDOWEVENT_FOCUS_GAINED) fprintf(stderr, "[window] focus gained\n");
+            if (e.window.event == SDL_WINDOWEVENT_FOCUS_LOST)   fprintf(stderr, "[window] focus lost\n");
+            if (e.window.event == SDL_WINDOWEVENT_ENTER)        fprintf(stderr, "[window] pointer entered\n");
+            if (e.window.event == SDL_WINDOWEVENT_LEAVE)        fprintf(stderr, "[window] pointer left\n");
+            break;
         case SDL_MOUSEMOTION:
             g_mouse_x = e.motion.x;
             g_mouse_y = e.motion.y;
