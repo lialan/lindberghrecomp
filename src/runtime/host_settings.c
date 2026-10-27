@@ -26,6 +26,7 @@ static const struct { const char *key, *name; int dflt; } ACTIONS[ACT_COUNT] = {
     [ACT_TRIGGER] = { "trigger", "Trigger",           MOUSE_BIND(SDL_BUTTON_LEFT) },
     [ACT_RELOAD]  = { "reload",  "Reload",            MOUSE_BIND(SDL_BUTTON_RIGHT) },
     [ACT_ACTION]  = { "action",  "Action button",     ' ' },
+    [ACT_FIREMODE] = { "firemode", "Fire mode / grenade launcher", 'f' },
     [ACT_COIN2]   = { "coin2",   "Coin (Player 2)",   '6' },
     [ACT_START2]  = { "start2",  "Start (Player 2)",  '2' },
     [ACT_TEST]    = { "test",    "Test (operator)",   't' },

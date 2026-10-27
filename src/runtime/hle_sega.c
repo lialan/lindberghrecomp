@@ -176,9 +176,14 @@ static void jvs_command(const unsigned char *p)
             }
             ack_byte(b0);
             if (bytes > 1) {
-                /* second byte: bit 7 is the gun's third button, which Ghost
-                 * Squad uses as its action button */
-                ack_byte(pl == 0 && (in.buttons & CAB_P1_ACTION) ? 0x80 : 0x00);
+                /* second byte: bit 7 is the gun's action button, bit 6 its
+                 * fire-mode selector - the masks the game's gun code holds */
+                unsigned char b1 = 0;
+                if (pl == 0) {        /* the gun's other two buttons */
+                    if (in.buttons & CAB_P1_ACTION)   b1 |= 0x80;
+                    if (in.buttons & CAB_P1_FIREMODE) b1 |= 0x40;  /* single/burst/auto/grenade */
+                }
+                ack_byte(b1);
                 ack_zeros(bytes - 2);
             }
         }

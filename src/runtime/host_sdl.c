@@ -108,6 +108,7 @@ static int g_pointer_in = 1;
 static const unsigned CAB_OF[ACT_COUNT] = {
     [ACT_START1] = CAB_P1_START, [ACT_START2] = CAB_P2_START,
     [ACT_TRIGGER] = CAB_P1_TRIGGER, [ACT_RELOAD] = CAB_P1_RELOAD, [ACT_ACTION] = CAB_P1_ACTION,
+    [ACT_FIREMODE] = CAB_P1_FIREMODE,
     [ACT_TEST] = CAB_TEST, [ACT_SERVICE] = CAB_SERVICE,
 };
 
@@ -235,6 +236,12 @@ static void cabinet_autostart(void)
         }
         g_auto &= ~(CAB_P1_TRIGGER | CAB_P1_RELOAD);
         if (g_frame % 60u < 30u) g_auto |= CAB_P1_TRIGGER;
+        /* LINDBERGH_AUTOPRESS=<cab bits, hex>: also press those for a quarter
+         * second every two seconds - for finding what a button does */
+        static int press = -1;
+        if (press < 0) { const char *v = getenv("LINDBERGH_AUTOPRESS"); press = v ? (int)strtol(v, NULL, 16) : 0; }
+        g_auto &= ~(unsigned)press;
+        if (press && g_frame % 120u >= 60u && g_frame % 120u < 75u) g_auto |= (unsigned)press;
         /* LINDBERGH_AUTOGUN=2: one second in four off the screen, with a
          * press of the gun's screen-out signal - the arcade's reload */
         if (gun == 2 && g_frame % 240u < 60u) {

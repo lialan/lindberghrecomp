@@ -217,7 +217,7 @@ int        hle_stub_call(CPU *c, uint32_t va);
 enum { CAB_P1_START = 1u << 0, CAB_P2_START = 1u << 1,
        CAB_TEST     = 1u << 2, CAB_SERVICE  = 1u << 3,
        CAB_P1_TRIGGER = 1u << 4, CAB_P1_RELOAD = 1u << 5,
-       CAB_P1_ACTION  = 1u << 6 };
+       CAB_P1_ACTION  = 1u << 6, CAB_P1_FIREMODE = 1u << 7 };
 
 typedef struct {
     unsigned coins[2];        /* only ever counts up, like a coin mech */
