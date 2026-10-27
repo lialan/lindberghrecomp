@@ -54,6 +54,7 @@ function(lindbergh_runtime target generated_dir)
             "${LINDBERGH_RUNTIME_DIR}/host_settings.c"
             "${LINDBERGH_RUNTIME_DIR}/hle_gl_posix.c"
             "${LINDBERGH_RUNTIME_DIR}/arbprog.c"
+            "${LINDBERGH_RUNTIME_DIR}/stereo.c"
             "${LINDBERGH_RUNTIME_DIR}/hle_openal.c"
             "${LINDBERGH_RUNTIME_DIR}/solib.c")
         target_compile_definitions(${target} PRIVATE RECOMP_GUEST_BASE=1)

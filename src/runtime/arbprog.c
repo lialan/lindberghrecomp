@@ -34,6 +34,7 @@
 
 #include "gl_posix.h"
 #include "arbprog.h"
+#include "stereo.h"
 
 #ifndef GL_MATRIX0_ARB
 #define GL_MATRIX0_ARB 0x88C0
@@ -750,7 +751,12 @@ static int emit_instr(Tr *t, char *stmt)
         static const char *const fnb[] = { "", "texture1D", "texture2D", "texture3D", "textureCube", "texture2DRect" };
         static const char *const sw[] = { "", ".x", ".xy", ".xyz", ".xyz", ".xy" };
         static const char *const sm[] = { "", "s1_", "s2_", "s3_", "sc_", "sr_" };
-        if (proj && target != 4)
+        if (target == 5) {
+            /* Rectangle textures are sampled in texels; the game's render
+             * targets are, and stereo.c draws them at the eye's size. */
+            if (proj) snprintf(r, sizeof r, "texture2DRectProj(sr_%d, vec4(%s.xy * u_rect_scale, %s.zw))", unit, X(0), X(0));
+            else      snprintf(r, sizeof r, "texture2DRect(sr_%d, %s.xy * u_rect_scale)", unit, X(0));
+        } else if (proj && target != 4)
             snprintf(r, sizeof r, "%sProj(%s%d, %s)", fnb[target], sm[target], unit, X(0));
         else if (bias)
             snprintf(r, sizeof r, "%s(%s%d, %s%s, %s.w)", fnb[target], sm[target], unit, X(0), sw[target], X(0));
@@ -945,7 +951,8 @@ static char *translate(int stage, const char *src_in, Tr *t)
         bput(&g, "#version 120\n");
         int rect = 0;
         for (int u = 0; u < 16; u++) if (t->tex_target[u] == 5) rect = 1;
-        if (rect) bput(&g, "#extension GL_ARB_texture_rectangle : enable\n");
+        if (rect) bput(&g, "#extension GL_ARB_texture_rectangle : enable\n"
+                           "uniform vec2 u_rect_scale;\n");    /* render targets drawn larger (stereo.c) */
         const char *P = stage ? "f" : "v";
         if (t->env_hi >= 0) bput(&g, "uniform vec4 %s_env[%d];\n", P, t->env_hi + 1);
         if (t->local_hi >= 0) bput(&g, "uniform vec4 %s_loc[%d];\n", P, t->local_hi + 1);
@@ -1005,7 +1012,7 @@ typedef struct {
     int    ok;
     MatRef mat[2][16]; int nmat[2];
     int    env_hi[2], local_hi[2];
-    GLint  u_env[2], u_loc[2], u_mat[2][16];
+    GLint  u_env[2], u_loc[2], u_mat[2][16], u_rect;
     unsigned up_env[2], up_loc[2];      /* generations last uploaded */
 } Linked;
 
@@ -1119,6 +1126,7 @@ static Linked *link_pair(GLuint vid, GLuint fid)
             l->u_mat[st][m] = glGetUniformLocation(l->prog, nm);
         }
     }
+    l->u_rect = glGetUniformLocation(l->prog, "u_rect_scale");
     static const char *const pre[] = { "s1_", "s2_", "s3_", "sc_", "sr_" };
     for (int u = 0; u < 16; u++)
         for (int k = 0; k < 5; k++) {
@@ -1198,6 +1206,7 @@ static void stack_matrix(int which, int index, float *m)
 
 static void upload(Linked *l)
 {
+    if (l->u_rect >= 0) { float rx, ry; stereo_rect_scale(&rx, &ry); glUniform2f(l->u_rect, rx, ry); }
     for (int st = 0; st < 2; st++) {
         GLuint id = st ? l->fid : l->vid;
         if (!id) continue;

@@ -34,6 +34,7 @@ static void mac_activate(void)
 
 #include "gl_posix.h"
 #include "host_settings.h"
+#include "stereo.h"
 
 #define DEFAULT_W 640
 #define DEFAULT_H 480
@@ -504,6 +505,7 @@ int host_gl_context(void)
     SDL_GL_SetSwapInterval(env_int("LINDBERGH_VSYNC", 0));   /* the game paces itself; macOS stalls vsync swaps for hidden windows */
     fprintf(stderr, "[window] GL context ready: %s / %s\n",
             (const char *)glGetString(GL_RENDERER), (const char *)glGetString(GL_VERSION));
+    stereo_frame_begin();
     return 1;
 }
 
@@ -567,6 +569,10 @@ static void maybe_screenshot(void)
 
 void host_swap(void)
 {
+    if (stereo_enabled()) {             /* draw the second eye, show both */
+        stereo_frame_end();
+        stereo_present_desktop(g_win.w, g_win.h);
+    }
     maybe_screenshot();
     maybe_peek();
     g_frame++;
@@ -580,6 +586,7 @@ void host_swap(void)
         SDL_GL_SwapWindow(g_win.win);
         if (fb) glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)fb);
     }
+    stereo_frame_begin();
     {
         static int after = -1;
         if (after < 0) after = env_int("LINDBERGH_EXIT_AFTER", 0);

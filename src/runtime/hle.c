@@ -27,6 +27,8 @@ const char *hle_name(HleId id)
 }
 
 HleHandler g_hle_handlers[HLE_COUNT];
+GlHook g_gl_hook;
+unsigned char g_gl_ids[HLE_COUNT];
 
 int hle_bind(const char *name, HleHandler fn)
 {
@@ -126,6 +128,9 @@ void hle_call(CPU *c, HleId id)
         fflush(stderr);
     }
     if ((unsigned)id < HLE_COUNT && g_hle_handlers[id]) {
+        /* GL calls can be routed through stereo.c, which records each frame
+         * to draw it again for the second eye. */
+        if (g_gl_hook && g_gl_ids[id]) { g_gl_hook(c, id, g_hle_handlers[id]); return; }
         g_hle_handlers[id](c);
         return;
     }

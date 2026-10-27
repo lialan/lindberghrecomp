@@ -16,6 +16,7 @@
 
 #include "gl_posix.h"
 #include "arbprog.h"
+#include "stereo.h"
 
 int g_gl_trace;
 int g_gl_errcheck;
@@ -141,6 +142,23 @@ static void h_glMapBufferARB(CPU *c)
     }
     fprintf(stderr, "[gl] glMapBuffer: no shadow slot for target %#x\n", target);
     RET(0);
+}
+
+unsigned gl_bound_buffer(unsigned target)
+{
+    GLuint *slot = binding_slot(target);
+    return slot ? *slot : 0;
+}
+
+int gl_map_shadow(unsigned target, void **shadow, int *size)
+{
+    GLuint *slot = binding_slot(target);
+    for (int i = 0; i < 4; i++)
+        if (g_maps[i].shadow && g_maps[i].target == target && slot && g_maps[i].buffer == *slot &&
+            g_maps[i].access != GL_READ_ONLY) {
+            *shadow = g_maps[i].shadow; *size = g_maps[i].size; return 1;
+        }
+    return 0;
 }
 
 static void h_glUnmapBufferARB(CPU *c)
@@ -375,6 +393,7 @@ void hle_register_gl(void)
     hle_bind("gluOrtho2D", h_gluOrtho2D);
     hle_bind("gluPerspective", h_gluPerspective);
     hle_bind("gluErrorString", h_gluErrorString);
+    stereo_init();
 }
 
 /* glXGetProcAddressARB tokens: a GLX game's indirect GL calls. This game is

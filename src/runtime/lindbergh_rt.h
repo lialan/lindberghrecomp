@@ -88,6 +88,13 @@ extern HleHandler g_hle_handlers[];
 
 void hle_call(CPU *c, HleId id);
 
+/* When set, every import marked in g_gl_ids goes through the hook instead of
+ * straight to its handler (stereo.c: record a frame's GL calls, replay them
+ * for the second eye). */
+typedef void (*GlHook)(CPU *c, HleId id, HleHandler fn);
+extern GlHook g_gl_hook;
+extern unsigned char g_gl_ids[];
+
 /* The PLT stub address for a named import, or 0. What glXGetProcAddressARB
  * hands back, so the guest's indirect call through it routes like any other. */
 uint32_t hle_plt_address(const char *name);
