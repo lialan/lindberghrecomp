@@ -20,6 +20,9 @@
 #include <string.h>
 
 #include "lindbergh_rt.h"
+#if !defined(_WIN32)
+#include "host_settings.h"
+#endif
 
 /* The library's own success code. Every am* function returns 0 for success
  * and a negative value for a failure the game then reports. */
@@ -172,7 +175,12 @@ static void jvs_command(const unsigned char *p)
                 if (in.buttons & CAB_P2_START)   b0 |= 0x80;
             }
             ack_byte(b0);
-            ack_zeros(bytes > 1 ? bytes - 1 : 0);
+            if (bytes > 1) {
+                /* second byte: bit 7 is the gun's third button, which Ghost
+                 * Squad uses as its action button */
+                ack_byte(pl == 0 && (in.buttons & CAB_P1_ACTION) ? 0x80 : 0x00);
+                ack_zeros(bytes - 2);
+            }
         }
         host_cabinet_switches_read();
         break;
@@ -577,11 +585,14 @@ void hle_register_sega(void)
 
     /* The country, and with it the language: the game reads the region byte
      * of the cabinet's system data (0, Japan, on a Japanese board) and shows
-     * Japanese for country 0, English otherwise. LINDBERGH_COUNTRY picks it;
-     * the default is 1, English. */
+     * Japanese for country 0, English otherwise. The Language menu picks it
+     * (default English); it applies from the next start. */
     {
-        const char *v = getenv("LINDBERGH_COUNTRY");
-        g_country = v && *v ? atoi(v) : 1;
+#if defined(_WIN32)
+        { const char *v = getenv("LINDBERGH_COUNTRY"); g_country = v && *v ? atoi(v) : 1; }
+#else
+        g_country = settings()->country;     /* LINDBERGH_COUNTRY overrides */
+#endif
         if (guest_override("_Z25get_arcade_region_countryv", h_country)) {
             n++;
             fprintf(stderr, "[sega] country %d (%s)\n", g_country, g_country ? "English" : "Japanese");

@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(lindberghrecomp VERSION 0.1.0 LANGUAGES C)
+if(APPLE)
+    enable_language(OBJC)       # host_menu_mac.m, the menu bar
+endif()
 
 # Runtime for statically recompiled Sega Lindbergh games.
 #
@@ -48,6 +51,7 @@ function(lindbergh_runtime target generated_dir)
         set(platform_sources
             "${LINDBERGH_RUNTIME_DIR}/guest_mem.c"
             "${LINDBERGH_RUNTIME_DIR}/host_sdl.c"
+            "${LINDBERGH_RUNTIME_DIR}/host_settings.c"
             "${LINDBERGH_RUNTIME_DIR}/hle_gl_posix.c"
             "${LINDBERGH_RUNTIME_DIR}/arbprog.c"
             "${LINDBERGH_RUNTIME_DIR}/hle_openal.c"
@@ -102,6 +106,10 @@ function(lindbergh_runtime target generated_dir)
         target_link_libraries(${target} PRIVATE SDL2::SDL2 z)
         if(APPLE)
             target_link_libraries(${target} PRIVATE "-framework OpenGL" "-framework AppKit" "-framework OpenAL" objc)
+            # the menu bar (Controls, Aim, Sound, Language)
+            target_sources(${target} PRIVATE "${LINDBERGH_RUNTIME_DIR}/host_menu_mac.m")
+            set_source_files_properties("${LINDBERGH_RUNTIME_DIR}/host_menu_mac.m"
+                PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
             # Every guest call is a host call: give the main thread room.
             target_link_options(${target} PRIVATE "LINKER:-stack_size,0x10000000")
         endif()

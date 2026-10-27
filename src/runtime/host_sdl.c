@@ -21,6 +21,8 @@
 /* A bare executable (not a .app) started from a script is not made the active
  * application, so its window shows but keystrokes keep going to the terminal.
  * Register as a regular app and take focus. */
+void host_menu_install(void);    /* host_menu_mac.m */
+
 static void mac_activate(void)
 {
     id app = ((id (*)(Class, SEL))objc_msgSend)(objc_getClass("NSApplication"),
@@ -31,6 +33,7 @@ static void mac_activate(void)
 #endif
 
 #include "gl_posix.h"
+#include "host_settings.h"
 
 #define DEFAULT_W 640
 #define DEFAULT_H 480
@@ -85,28 +88,118 @@ void host_mouse_state(int *x, int *y, int *buttons)
     if (buttons) *buttons = g_buttons;
 }
 
-/* ---- the cabinet ---- */
+/* ---- the cabinet ----
+ * Every key and mouse button goes through the bindings in host_settings.c;
+ * what each action does to the cabinet is here. */
 static CabinetInput g_cab;
+static unsigned g_held;       /* cabinet buttons held down right now */
 /* Presses not yet seen by the I/O board. Events are drained once a frame and
  * the board is read once a frame, so a quick tap can go down and up inside
  * one drain; latching it until the next read means no tap is lost. */
 static unsigned g_cab_latch;
-static int      g_mouse_latch;
+static unsigned g_auto;       /* buttons driven by LINDBERGH_AUTOSTART/AUTOGUN */
+static int      g_scripted;   /* the gun is scripted: real input is ignored */
 
-static void cabinet_key(int vk, int down)
+static int g_capture = -1;    /* binding the next key or click, for this action */
+static int g_calib;           /* aim calibration step, 0 = off */
+static double g_calib_sx, g_calib_sy;     /* where the sight was clicked, step 1 */
+static int g_pointer_in = 1;
+
+static const unsigned CAB_OF[ACT_COUNT] = {
+    [ACT_START1] = CAB_P1_START, [ACT_START2] = CAB_P2_START,
+    [ACT_TRIGGER] = CAB_P1_TRIGGER, [ACT_RELOAD] = CAB_P1_RELOAD, [ACT_ACTION] = CAB_P1_ACTION,
+    [ACT_TEST] = CAB_TEST, [ACT_SERVICE] = CAB_SERVICE,
+};
+
+static void set_title(const char *msg);
+static int g_capture_or_calib(void);
+
+static void cabinet_action(HostAction a, int down)
 {
-    unsigned bit = 0;
-    switch (vk) {
-    case '5': if (down) g_cab.coins[0]++; return;
-    case '6': if (down) g_cab.coins[1]++; return;
-    case '1': bit = CAB_P1_START;   break;
-    case '2': bit = CAB_P2_START;   break;
-    case 'T': bit = CAB_TEST;       break;
-    case 'S': bit = CAB_SERVICE;    break;
-    case 'M': if (down) host_audio_toggle_mute(); return;
-    default: return;
+    switch (a) {
+    case ACT_COIN1: if (down) g_cab.coins[0]++; return;
+    case ACT_COIN2: if (down) g_cab.coins[1]++; return;
+    case ACT_MUTE:  if (down) host_audio_toggle_mute(); return;
+    default: break;
     }
-    if (down) { g_cab.buttons |= bit; g_cab_latch |= bit; } else g_cab.buttons &= ~bit;
+    unsigned bit = CAB_OF[a];
+    if (!bit) return;
+    if (down) { g_held |= bit; g_cab_latch |= bit; } else g_held &= ~bit;
+}
+
+/* A key (SDL keycode) or mouse button (MOUSE_BIND) went down or up. Returns
+ * whether something was bound to it. */
+static int cabinet_input(int bind, int down)
+{
+    HostSettings *st = settings();
+    int hit = 0;
+    for (int a = 0; a < ACT_COUNT; a++)
+        if (st->bind[a] == bind) { cabinet_action((HostAction)a, down); hit = 1; }
+    return hit;
+}
+
+/* ---- remapping and calibration, started from the menus ---- */
+void host_begin_capture(HostAction a)
+{
+    g_calib = 0;
+    g_capture = (int)a;
+    char t[160];
+    snprintf(t, sizeof t, "Press a key or mouse button for \"%s\" (Esc cancels)", settings_action_name(a));
+    set_title(t);
+}
+
+static void finish_capture(int bind)
+{
+    HostSettings *st = settings();
+    if (bind) {
+        for (int a = 0; a < ACT_COUNT; a++)       /* one action per input */
+            if (st->bind[a] == bind) st->bind[a] = 0;
+        st->bind[g_capture] = bind;
+        settings_save();
+        char nm[64]; settings_binding_name(bind, nm, sizeof nm);
+        fprintf(stderr, "[settings] %s -> %s\n", settings_action_name((HostAction)g_capture), nm);
+    }
+    g_capture = -1;
+    g_held = 0;
+    set_title(NULL);
+}
+
+/* Aim calibration: the gun is held at two known points in turn and the player
+ * clicks where the game draws its sight; the two pairs give scale and offset
+ * per axis. Points are in window pixels, before the correction. */
+#define CAL_AX 0.30
+#define CAL_BX 0.70
+#define CAL_AY 0.30
+#define CAL_BY 0.70
+
+void host_begin_aim_calibration(void)
+{
+    g_capture = -1;
+    g_calib = 1;
+    set_title("Aim calibration 1/2: click the centre of the game's sight (Esc cancels)");
+}
+
+static void calib_click(int x, int y)
+{
+    double w = g_win.w ? g_win.w : DEFAULT_W, h = g_win.h ? g_win.h : DEFAULT_H;
+    if (g_calib == 1) {
+        g_calib_sx = x; g_calib_sy = y; g_calib = 2;
+        set_title("Aim calibration 2/2: click the centre of the game's sight again (Esc cancels)");
+        return;
+    }
+    HostSettings *st = settings();
+    double ax = CAL_AX * w, bx = CAL_BX * w, ay = CAL_AY * h, by = CAL_BY * h;
+    double sx = (x - g_calib_sx) / (bx - ax), sy = (y - g_calib_sy) / (by - ay);
+    if (sx > 0.5 && sx < 2.0 && sy > 0.5 && sy < 2.0) {
+        st->aim_sx = sx; st->aim_ox = g_calib_sx - sx * ax;
+        st->aim_sy = sy; st->aim_oy = g_calib_sy - sy * ay;
+        settings_save();
+        fprintf(stderr, "[settings] aim calibrated: %.3fx%+.1f, %.3fy%+.1f\n", st->aim_sx, st->aim_ox, st->aim_sy, st->aim_oy);
+    } else {
+        fprintf(stderr, "[settings] aim calibration rejected (scale %.2f, %.2f) - kept the old one\n", sx, sy);
+    }
+    g_calib = 0;
+    set_title(NULL);
 }
 
 /* LINDBERGH_AUTOSTART=1: a coin at frame 240, then start pressed every two
@@ -122,14 +215,15 @@ static void cabinet_autostart(void)
         fprintf(stderr, "[cab] autostart: coin inserted at frame %u\n", g_frame);
     }
     if (coined) {
-        if (g_frame % 120u < 20u) g_cab.buttons |= CAB_P1_START;
-        else                      g_cab.buttons &= ~CAB_P1_START;
+        if (g_frame % 120u < 20u) g_auto |= CAB_P1_START;
+        else                      g_auto &= ~CAB_P1_START;
     }
     /* LINDBERGH_AUTOGUN=1 as well: the gun circles the screen and fires in
      * half-second bursts, to check aim and trigger without a mouse */
     static int gun = -1;
-    if (gun < 0) gun = env_int("LINDBERGH_AUTOGUN", 0) != 0;
+    if (gun < 0) gun = env_int("LINDBERGH_AUTOGUN", 0);
     if (gun && coined) {
+        g_scripted = 1;
         double t = g_frame / 90.0;
         int w = g_win.w ? g_win.w : DEFAULT_W, h = g_win.h ? g_win.h : DEFAULT_H;
         int ax, ay;     /* LINDBERGH_AIM=x,y holds the gun still instead */
@@ -139,32 +233,35 @@ static void cabinet_autostart(void)
             g_mouse_x = (int)(w / 2 + w / 3 * cos(t));
             g_mouse_y = (int)(h / 2 + h / 3 * sin(t));
         }
-        if (g_frame % 60u < 30u) g_buttons |= 1; else g_buttons &= ~1;
+        g_auto &= ~(CAB_P1_TRIGGER | CAB_P1_RELOAD);
+        if (g_frame % 60u < 30u) g_auto |= CAB_P1_TRIGGER;
+        /* LINDBERGH_AUTOGUN=2: one second in four off the screen, with a
+         * press of the gun's screen-out signal - the arcade's reload */
+        if (gun == 2 && g_frame % 240u < 60u) {
+            g_mouse_x = -100000; g_mouse_y = -100000;
+            g_auto &= ~CAB_P1_TRIGGER;
+            if (g_frame % 240u >= 20u && g_frame % 240u < 30u) g_auto |= CAB_P1_RELOAD;
+        }
     }
 }
 
 void host_cabinet_input(CabinetInput *out)
 {
     cabinet_autostart();
-    /* The game maps the gun through its own calibration, which stretches the
-     * raw range: measured, the sight lands at 1.14x + 21, 1.06y + 17. Undo
-     * that so the sight is where the pointer is. LINDBERGH_GUN_CAL=sx,ox,sy,oy
-     * overrides the measured values (1,0,1,0 sends the pointer unchanged). */
-    static double sx = 1.139, ox = 20.6, sy = 1.056, oy = 16.7;
-    static int cal = -1;
-    if (cal < 0) { const char *v = getenv("LINDBERGH_GUN_CAL"); cal = 1;
-                   if (v) sscanf(v, "%lf,%lf,%lf,%lf", &sx, &ox, &sy, &oy); }
-    g_cab.gun_x = (int)((g_mouse_x - ox) / sx);
-    g_cab.gun_y = (int)((g_mouse_y - oy) / sy);
-    g_cab.screen_w = g_win.w ? g_win.w : 1;
-    g_cab.screen_h = g_win.h ? g_win.h : 1;
-    g_cab.buttons &= ~(CAB_P1_TRIGGER | CAB_P1_RELOAD);
-    if (g_buttons & 1) g_cab.buttons |= CAB_P1_TRIGGER;
-    if (g_buttons & 4) g_cab.buttons |= CAB_P1_RELOAD;
-    if (g_mouse_latch & 1) g_cab.buttons |= CAB_P1_TRIGGER;
-    if (g_mouse_latch & 4) g_cab.buttons |= CAB_P1_RELOAD;
+    HostSettings *st = settings();
+    double w = g_win.w ? g_win.w : DEFAULT_W, h = g_win.h ? g_win.h : DEFAULT_H;
+    if (g_calib == 1)      { g_cab.gun_x = (int)(CAL_AX * w); g_cab.gun_y = (int)(CAL_AY * h); }
+    else if (g_calib == 2) { g_cab.gun_x = (int)(CAL_BX * w); g_cab.gun_y = (int)(CAL_BY * h); }
+    else {
+        /* undo the game's own calibration, so the sight is under the pointer */
+        g_cab.gun_x = (int)((g_mouse_x - st->aim_ox) / st->aim_sx);
+        g_cab.gun_y = (int)((g_mouse_y - st->aim_oy) / st->aim_sy);
+    }
+    g_cab.screen_w = (int)w;
+    g_cab.screen_h = (int)h;
+    g_cab.buttons = g_auto | (g_scripted ? 0 : g_held);
     *out = g_cab;
-    out->buttons |= g_cab_latch;
+    if (!g_scripted) out->buttons |= g_cab_latch;
     {   /* What the board reports, whenever it changes - and the gun, at most
          * once a second - so a report of "nothing registers" can be checked
          * against what the game was actually given. */
@@ -184,7 +281,6 @@ void host_cabinet_input(CabinetInput *out)
 void host_cabinet_switches_read(void)
 {
     g_cab_latch = 0;
-    g_mouse_latch = 0;
 }
 
 /* SDL keysym -> Win32 virtual key: letters upper case, digits as themselves. */
@@ -211,7 +307,8 @@ static int button_of(Uint8 b)
 
 /* LINDBERGH_KEYS="frame:key,frame:key...": push real SDL key events - a
  * press at that frame, the release in the same drain (a fast tap) - so the
- * keyboard path is tested exactly as a person drives it. */
+ * keyboard path is tested exactly as a person drives it. "!" is the pointer
+ * leaving the window and coming back. */
 static void fake_keys(void)
 {
     static const char *v = (const char *)1;
@@ -225,6 +322,14 @@ static void fake_keys(void)
         char k = *p++;
         if (f == g_frame) {
             SDL_Event e; memset(&e, 0, sizeof e);
+            if (k == '!') {                  /* the pointer leaves the window */
+                e.type = SDL_WINDOWEVENT; e.window.event = SDL_WINDOWEVENT_LEAVE;
+                SDL_PushEvent(&e);
+                e.window.event = SDL_WINDOWEVENT_ENTER; SDL_PushEvent(&e);
+                fprintf(stderr, "[keys] pointer out and back at frame %u\n", f);
+                while (*p == ',') p++;
+                continue;
+            }
             e.type = SDL_KEYDOWN; e.key.keysym.sym = (SDL_Keycode)(k >= 'A' && k <= 'Z' ? k + 32 : k);
             SDL_PushEvent(&e);
             e.type = SDL_KEYUP; SDL_PushEvent(&e);
@@ -232,6 +337,14 @@ static void fake_keys(void)
         }
         while (*p == ',') p++;
     }
+}
+
+static int g_capture_or_calib(void) { return g_capture >= 0 || g_calib; }
+
+static char g_title[128] = "lindberghrecomp";
+static void set_title(const char *msg)
+{
+    if (g_win.win) SDL_SetWindowTitle(g_win.win, msg ? msg : g_title);
 }
 
 static void pump(void)
@@ -246,8 +359,14 @@ static void pump(void)
         case SDL_WINDOWEVENT:
             if (e.window.event == SDL_WINDOWEVENT_FOCUS_GAINED) fprintf(stderr, "[window] focus gained\n");
             if (e.window.event == SDL_WINDOWEVENT_FOCUS_LOST)   fprintf(stderr, "[window] focus lost\n");
-            if (e.window.event == SDL_WINDOWEVENT_ENTER)        fprintf(stderr, "[window] pointer entered\n");
-            if (e.window.event == SDL_WINDOWEVENT_LEAVE)        fprintf(stderr, "[window] pointer left\n");
+            if (e.window.event == SDL_WINDOWEVENT_ENTER) { fprintf(stderr, "[window] pointer entered\n"); g_pointer_in = 1; }
+            if (e.window.event == SDL_WINDOWEVENT_LEAVE) {
+                fprintf(stderr, "[window] pointer left\n");
+                /* Pointing a real gun off the screen is the reload; the
+                 * nearest thing a mouse can do is leave the window. */
+                if (g_pointer_in && settings()->leave_reload && !g_capture_or_calib()) g_cab_latch |= CAB_P1_RELOAD;
+                g_pointer_in = 0;
+            }
             break;
         case SDL_MOUSEMOTION:
             g_mouse_x = e.motion.x;
@@ -259,7 +378,10 @@ static void pump(void)
             int b = button_of(e.button.button), down = e.type == SDL_MOUSEBUTTONDOWN;
             g_mouse_x = e.button.x;
             g_mouse_y = e.button.y;
-            if (down) { g_buttons |= 1 << b; g_mouse_latch |= 1 << b; } else g_buttons &= ~(1 << b);
+            if (down && g_capture >= 0) { finish_capture(MOUSE_BIND(e.button.button)); break; }
+            if (down && g_calib) { calib_click(e.button.x, e.button.y); break; }
+            if (down) g_buttons |= 1 << b; else g_buttons &= ~(1 << b);
+            cabinet_input(MOUSE_BIND(e.button.button), down);
             in_push(HOST_IN_MOUSE, b, down ? 0 : 1, g_mouse_x, g_mouse_y);
             break;
         }
@@ -267,12 +389,17 @@ static void pump(void)
             if (e.key.repeat) break;
             int vk = vk_of(e.key.keysym.sym);
             fprintf(stderr, "[key] down %s (vk %#x)\n", SDL_GetKeyName(e.key.keysym.sym), vk);
-            if (!vk) break;
+            if (g_capture >= 0 || g_calib) {
+                if (e.key.keysym.sym == SDLK_ESCAPE) { g_capture = -1; g_calib = 0; set_title(NULL); }
+                else if (g_capture >= 0) finish_capture((int)e.key.keysym.sym);
+                break;
+            }
             if (vk == VK_ESCAPE) {
                 fprintf(stderr, "[window] Escape pressed - quitting\n");
                 exit(0);
             }
-            cabinet_key(vk, 1);
+            cabinet_input((int)e.key.keysym.sym, 1);
+            if (!vk) break;
             if (e.key.keysym.sym < 0x80)
                 in_push(HOST_IN_KEY, (int)e.key.keysym.sym, 1, g_mouse_x, g_mouse_y);
             else
@@ -281,8 +408,8 @@ static void pump(void)
         }
         case SDL_KEYUP: {
             int vk = vk_of(e.key.keysym.sym);
+            cabinet_input((int)e.key.keysym.sym, 0);
             if (!vk) break;
-            cabinet_key(vk, 0);
             in_push(HOST_IN_KEYUP, vk, 0, g_mouse_x, g_mouse_y);
             break;
         }
@@ -299,6 +426,7 @@ void host_window_hint(int w, int h)
 
 int host_window_open(const char *title)
 {
+    if (title && *title) snprintf(g_title, sizeof g_title, "%s", title);
     if (g_win.win) {
         if (title && *title) SDL_SetWindowTitle(g_win.win, title);
         return 1;
@@ -326,6 +454,7 @@ int host_window_open(const char *title)
     }
 #if defined(__APPLE__)
     mac_activate();
+    host_menu_install();
 #endif
     SDL_RaiseWindow(g_win.win);
     fprintf(stderr, "[window] %dx%d\n", g_win.w, g_win.h);
