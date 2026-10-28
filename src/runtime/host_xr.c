@@ -586,7 +586,9 @@ int xr_init(void)
     XRCHECK(xrEnumerateSwapchainFormats(session, 0, &nf, NULL));
     int64_t *fmts = calloc(nf ? nf : 1, sizeof *fmts);
     xrEnumerateSwapchainFormats(session, nf, &nf, fmts);
-    for (uint32_t i = 0; i < nf; i++) if (fmts[i] == GL_SRGB8_ALPHA8) color_format = GL_SRGB8_ALPHA8;
+    const char *want = getenv("LINDBERGH_XR_SWAPCHAIN");     /* "rgba8": the plain one, for comparing */
+    if (!(want && !strcmp(want, "rgba8")))
+        for (uint32_t i = 0; i < nf; i++) if (fmts[i] == GL_SRGB8_ALPHA8) color_format = GL_SRGB8_ALPHA8;
     if (!color_format) for (uint32_t i = 0; i < nf; i++) if (fmts[i] == GL_RGBA8) color_format = GL_RGBA8;
     free(fmts);
     if (!color_format) { fprintf(stderr, "[xr] no 8-bit colour swapchain\n"); return 0; }
@@ -745,6 +747,25 @@ void xr_frame_end(void)
             gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, e->fb[e->acquired]);
             gl.BlitFramebuffer(0, 0, (GLint)e->w, (GLint)e->h, 0, 0, (GLint)e->w, (GLint)e->h,
                                GL_COLOR_BUFFER_BIT, GL_NEAREST);
+            if (i == 0 && g_frame % 600 == 300) {
+                /* the game's centre pixel, and what the copy stored in the
+                 * swapchain: equal unless the copy encoded it as sRGB again */
+                unsigned char a[4] = { 0 }, b[4] = { 0 };
+                GLint cx = (GLint)e->w / 2, cy = (GLint)e->h / 2;
+                gl.ReadPixels(cx, cy, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, a);
+                gl.BindFramebuffer(GL_READ_FRAMEBUFFER, e->fb[e->acquired]);
+                gl.ReadPixels(cx, cy, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, b);
+                gl.BindFramebuffer(GL_READ_FRAMEBUFFER, read_fb);
+                static int told;
+                if (!told++) {
+                    const char *x = (const char *)gl.GetString(GL_EXTENSIONS);
+                    fprintf(stderr, "[xr] colour: swapchain %s, sRGB write control %s\n",
+                            color_format == GL_SRGB8_ALPHA8 ? "sRGB" : "RGBA8",
+                            x && strstr(x, "GL_EXT_sRGB_write_control") ? "yes" : "no");
+                }
+                fprintf(stderr, "[xr] colour check frame %u: game %u %u %u, stored %u %u %u\n",
+                        g_frame, a[0], a[1], a[2], b[0], b[1], b[2]);
+            }
             if (fl_on < 0) { const char *v = getenv("LINDBERGH_FLASH_LOG"); fl_on = v && *v && *v != '0'; }
             if (fl_on) { fl_sample(i, (GLint)e->w, (GLint)e->h); gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, e->fb[e->acquired]); }
             if (overlay_ok) {
