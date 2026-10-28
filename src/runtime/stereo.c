@@ -298,6 +298,15 @@ static int offscreen_fb(GLuint fb)
     return 0;
 }
 
+static struct { GLuint fb, depth; } g_fb_depth[MAX_FBS];   /* each framebuffer's depth texture */
+static unsigned g_nfb_depth;
+
+static void note_fb_depth(GLuint fb, GLuint tex)
+{
+    for (unsigned i = 0; i < g_nfb_depth; i++) if (g_fb_depth[i].fb == fb) { g_fb_depth[i].depth = tex; return; }
+    if (g_nfb_depth < MAX_FBS) { g_fb_depth[g_nfb_depth].fb = fb; g_fb_depth[g_nfb_depth++].depth = tex; }
+}
+
 static void note_fb_target(GLuint fb, GLuint tex)
 {
     int w = 0, h = 0;
@@ -345,8 +354,21 @@ static void scale_target(GLenum textarget, GLuint tex)
     glBindTexture(tg, (GLuint)prev);
 }
 
+static int g_flat;                      /* this frame is drawn flat: the arcade's picture, on the screen */
+static void (*g_aim_hook)(void);
+void stereo_set_aim_hook(void (*fn)(void)) { g_aim_hook = fn; }
+
 static void bind_framebuffer(GLenum target, GLuint fb)
 {
+    /* Leaving the world's target with the scene drawn: its depth is the
+     * world's now - later full-screen passes into it write a flat 0.5 over
+     * it - so the aim reads it here. */
+    static unsigned probed = ~0u;
+    if (g_aim_hook && g_mv && !g_flat && g_scene_draws > 0 && g_game_fb == g_world_fb_next && fb != g_game_fb &&
+        probed != g_frame) {
+        probed = g_frame;
+        g_aim_hook();
+    }
     g_game_fb = fb;
     glBindFramebuffer(target, fb ? fb : g_eye_fbo[g_eye]);
 }
@@ -667,7 +689,7 @@ static int menu_state(void)
  * which drawing the menu's 3D from the eyes broke (a black window where the
  * soldier stands, buttons that changed every frame). Decided per frame:
  * the state the game ran last frame. */
-static int g_flat, g_flat_shown;
+static int g_flat_shown;
 int stereo_flat_frame(void) { return g_flat_shown; }
 void stereo_screen(float *half_w, float *half_h, float *dist)
 {
@@ -799,6 +821,7 @@ static int transform_call(CPU *c, HleId id, const char *n)
     if (k == K_FBTEX2D) {
         scale_target(A32(2), A32(3));
         if (A32(1) == GL_COLOR_ATTACHMENT0) note_fb_target(g_game_fb, A32(3));
+        if (A32(1) == GL_DEPTH_ATTACHMENT || A32(1) == GL_DEPTH_STENCIL_ATTACHMENT) note_fb_depth(g_game_fb, A32(3));
         return 0;
     }
     if (k == K_ACTIVETEX) { g_active_unit = A32(0); return 0; }
@@ -1741,6 +1764,56 @@ void stereo_set_screen_distance(float d) { if (d > 0) g_screen_dist = d; }
 
 /* Where a ray from the game camera's space crosses the HUD's screen, in the
  * game's 640x480 pixels. 0 when it points away from the screen. */
+/* Points along the gun's ray (game units, the game camera's space), placed
+ * in the first eye's view of this frame's world: their pixel there and their
+ * depth, to be compared with the depth the world left - where the ray first
+ * goes behind a surface is what it points at. 0 if there is no such view (a
+ * flat frame, or the eyes drawn one at a time). */
+int stereo_aim_samples(const float o[3], const float d[3], int max, float (*px)[2], float *z, float *t, unsigned *depth, float *zn, float *zf)
+{
+#ifdef LINDBERGH_GL4ES
+    if (!g_on || !g_mv || g_flat) return 0;
+    GLuint dt = 0;
+    for (unsigned i = 0; i < g_nfb_depth; i++) if (g_fb_depth[i].fb == g_world_fb_next) dt = g_fb_depth[i].depth;
+    unsigned arr = dt ? gl4es_multiview_array(dt) : 0;
+    static unsigned dbg;
+    if (getenv("LINDBERGH_AIM_LOG") && ++dbg % 120 == 1) {
+        fprintf(stderr, "[aim] world fb %u, depth texture %u, array %u; depth attachments:", g_world_fb, dt, arr);
+        for (unsigned i = 0; i < g_nfb_depth; i++) fprintf(stderr, " fb%u=%u", g_fb_depth[i].fb, g_fb_depth[i].depth);
+        fprintf(stderr, "\n");
+    }
+    if (!arr) return 0;
+    const float *p = g_last_persp;
+    float n = p[14] / (p[10] - 1), f = p[14] / (p[10] + 1), e[16], m[16];
+    if (!(n > 0) || !(f > n)) return 0;
+    const float *tn = g_tan[0];
+    mat_frustum(e, -tn[0] * n, tn[1] * n, -tn[2] * n, tn[3] * n, n, f);
+    mat_mul(m, e, g_view[0]);
+    int k = 0;
+    for (int i = 0; i < max; i++) {
+        float ti = 0.5f * powf(200.0f, (float)i / (float)(max - 1));     /* 0.5 to 100 units */
+        float q[3] = { o[0] + d[0] * ti, o[1] + d[1] * ti, o[2] + d[2] * ti };
+        float cx = m[0] * q[0] + m[4] * q[1] + m[8] * q[2] + m[12];
+        float cy = m[1] * q[0] + m[5] * q[1] + m[9] * q[2] + m[13];
+        float cz = m[2] * q[0] + m[6] * q[1] + m[10] * q[2] + m[14];
+        float cw = m[3] * q[0] + m[7] * q[1] + m[11] * q[2] + m[15];
+        if (cw <= 1e-5f) continue;
+        float x = cx / cw, y = cy / cw;
+        if (x <= -1 || x >= 1 || y <= -1 || y >= 1) continue;
+        px[k][0] = (x * 0.5f + 0.5f) * (float)g_ew;
+        px[k][1] = (y * 0.5f + 0.5f) * (float)g_eh;
+        z[k] = cz / cw * 0.5f + 0.5f;
+        t[k] = ti;
+        k++;
+    }
+    *depth = arr; *zn = n; *zf = f;
+    return k;
+#else
+    (void)o; (void)d; (void)max; (void)px; (void)z; (void)t; (void)depth; (void)zn; (void)zf;
+    return 0;
+#endif
+}
+
 int stereo_ray_to_screen(const float o[3], const float d[3], float *x, float *y)
 {
     if (d[2] > -1e-4f) return 0;

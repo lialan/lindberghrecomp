@@ -47,6 +47,12 @@ extern uint32_t stereo_state_lo, stereo_state_hi;
  * the eye image on the screen, whose half size and distance in game units
  * from the game camera stereo_screen gives. */
 int  stereo_flat_frame(void);
+/* Points along a ray (game units, from the game camera) in the first eye's
+ * view of the world: pixel, window depth, distance; and the world's depth
+ * array to compare them with. 0: no such view this frame. */
+/* Called once a frame, when the world's depth is complete. */
+void stereo_set_aim_hook(void (*fn)(void));
+int  stereo_aim_samples(const float o[3], const float d[3], int max, float (*px)[2], float *z, float *t, unsigned *depth, float *zn, float *zf);
 void stereo_screen(float *half_w, float *half_h, float *dist);
 /* Where the gun points this frame, in the game's 640x480 (off the screen:
  * below -1000); and whether the game's own sight is drawn. */

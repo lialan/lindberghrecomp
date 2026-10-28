@@ -30,4 +30,9 @@ void xo_draw_screen(const float mvp[16], unsigned tex, int array_layer0, int w, 
 void xo_panel_upload(const unsigned char *rgba, int w, int h);
 void xo_draw_panel(const float mvp[16], int w, int h);
 
+/* What the gun's ray points at: queues a read of the world's depth array at
+ * the n samples' pixels, and returns the distance t of the first sample that
+ * lay behind a surface two frames ago (zn, zf: the view's near and far) (-1 none, -2 no answer yet). */
+float xo_probe(unsigned depth_array, const float (*px)[2], const float *z, const float *t, int n, float zn, float zf);
+
 #endif

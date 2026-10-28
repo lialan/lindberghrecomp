@@ -381,7 +381,11 @@ static struct {
     int test_frames, service_frames, coin;
 } menu;
 static float rates[16];
-static int running_resolution, running_width;   /* the eye size this run was set up with */
+static int running_resolution, running_width;
+/* the gun's ray this frame (game units), what it reached two frames ago */
+static float probe_o[3], probe_d[3], aim_hit_t = -1, aim_reach;
+static int probe_on;
+static void aim_probe(void);   /* the eye size this run was set up with */
 static int nrates;
 
 static void menu_items(XmItem *it)
@@ -536,6 +540,9 @@ static void input_frame(XrTime t)
          * the floor with the trigger held - the arcade's reload */
         double s = (double)t / 1e9;
         float yaw = (float)(0.25 * sin(s * 0.7)), pitch = (float)(0.05 + 0.08 * sin(s * 1.1));
+        static int fixed = -1; static float fyaw, fpitch;   /* LINDBERGH_XR_FAKE_AIM=yaw,pitch (radians): held still */
+        if (fixed < 0) { const char *v = getenv("LINDBERGH_XR_FAKE_AIM"); fixed = v && sscanf(v, "%f,%f", &fyaw, &fpitch) == 2; }
+        if (fixed) { yaw = fyaw; pitch = fpitch; }
         int reload = fmod(s, 6.0) >= 5.0;
         if (reload) pitch = -0.9f;
         float cy = cosf(yaw / 2), sy = sinf(yaw / 2), cp = cosf(pitch / 2), sp = sinf(pitch / 2);
@@ -563,10 +570,19 @@ static void input_frame(XrTime t)
          * point cfg.aim metres along the laser, which the game is aimed
          * through. At the screen's own 5 m a soldier 12 m off was missed by
          * half a metre with the gun at the hip. */
-        float x, y, ah[3] = { 0, 0, 0 }, at = d[2] < -1e-4f ? (-cfg.aim * cfg.scale - o[2]) / d[2] : -1, ax[3];
+        /* Better still, the point the laser actually reaches: the world's
+         * depth along it, read back from the GPU (aim_hit_t). A flat frame -
+         * a scope, a menu - is a picture on the screen: aimed at where the
+         * laser meets it. */
+        float x, y, ah[3] = { 0, 0, 0 }, at, ax[3];
+        int flat = stereo_flat_frame();
+        if (flat) at = d[2] < -1e-4f ? (-cfg.screen * cfg.scale - o[2]) / d[2] : -1;
+        else if (aim_hit_t > 0) at = aim_hit_t;
+        else at = d[2] < -1e-4f ? (-cfg.aim * cfg.scale - o[2]) / d[2] : -1;
         for (int i = 0; i < 3; i++) ax[i] = o[i] + d[i] * at;
+        memcpy(probe_o, o, sizeof probe_o); memcpy(probe_d, d, sizeof probe_d); probe_on = 1;
         if (at > 0 && stereo_ray_to_screen(ah, ax, &x, &y) && x >= 0 && x < 640 && y >= 0 && y < 480) {
-            gx = x; gy = y; aimed = 1;
+            gx = x; gy = y; aimed = 1; aim_reach = at / cfg.scale;
         }
         /* the overlay: the gun on the aim pose, the laser to the game's screen */
         xo.gun_valid = 1;
@@ -577,7 +593,7 @@ static void input_frame(XrTime t)
         qrot(loc.pose.orientation, tip, m);
         for (int i = 0; i < 3; i++) xo.muzzle[i] = p[i] + m[i];
         float reach = 5.0f;
-        if (aimed) reach = (-cfg.aim - p[2]) / d[2];
+        if (aimed) reach = aim_reach;
         for (int i = 0; i < 3; i++) xo.end[i] = p[i] + d[i] * reach;
         xo.beam = cfg.laser == LASER_ON;
         xo.dot = aimed && cfg.laser != LASER_OFF;
@@ -870,6 +886,7 @@ int xr_init(void)
     gl.GenFramebuffers(1, &read_fb);
 
     overlay_ok = xo_init();
+    stereo_set_aim_hook(aim_probe);
     stereo_eye_size((int)w, (int)h);
     stereo_set_screen_distance(cfg.screen * cfg.scale);
     stereo_start();
@@ -999,6 +1016,23 @@ void xr_frame_begin(void)
     }
     if (state == XR_SESSION_STATE_FOCUSED) input_frame(frame.predictedDisplayTime);
     else { host_vr_input(-100000, -100000, 0, 0); xo.gun_valid = xo.beam = xo.dot = xo.flash = 0; }
+}
+
+/* stereo's hook, once the world's depth is drawn: what the gun's ray reaches */
+static void aim_probe(void)
+{
+    if (overlay_ok && probe_on) {
+        float px[48][2], z[48], t[48];
+        unsigned arr = 0;
+        float zn = 0, zf = 0;
+        int n = stereo_aim_samples(probe_o, probe_d, 48, px, z, t, &arr, &zn, &zf);
+        float h = xo_probe(arr, (const float (*)[2])px, z, t, n, zn, zf);
+        if (h != -2) aim_hit_t = h;
+        probe_on = 0;
+        static int log = -1; static unsigned k;
+        if (log < 0) { const char *v = getenv("LINDBERGH_AIM_LOG"); log = v && *v == '1'; }
+        if (log && ++k % 30 == 0) fprintf(stderr, "[aim] %d samples, laser reaches %.2f m\n", n, aim_hit_t / cfg.scale);
+    }
 }
 
 void xr_frame_end(void)

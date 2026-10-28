@@ -292,8 +292,11 @@ static void cabinet_script(void)
         else if (path && *path) fprintf(stderr, "[cab] script %s not found\n", path);
     }
     if (!n) return;
-    g_scripted = 1;
+    int any = 0;
+    for (int i = 0; i < n; i++) any |= g_frame >= ln[i].from && g_frame <= ln[i].to;
+    g_scripted = any;           /* between the script's lines, the real gun */
     g_auto = 0;
+    if (!any) return;
     int w = g_win.w ? g_win.w : DEFAULT_W, h = g_win.h ? g_win.h : DEFAULT_H;
     g_mouse_x = -100000; g_mouse_y = -100000;
     for (int i = 0; i < n; i++) {

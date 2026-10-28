@@ -15,6 +15,7 @@
 #include <dlfcn.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <GLES3/gl3.h>
@@ -46,6 +47,13 @@ static struct {
     F(void, DepthRangef, (GLfloat, GLfloat)) F(void, GetFloatv, (GLenum, GLfloat *)) F(void, Uniform2f, (GLint, GLfloat, GLfloat))
     F(void, TexImage2D, (GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *))
     F(void, GenTextures, (GLsizei, GLuint *)) F(void, TexParameteri, (GLenum, GLenum, GLint))
+    F(void, GenFramebuffers, (GLsizei, GLuint *)) F(void, BindFramebuffer, (GLenum, GLuint))
+    F(void, FramebufferTexture2D, (GLenum, GLenum, GLenum, GLuint, GLint))
+    F(void, ReadPixels, (GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void *))
+    F(void *, MapBufferRange, (GLenum, GLintptr, GLsizeiptr, GLbitfield)) F(GLboolean, UnmapBuffer, (GLenum))
+    F(void, Uniform2iv, (GLint, GLsizei, const GLint *))
+    F(GLsync, FenceSync, (GLenum, GLbitfield)) F(GLenum, ClientWaitSync, (GLsync, GLbitfield, GLuint64))
+    F(void, DeleteSync, (GLsync))
 #undef F
 } gl;
 
@@ -155,6 +163,8 @@ int xo_init(void)
     L(Clear) L(ClearDepthf) L(FrontFace) L(CullFace) L(ActiveTexture) L(BindTexture) L(Uniform1i)
     L(GenSamplers) L(BindSampler) L(SamplerParameteri) L(ClearColor) L(DepthRangef) L(GetFloatv) L(Uniform2f)
     L(TexImage2D) L(GenTextures) L(TexParameteri)
+    L(GenFramebuffers) L(BindFramebuffer) L(FramebufferTexture2D) L(ReadPixels) L(MapBufferRange) L(UnmapBuffer)
+    L(Uniform2iv) L(FenceSync) L(ClientWaitSync) L(DeleteSync)
 #undef L
     prog_gun = program(
         "#version 300 es\nlayout(location=0) in vec3 p; layout(location=1) in vec3 n; layout(location=2) in vec3 c;\n"
@@ -550,3 +560,137 @@ void xo_draw_panel(const float mvp[16], int w, int h)
 }
 
 #endif /* __ANDROID__ */
+
+/* ---- what the laser points at ----
+ * The world's depth at a few pixels along the gun's ray, read back through a
+ * ring of pixel buffers two frames later, so the GPU is never waited on. */
+#define PROBE_MAX 64
+#define PROBE_RING 3
+static GLuint prog_probe, probe_fb, probe_tex, probe_pbo[PROBE_RING], probe_smp;
+static GLint u_probe_px, u_probe_d;
+static struct { int n, pending; GLsync fence; float z[PROBE_MAX], t[PROBE_MAX], zn, zf; } probe_slot[PROBE_RING];
+static unsigned probe_k;
+
+static int probe_init(void)
+{
+    if (prog_probe) return 1;
+    prog_probe = program(
+        "#version 300 es\nlayout(location=0) in vec2 p; void main() { gl_Position = vec4(p, 0.0, 1.0); }\n",
+        "#version 300 es\nprecision highp float; precision highp int; precision highp sampler2DArray;\n"
+        "uniform sampler2DArray d; uniform ivec2 px[64]; uniform int selftest; out vec4 o;\n"
+        "void main() { int i = int(gl_FragCoord.x);\n"
+        "  vec2 sz = vec2(textureSize(d, 0).xy);\n"
+        "  uint v = uint(clamp(texture(d, vec3((vec2(px[i]) + 0.5) / sz, 0.0)).r, 0.0, 1.0) * 16777215.0 + 0.5);\n"
+        "  if (selftest == 1) v = uint(float(i) / 64.0 * 16777215.0);\n"
+        "  if (selftest == 2) v = uint(sz.x);\n"
+        "  o = vec4(float(v & 255u), float((v >> 8) & 255u), float((v >> 16) & 255u), 255.0) / 255.0; }\n",
+        "p", NULL, NULL);
+    u_probe_px = gl.GetUniformLocation(prog_probe, "px");
+    u_probe_d = gl.GetUniformLocation(prog_probe, "d");
+    GLint was = 0;
+    gl.GetIntegerv(GL_TEXTURE_BINDING_2D, &was);
+    gl.GenTextures(1, &probe_tex);
+    gl.BindTexture(GL_TEXTURE_2D, probe_tex);
+    gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, PROBE_MAX, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    gl.BindTexture(GL_TEXTURE_2D, (GLuint)was);
+    GLint fb = 0;
+    gl.GetIntegerv(GL_FRAMEBUFFER_BINDING, &fb);
+    gl.GenFramebuffers(1, &probe_fb);
+    gl.BindFramebuffer(GL_FRAMEBUFFER, probe_fb);
+    gl.FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, probe_tex, 0);
+    gl.BindFramebuffer(GL_FRAMEBUFFER, (GLuint)fb);
+    GLint pb = 0;
+    gl.GetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &pb);
+    gl.GenBuffers(PROBE_RING, probe_pbo);
+    for (int i = 0; i < PROBE_RING; i++) {
+        gl.BindBuffer(GL_PIXEL_PACK_BUFFER, probe_pbo[i]);
+        gl.BufferData(GL_PIXEL_PACK_BUFFER, PROBE_MAX * 4, NULL, GL_STREAM_READ);
+    }
+    gl.BindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)pb);
+    gl.GenSamplers(1, &probe_smp);
+    gl.SamplerParameteri(probe_smp, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    gl.SamplerParameteri(probe_smp, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    gl.SamplerParameteri(probe_smp, GL_TEXTURE_COMPARE_MODE, GL_NONE);
+    return 1;
+}
+
+float xo_probe(unsigned depth_array, const float (*px)[2], const float *z, const float *t, int n, float zn, float zf)
+{
+    if (!prog_screen[0] || !probe_init()) return -1;
+    if (n > PROBE_MAX) n = PROBE_MAX;
+    /* the oldest slot's answer, if it is ready: the first sample behind a surface */
+    float hit = -2;
+    int o = (int)(probe_k % PROBE_RING);
+    if (probe_slot[o].pending) {
+        GLint pb = 0;
+        gl.GetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &pb);
+        gl.ClientWaitSync(probe_slot[o].fence, 0, 0);
+        gl.DeleteSync(probe_slot[o].fence);
+        gl.BindBuffer(GL_PIXEL_PACK_BUFFER, probe_pbo[o]);
+        const unsigned char *b = gl.MapBufferRange(GL_PIXEL_PACK_BUFFER, 0, PROBE_MAX * 4, GL_MAP_READ_BIT);
+        hit = -1;
+        static unsigned dbg;
+        if (b && getenv("LINDBERGH_AIM_LOG") && ++dbg % 60 == 0)
+            for (int i = 0; i < probe_slot[o].n; i += 6)
+                fprintf(stderr, "[aim] t %.2f: ray depth %.6f, scene %.6f\n", probe_slot[o].t[i], probe_slot[o].z[i],
+                        (float)(b[i * 4] | b[i * 4 + 1] << 8 | b[i * 4 + 2] << 16) / 16777215.0f);
+        /* The first sample behind a surface that lies between it and the one
+         * before: something much nearer only hides the ray from the eye (the
+         * eye and the gun see from different places), the ray passes behind */
+        float zn = probe_slot[o].zn, zf = probe_slot[o].zf, prev = 0;
+#define LIN(w) (2.0f * zn * zf / (zf + zn - (2.0f * (w) - 1.0f) * (zf - zn)))
+        for (int i = 0; b && i < probe_slot[o].n; i++) {
+            float dz = (float)(b[i * 4] | b[i * 4 + 1] << 8 | b[i * 4 + 2] << 16) / 16777215.0f;
+            float ray = LIN(probe_slot[o].z[i]), scene = LIN(dz);
+            if (prev > 0 && dz < 1.0f && scene < ray && scene > prev * 0.9f) { hit = probe_slot[o].t[i] * scene / ray; break; }
+            prev = ray;
+        }
+#undef LIN
+        if (b) gl.UnmapBuffer(GL_PIXEL_PACK_BUFFER);
+        gl.BindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)pb);
+        probe_slot[o].pending = 0;
+    }
+    if (n > 0 && depth_array) {
+        Saved s;
+        save(&s);
+        GLint fb = 0, unit = 0, bound = 0, pb = 0;
+        gl.GetIntegerv(GL_FRAMEBUFFER_BINDING, &fb);
+        gl.GetIntegerv(GL_ACTIVE_TEXTURE, &unit);
+        gl.GetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &pb);
+        GLboolean scissor = gl.IsEnabled(GL_SCISSOR_TEST);
+        gl.ActiveTexture(GL_TEXTURE0);
+        gl.GetIntegerv(GL_TEXTURE_BINDING_2D_ARRAY, &bound);
+        GLint ipx[PROBE_MAX * 2];
+        for (int i = 0; i < n; i++) { ipx[i * 2] = (GLint)px[i][0]; ipx[i * 2 + 1] = (GLint)px[i][1]; }
+        gl.BindFramebuffer(GL_FRAMEBUFFER, probe_fb);
+        gl.Disable(GL_SCISSOR_TEST); gl.Disable(GL_DEPTH_TEST); gl.Disable(GL_BLEND); gl.Disable(GL_CULL_FACE);
+        gl.ColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        gl.Viewport(0, 0, n, 1);
+        gl.UseProgram(prog_probe);
+        gl.Uniform2iv(u_probe_px, n, ipx);
+        gl.Uniform1i(u_probe_d, 0);
+        { const char *v = getenv("LINDBERGH_AIM_SELFTEST"); gl.Uniform1i(gl.GetUniformLocation(prog_probe, "selftest"), v ? atoi(v) : 0); }
+        gl.BindTexture(GL_TEXTURE_2D_ARRAY, depth_array);
+        gl.BindSampler(0, probe_smp);
+        gl.BindVertexArray(vao_screen);
+        gl.DrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        int w = (int)(probe_k % PROBE_RING);
+        gl.BindBuffer(GL_PIXEL_PACK_BUFFER, probe_pbo[w]);
+        gl.ReadPixels(0, 0, n, 1, GL_RGBA, GL_UNSIGNED_BYTE, 0);
+        probe_slot[w].fence = gl.FenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        probe_slot[w].n = n;
+        probe_slot[w].zn = zn; probe_slot[w].zf = zf;
+        memcpy(probe_slot[w].z, z, sizeof(float) * n);
+        memcpy(probe_slot[w].t, t, sizeof(float) * n);
+        probe_slot[w].pending = 1;
+        gl.BindSampler(0, 0);
+        gl.BindTexture(GL_TEXTURE_2D_ARRAY, (GLuint)bound);
+        gl.BindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)pb);
+        gl.ActiveTexture((GLenum)unit);
+        gl.BindFramebuffer(GL_FRAMEBUFFER, (GLuint)fb);
+        if (scissor) gl.Enable(GL_SCISSOR_TEST);
+        restore(&s);
+    }
+    probe_k++;
+    return hit;
+}
