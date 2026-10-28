@@ -1466,6 +1466,9 @@ void arb_env(GLenum target, GLuint index, const float *v)
 {
     int st = stage_of(target);
     if (st < 0 || index >= MAX_ENV) return;
+    /* about half of the game's sets repeat the value already there, and a
+     * change means the whole array goes to the driver again at the next draw */
+    if (!memcmp(g_env[st][index], v, 16)) return;
     memcpy(g_env[st][index], v, 16);
     g_env_gen[st]++;
 }
@@ -1475,7 +1478,7 @@ void arb_local(GLenum target, GLuint index, const float *v)
     int st = stage_of(target);
     if (st < 0 || index >= MAX_LOCAL) return;
     ArbProg *p = prog_get(st, g_bound[st], 1);
-    if (!p) return;
+    if (!p || !memcmp(p->local[index], v, 16)) return;
     memcpy(p->local[index], v, 16);
     p->local_gen++;
 }

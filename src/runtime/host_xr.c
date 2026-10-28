@@ -156,6 +156,7 @@ static GLuint read_fb;
 static int64_t color_format;
 
 static PFN_xrRequestDisplayRefreshRateFB request_rate;
+static PFN_xrPerfSettingsSetPerformanceLevelEXT set_perf_level;
 static PFN_xrEnumerateDisplayRefreshRatesFB enumerate_rates;
 
 #define XRCHECK(call) do { XrResult r_ = (call); if (XR_FAILED(r_)) { \
@@ -436,11 +437,14 @@ int xr_init(void)
     XrExtensionProperties *props = calloc(n ? n : 1, sizeof *props);
     for (uint32_t i = 0; i < n; i++) props[i].type = XR_TYPE_EXTENSION_PROPERTIES;
     xrEnumerateInstanceExtensionProperties(NULL, n, &n, props);
-    int have_rate = 0;
-    for (uint32_t i = 0; i < n; i++)
+    int have_rate = 0, have_perf = 0;
+    for (uint32_t i = 0; i < n; i++) {
         if (!strcmp(props[i].extensionName, XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME)) have_rate = 1;
+        if (!strcmp(props[i].extensionName, XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME)) have_perf = 1;
+    }
     free(props);
     if (have_rate) ext[next++] = XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME;
+    if (have_perf) ext[next++] = XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME;
 
     XrInstanceCreateInfoAndroidKHR ai = { XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR };
     ai.applicationVM = vm; ai.applicationActivity = activity;
@@ -456,6 +460,8 @@ int xr_init(void)
         xrGetInstanceProcAddr(instance, "xrRequestDisplayRefreshRateFB", (PFN_xrVoidFunction *)&request_rate);
         xrGetInstanceProcAddr(instance, "xrEnumerateDisplayRefreshRatesFB", (PFN_xrVoidFunction *)&enumerate_rates);
     }
+    if (have_perf)
+        xrGetInstanceProcAddr(instance, "xrPerfSettingsSetPerformanceLevelEXT", (PFN_xrVoidFunction *)&set_perf_level);
 
     XrSystemGetInfo sgi = { XR_TYPE_SYSTEM_GET_INFO };
     sgi.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
@@ -478,6 +484,14 @@ int xr_init(void)
     XrSessionCreateInfo sc = { XR_TYPE_SESSION_CREATE_INFO };
     sc.next = &gb; sc.systemId = sys;
     XRCHECK(xrCreateSession(instance, &sc, &session));
+    /* The game runs on one CPU thread and every GL call is translated on it:
+     * it is the CPU that limits the frame rate, not the GPU. Ask for the
+     * CPU's sustained high clocks rather than the headset's power-saving
+     * default. */
+    if (set_perf_level) {
+        XrResult r = set_perf_level(session, XR_PERF_SETTINGS_DOMAIN_CPU_EXT, XR_PERF_SETTINGS_LEVEL_SUSTAINED_HIGH_EXT);
+        fprintf(stderr, "[xr] CPU at sustained high clocks: %s\n", XR_SUCCEEDED(r) ? "yes" : "refused");
+    }
 
     XrReferenceSpaceCreateInfo rc = { XR_TYPE_REFERENCE_SPACE_CREATE_INFO };
     rc.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
