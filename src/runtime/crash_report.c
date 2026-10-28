@@ -394,6 +394,7 @@ static pthread_t g_main_thread;
 #ifndef _WIN32
 unsigned guest_threads(pthread_t *out, unsigned max);
 #endif
+void guest_mutex_report(void);
 static void on_watchdog_signal(int sig, siginfo_t *si, void *uc)
 {
     (void)sig; (void)si;
@@ -401,6 +402,9 @@ static void on_watchdog_signal(int sig, siginfo_t *si, void *uc)
     snprintf(why, sizeof why, "watchdog: no frame presented - %s thread %#lx is here",
              pthread_equal(pthread_self(), g_main_thread) ? "main" : "guest", (unsigned long)pthread_self());
     guest_report_state(why);
+#ifndef _WIN32
+    guest_mutex_report();
+#endif
     host_report_pc(uc);
 #ifdef __ANDROID__
     int n = 0;      /* offsets in the unstripped libmain.so (build-quest) name them */

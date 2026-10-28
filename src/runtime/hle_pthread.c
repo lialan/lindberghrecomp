@@ -432,22 +432,92 @@ static void dtor_cond(void *p)  { pthread_cond_destroy((pthread_cond_t *)p); }
 #define MUTEX(n) ((pthread_mutex_t *)obj_get(A32(n), sizeof(pthread_mutex_t), ctor_mutex))
 #define COND(n)  ((pthread_cond_t *)obj_get(A32(n), sizeof(pthread_cond_t), ctor_cond))
 
+/* Who holds each guest mutex, and what each thread waits for: the hang
+ * watchdog prints them (guest_mutex_report), so a deadlock names its holder.
+ * The game's sound library sometimes stalls start-up this way. */
+#define MOWN 256
+static struct { volatile uint32_t va; volatile unsigned long tid; volatile int depth; } g_mown[MOWN];
+static __thread uint32_t t_waiting;
+static int mown_slot(uint32_t va)
+{
+    unsigned h = (va >> 2) * 2654435761u % MOWN;
+    for (unsigned i = 0; i < MOWN; i++, h = (h + 1) % MOWN) {
+        if (g_mown[h].va == va) return (int)h;
+        if (!g_mown[h].va && __sync_bool_compare_and_swap(&g_mown[h].va, 0, va)) return (int)h;
+    }
+    return -1;
+}
 static void h_mutex_init(CPU *c)    { (void)MUTEX(0); RET(0); }
-static void h_mutex_lock(CPU *c)    { RET(pthread_mutex_lock(MUTEX(0))); }
-static void h_mutex_unlock(CPU *c)  { RET(pthread_mutex_unlock(MUTEX(0))); }
-static void h_mutex_trylock(CPU *c) { RET(pthread_mutex_trylock(MUTEX(0)) ? 16 : 0); }
+static void h_mutex_lock(CPU *c)
+{
+    uint32_t va = A32(0);
+    pthread_mutex_t *m = MUTEX(0);
+    t_waiting = va;
+    int r = pthread_mutex_lock(m);
+    t_waiting = 0;
+    int k = mown_slot(va);
+    if (!r && k >= 0) { g_mown[k].tid = (unsigned long)pthread_self(); g_mown[k].depth++; }
+    RET(r);
+}
+static void h_mutex_unlock(CPU *c)
+{
+    int k = mown_slot(A32(0));
+    if (k >= 0 && g_mown[k].depth > 0 && --g_mown[k].depth == 0) g_mown[k].tid = 0;
+    RET(pthread_mutex_unlock(MUTEX(0)));
+}
+static void h_mutex_trylock(CPU *c)
+{
+    int r = pthread_mutex_trylock(MUTEX(0));
+    int k = r ? -1 : mown_slot(A32(0));
+    if (k >= 0) { g_mown[k].tid = (unsigned long)pthread_self(); g_mown[k].depth++; }
+    RET(r ? 16 : 0);
+}
+
+void guest_mutex_report(void)
+{
+    if (t_waiting) {
+        int k = mown_slot(t_waiting);
+        fprintf(stderr, "waiting for guest mutex %#x, held by thread %#lx (depth %d)\n", t_waiting,
+                k >= 0 ? g_mown[k].tid : 0, k >= 0 ? g_mown[k].depth : 0);
+    }
+    for (int i = 0; i < MOWN; i++)
+        if (g_mown[i].va && g_mown[i].depth > 0 && g_mown[i].tid == (unsigned long)pthread_self())
+            fprintf(stderr, "holding guest mutex %#x (depth %d)\n", g_mown[i].va, g_mown[i].depth);
+}
 static void h_mutex_destroy(CPU *c) { obj_drop(A32(0), dtor_mutex); RET(0); }
 
 static void h_cond_init(CPU *c)      { (void)COND(0); RET(0); }
 static void h_cond_signal(CPU *c)    { pthread_cond_signal(COND(0)); RET(0); }
 static void h_cond_broadcast(CPU *c) { pthread_cond_broadcast(COND(0)); RET(0); }
-static void h_cond_wait(CPU *c)      { pthread_cond_wait(COND(0), MUTEX(1)); RET(0); }
+/* waiting on a condition lets its mutex go meanwhile: so does the record */
+static int cond_release(uint32_t va, int *depth)
+{
+    int k = mown_slot(va);
+    *depth = k >= 0 ? g_mown[k].depth : 0;
+    if (k >= 0) { g_mown[k].depth = 0; g_mown[k].tid = 0; }
+    return k;
+}
+static void cond_reacquire(int k, int depth)
+{
+    if (k >= 0) { g_mown[k].tid = (unsigned long)pthread_self(); g_mown[k].depth = depth; }
+}
+static void h_cond_wait(CPU *c)
+{
+    int d, k = cond_release(A32(1), &d);
+    pthread_cond_wait(COND(0), MUTEX(1));
+    cond_reacquire(k, d);
+    RET(0);
+}
 static void h_cond_timedwait(CPU *c)
 {
     uint32_t ts = A32(2);
-    if (!ts) { pthread_cond_wait(COND(0), MUTEX(1)); RET(0); return; }
-    struct timespec t = { (time_t)(int32_t)rd32(ts), (long)(int32_t)rd32(ts + 4) };
-    int r = pthread_cond_timedwait(COND(0), MUTEX(1), &t);
+    int d, k = cond_release(A32(1), &d), r = 0;
+    if (!ts) pthread_cond_wait(COND(0), MUTEX(1));
+    else {
+        struct timespec t = { (time_t)(int32_t)rd32(ts), (long)(int32_t)rd32(ts + 4) };
+        r = pthread_cond_timedwait(COND(0), MUTEX(1), &t);
+    }
+    cond_reacquire(k, d);
     RET(r == ETIMEDOUT ? 110u : 0u);                    /* Linux ETIMEDOUT */
 }
 static void h_cond_destroy(CPU *c) { obj_drop(A32(0), dtor_cond); RET(0); }

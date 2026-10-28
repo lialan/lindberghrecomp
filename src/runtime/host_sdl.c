@@ -581,7 +581,7 @@ static void maybe_screenshot(void)
     int at = env_int("LINDBERGH_SHOT_FRAME", 600);
     char name[512];
     if (every > 0) {
-        if (g_frame == 0 || g_frame % (unsigned)every) return;
+        if (g_frame == 0 || g_frame % (unsigned)every || g_frame < (unsigned)env_int("LINDBERGH_SHOT_FROM", 0)) return;
         snprintf(name, sizeof name, "%s.%05u.ppm", path, g_frame);
     } else {
         if (g_frame != (unsigned)at) return;

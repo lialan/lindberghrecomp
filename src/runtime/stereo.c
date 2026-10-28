@@ -1385,6 +1385,14 @@ static void dump_targets(void)
 #ifdef LINDBERGH_GL4ES
         if (px && g_mv) ok = gl4es_multiview_read(g_eye_tex[0], GL_TEXTURE_RECTANGLE_ARB, layer, px);
 #endif
+        if (px && !g_mv && !ok) {       /* the eyes drawn one at a time: read the first eye's framebuffer */
+            GLint was = 0;
+            glGetIntegerv(GL_FRAMEBUFFER_BINDING, &was);
+            glBindFramebuffer(GL_FRAMEBUFFER, g_eye_fbo[0]);
+            glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+            glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)was);
+            ok = 1;
+        }
         if (ok && (es > 1 || en > 10)) {   /* many frames: a quarter the size */
             int qw = w / 4, qh = h / 4;
             for (int y = 0; y < qh; y++)
@@ -1552,7 +1560,9 @@ void stereo_frame_begin(void)
     {
         static int flat_env = -1;
         if (flat_env < 0) { const char *v = getenv("LINDBERGH_FLAT_MENUS"); flat_env = !v || *v != '0'; }
-        g_flat = flat_env && menu_state();
+        static int flat_all = -1;       /* LINDBERGH_FLAT_ALL=1: everything flat, the arcade's picture - for comparing */
+        if (flat_all < 0) { const char *v = getenv("LINDBERGH_FLAT_ALL"); flat_all = v && *v == '1'; }
+        g_flat = flat_all || (flat_env && menu_state());
     }
     g_hud_fb = g_hud_fb_next;           /* 3D drawn there this frame is screen content */
     g_world_fb = g_world_fb_next;
