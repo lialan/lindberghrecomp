@@ -46,6 +46,7 @@ static void h_alcOpenDevice(CPU *c)
     fprintf(stderr, "[al] alcOpenDevice(%s) -> default device\n", A32(0) ? ASTR(0) : "NULL");
     ALCdevice *d = alcOpenDevice(NULL);
     if (!d) { fprintf(stderr, "[al] no audio device\n"); RET(0); return; }
+    fprintf(stderr, "[al] device \"%s\"\n", alcGetString(d, ALC_DEVICE_SPECIFIER));
     for (unsigned i = 0; i < 4; i++)
         if (!g_dev[i]) { g_dev[i] = d; RET(TOK_DEV | i); return; }
     RET(0);
@@ -60,6 +61,7 @@ static void h_alcCreateContext(CPU *c)
 {
     ALCdevice *d = dev_of(A32(0));
     ALCcontext *x = d ? alcCreateContext(d, (const ALCint *)APTR(1)) : NULL;
+    fprintf(stderr, "[al] context %s (error %#x)\n", x ? "made" : "NOT made", d ? alcGetError(d) : 0);
     if (!x) { RET(0); return; }
     for (unsigned i = 0; i < 8; i++)
         if (!g_ctx[i]) { g_ctx[i] = x; RET(TOK_CTX | i); return; }

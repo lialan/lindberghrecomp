@@ -1078,6 +1078,14 @@ static void glprof_report(void)
         g_glprof_ns[best] = -g_glprof_ns[best];
     }
     fputc('\n', stderr);
+#ifdef LINDBERGH_GL4ES
+    {   /* inside gl4es' draws */
+        extern double gl4es_drawprof[4];
+        fprintf(stderr, "[glprof]   in gl4es' draws, ms per frame: textures %.2f, program and uniforms %.2f, the driver's draw %.2f\n",
+                gl4es_drawprof[0] / frames / 1e6, gl4es_drawprof[1] / frames / 1e6, gl4es_drawprof[2] / frames / 1e6);
+        memset(gl4es_drawprof, 0, 4 * sizeof(double));
+    }
+#endif
     memset(g_glprof_ns, 0, sizeof g_glprof_ns);
     memset(g_glprof_n, 0, sizeof g_glprof_n);
     g_glprof_f0 = g_frame;
@@ -1085,7 +1093,13 @@ static void glprof_report(void)
 
 int stereo_glprof_on(void)
 {
-    if (g_glprof < 0) { const char *v = getenv("LINDBERGH_GLPROF"); g_glprof = v && *v && *v != '0'; }
+    if (g_glprof < 0) {
+        const char *v = getenv("LINDBERGH_GLPROF"); g_glprof = v && *v && *v != '0';
+#ifdef LINDBERGH_GL4ES
+        extern int gl4es_drawprof_on;
+        gl4es_drawprof_on = g_glprof;
+#endif
+    }
     return g_glprof;
 }
 
