@@ -99,7 +99,8 @@ static float    g_zoom_lens = 4.0f;     /* a longer one is a zoomed view (the ga
 static int      g_menu;                 /* a menu: its 3D belongs on the screen too */
 static int      g_tex2d_on;             /* GL_TEXTURE_2D enabled on unit 0 (frame map) */
 static unsigned g_menu_frames;          /* frames in a row that looked like a menu */
-static unsigned g_menu_draws = 120;     /* fewer world draws than this looks like a menu */
+static unsigned g_menu_draws = 120;
+static unsigned g_zoom_draws, g_hudfb_draws;   /* this frame's 3D sent to the screen, for LINDBERGH_MODE_LOG */     /* fewer world draws than this looks like a menu */
 
 /* ---- the recording ---- */
 enum { OP_CALL, OP_UNMAP, OP_PTR };
@@ -628,6 +629,7 @@ static int transform_call(CPU *c, HleId id, const char *n)
          * magnified view the eye's own frustum would undo: it goes on the
          * screen too, framed by the scope the game draws there. */
         int zoom = persp && g_proj[g_proj_top][0] > g_zoom_lens;
+        if (persp && !g_replaying) { if (zoom) g_zoom_draws++; if (g_game_fb == g_hud_fb) g_hudfb_draws++; }
         int hud = persp ? g_game_fb == g_hud_fb || g_menu || zoom
                         : !g_unit0_rect || !covers_viewport(c, n);
         if (hud && !is_perspective(g_proj[g_proj_top]) && !g_replaying) g_hud_fb_next = g_game_fb;
@@ -1305,6 +1307,16 @@ void stereo_frame_begin(void)
     else if (++g_menu_frames >= 30 && !g_menu) g_menu = 1;
     if (getenv("LINDBERGH_SCENE_STATS") && g_frame % 50 == 0)
         fprintf(stderr, "[stereo] frame %u: %u world draws%s, lens %.2f\n", g_frame, g_scene_draws, g_menu ? " (menu)" : "", g_lens_seen);
+    static int mode_log = -1, last_sig = -1;
+    if (mode_log < 0) { const char *v = getenv("LINDBERGH_MODE_LOG"); mode_log = v && *v && *v != '0'; }
+    if (mode_log) {
+        int sig = g_menu | (g_zoom_draws ? 2 : 0) | (g_hudfb_draws ? 4 : 0);
+        if (sig != last_sig)
+            fprintf(stderr, "[mode] frame %u: menu %d, zoom draws %u, 3D into HUD target %u, world draws %u, lens %.2f\n",
+                    g_frame, g_menu, g_zoom_draws, g_hudfb_draws, g_scene_draws, g_lens_seen);
+        last_sig = sig;
+    }
+    g_zoom_draws = g_hudfb_draws = 0;
     g_lens_seen = 0;
     g_scene_draws = 0;
     g_hud_fb = g_hud_fb_next;           /* 3D drawn there this frame is screen content */

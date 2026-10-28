@@ -390,10 +390,16 @@ static _Unwind_Reason_Code unwind_one(struct _Unwind_Context *c, void *arg)
 #endif
 static pthread_t g_main_thread;
 
+#ifndef _WIN32
+unsigned guest_threads(pthread_t *out, unsigned max);
+#endif
 static void on_watchdog_signal(int sig, siginfo_t *si, void *uc)
 {
     (void)sig; (void)si;
-    guest_report_state("watchdog: no frame presented - main thread is here");
+    char why[96];
+    snprintf(why, sizeof why, "watchdog: no frame presented - %s thread %#lx is here",
+             pthread_equal(pthread_self(), g_main_thread) ? "main" : "guest", (unsigned long)pthread_self());
+    guest_report_state(why);
     host_report_pc(uc);
 #ifdef __ANDROID__
     int n = 0;      /* offsets in the unstripped libmain.so (build-quest) name them */
@@ -413,6 +419,12 @@ static void *watchdog(void *arg)
             told = 1;
             fprintf(stderr, "\n[watchdog] frame %u has not advanced for %u s\n", f, still);
             pthread_kill(g_main_thread, WATCHDOG_SIG);
+#ifndef _WIN32
+            /* and every other guest thread: a stall is often one waiting on another */
+            pthread_t th[64];
+            unsigned n = guest_threads(th, 64);
+            for (unsigned i = 0; i < n; i++) { sleep(1); pthread_kill(th[i], WATCHDOG_SIG); }
+#endif
         }
     }
     return NULL;

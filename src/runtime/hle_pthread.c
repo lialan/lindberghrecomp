@@ -501,9 +501,24 @@ typedef struct {
  * recursion costs host stack; give it room. */
 #define HOST_THREAD_STACK (64u << 20)
 
+/* Every guest thread's host handle, for the hang watchdog to ask each where it is. */
+static pthread_t g_threads[64];
+static unsigned g_nthreads;
+unsigned guest_threads(pthread_t *out, unsigned max)
+{
+    unsigned n = __atomic_load_n(&g_nthreads, __ATOMIC_ACQUIRE);
+    if (n > max) n = max;
+    memcpy(out, g_threads, n * sizeof *out);
+    return n;
+}
+
 static void *thread_trampoline(void *p)
 {
     GuestThread *t = (GuestThread *)p;
+    {
+        unsigned i = __atomic_fetch_add(&g_nthreads, 1, __ATOMIC_ACQ_REL);
+        if (i < 64) g_threads[i] = pthread_self(); else g_nthreads = 64;
+    }
     CPU cpu;
     memset(&cpu, 0, sizeof cpu);
     guest_set_current_cpu(&cpu);
