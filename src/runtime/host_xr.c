@@ -462,6 +462,9 @@ static int poll_events(void)
         if (ev.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
             state = ((XrEventDataSessionStateChanged *)&ev)->state;
             fprintf(stderr, "[xr] session state %d\n", (int)state);
+            /* the headset put on, or the game back in front: anchor the game
+             * camera on the head where it is now */
+            if (state == XR_SESSION_STATE_FOCUSED) anchor_pending = 1;
             if (state == XR_SESSION_STATE_READY && !running) {
                 XrSessionBeginInfo bi = { XR_TYPE_SESSION_BEGIN_INFO };
                 bi.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
