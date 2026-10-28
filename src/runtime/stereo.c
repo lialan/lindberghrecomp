@@ -28,6 +28,9 @@
  * lists that frame's GL calls with their first arguments.
  * LINDBERGH_MENU_DRAWS=<n> (120): a frame with fewer world draws looks like a
  * menu; LINDBERGH_SCENE_STATS=1 reports the count every 50 frames.
+ * LINDBERGH_ZOOM_LENS=<x> (4): 3D drawn with a longer lens (projection x
+ * scale; the game's usual is 1.7-2.4, its sniper scope 11.4) is a magnified
+ * view, put on the screen like the HUD.
  */
 
 #include <dlfcn.h>
@@ -91,6 +94,8 @@ static GLint    g_scissor[4];           /* the game's scissor box, in eye pixels
 static int      g_clipped;              /* a screen draw is clipped to the screen: undo after it */
 static GLint    g_eye_vp[4];            /* the viewport GL has, in eye pixels */
 static unsigned g_scene_draws;          /* 3D draws in the world this frame */
+static float    g_lens_seen;            /* the longest lens (projection x scale) drawn with this frame */
+static float    g_zoom_lens = 4.0f;     /* a longer one is a zoomed view (the game's own is 1.7-2.4) */
 static int      g_menu;                 /* a menu: its 3D belongs on the screen too */
 static int      g_tex2d_on;             /* GL_TEXTURE_2D enabled on unit 0 (frame map) */
 static unsigned g_menu_frames;          /* frames in a row that looked like a menu */
@@ -618,7 +623,12 @@ static int transform_call(CPU *c, HleId id, const char *n)
          * a render target, and 3D drawn into the HUD's target. */
         int persp = is_perspective(g_proj[g_proj_top]);
         if (persp && g_game_fb != g_hud_fb && !g_replaying) g_scene_draws++;
-        int hud = persp ? g_game_fb == g_hud_fb || g_menu
+        if (persp && g_proj[g_proj_top][0] > g_lens_seen) g_lens_seen = g_proj[g_proj_top][0];
+        /* A long lens - the sniper scope, a cutscene's close-up - is a
+         * magnified view the eye's own frustum would undo: it goes on the
+         * screen too, framed by the scope the game draws there. */
+        int zoom = persp && g_proj[g_proj_top][0] > g_zoom_lens;
+        int hud = persp ? g_game_fb == g_hud_fb || g_menu || zoom
                         : !g_unit0_rect || !covers_viewport(c, n);
         if (hud && !is_perspective(g_proj[g_proj_top]) && !g_replaying) g_hud_fb_next = g_game_fb;
         if (hud && !persp && letterbox_bar(c, n)) return 1;
@@ -1271,7 +1281,8 @@ void stereo_frame_begin(void)
     if (g_scene_draws >= g_menu_draws) g_menu_frames = 0, g_menu = 0;
     else if (++g_menu_frames >= 30 && !g_menu) g_menu = 1;
     if (getenv("LINDBERGH_SCENE_STATS") && g_frame % 50 == 0)
-        fprintf(stderr, "[stereo] frame %u: %u world draws%s\n", g_frame, g_scene_draws, g_menu ? " (menu)" : "");
+        fprintf(stderr, "[stereo] frame %u: %u world draws%s, lens %.2f\n", g_frame, g_scene_draws, g_menu ? " (menu)" : "", g_lens_seen);
+    g_lens_seen = 0;
     g_scene_draws = 0;
     g_hud_fb = g_hud_fb_next;           /* 3D drawn there this frame is screen content */
     g_hud_fb_next = ~0u;
@@ -1425,6 +1436,8 @@ void stereo_init(void)
     for (int i = 0; i < 32; i++) mat_identity(g_proj[i]);
     v = getenv("LINDBERGH_MENU_DRAWS");
     if (v && *v) g_menu_draws = (unsigned)atoi(v);
+    v = getenv("LINDBERGH_ZOOM_LENS");
+    if (v && *v) g_zoom_lens = (float)atof(v);
     v = getenv("LINDBERGH_STEREO");
     if (!v || !*v || *v == '0') { stereo_eye_size(GAME_W, GAME_H); return; }
     stereo_start();
