@@ -24,7 +24,8 @@
  *   resolution 1440     the longer side of each eye's image, in pixels
  *   refresh 90          display rate to ask for (72, 80, 90, 120)
  *   hand right          the gun hand (a trigger on the other hand moves it)
- *   laser laser         aim aid: laser (beam and dot), dot, or off
+ *   laser laser         aim aid: laser (beam and dot), dot, or off; holding
+ *                       the off hand's upper button for a second cycles it
  *   coins auto          auto: a coin with every Start, so no coin button is
  *                       needed; manual: only the left menu button
  *
@@ -410,9 +411,13 @@ static void input_frame(XrTime t)
     if (firing && (phase < last_phase)) rumble(g, 0.7f, 35);
     last_phase = phase;
 
-    /* the other hand's upper button: laser, dot, off */
+    /* the other hand's upper button, held for a second: laser, dot, off (a
+     * held press, so a stray tap can't hide the aim) */
     int off = 1 - g;
-    if (btn_b[off] && !prev[off][3]) {
+    static XrTime laser_held;
+    if (btn_b[off] && !prev[off][3]) laser_held = t;
+    if (btn_b[off] && laser_held && t - laser_held >= 1000000000) {
+        laser_held = 0;
         cfg.laser = (cfg.laser + 1) % 3;
         cfg_save();
         rumble(off, 0.3f, 20);
