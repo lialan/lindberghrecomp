@@ -488,12 +488,12 @@ static int poll_events(void)
                 running = 0;
             } else if (state == XR_SESSION_STATE_EXITING || state == XR_SESSION_STATE_LOSS_PENDING) {
                 fprintf(stderr, "[xr] session over - exiting\n");
-                exit(0);
+                host_quit();
             }
         } else if (ev.type == XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING) {
             anchor_pending = 1;         /* recentred: the game camera follows */
         } else if (ev.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) {
-            exit(0);
+            host_quit();
         }
         ev = (XrEventDataBuffer){ XR_TYPE_EVENT_DATA_BUFFER };
     }

@@ -407,7 +407,7 @@ static void pump(void)
         switch (e.type) {
         case SDL_QUIT:
             fprintf(stderr, "[window] closed by the user\n");
-            exit(0);
+            host_quit();
         case SDL_WINDOWEVENT:
             if (e.window.event == SDL_WINDOWEVENT_FOCUS_GAINED) fprintf(stderr, "[window] focus gained\n");
             if (e.window.event == SDL_WINDOWEVENT_FOCUS_LOST)   fprintf(stderr, "[window] focus lost\n");

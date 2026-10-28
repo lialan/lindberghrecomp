@@ -20,6 +20,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <unistd.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -482,4 +483,20 @@ void lindbergh_todo(uint32_t va, const char *text)
     fprintf(stderr, "\n[recomp] unimplemented instruction at %#010x: %s\n", va, text);
     guest_report_state("unimplemented instruction");
     exit(44);
+}
+
+/* Ending the game at the platform's request. On Android exit() runs the
+ * libraries' teardown - OpenAL's among them - while the game's sound thread
+ * is still calling into it, which aborted on a destroyed mutex; the nvram is
+ * written as the game writes it, so there is nothing left to save: end the
+ * process at once. */
+void host_quit(void)
+{
+#ifdef __ANDROID__
+    fprintf(stderr, "[exit] quitting\n");
+    fflush(NULL);
+    _exit(0);
+#else
+    exit(0);
+#endif
 }
