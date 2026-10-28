@@ -717,9 +717,17 @@ static void trace_draw(const char *n)
         const unsigned char *b = (const unsigned char *)GP(col->ptr);
         const float *t = tc->on && tc->ptr ? (const float *)GP(tc->ptr) : NULL;
         int ts = tc->stride ? tc->stride / 4 : 2;
-        fprintf(stderr, "[px]   colours %02x%02x%02x%02x %02x%02x%02x%02x  uv %g,%g %g,%g\n",
+        GLint active = 0, env = 0, bound = 0, w = 0;
+        glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+        glActiveTexture(GL_TEXTURE0);
+        int on_rect = glIsEnabled(GL_TEXTURE_RECTANGLE_ARB), on_2d = glIsEnabled(GL_TEXTURE_2D);
+        glGetTexEnviv(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, &env);
+        glGetIntegerv(GL_TEXTURE_BINDING_RECTANGLE_ARB, &bound);
+        glGetTexLevelParameteriv(GL_TEXTURE_RECTANGLE_ARB, 0, GL_TEXTURE_WIDTH, &w);
+        glActiveTexture((GLenum)active);
+        fprintf(stderr, "[px]   colours %02x%02x%02x%02x %02x%02x%02x%02x  uv %g,%g %g,%g  unit0: rect %d 2d %d env %#x bound %d w %d\n",
                 b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-                t ? t[0] : -1, t ? t[1] : -1, t ? t[2 * ts] : -1, t ? t[2 * ts + 1] : -1);
+                t ? t[0] : -1, t ? t[1] : -1, t ? t[2 * ts] : -1, t ? t[2 * ts + 1] : -1, on_rect, on_2d, env, bound, w);
     }
 }
 
