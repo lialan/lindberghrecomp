@@ -74,6 +74,7 @@ static struct {
     void (*RenderbufferStorage)(GLenum, GLenum, GLsizei, GLsizei);
     void (*FramebufferRenderbuffer)(GLenum, GLenum, GLenum, GLuint);
     void (*FramebufferTextureLayer)(GLenum, GLenum, GLuint, GLint, GLint);
+    void (*ReadPixels)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void *);
 } gl;
 
 static int gl_load(void)
@@ -85,7 +86,7 @@ static int gl_load(void)
     L(BindFramebuffer) L(GenFramebuffers) L(FramebufferTexture2D) L(CheckFramebufferStatus)
     L(BlitFramebuffer) L(GetIntegerv) L(IsEnabled) L(Enable) L(Disable) L(GetString)
     L(GenRenderbuffers) L(BindRenderbuffer) L(RenderbufferStorage) L(FramebufferRenderbuffer)
-    L(FramebufferTextureLayer)
+    L(FramebufferTextureLayer) L(ReadPixels)
 #undef L
     return 1;
 }
@@ -155,6 +156,61 @@ static struct Eye {
 static XoFrame xo;                     /* the gun and laser for this frame */
 static int overlay_ok;
 static GLuint read_fb;
+
+/* LINDBERGH_FLASH_LOG=1: each eye's finished image sampled at 8x8 points every
+ * frame, to find flashes - a frame unlike the ones either side of it, while
+ * those two agree - and frames where the two eyes disagree far more than
+ * usual. Diagnostic only: the read back waits on the GPU. */
+#define FL_N (8 * 8 * 4)
+static int fl_on = -1;
+static GLuint fl_fb, fl_rb;
+static unsigned char fl_img[3][2][FL_N];   /* frames f-2, f-1, f; per eye */
+static unsigned fl_count, fl_flashes, fl_split;
+extern unsigned g_frame;
+static unsigned fl_diff(const unsigned char *a, const unsigned char *b)
+{
+    unsigned d = 0;
+    for (int k = 0; k < FL_N; k++) if ((k & 3) != 3) d += (unsigned)abs((int)a[k] - (int)b[k]);
+    return d / (FL_N / 4 * 3);              /* mean per channel, 0..255 */
+}
+static void fl_sample(int eye_i, GLint w, GLint h)
+{
+    if (!fl_fb) {
+        gl.GenRenderbuffers(1, &fl_rb);
+        gl.BindRenderbuffer(GL_RENDERBUFFER, fl_rb);
+        gl.RenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 8, 8);
+        gl.GenFramebuffers(1, &fl_fb);
+        gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, fl_fb);
+        gl.FramebufferRenderbuffer(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, fl_rb);
+    }
+    gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, fl_fb);
+    gl.BlitFramebuffer(0, 0, w, h, 0, 0, 8, 8, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    gl.BindFramebuffer(GL_READ_FRAMEBUFFER, fl_fb);
+    gl.ReadPixels(0, 0, 8, 8, GL_RGBA, GL_UNSIGNED_BYTE, fl_img[2][eye_i]);
+    gl.BindFramebuffer(GL_READ_FRAMEBUFFER, read_fb);
+}
+static void fl_frame(void)
+{
+    if (++fl_count >= 3) {
+        for (int i = 0; i < 2; i++) {
+            unsigned in = fl_diff(fl_img[0][i], fl_img[1][i]), out = fl_diff(fl_img[1][i], fl_img[2][i]);
+            unsigned across = fl_diff(fl_img[0][i], fl_img[2][i]);
+            if (in >= 24 && out >= 24 && across * 3 < (in < out ? in : out)) {
+                fl_flashes++;
+                unsigned m[2][3] = { { 0 } };
+                for (int k = 0; k < FL_N; k++) if ((k & 3) != 3) { m[0][k & 3] += fl_img[1][i][k]; m[1][k & 3] += fl_img[0][i][k]; }
+                fprintf(stderr, "[flash] frame %u, %s eye: one frame unlike its neighbours (%u in, %u out, %u across); "
+                        "mean rgb %u %u %u, before %u %u %u\n", g_frame - 1, i ? "right" : "left", in, out, across,
+                        m[0][0] / 64, m[0][1] / 64, m[0][2] / 64, m[1][0] / 64, m[1][1] / 64, m[1][2] / 64);
+            }
+        }
+        unsigned lr = fl_diff(fl_img[2][0], fl_img[2][1]);
+        if (lr >= 40) { fl_split++; if (fl_split < 200) fprintf(stderr, "[flash] frame %u: eyes differ by %u\n", g_frame, lr); }
+        if (g_frame % 1800 == 0) fprintf(stderr, "[flash] frame %u: %u flashes, %u split frames so far\n", g_frame, fl_flashes, fl_split);
+    }
+    memcpy(fl_img[0], fl_img[1], sizeof fl_img[0]);
+    memcpy(fl_img[1], fl_img[2], sizeof fl_img[1]);
+}
 static int64_t color_format;
 
 static PFN_xrRequestDisplayRefreshRateFB request_rate;
@@ -674,6 +730,8 @@ void xr_frame_end(void)
             gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, e->fb[e->acquired]);
             gl.BlitFramebuffer(0, 0, (GLint)e->w, (GLint)e->h, 0, 0, (GLint)e->w, (GLint)e->h,
                                GL_COLOR_BUFFER_BIT, GL_NEAREST);
+            if (fl_on < 0) { const char *v = getenv("LINDBERGH_FLASH_LOG"); fl_on = v && *v && *v != '0'; }
+            if (fl_on) { fl_sample(i, (GLint)e->w, (GLint)e->h); gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, e->fb[e->acquired]); }
             if (overlay_ok) {
                 /* the gun and laser, seen from this eye */
                 float view[16], proj[16], vp[16], n = 0.02f, far = 100.0f;
@@ -696,6 +754,7 @@ void xr_frame_end(void)
             pv[i].subImage.imageRect.extent.width = (int32_t)e->w;
             pv[i].subImage.imageRect.extent.height = (int32_t)e->h;
         }
+        if (fl_on > 0 && ok) fl_frame();
         if (color_format == GL_SRGB8_ALPHA8) gl.Enable(GL_FRAMEBUFFER_SRGB_EXT);
         if (scissor) gl.Enable(GL_SCISSOR_TEST);
         gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw);
