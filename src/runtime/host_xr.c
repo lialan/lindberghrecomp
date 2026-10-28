@@ -24,6 +24,12 @@
  *   resolution 1440     the longer side of each eye's image, in pixels
  *   refresh 90          display rate to ask for (72, 80, 90, 120)
  *   hand right          the gun hand (a trigger on the other hand moves it)
+ *   laser laser         aim aid: laser (beam and dot), dot, or off
+ *   coins auto          auto: a coin with every Start, so no coin button is
+ *                       needed; manual: only the left menu button
+ *
+ * The laser setting is changed in the headset with the other hand's upper
+ * button and saved back to vr.cfg.
  */
 #if defined(__ANDROID__)
 
@@ -46,6 +52,7 @@
 
 #include "lindbergh_rt.h"
 #include "stereo.h"
+#include "xr_overlay.h"
 
 /* host_sdl.c: the gun and the cabinet's buttons, from the controllers */
 void host_vr_input(int gun_x, int gun_y, unsigned held, int coin);
@@ -62,6 +69,10 @@ static struct {
     void (*Enable)(GLenum);
     void (*Disable)(GLenum);
     const GLubyte *(*GetString)(GLenum);
+    void (*GenRenderbuffers)(GLsizei, GLuint *);
+    void (*BindRenderbuffer)(GLenum, GLuint);
+    void (*RenderbufferStorage)(GLenum, GLenum, GLsizei, GLsizei);
+    void (*FramebufferRenderbuffer)(GLenum, GLenum, GLenum, GLuint);
 } gl;
 
 static int gl_load(void)
@@ -72,6 +83,7 @@ static int gl_load(void)
 #define L(n) if (!(*(void **)&gl.n = dlsym(lib, "gl" #n))) { fprintf(stderr, "[xr] no gl" #n "\n"); return 0; }
     L(BindFramebuffer) L(GenFramebuffers) L(FramebufferTexture2D) L(CheckFramebufferStatus)
     L(BlitFramebuffer) L(GetIntegerv) L(IsEnabled) L(Enable) L(Disable) L(GetString)
+    L(GenRenderbuffers) L(BindRenderbuffer) L(RenderbufferStorage) L(FramebufferRenderbuffer)
 #undef L
     return 1;
 }
@@ -79,10 +91,23 @@ static int gl_load(void)
 #define GL_FRAMEBUFFER_SRGB_EXT 0x8DB9
 
 /* ---- settings ---- */
+enum { LASER_ON, LASER_DOT, LASER_OFF };
+static const char *const LASER_NAME[] = { "laser", "dot", "off" };
+
 static struct {
     float scale, screen;
-    int   resolution, refresh, left_handed;
-} cfg = { 1.0f, 3.0f, 1440, 90, 0 };
+    int   resolution, refresh, left_handed, laser, auto_coins;
+} cfg = { 1.0f, 3.0f, 1440, 90, 0, LASER_ON, 1 };
+
+static void cfg_save(void)
+{
+    FILE *f = fopen("vr.cfg", "w");
+    if (!f) return;
+    fprintf(f, "scale %g\nscreen %g\nresolution %d\nrefresh %d\nhand %s\nlaser %s\ncoins %s\n",
+            cfg.scale, cfg.screen, cfg.resolution, cfg.refresh, cfg.left_handed ? "left" : "right",
+            LASER_NAME[cfg.laser], cfg.auto_coins ? "auto" : "manual");
+    fclose(f);
+}
 
 static void cfg_load(void)
 {
@@ -95,6 +120,8 @@ static void cfg_load(void)
         else if (!strcmp(key, "resolution")) cfg.resolution = atoi(val);
         else if (!strcmp(key, "refresh")) cfg.refresh = atoi(val);
         else if (!strcmp(key, "hand")) cfg.left_handed = !strcmp(val, "left");
+        else if (!strcmp(key, "laser")) cfg.laser = !strcmp(val, "dot") ? LASER_DOT : !strcmp(val, "off") ? LASER_OFF : LASER_ON;
+        else if (!strcmp(key, "coins")) cfg.auto_coins = strcmp(val, "manual") != 0;
     }
     fclose(f);
     if (cfg.scale <= 0) cfg.scale = 1;
@@ -119,9 +146,11 @@ static struct Eye {
     XrSwapchain chain;
     uint32_t    n, w, h;
     XrSwapchainImageOpenGLESKHR img[8];
-    GLuint      fb[8];
+    GLuint      fb[8], depth;
     uint32_t    acquired;
 } eye[2];
+static XoFrame xo;                     /* the gun and laser for this frame */
+static int overlay_ok;
 static GLuint read_fb;
 static int64_t color_format;
 
@@ -258,29 +287,89 @@ static void input_frame(XrTime t)
     float gx = -100000, gy = -100000;
     XrSpaceLocation loc = { XR_TYPE_SPACE_LOCATION };
     int aimed = 0;
-    if (XR_SUCCEEDED(xrLocateSpace(aim_space[g], local, t, &loc)) &&
-        (loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) &&
-        (loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)) {
-        static const float fwd[3] = { 0, 0, -1 };
-        float d[3], o[3] = { loc.pose.position.x * cfg.scale, loc.pose.position.y * cfg.scale, loc.pose.position.z * cfg.scale };
+    xo.gun_valid = 0;
+    int located = XR_SUCCEEDED(xrLocateSpace(aim_space[g], local, t, &loc)) &&
+                  (loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) &&
+                  (loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT);
+    static int fake = -1;
+    if (fake < 0) { const char *v = getenv("LINDBERGH_XR_FAKE_GUN"); fake = v && *v && *v != '0'; }
+    if (!located && fake) {
+        /* LINDBERGH_XR_FAKE_GUN=1, for a headset or emulator without
+         * controllers: a gun at the right hip sweeping across the screen,
+         * firing in half-second bursts, and for one second in six pointed at
+         * the floor with the trigger held - the arcade's reload */
+        double s = (double)t / 1e9;
+        float yaw = (float)(0.25 * sin(s * 0.7)), pitch = (float)(0.05 + 0.08 * sin(s * 1.1));
+        int reload = fmod(s, 6.0) >= 5.0;
+        if (reload) pitch = -0.9f;
+        float cy = cosf(yaw / 2), sy = sinf(yaw / 2), cp = cosf(pitch / 2), sp = sinf(pitch / 2);
+        loc.pose.orientation = (XrQuaternionf){ sp * cy, cp * sy, -sp * sy, cp * cy };
+        loc.pose.position = (XrVector3f){ 0.16f, -0.22f, -0.28f };
+        trig[g] = reload || fmod(s, 1.0) < 0.5;
+        located = 1;
+    }
+    if (located) {
+        static const float fwd[3] = { 0, 0, -1 }, tip[3] = { 0, -0.006f, -0.26f };
+        float d[3], p[3] = { loc.pose.position.x, loc.pose.position.y, loc.pose.position.z };
+        float o[3] = { p[0] * cfg.scale, p[1] * cfg.scale, p[2] * cfg.scale };
         qrot(loc.pose.orientation, fwd, d);
         float x, y;
         if (stereo_ray_to_screen(o, d, &x, &y) && x >= 0 && x < 640 && y >= 0 && y < 480) {
             gx = x; gy = y; aimed = 1;
         }
+        /* the overlay: the gun on the aim pose, the laser to the game's screen */
+        xo.gun_valid = 1;
+        xo.gun_q[0] = loc.pose.orientation.x; xo.gun_q[1] = loc.pose.orientation.y;
+        xo.gun_q[2] = loc.pose.orientation.z; xo.gun_q[3] = loc.pose.orientation.w;
+        memcpy(xo.gun_p, p, sizeof p);
+        float m[3];
+        qrot(loc.pose.orientation, tip, m);
+        for (int i = 0; i < 3; i++) xo.muzzle[i] = p[i] + m[i];
+        float reach = 5.0f;
+        if (aimed) reach = (-cfg.screen - p[2]) / d[2];
+        for (int i = 0; i < 3; i++) xo.end[i] = p[i] + d[i] * reach;
+        xo.beam = cfg.laser == LASER_ON;
+        xo.dot = aimed && cfg.laser != LASER_OFF;
+    }
+
+    /* firing: a kick, a flash and a pulse ten times a second while held on
+     * the screen - the cabinet gun's recoil */
+    static XrTime fire_start;
+    int firing = trig[g] && aimed;
+    if (firing && !prev[g][0]) fire_start = t;
+    float phase = firing ? fmodf((float)((t - fire_start) / 1000000) / 100.0f, 1.0f) : 1.0f;
+    static float last_phase = 1.0f;
+    xo.recoil = firing ? 0.018f * (1.0f - phase) * (1.0f - phase) : 0;
+    xo.flash = firing && phase < 0.35f;
+    if (firing && (phase < last_phase)) rumble(g, 0.7f, 35);
+    last_phase = phase;
+
+    /* the other hand's upper button: laser, dot, off */
+    int off = 1 - g;
+    if (btn_b[off] && !prev[off][3]) {
+        cfg.laser = (cfg.laser + 1) % 3;
+        cfg_save();
+        rumble(off, 0.3f, 20);
+        fprintf(stderr, "[xr] aim aid: %s\n", LASER_NAME[cfg.laser]);
     }
 
     unsigned held = 0;
-    if (trig[g] && aimed) held |= CAB_P1_TRIGGER;
+    if (firing) held |= CAB_P1_TRIGGER;
     if (trig[g] && !aimed) held |= CAB_P1_RELOAD;  /* the arcade's reload: fire off the screen */
     if (grip[g]) held |= CAB_P1_RELOAD;
     if (btn_a[g]) held |= CAB_P1_ACTION;
     if (btn_b[g]) held |= CAB_P1_FIREMODE;
-    if (stick[0] || stick[1]) held |= CAB_P1_START;
+    int start = stick[0] || stick[1];
+    if (start) held |= CAB_P1_START;
+    /* Coins: the left menu button, and with automatic coins one at start-up
+     * and one with every press of Start - Start alone plays and continues. */
+    static unsigned frames;
     int coin = menu && !prev[HAND_L][6];
+    if (cfg.auto_coins && ((++frames == 240) || (start && !prev[HAND_L][7]))) coin = 1;
+    prev[HAND_L][7] = start;
     host_vr_input((int)gx, (int)gy, held, coin);
 
-    if (trig[g] && !prev[g][0]) rumble(g, aimed ? 0.6f : 0.3f, 40);
+    if (trig[g] && !aimed && !prev[g][0]) rumble(g, 0.3f, 40);
     for (int h = 0; h < 2; h++) {
         prev[h][0] = trig[h]; prev[h][1] = grip[h]; prev[h][2] = btn_a[h];
         prev[h][3] = btn_b[h]; prev[h][4] = stick[h];
@@ -427,10 +516,16 @@ int xr_init(void)
         for (uint32_t j = 0; j < eye[i].n; j++) eye[i].img[j].type = XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR;
         XRCHECK(xrEnumerateSwapchainImages(eye[i].chain, eye[i].n, &eye[i].n, (XrSwapchainImageBaseHeader *)eye[i].img));
         gl.GenFramebuffers((GLsizei)eye[i].n, eye[i].fb);
-        GLint was = 0; gl.GetIntegerv(GL_FRAMEBUFFER_BINDING, &was);
+        GLint was = 0, was_rb = 0; gl.GetIntegerv(GL_FRAMEBUFFER_BINDING, &was);
+        gl.GetIntegerv(GL_RENDERBUFFER_BINDING, &was_rb);
+        gl.GenRenderbuffers(1, &eye[i].depth);         /* for the gun model */
+        gl.BindRenderbuffer(GL_RENDERBUFFER, eye[i].depth);
+        gl.RenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, (GLsizei)w, (GLsizei)h);
+        gl.BindRenderbuffer(GL_RENDERBUFFER, (GLuint)was_rb);
         for (uint32_t j = 0; j < eye[i].n; j++) {
             gl.BindFramebuffer(GL_FRAMEBUFFER, eye[i].fb[j]);
             gl.FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, eye[i].img[j].image, 0);
+            gl.FramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, eye[i].depth);
             if (gl.CheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
                 fprintf(stderr, "[xr] swapchain framebuffer %d/%u incomplete\n", i, j);
         }
@@ -438,6 +533,7 @@ int xr_init(void)
     }
     gl.GenFramebuffers(1, &read_fb);
 
+    overlay_ok = xo_init();
     stereo_eye_size((int)w, (int)h);
     stereo_set_screen_distance(cfg.screen * cfg.scale);
     stereo_start();
@@ -445,6 +541,7 @@ int xr_init(void)
     fprintf(stderr, "[xr] ready: %ux%u per eye, %s swapchain, %.2f game units/m, HUD screen at %.1f m, on %s\n",
             w, h, color_format == GL_SRGB8_ALPHA8 ? "sRGB" : "RGBA8", cfg.scale, cfg.screen,
             (const char *)gl.GetString(GL_RENDERER));
+    fprintf(stderr, "[xr] aim aid %s, coins %s\n", LASER_NAME[cfg.laser], cfg.auto_coins ? "automatic" : "by button");
 
     /* the session usually becomes ready within a few polls */
     for (int i = 0; i < 200 && !running; i++) { poll_events(); if (!running) usleep(10000); }
@@ -452,6 +549,26 @@ int xr_init(void)
 }
 
 /* ---- per frame ---- */
+
+static void mat4_mul(float *o, const float *a, const float *b)
+{
+    float r[16];
+    for (int c = 0; c < 4; c++)
+        for (int k = 0; k < 4; k++)
+            r[c * 4 + k] = a[k] * b[c * 4] + a[4 + k] * b[c * 4 + 1] + a[8 + k] * b[c * 4 + 2] + a[12 + k] * b[c * 4 + 3];
+    memcpy(o, r, 64);
+}
+
+static void view_matrix(XrPosef p, float m[16]);
+
+/* LOCAL space (metres) -> eye space, for the overlay */
+static void pose_view(XrPosef p, float m[16])
+{
+    float keep = cfg.scale;
+    cfg.scale = 1;
+    view_matrix(p, m);
+    cfg.scale = keep;
+}
 
 /* game camera space -> eye space, for a pose in LOCAL space (metres) */
 static void view_matrix(XrPosef p, float m[16])
@@ -501,7 +618,7 @@ void xr_frame_begin(void)
         }
     }
     if (state == XR_SESSION_STATE_FOCUSED) input_frame(frame.predictedDisplayTime);
-    else host_vr_input(-100000, -100000, 0, 0);
+    else { host_vr_input(-100000, -100000, 0, 0); xo.gun_valid = xo.beam = xo.dot = xo.flash = 0; }
 }
 
 void xr_frame_end(void)
@@ -530,6 +647,18 @@ void xr_frame_end(void)
             gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, e->fb[e->acquired]);
             gl.BlitFramebuffer(0, 0, (GLint)e->w, (GLint)e->h, 0, 0, (GLint)e->w, (GLint)e->h,
                                GL_COLOR_BUFFER_BIT, GL_NEAREST);
+            if (overlay_ok) {
+                /* the gun and laser, seen from this eye */
+                float view[16], proj[16], vp[16], n = 0.02f, far = 100.0f;
+                pose_view(views[i].pose, view);
+                float tx = tanf(fov[i].angleRight), ty = tanf(fov[i].angleUp);
+                memset(proj, 0, sizeof proj);
+                proj[0] = 1 / tx; proj[5] = 1 / ty; proj[10] = -(far + n) / (far - n);
+                proj[11] = -1; proj[14] = -2 * far * n / (far - n);
+                mat4_mul(vp, proj, view);
+                float eye_pos[3] = { views[i].pose.position.x, views[i].pose.position.y, views[i].pose.position.z };
+                xo_draw(&xo, vp, eye_pos, (int)e->w, (int)e->h);
+            }
             XrSwapchainImageReleaseInfo ri = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
             xrReleaseSwapchainImage(e->chain, &ri);
 

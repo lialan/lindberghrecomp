@@ -114,7 +114,8 @@ function(lindbergh_runtime target generated_dir)
                     message(FATAL_ERROR "Android build: set -D${v}=... (docs/QUEST.md)")
                 endif()
             endforeach()
-            target_sources(${target} PRIVATE "${LINDBERGH_RUNTIME_DIR}/host_xr.c")
+            target_sources(${target} PRIVATE "${LINDBERGH_RUNTIME_DIR}/host_xr.c"
+                "${LINDBERGH_RUNTIME_DIR}/xr_overlay.c")
             target_compile_definitions(${target} PRIVATE LINDBERGH_GL4ES)
             # printf and friends are handed the guest's own format strings
             target_compile_options(${target} PRIVATE -Wno-format-security)
