@@ -86,6 +86,7 @@ static const float g_screen_lens[2] = { 1.732f, 2.309f };
                                          * its current one: menus zoom the camera to 3.7 and back,
                                          * and the 2D shrank and grew with it */
 static int      g_loaded_hud;           /* the projection GL has is the HUD's screen */
+static int      g_hud_nowrite;          /* this 2D draw's depth writes are off, to be put back */
 static GLuint   g_unit0_rect;           /* render target bound to texture unit 0 */
 static GLenum   g_active_unit = GL_TEXTURE0;
 static GLuint   g_rect_bound[8];        /* rectangle texture bound to each unit */
@@ -826,6 +827,16 @@ static int transform_call(CPU *c, HleId id, const char *n)
         if (hud != g_loaded_hud) { g_loaded_hud = hud; load_projection(); }
         if (hud == 1 && persp && !g_menu_vp[2] && (g_vp[2] != GAME_W || g_vp[3] != GAME_H)) memcpy(g_menu_vp, g_vp, sizeof g_vp);
         if (hud == 1) clip_to_screen();
+        /* The game's 2D all sits at one depth and is drawn with LEQUAL, so on
+         * the arcade the last draw wins. Put on the screen, coplanar quads
+         * round to slightly different depths and fight pixel by pixel - the
+         * HUD's gauges and text flickered in stripes. They still test against
+         * the world; they just stop writing depth for each other. */
+        if (hud == 1 && !persp) {
+            GLboolean wm = GL_FALSE;
+            glGetBooleanv(GL_DEPTH_WRITEMASK, &wm);
+            if (wm) { glDepthMask(GL_FALSE); g_hud_nowrite = 1; }
+        }
         fixed_function_rect();
         return 0;
     }
@@ -870,7 +881,10 @@ static void exec(CPU *c, HleId id, HleHandler fn)
 {
     int k = cls(id)->kind;
     if (!transform_call(c, id, hle_name(id))) fn(c);
-    if (is_draw(k) || k == K_END) { fixed_function_rect_done(); clip_done(); }
+    if (is_draw(k) || k == K_END) {
+        fixed_function_rect_done(); clip_done();
+        if (g_hud_nowrite) { glDepthMask(GL_TRUE); g_hud_nowrite = 0; }
+    }
     if (!g_replaying && (k == K_GETINTEGERV || k == K_GETFLOATV)) fix_query(c, k);
 }
 
