@@ -21,7 +21,8 @@
  * Settings, one per line in vr.cfg next to the game:
  *   scale 1.0           game units per metre
  *   screen 3.0          distance of the HUD's screen, in metres
- *   resolution 2208     the longer side of each eye's image (2208 = the Quest 3 panel, 2064x2208)
+ *   resolution 2280     the longer side of each eye's image, in pixels
+ *   width 2064          each eye's width; 0 keeps the headset's own proportions
  *   refresh 120         display rate to ask for (72, 80, 90, 120); the game
  *                       draws at 60, so 120 shows every frame twice - evenly
  *                       - where 72 or 90 repeat some and not others (judder)
@@ -105,17 +106,17 @@ static const char *const SIGHT_NAME[] = { "none", "reddot", "holo" };
 
 static struct {
     float scale, screen;
-    int   resolution, refresh, left_handed, laser, auto_coins;
+    int   resolution, width, refresh, left_handed, laser, auto_coins;
     int   sight, crosshair, show_gun;         /* XO_SIGHT_*; the game's own sight; the gun model */
-} cfg = { 1.0f, 3.0f, 2208, 120, 0, LASER_ON, 1, XO_SIGHT_NONE, 1, 1 };
+} cfg = { 1.0f, 3.0f, 2280, 2064, 120, 0, LASER_ON, 1, XO_SIGHT_NONE, 1, 1 };
 
 static void cfg_save(void)
 {
     FILE *f = fopen("vr.cfg", "w");
     if (!f) return;
-    fprintf(f, "scale %g\nscreen %g\nresolution %d\nrefresh %d\nhand %s\nlaser %s\ncoins %s\n"
+    fprintf(f, "scale %g\nscreen %g\nresolution %d\nwidth %d\nrefresh %d\nhand %s\nlaser %s\ncoins %s\n"
                "sight %s\ncrosshair %s\ngun %s\n",
-            cfg.scale, cfg.screen, cfg.resolution, cfg.refresh, cfg.left_handed ? "left" : "right",
+            cfg.scale, cfg.screen, cfg.resolution, cfg.width, cfg.refresh, cfg.left_handed ? "left" : "right",
             LASER_NAME[cfg.laser], cfg.auto_coins ? "auto" : "manual",
             SIGHT_NAME[cfg.sight], cfg.crosshair ? "on" : "off", cfg.show_gun ? "on" : "off");
     fclose(f);
@@ -139,7 +140,8 @@ static void cfg_load(void)
     }
     if (cfg.scale <= 0) cfg.scale = 1;
     if (cfg.screen <= 0.2f) cfg.screen = 3;
-    if (cfg.resolution < 512 || cfg.resolution > 4096) cfg.resolution = 2208;
+    if (cfg.resolution < 512 || cfg.resolution > 4096) cfg.resolution = 2280;
+    if (cfg.width < 0 || cfg.width > 4096) cfg.width = 0;
 }
 
 static void cfg_set(const char *key, const char *val)
@@ -148,6 +150,7 @@ static void cfg_set(const char *key, const char *val)
         if (!strcmp(key, "scale")) cfg.scale = (float)atof(val);
         else if (!strcmp(key, "screen")) cfg.screen = (float)atof(val);
         else if (!strcmp(key, "resolution")) cfg.resolution = atoi(val);
+        else if (!strcmp(key, "width")) cfg.width = atoi(val);
         else if (!strcmp(key, "refresh")) cfg.refresh = atoi(val);
         else if (!strcmp(key, "hand")) cfg.left_handed = !strcmp(val, "left");
         else if (!strcmp(key, "laser")) cfg.laser = !strcmp(val, "dot") ? LASER_DOT : !strcmp(val, "off") ? LASER_OFF : LASER_ON;
@@ -374,7 +377,7 @@ static struct {
     int test_frames, service_frames, coin;
 } menu;
 static float rates[16];
-static int running_resolution;   /* the eye size this run was set up with */
+static int running_resolution, running_width;   /* the eye size this run was set up with */
 static int nrates;
 
 static void menu_items(XmItem *it)
@@ -393,8 +396,11 @@ static void menu_items(XmItem *it)
     snprintf(it[M_HAND].value, 40, "%s", gun_hand == HAND_L ? "Left" : "Right");
     snprintf(it[M_SCREEN].value, 40, "%.1f m", cfg.screen);
     snprintf(it[M_RATE].value, 40, "%d Hz", cfg.refresh);
-    if (cfg.resolution == running_resolution) snprintf(it[M_RES].value, 40, "%d", cfg.resolution);
-    else snprintf(it[M_RES].value, 40, "%d (on restart)", cfg.resolution);
+    char res[24];
+    if (cfg.width) snprintf(res, sizeof res, "%d x %d", cfg.width, cfg.resolution);
+    else snprintf(res, sizeof res, "%d", cfg.resolution);
+    if (cfg.resolution == running_resolution && cfg.width == running_width) snprintf(it[M_RES].value, 40, "%s", res);
+    else snprintf(it[M_RES].value, 40, "%s (on restart)", res);
     snprintf(it[M_COINS].value, 40, "%s", cfg.auto_coins ? "Automatic" : "By menu");
 }
 
@@ -468,10 +474,11 @@ static void menu_choose(int item)
         break;
     case M_RES: {
         /* the eye images are set up once, so this takes effect next launch */
-        static const int sizes[] = { 1216, 1440, 1680, 1920, 2208 };
+        static const int sizes[][2] = { { 0, 1216 }, { 0, 1440 }, { 0, 1680 }, { 0, 1920 }, { 0, 2208 }, { 2064, 2280 } };
         int k = 0;
-        while (k < 5 && sizes[k] <= cfg.resolution) k++;
-        cfg.resolution = sizes[k % 5];
+        while (k < 6 && (sizes[k][1] < cfg.resolution || (sizes[k][1] == cfg.resolution && sizes[k][0] <= cfg.width))) k++;
+        cfg.width = sizes[k % 6][0];
+        cfg.resolution = sizes[k % 6][1];
         break;
     }
     case M_COINS: cfg.auto_coins = !cfg.auto_coins; break;
@@ -813,9 +820,12 @@ int xr_init(void)
     uint32_t nv = 0;
     XRCHECK(xrEnumerateViewConfigurationViews(instance, sys, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 2, &nv, vc));
     uint32_t w = vc[0].recommendedImageRectWidth, h = vc[0].recommendedImageRectHeight;
-    running_resolution = cfg.resolution;
-    float f = (float)cfg.resolution / (float)(w > h ? w : h);
-    w = (uint32_t)(w * f) & ~3u; h = (uint32_t)(h * f) & ~3u;
+    running_resolution = cfg.resolution; running_width = cfg.width;
+    if (cfg.width) { w = (uint32_t)cfg.width; h = (uint32_t)cfg.resolution; }   /* exactly as set */
+    else {
+        float f = (float)cfg.resolution / (float)(w > h ? w : h);
+        w = (uint32_t)(w * f) & ~3u; h = (uint32_t)(h * f) & ~3u;
+    }
     if (w > vc[0].maxImageRectWidth) w = vc[0].maxImageRectWidth;
     if (h > vc[0].maxImageRectHeight) h = vc[0].maxImageRectHeight;
 
