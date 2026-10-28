@@ -1461,6 +1461,8 @@ int stereo_ray_to_screen(const float o[3], const float d[3], float *x, float *y)
     return 1;
 }
 
+int stereo_is_render_target(unsigned tex) { return g_on && scaled(tex); }
+
 void stereo_rect_scale(float *x, float *y)
 {
     *x = g_on ? g_sx : 1; *y = g_on ? g_sy : 1;

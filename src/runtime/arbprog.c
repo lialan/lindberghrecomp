@@ -1133,7 +1133,7 @@ static void cache_path(char *out, size_t n, const char *v, const char *f)
         drv = fnv(drv, (const char *)glGetString(GL_VERSION));
         drv = fnv(drv, "arbprog 1");
 #ifdef LINDBERGH_GL4ES
-        if (gl4es_mv_shaders) drv = fnv(drv, "multiview 8");   /* gl4es makes other shaders of the same GLSL */
+        if (gl4es_mv_shaders) drv = fnv(drv, "multiview 9");   /* gl4es makes other shaders of the same GLSL */
         if (gl4es_mv_shaders && getenv("LIBGL_MV_NOCLIP")) drv = fnv(drv, "noclip");
 #endif
         mkdir("../shadercache", 0755);
@@ -1438,7 +1438,14 @@ static void upload(Linked *l)
             glActiveTexture(GL_TEXTURE0 + u);
             glGetTexLevelParameteriv(GL_TEXTURE_RECTANGLE_ARB, 0, GL_TEXTURE_WIDTH, &w);
             glGetTexLevelParameteriv(GL_TEXTURE_RECTANGLE_ARB, 0, GL_TEXTURE_HEIGHT, &h);
-            if (w > 0 && h > 0) { norm[u][0] = rx / (float)w; norm[u][1] = ry / (float)h; }
+            /* only render targets were drawn larger; a texture the game
+             * filled itself (the 256x1 colour table of the final pass) is
+             * still its own size, and scaling its lookups washed every
+             * colour out */
+            GLint bound = 0;
+            glGetIntegerv(GL_TEXTURE_BINDING_RECTANGLE_ARB, &bound);
+            int big = stereo_is_render_target((GLuint)bound);
+            if (w > 0 && h > 0) { norm[u][0] = (big ? rx : 1) / (float)w; norm[u][1] = (big ? ry : 1) / (float)h; }
         }
         glActiveTexture((GLenum)active);
         glUniform2fv(l->u_rect, l->n_rect, &norm[0][0]);

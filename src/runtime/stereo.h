@@ -33,6 +33,8 @@ void stereo_reproject_view(int view, float out[16]);
 unsigned stereo_eye_framebuffer(int eye);
 /* Rectangle-texture coordinates are scaled by this (1 when not in stereo). */
 void stereo_rect_scale(float *x, float *y);
+/* a texture the game renders into, reallocated larger for the eye */
+int stereo_is_render_target(unsigned tex);
 /* For vertex programs with the game's projection in their own constants. */
 void stereo_reproject(float out[16]);
 void stereo_present_desktop(int win_w, int win_h);
