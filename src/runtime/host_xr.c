@@ -21,7 +21,7 @@
  * Settings, one per line in vr.cfg next to the game:
  *   scale 1.0           game units per metre
  *   screen 3.0          distance of the HUD's screen, in metres
- *   resolution 1440     the longer side of each eye's image, in pixels
+ *   resolution 2280     the longer side of each eye's image, in pixels
  *   refresh 120         display rate to ask for (72, 80, 90, 120); the game
  *                       draws at 60, so 120 shows every frame twice - evenly
  *                       - where 72 or 90 repeat some and not others (judder)
@@ -107,7 +107,7 @@ static struct {
     float scale, screen;
     int   resolution, refresh, left_handed, laser, auto_coins;
     int   sight, crosshair, show_gun;         /* XO_SIGHT_*; the game's own sight; the gun model */
-} cfg = { 1.0f, 3.0f, 1440, 120, 0, LASER_ON, 1, XO_SIGHT_NONE, 1, 1 };
+} cfg = { 1.0f, 3.0f, 2280, 120, 0, LASER_ON, 1, XO_SIGHT_NONE, 1, 1 };
 
 static void cfg_save(void)
 {
@@ -139,7 +139,7 @@ static void cfg_load(void)
     }
     if (cfg.scale <= 0) cfg.scale = 1;
     if (cfg.screen <= 0.2f) cfg.screen = 3;
-    if (cfg.resolution < 512 || cfg.resolution > 4096) cfg.resolution = 1440;
+    if (cfg.resolution < 512 || cfg.resolution > 4096) cfg.resolution = 2280;
 }
 
 static void cfg_set(const char *key, const char *val)
@@ -468,10 +468,10 @@ static void menu_choose(int item)
         break;
     case M_RES: {
         /* the eye images are set up once, so this takes effect next launch */
-        static const int sizes[] = { 1216, 1440, 1680, 1920, 2208 };
+        static const int sizes[] = { 1216, 1440, 1680, 1920, 2208, 2280 };
         int k = 0;
-        while (k < 5 && sizes[k] <= cfg.resolution) k++;
-        cfg.resolution = sizes[k % 5];
+        while (k < 6 && sizes[k] <= cfg.resolution) k++;
+        cfg.resolution = sizes[k % 6];
         break;
     }
     case M_COINS: cfg.auto_coins = !cfg.auto_coins; break;
