@@ -111,7 +111,8 @@ static unsigned g_zoom_draws, g_hudfb_draws;   /* this frame's 3D sent to the sc
 static float    g_near_seen;            /* the nearest near plane of this frame's world draws */
 static GLuint   g_world_fb = ~0u, g_world_fb_next = ~0u;   /* the target the world was drawn into last frame */
 static unsigned g_hud2d, g_pass2d;      /* this frame's 2D draws put on the screen / left as passes (LINDBERGH_HUD_LOG) */
-static float    g_hud_lens;             /* the lens the screen was sized by at this frame's first 2D draw on it */
+static float    g_hud_lens;
+static GLint    g_menu_vp[4];           /* this frame's first sub-viewport a screen 3D draw used (LINDBERGH_HUD_LOG) */             /* the lens the screen was sized by at this frame's first 2D draw on it */
 
 /* ---- the recording ---- */
 enum { OP_CALL, OP_UNMAP, OP_PTR };
@@ -165,7 +166,7 @@ static int is_perspective(const float *m) { return fabsf(m[11] + 1) < 1e-4f && f
  * exactly where the arcade monitor showed it. */
 static void effective_projection(const float *p, int hud, float *out)
 {
-    if (!g_on) { memcpy(out, p, 64); return; }
+    if (!g_on || hud == 2) { memcpy(out, p, 64); return; }
     const float *t = g_tan[g_eye];
     float e[16], ev[16];
     if (is_perspective(p) && !hud) {
@@ -266,6 +267,35 @@ static void load_projection(void)
 #define MAX_SCALED 256
 static GLuint g_scaled[MAX_SCALED];
 static unsigned g_nscaled;
+static short  g_scaled_w[MAX_SCALED], g_scaled_h[MAX_SCALED];   /* their size as the game made them */
+
+/* Framebuffers drawn into a texture that is not the game's 640x480 picture -
+ * the menu's soldier and rifle, drawn with their own camera into 256x256
+ * textures shown as sprites: what is drawn there is no view from the eyes,
+ * and keeps the game's projection as it is. */
+#define MAX_FBS 64
+static struct { GLuint fb; int offscreen; } g_fbs[MAX_FBS];
+static unsigned g_nfbs;
+
+static int offscreen_fb(GLuint fb)
+{
+    for (unsigned i = 0; i < g_nfbs; i++) if (g_fbs[i].fb == fb) return g_fbs[i].offscreen;
+    return 0;
+}
+
+static void note_fb_target(GLuint fb, GLuint tex)
+{
+    int w = 0, h = 0;
+    for (unsigned i = 0; i < g_nscaled; i++) if (g_scaled[i] == tex) { w = g_scaled_w[i]; h = g_scaled_h[i]; }
+    if (!w || !fb) return;
+    int off = !(w == GAME_W && h == GAME_H);
+    unsigned i = 0;
+    while (i < g_nfbs && g_fbs[i].fb != fb) i++;
+    if (i == g_nfbs) { if (g_nfbs >= MAX_FBS) return; g_nfbs++; g_fbs[i].fb = fb; }
+    if (g_fbs[i].offscreen != off || i == g_nfbs - 1)
+        fprintf(stderr, "[stereo] framebuffer %u draws into texture %u, %dx%d%s\n", fb, tex, w, h, off ? ": offscreen, the game's own projection" : "");
+    g_fbs[i].offscreen = off;
+}
 
 static int scaled(GLuint t)
 {
@@ -293,6 +323,7 @@ static void scale_target(GLenum textarget, GLuint tex)
     else if (ifmt == GL_DEPTH24_STENCIL8 || ifmt == GL_DEPTH_STENCIL) { fmt = GL_DEPTH_STENCIL; type = GL_UNSIGNED_INT_24_8; }
     else if (ifmt == GL_RGB || ifmt == GL_RGB8) fmt = GL_RGB;
     int nw = (int)lroundf(w * g_sx), nh = (int)lroundf(h * g_sy);
+    g_scaled_w[g_nscaled - 1] = (short)w; g_scaled_h[g_nscaled - 1] = (short)h;
     glTexImage2D(tg, 0, ifmt, nw, nh, 0, fmt, type, NULL);
     fprintf(stderr, "[stereo] render target %u%s: %dx%d -> %dx%d (format %#x)\n", tex,
             tg == GL_TEXTURE_2D ? "" : " (rect)", w, h, nw, nh, ifmt);
@@ -559,17 +590,18 @@ static uint32_t g_state_va[48];
 static unsigned g_nstate, g_nmenu;      /* the first g_nmenu are menus */
 static unsigned g_state_frame = ~0u;    /* the frame a menu state last ran */
 static uint32_t g_state_last;
+static long g_rt_dump_at = -2;          /* LINDBERGH_RT_DUMP_MENU=N: dump N frames after the first menu state */
 
 static void watch_states(void)
 {
     static const char *menus[] = {
-        "Calibration", "Instruction", "Card", "Custom", "MatchUpSelect", "CharacterSelect", "WeaponSelect",
+        "Init", "Calibration", "Instruction", "Card", "Custom", "MatchUpSelect", "CharacterSelect", "WeaponSelect",
         "Information", "Entry", "StartWait", "StageSelect", "WaitCard", "NameEntry", "Ranking", "Record",
-        "Password", "Result",
+        "Password", "Result", "Start",
     };
     static const char *play[] = {   /* reported in LINDBERGH_HUD_LOG only */
-        "Init", "Opening", "RoundStart", "Loop", "RoundResult", "Replay", "SceneClear", "ChallengerComes",
-        "TimeUp", "Continue", "Close", "Ending", "CleanUp", "Pause", "Start", "Exit", "Over", "StageClear",
+        "Opening", "RoundStart", "Loop", "RoundResult", "Replay", "SceneClear", "ChallengerComes",
+        "TimeUp", "Continue", "Close", "Ending", "CleanUp", "Pause", "Exit", "Over", "StageClear",
     };
     if (g_nstate) return;
     for (int pass = 0; pass < 2; pass++) {
@@ -593,7 +625,13 @@ void stereo_guest_state(uint32_t va)
 {
     for (unsigned i = 0; i < g_nstate; i++) {
         if (g_state_va[i] != va) continue;
-        if (i < g_nmenu) g_state_frame = g_frame;
+        if (i < g_nmenu) {
+            if (g_state_frame == ~0u && g_rt_dump_at == -2) {
+                const char *v = getenv("LINDBERGH_RT_DUMP_MENU");
+                g_rt_dump_at = v && *v ? (long)g_frame + atol(v) : -1;
+            }
+            g_state_frame = g_frame;
+        }
         else g_state_frame = ~0u;
         if (va != g_state_last && getenv("LINDBERGH_HUD_LOG"))
             fprintf(stderr, "[state] frame %u: %#x (%s)\n", g_frame, va, i < g_nmenu ? "menu" : "play");
@@ -606,6 +644,21 @@ void stereo_guest_state(uint32_t va)
 static int menu_state(void)
 {
     return g_state_frame != ~0u && g_frame - g_state_frame <= 1;
+}
+
+/* A menu frame is drawn flat - the arcade's own picture, every pass and
+ * sprite as the game made it - and the host puts that picture on the screen.
+ * Its sprites sample their render targets where the game drew into them,
+ * which drawing the menu's 3D from the eyes broke (a black window where the
+ * soldier stands, buttons that changed every frame). Decided per frame:
+ * the state the game ran last frame. */
+static int g_flat, g_flat_shown;
+int stereo_flat_frame(void) { return g_flat_shown; }
+void stereo_screen(float *half_w, float *half_h, float *dist)
+{
+    *half_w = g_screen_dist / g_screen_lens[0];
+    *half_h = g_screen_dist / g_screen_lens[1];
+    *dist = g_screen_dist;
 }
 
 static int live_only(const char *n);
@@ -688,6 +741,7 @@ static int transform_call(CPU *c, HleId id, const char *n)
     }
     if (k == K_FBTEX2D) {
         scale_target(A32(2), A32(3));
+        if (A32(1) == GL_COLOR_ATTACHMENT0) note_fb_target(g_game_fb, A32(3));
         return 0;
     }
     if (k == K_ACTIVETEX) { g_active_unit = A32(0); return 0; }
@@ -713,7 +767,7 @@ static int transform_call(CPU *c, HleId id, const char *n)
         /* Screen content or not, decided per draw: 2D that is not a pass over
          * a render target, and 3D drawn into the HUD's target. */
         int persp = is_perspective(g_proj[g_proj_top]);
-        if (persp && g_game_fb != g_hud_fb && !g_replaying) { g_scene_draws++; g_world_fb_next = g_game_fb; }
+        if (persp && g_game_fb != g_hud_fb && !g_replaying && !offscreen_fb(g_game_fb)) { g_scene_draws++; g_world_fb_next = g_game_fb; }
         if (persp && g_proj[g_proj_top][0] > g_lens_seen) g_lens_seen = g_proj[g_proj_top][0];
         if (persp && !g_replaying && g_game_fb != g_hud_fb) {
             const float *P = g_proj[g_proj_top];
@@ -727,11 +781,13 @@ static int transform_call(CPU *c, HleId id, const char *n)
         if (persp && !g_replaying) { if (zoom) g_zoom_draws++; if (g_game_fb == g_hud_fb) g_hudfb_draws++; }
         int hud = persp ? g_game_fb == g_hud_fb || menu_state() || g_menu || zoom
                         : !g_unit0_rect || !covers_viewport(c, n);
-        if (hud && !is_perspective(g_proj[g_proj_top]) && !g_replaying) g_hud_fb_next = g_game_fb;
+        if (offscreen_fb(g_game_fb) || g_flat) hud = 2;  /* the game's own projection, untouched */
+        if (hud == 1 && !is_perspective(g_proj[g_proj_top]) && !g_replaying) g_hud_fb_next = g_game_fb;
         if (!persp && !g_replaying) { if (hud) { if (!g_hud2d) g_hud_lens = g_last_persp[0]; g_hud2d++; } else g_pass2d++; }
-        if (hud && !persp && letterbox_bar(c, n)) return 1;
+        if (hud == 1 && !persp && letterbox_bar(c, n)) return 1;
         if (hud != g_loaded_hud) { g_loaded_hud = hud; load_projection(); }
-        if (hud) clip_to_screen();
+        if (hud == 1 && persp && !g_menu_vp[2] && (g_vp[2] != GAME_W || g_vp[3] != GAME_H)) memcpy(g_menu_vp, g_vp, sizeof g_vp);
+        if (hud == 1) clip_to_screen();
         fixed_function_rect();
         return 0;
     }
@@ -1322,20 +1378,22 @@ static void dump_targets(void)
         if (s2) es = atol(s2 + 1) > 0 ? atol(s2 + 1) : 1;   /* ,<stride>: every stride-th frame, a quarter the size */
     }
     if (e0 >= 0 && (long)g_frame >= e0 && (long)g_frame < e0 + en && ((long)g_frame - e0) % es == 0) {
+        for (int layer = 0; layer < (g_mv ? 2 : 1); layer++) {     /* eye_ the left eye, eyeR_ the right */
         GLint w = g_ew, h = g_eh;
         unsigned char *px = malloc((size_t)w * h * 4);
         int ok = 0;
 #ifdef LINDBERGH_GL4ES
-        if (px && g_mv) ok = gl4es_multiview_read(g_eye_tex[0], GL_TEXTURE_RECTANGLE_ARB, 0, px);
+        if (px && g_mv) ok = gl4es_multiview_read(g_eye_tex[0], GL_TEXTURE_RECTANGLE_ARB, layer, px);
 #endif
-        if (ok && es > 1) {
+        if (ok && (es > 1 || en > 10)) {   /* many frames: a quarter the size */
             int qw = w / 4, qh = h / 4;
             for (int y = 0; y < qh; y++)
                 for (int x = 0; x < qw; x++) memcpy(px + ((size_t)y * qw + x) * 4, px + ((size_t)y * 4 * w + x * 4) * 4, 4);
             w = qw; h = qh;
         }
-        if (ok) { char name[64]; snprintf(name, sizeof name, "eye_%u.ppm", g_frame); write_ppm(name, w, h, px); }
+        if (ok) { char name[64]; snprintf(name, sizeof name, layer ? "eyeR_%u.ppm" : "eye_%u.ppm", g_frame); write_ppm(name, w, h, px); }
         free(px);
+        }
 #ifdef LINDBERGH_GL4ES
         /* LINDBERGH_EYE_DUMP_TEX=a,b,...: those render targets every frame too */
         const char *xt = getenv("LINDBERGH_EYE_DUMP_TEX");
@@ -1357,7 +1415,7 @@ static void dump_targets(void)
     }
     static long at = -2;
     if (at == -2) { const char *v = getenv("LINDBERGH_RT_DUMP"); at = v && *v ? atol(v) : -1; }
-    if ((long)g_frame != at) return;
+    if ((long)g_frame != at && (long)g_frame != g_rt_dump_at) return;
     GLint prev = 0;
     glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev);
     GLuint fb;
@@ -1392,6 +1450,14 @@ static void dump_targets(void)
         char name[64];
         snprintf(name, sizeof name, i < g_nscaled ? "rt_%u.ppm" : "rt_eye.ppm", tex);
         write_ppm(name, w, h, px);
+#ifdef LINDBERGH_GL4ES
+        if (g_mv && tg == GL_TEXTURE_2D && i < g_nscaled) {   /* and the 2D texture itself, which is what is sampled */
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+            glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+            snprintf(name, sizeof name, "rt2d_%u.ppm", tex);
+            write_ppm(name, w, h, px);
+        }
+#endif
         free(px);
         fprintf(stderr, "[stereo] frame %u: wrote %s (%dx%d%s, status %#x)\n", g_frame, name, w, h,
                 tg == GL_TEXTURE_2D ? "" : " rect", glCheckFramebufferStatus(GL_FRAMEBUFFER));
@@ -1427,6 +1493,7 @@ static void dump_targets(void)
 void stereo_frame_end(void)
 {
     if (!g_on) return;
+    g_flat_shown = g_flat;
     dump_targets();
     if (!g_mv) replay(1);
     if (g_overflow) { fprintf(stderr, "[stereo] frame %u: recording overflowed %u times\n", g_frame, g_overflow); g_overflow = 0; }
@@ -1468,9 +1535,10 @@ void stereo_frame_begin(void)
     if (hud_log < 0) { const char *v = getenv("LINDBERGH_HUD_LOG"); hud_log = v && *v && *v != '0'; }
     if (hud_log) {
         char sig[160];
-        snprintf(sig, sizeof sig, "HUD target %d, world target %d, 2D on screen %u, passes %u, 3D into HUD %u, menu state %d",
+        snprintf(sig, sizeof sig, "HUD target %d, world target %d, 2D on screen %u, passes %u, 3D into HUD %u, menu state %d, screen 3D viewport %d,%d %dx%d",
                  (int)g_hud_fb_next, (int)g_world_fb_next, g_hud2d, g_pass2d, g_hudfb_draws,
-                 menu_state());
+                 menu_state(), g_menu_vp[0], g_menu_vp[1], g_menu_vp[2], g_menu_vp[3]);
+        memset(g_menu_vp, 0, sizeof g_menu_vp);
         if (strcmp(sig, last_hud)) fprintf(stderr, "[hud] frame %u: %s\n", g_frame, sig);
         strcpy(last_hud, sig);
     }
@@ -1481,6 +1549,11 @@ void stereo_frame_begin(void)
     g_lens_seen = 0;
     g_near_seen = 0;
     g_scene_draws = 0;
+    {
+        static int flat_env = -1;
+        if (flat_env < 0) { const char *v = getenv("LINDBERGH_FLAT_MENUS"); flat_env = !v || *v != '0'; }
+        g_flat = flat_env && menu_state();
+    }
     g_hud_fb = g_hud_fb_next;           /* 3D drawn there this frame is screen content */
     g_world_fb = g_world_fb_next;
     g_hud_fb_next = ~0u;

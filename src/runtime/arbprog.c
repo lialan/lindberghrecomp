@@ -1144,6 +1144,9 @@ static void cache_path(char *out, size_t n, const char *v, const char *f)
 
 static int cache_load(GLuint prog, const char *path)
 {
+    static int off = -1;     /* LINDBERGH_ARB_NOCACHE=1: build every program afresh, to see what fails */
+    if (off < 0) { const char *v = getenv("LINDBERGH_ARB_NOCACHE"); off = v && *v == '1'; }
+    if (off) return 0;
     FILE *fl = fopen(path, "rb");
     if (!fl) return 0;
     GLenum fmt = 0;

@@ -43,6 +43,11 @@ void stereo_present_desktop(int win_w, int win_h);
  * while one is up: its 3D goes on the screen with the menu's 2D. dispatch()
  * passes on every guest call inside [stereo_state_lo, stereo_state_hi]. */
 extern uint32_t stereo_state_lo, stereo_state_hi;
+/* The frame just drawn is a menu, drawn flat as on the arcade: the host shows
+ * the eye image on the screen, whose half size and distance in game units
+ * from the game camera stereo_screen gives. */
+int  stereo_flat_frame(void);
+void stereo_screen(float *half_w, float *half_h, float *dist);
 void stereo_guest_state(uint32_t va);
 
 /* hle_gl_posix.c: a live glMapBuffer's guest shadow, for the recording */

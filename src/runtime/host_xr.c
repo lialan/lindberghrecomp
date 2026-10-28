@@ -777,6 +777,7 @@ void xr_frame_end(void)
     in_frame = 0;
     XrCompositionLayerProjectionView pv[2];
     int ok = views_ok && frame.shouldRender;
+    int flat = stereo_flat_frame();
     if (ok) {
         GLint draw = 0, read = 0;
         gl.GetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
@@ -797,8 +798,23 @@ void xr_frame_end(void)
             if (layers) gl.FramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, layers, 0, i);
             else gl.FramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, stereo_eye_texture(i), 0);
             gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, e->fb[e->acquired]);
-            gl.BlitFramebuffer(0, 0, (GLint)e->w, (GLint)e->h, 0, 0, (GLint)e->w, (GLint)e->h,
-                               GL_COLOR_BUFFER_BIT, GL_NEAREST);
+            if (flat && overlay_ok) {
+                /* a menu: the game's flat picture, on the screen in front of the player */
+                float hw, hh, d, place[16], view[16], proj[16], m[16], n = 0.02f, far = 1000.0f;
+                stereo_screen(&hw, &hh, &d);
+                memset(place, 0, sizeof place);
+                place[0] = hw; place[5] = hh; place[10] = 1; place[14] = -d; place[15] = 1;
+                view_matrix(views[i].pose, view);
+                float tx = tanf(fov[i].angleRight), ty = tanf(fov[i].angleUp);
+                memset(proj, 0, sizeof proj);
+                proj[0] = 1 / tx; proj[5] = 1 / ty; proj[10] = -(far + n) / (far - n);
+                proj[11] = -1; proj[14] = -2 * far * n / (far - n);
+                mat4_mul(m, view, place);
+                mat4_mul(m, proj, m);
+                xo_draw_screen(m, layers ? layers : stereo_eye_texture(0), layers != 0, (int)e->w, (int)e->h);
+            } else
+                gl.BlitFramebuffer(0, 0, (GLint)e->w, (GLint)e->h, 0, 0, (GLint)e->w, (GLint)e->h,
+                                   GL_COLOR_BUFFER_BIT, GL_NEAREST);
             if (i == 0 && g_frame % 600 == 300) {
                 /* the game's centre pixel, and what the copy stored in the
                  * swapchain: equal unless the copy encoded it as sRGB again */
@@ -855,7 +871,14 @@ void xr_frame_end(void)
     ei.displayTime = frame.predictedDisplayTime;
     ei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
     ei.layerCount = ok ? 1 : 0; ei.layers = layers;
-    xrEndFrame(session, &ei);
+    static int last_ok = -1;
+    if (ok != last_ok)
+        fprintf(stderr, "[xr] frame %u: %s (views %d, should render %d, state %d)\n", g_frame,
+                ok ? "showing the game" : "nothing to show", views_ok, (int)frame.shouldRender, (int)state);
+    last_ok = ok;
+    XrResult er = xrEndFrame(session, &ei);
+    static unsigned bad;
+    if (XR_FAILED(er) && bad++ < 20) fprintf(stderr, "[xr] frame %u: xrEndFrame failed %d\n", g_frame, (int)er);
 }
 
 int xr_running(void) { return running; }

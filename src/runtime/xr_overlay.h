@@ -18,4 +18,8 @@ int  xo_init(void);
 /* With the eye's swapchain image bound for drawing (and a depth buffer). */
 void xo_draw(const XoFrame *f, const float viewproj[16], const float eye_pos[3], int w, int h);
 
+/* The game's flat picture (a 2D texture, or layer 0 of an array) on the
+ * quad -1..1 placed by mvp; clears the rest of the image to black. */
+void xo_draw_screen(const float mvp[16], unsigned tex, int array_layer0, int w, int h);
+
 #endif

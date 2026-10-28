@@ -40,10 +40,15 @@ static struct {
     F(void, DepthFunc, (GLenum)) F(void, ColorMask, (GLboolean, GLboolean, GLboolean, GLboolean))
     F(void, Viewport, (GLint, GLint, GLsizei, GLsizei)) F(void, Clear, (GLbitfield)) F(void, ClearDepthf, (GLfloat))
     F(void, FrontFace, (GLenum)) F(void, CullFace, (GLenum))
+    F(void, ActiveTexture, (GLenum)) F(void, BindTexture, (GLenum, GLuint)) F(void, Uniform1i, (GLint, GLint))
+    F(void, GenSamplers, (GLsizei, GLuint *)) F(void, BindSampler, (GLuint, GLuint))
+    F(void, SamplerParameteri, (GLuint, GLenum, GLint)) F(void, ClearColor, (GLfloat, GLfloat, GLfloat, GLfloat))
 #undef F
 } gl;
 
 static GLuint prog_gun, prog_beam, vao_gun, vbo_gun, vao_beam, vbo_beam;
+static GLuint prog_screen[2], vao_screen, vbo_screen, smp_screen;   /* [0] a 2D texture, [1] a layer of an array */
+static GLint u_screen_mvp[2], u_screen_tex[2];
 static GLint u_gun_mvp, u_gun_model, u_beam_mvp, u_beam_color;
 static int gun_verts;
 
@@ -124,7 +129,8 @@ int xo_init(void)
     L(Uniform4f) L(GenVertexArrays) L(BindVertexArray) L(GenBuffers) L(BindBuffer) L(BufferData)
     L(VertexAttribPointer) L(EnableVertexAttribArray) L(DrawArrays) L(Enable) L(Disable) L(IsEnabled)
     L(GetIntegerv) L(GetBooleanv) L(BlendFuncSeparate) L(DepthMask) L(DepthFunc) L(ColorMask) L(Viewport)
-    L(Clear) L(ClearDepthf) L(FrontFace) L(CullFace)
+    L(Clear) L(ClearDepthf) L(FrontFace) L(CullFace) L(ActiveTexture) L(BindTexture) L(Uniform1i)
+    L(GenSamplers) L(BindSampler) L(SamplerParameteri) L(ClearColor)
 #undef L
     prog_gun = program(
         "#version 300 es\nlayout(location=0) in vec3 p; layout(location=1) in vec3 n; layout(location=2) in vec3 c;\n"
@@ -145,6 +151,32 @@ int xo_init(void)
         "p", "uv", NULL);
     u_beam_mvp = gl.GetUniformLocation(prog_beam, "mvp");
     u_beam_color = gl.GetUniformLocation(prog_beam, "color");
+
+    for (int a = 0; a < 2; a++) {
+        prog_screen[a] = program(
+            "#version 300 es\nlayout(location=0) in vec2 p; uniform mat4 mvp; out vec2 t;\n"
+            "void main() { t = p * 0.5 + 0.5; gl_Position = mvp * vec4(p, 0.0, 1.0); }\n",
+            a ? "#version 300 es\nprecision highp float; precision highp sampler2DArray; in vec2 t; uniform sampler2DArray tex; out vec4 o;\n"
+                "void main() { o = vec4(texture(tex, vec3(t, 0.0)).rgb, 1.0); }\n"
+              : "#version 300 es\nprecision highp float; in vec2 t; uniform sampler2D tex; out vec4 o;\n"
+                "void main() { o = vec4(texture(tex, t).rgb, 1.0); }\n",
+            "p", NULL, NULL);
+        u_screen_mvp[a] = gl.GetUniformLocation(prog_screen[a], "mvp");
+        u_screen_tex[a] = gl.GetUniformLocation(prog_screen[a], "tex");
+    }
+    static const float quad[8] = { -1, -1, 1, -1, -1, 1, 1, 1 };
+    gl.GenVertexArrays(1, &vao_screen);
+    gl.GenBuffers(1, &vbo_screen);
+    gl.BindVertexArray(vao_screen);
+    gl.BindBuffer(GL_ARRAY_BUFFER, vbo_screen);
+    gl.BufferData(GL_ARRAY_BUFFER, sizeof quad, quad, GL_STATIC_DRAW);
+    gl.VertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 8, (const void *)0);
+    gl.EnableVertexAttribArray(0);
+    gl.GenSamplers(1, &smp_screen);
+    gl.SamplerParameteri(smp_screen, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    gl.SamplerParameteri(smp_screen, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    gl.SamplerParameteri(smp_screen, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    gl.SamplerParameteri(smp_screen, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
     build_gun();
     gl.GenVertexArrays(1, &vao_gun);
@@ -322,6 +354,42 @@ void xo_draw(const XoFrame *f, const float viewproj[16], const float eye_pos[3],
     }
     if (f->flash) spot(viewproj, eye_pos, f->muzzle, 0.045f, 1.0f, 0.75f, 0.3f, 0.9f);
 
+    restore(&s);
+}
+
+/* The game's own picture, drawn flat as on the arcade, on the screen in front
+ * of the player: the quad -1..1 through mvp. The rest of the eye is black. */
+void xo_draw_screen(const float mvp[16], unsigned tex, int array_layer0, int w, int h)
+{
+    if (!prog_screen[0]) return;
+    Saved s;
+    save(&s);
+    GLint unit = 0, bound = 0;
+    gl.GetIntegerv(GL_ACTIVE_TEXTURE, &unit);
+    gl.ActiveTexture(GL_TEXTURE0);
+    GLenum target = array_layer0 ? GL_TEXTURE_2D_ARRAY : GL_TEXTURE_2D;
+    gl.GetIntegerv(array_layer0 ? GL_TEXTURE_BINDING_2D_ARRAY : GL_TEXTURE_BINDING_2D, &bound);
+    GLboolean scissor = gl.IsEnabled(GL_SCISSOR_TEST);
+    gl.Disable(GL_SCISSOR_TEST);
+    gl.Viewport(0, 0, w, h);
+    gl.ColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    gl.ClearColor(0, 0, 0, 1);
+    gl.Clear(GL_COLOR_BUFFER_BIT);
+    gl.Disable(GL_DEPTH_TEST);
+    gl.Disable(GL_CULL_FACE);
+    gl.Disable(GL_BLEND);
+    int a = array_layer0 ? 1 : 0;
+    gl.UseProgram(prog_screen[a]);
+    gl.UniformMatrix4fv(u_screen_mvp[a], 1, GL_FALSE, mvp);
+    gl.Uniform1i(u_screen_tex[a], 0);
+    gl.BindTexture(target, tex);
+    gl.BindSampler(0, smp_screen);
+    gl.BindVertexArray(vao_screen);
+    gl.DrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    gl.BindSampler(0, 0);
+    gl.BindTexture(target, (GLuint)bound);
+    gl.ActiveTexture((GLenum)unit);
+    if (scissor) gl.Enable(GL_SCISSOR_TEST);
     restore(&s);
 }
 
