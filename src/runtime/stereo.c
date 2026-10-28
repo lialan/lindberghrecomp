@@ -1056,6 +1056,15 @@ static void glprof_frame(void)
     if (all > 40e6)
         fprintf(stderr, "[glprof] frame %u took %.0f ms, GL %.0f ms of it, most in %s (%.0f ms)\n", g_frame,
                 all / 1e6, gl / 1e6, hle_name((HleId)best), g_frame_ns[best] / 1e6);
+#ifdef LINDBERGH_GL4ES
+    {   /* buffer uploads: the driver's, and gl4es' own copy */
+        extern double gl4es_drawprof[4], gl4es_bufprof_copy, gl4es_bufprof_bytes;
+        if (all > 40e6 && gl4es_bufprof_bytes > 0)
+            fprintf(stderr, "[glprof]   buffers: %.1f MB, driver %.0f ms, gl4es' copy %.0f ms\n",
+                    gl4es_bufprof_bytes / 1e6, gl4es_drawprof[3] / 1e6, gl4es_bufprof_copy / 1e6);
+        gl4es_bufprof_bytes = gl4es_bufprof_copy = gl4es_drawprof[3] = 0;
+    }
+#endif
     memset(g_frame_ns, 0, sizeof g_frame_ns);
     g_frame_t0 = now;
 }
