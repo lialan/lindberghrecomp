@@ -23,6 +23,48 @@ int g_gl_errcheck;
 
 static const char *arb_source(GLenum target, GLuint id) { return arb_get_source(target, id); }
 
+#ifdef LINDBERGH_GL4ES
+#include <EGL/egl.h>
+/* What the GLES driver itself says about its current program: gl4es draws
+ * with programs of its own, and its glValidateProgram reports nothing. */
+static void gles_program_report(void)
+{
+    typedef void (*Iv)(GLenum, GLint *);
+    typedef void (*Prog)(GLuint);
+    typedef void (*ProgIv)(GLuint, GLenum, GLint *);
+    typedef void (*Log)(GLuint, GLsizei, GLsizei *, char *);
+    typedef void (*Active)(GLuint, GLuint, GLsizei, GLsizei *, GLint *, GLenum *, char *);
+    typedef GLint (*Loc)(GLuint, const char *);
+    typedef void (*UIv)(GLuint, GLint, GLint *);
+    Iv get = (Iv)eglGetProcAddress("glGetIntegerv");
+    Prog validate = (Prog)eglGetProcAddress("glValidateProgram");
+    ProgIv piv = (ProgIv)eglGetProcAddress("glGetProgramiv");
+    Log plog = (Log)eglGetProcAddress("glGetProgramInfoLog");
+    Active act = (Active)eglGetProcAddress("glGetActiveUniform");
+    Loc loc = (Loc)eglGetProcAddress("glGetUniformLocation");
+    UIv uiv = (UIv)eglGetProcAddress("glGetUniformiv");
+    if (!get || !validate || !piv || !plog || !act || !loc || !uiv) return;
+    GLint prog = 0, linked = 0, n = 0;
+    get(GL_CURRENT_PROGRAM, &prog);
+    if (!prog) { fprintf(stderr, "[gl]   GLES: no current program\n"); return; }
+    char log[2048] = "";
+    validate((GLuint)prog);
+    plog((GLuint)prog, sizeof log, NULL, log);
+    piv((GLuint)prog, GL_LINK_STATUS, &linked);
+    fprintf(stderr, "[gl]   GLES program %d, linked %d, validation: %s\n", prog, linked, *log ? log : "(no log)");
+    piv((GLuint)prog, GL_ACTIVE_UNIFORMS, &n);
+    for (GLint i = 0; i < n; i++) {
+        char nm[128]; GLint sz; GLenum ty;
+        act((GLuint)prog, (GLuint)i, sizeof nm, NULL, &sz, &ty, nm);
+        GLint unit = -1;
+        if (ty == GL_SAMPLER_2D || ty == GL_SAMPLER_CUBE || ty == 0x8B5F /* 3D */ || ty == 0x8B62 /* 2D shadow */)
+            uiv((GLuint)prog, loc((GLuint)prog, nm), &unit);
+        fprintf(stderr, "[gl]     uniform %s type %#x%s", nm, ty, unit >= 0 ? "" : "\n");
+        if (unit >= 0) fprintf(stderr, " unit %d\n", unit);
+    }
+}
+#endif
+
 void gl_check_error(const char *name)
 {
     static struct { const char *name; GLenum err; } seen[64];
@@ -74,6 +116,9 @@ void gl_check_error(const char *name)
             }
         }
     }
+#ifdef LINDBERGH_GL4ES
+    if (e == GL_INVALID_OPERATION) gles_program_report();
+#endif
 }
 
 void gl_trace_call(const char *name)

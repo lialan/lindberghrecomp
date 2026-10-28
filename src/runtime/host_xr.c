@@ -112,6 +112,7 @@ static void cfg_save(void)
 static void cfg_load(void)
 {
     FILE *f = fopen("vr.cfg", "r");
+    if (!f) f = fopen("../vr.cfg", "r");    /* beside the game: where adb can put one */
     if (!f) return;
     char key[32], val[32];
     while (fscanf(f, "%31s %31s", key, val) == 2) {

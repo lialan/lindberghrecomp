@@ -1038,6 +1038,7 @@ typedef struct {
     MatRef mat[2][16]; int nmat[2];
     int    env_hi[2], local_hi[2];
     GLint  u_env[2], u_loc[2], u_mat[2][16], u_rect, u_reproj;
+    GLint  n_rect;                          /* u_rect_norm's length as the driver keeps it */
     unsigned rect_units;                /* texture units sampled as rectangles */
     unsigned up_env[2], up_loc[2];      /* generations last uploaded */
 } Linked;
@@ -1064,6 +1065,22 @@ static GLuint compile(GLenum type, const char *src, int stage, GLuint id)
         return 0;
     }
     return sh;
+}
+
+/* An array uniform's length as the driver keeps it: drivers may shorten an
+ * array to the last element the code uses (Adreno does), and an upload longer
+ * than that is refused outright. want is the length the translation declared. */
+static GLint array_len(GLuint prog, const char *name, GLint want)
+{
+    GLint n = 0;
+    size_t k = strlen(name);
+    glGetProgramiv(prog, GL_ACTIVE_UNIFORMS, &n);
+    for (GLint i = 0; i < n; i++) {
+        char nm[64]; GLint sz = 0; GLenum ty;
+        glGetActiveUniform(prog, (GLuint)i, sizeof nm, NULL, &sz, &ty, nm);
+        if (!strncmp(nm, name, k) && (nm[k] == 0 || nm[k] == '[')) return sz > 0 && sz < want ? sz : want;
+    }
+    return want;
 }
 
 static struct timespec g_link_t0;
@@ -1147,7 +1164,9 @@ static Linked *link_pair(GLuint vid, GLuint fid)
         const char *P = st ? "f" : "v";
         char nm[32];
         snprintf(nm, sizeof nm, "%s_env", P); l->u_env[st] = glGetUniformLocation(l->prog, nm);
+        if (l->u_env[st] >= 0) l->env_hi[st] = array_len(l->prog, nm, l->env_hi[st] + 1) - 1;
         snprintf(nm, sizeof nm, "%s_loc", P); l->u_loc[st] = glGetUniformLocation(l->prog, nm);
+        if (l->u_loc[st] >= 0) l->local_hi[st] = array_len(l->prog, nm, l->local_hi[st] + 1) - 1;
         for (int m = 0; m < l->nmat[st]; m++) {
             snprintf(nm, sizeof nm, "%s_m%d", P, m);
             l->u_mat[st][m] = glGetUniformLocation(l->prog, nm);
@@ -1155,6 +1174,7 @@ static Linked *link_pair(GLuint vid, GLuint fid)
     }
 #ifdef LINDBERGH_GL4ES
     l->u_rect = glGetUniformLocation(l->prog, "u_rect_norm");
+    l->n_rect = l->u_rect >= 0 ? array_len(l->prog, "u_rect_norm", 16) : 0;
 #else
     l->u_rect = glGetUniformLocation(l->prog, "u_rect_scale");
 #endif
@@ -1255,7 +1275,7 @@ static void upload(Linked *l)
             if (w > 0 && h > 0) { norm[u][0] = rx / (float)w; norm[u][1] = ry / (float)h; }
         }
         glActiveTexture((GLenum)active);
-        glUniform2fv(l->u_rect, 16, &norm[0][0]);
+        glUniform2fv(l->u_rect, l->n_rect, &norm[0][0]);
     }
 #else
     if (l->u_rect >= 0) { float rx, ry; stereo_rect_scale(&rx, &ry); glUniform2f(l->u_rect, rx, ry); }
@@ -1416,7 +1436,20 @@ void arb_rect_enable_seen(void)
 }
 #endif
 
+double g_arb_draw_ns;                   /* LINDBERGH_GLPROF: time in arb_before_draw */
+static void before_draw(void);
 void arb_before_draw(void)
+{
+    extern int stereo_glprof_on(void);
+    if (!stereo_glprof_on()) { before_draw(); return; }
+    struct timespec a, b;
+    clock_gettime(CLOCK_MONOTONIC, &a);
+    before_draw();
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    g_arb_draw_ns += (b.tv_sec - a.tv_sec) * 1e9 + (b.tv_nsec - a.tv_nsec);
+}
+
+static void before_draw(void)
 {
 #ifdef LINDBERGH_GL4ES
     rect_enables(0);

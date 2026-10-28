@@ -607,11 +607,29 @@ static void maybe_screenshot(void)
     free(px);
 }
 
+#if defined(__ANDROID__)
+/* Where a frame's time goes, summed over each [perf] period: the game's own
+ * work (first eye included), the second eye's replay, handing both to the
+ * headset, and waiting for its next frame. */
+static double g_t_game, g_t_eye2, g_t_submit, g_t_wait;
+static Uint64 g_t_mark;
+static double since_mark(void)
+{
+    Uint64 now = SDL_GetPerformanceCounter();
+    double ms = g_t_mark ? (now - g_t_mark) * 1000.0 / SDL_GetPerformanceFrequency() : 0;
+    g_t_mark = now;
+    return ms;
+}
+#endif
+
 void host_swap(void)
 {
 #if defined(__ANDROID__)
+    g_t_game += since_mark();
     stereo_frame_end();                 /* the second eye, then both to the headset */
+    g_t_eye2 += since_mark();
     xr_frame_end();
+    g_t_submit += since_mark();
 #else
     if (stereo_enabled()) {             /* draw the second eye, show both */
         stereo_frame_end();
@@ -623,6 +641,7 @@ void host_swap(void)
     g_frame++;
 #if defined(__ANDROID__)
     xr_frame_begin();
+    g_t_wait += since_mark();
     if (0) {
 #else
     if (g_win.win) {
@@ -655,8 +674,16 @@ void host_swap(void)
         Uint32 now = SDL_GetTicks();
         if (!t0) { t0 = now; f0 = g_frame; }
         else if (now - t0 >= 5000) {
+#if defined(__ANDROID__)
+            unsigned n = g_frame - f0 ? g_frame - f0 : 1;
+            fprintf(stderr, "[perf] frame %u, %.1f fps; ms per frame: game %.1f, second eye %.1f, submit %.1f, headset wait %.1f\n",
+                    g_frame, (g_frame - f0) * 1000.0 / (now - t0),
+                    g_t_game / n, g_t_eye2 / n, g_t_submit / n, g_t_wait / n);
+            g_t_game = g_t_eye2 = g_t_submit = g_t_wait = 0;
+#else
             fprintf(stderr, "[perf] frame %u, %.1f fps\n", g_frame,
                     (g_frame - f0) * 1000.0 / (now - t0));
+#endif
             t0 = now; f0 = g_frame;
         }
     }

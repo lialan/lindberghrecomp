@@ -34,9 +34,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "gl_posix.h"
 #include "stereo.h"
+#ifdef LINDBERGH_GL4ES
+#include <EGL/egl.h>
+#endif
 #include "arbprog.h"
 
 extern unsigned g_frame;
@@ -388,14 +392,76 @@ static void fixed_function_rect_done(void)
     g_texmat_scaled = 0;
 }
 
-/* Returns 1 when it did the call's work itself. */
-static int transform_call(CPU *c, const char *n)
+/* ---- what each GL import is, worked out once ----
+ * The game makes 20-30 thousand GL calls a frame; telling them apart by name
+ * on every call cost more than the calls. */
+enum {
+    K_OTHER, K_BINDFB, K_VIEWPORT, K_SCISSOR, K_FBTEX2D, K_ACTIVETEX, K_BINDTEX, K_ENABLE, K_DISABLE,
+    K_DRAWARRAYS, K_DRAWELEMENTS, K_DRAWOTHER, K_BEGIN, K_END, K_MATRIXMODE,
+    K_LOADID, K_LOADMATRIX, K_MULTMATRIX, K_ORTHO, K_ORTHO2D, K_FRUSTUM, K_PERSPECTIVE,
+    K_PUSHMATRIX, K_POPMATRIX, K_TRANSLATE, K_SCALE, K_GETINTEGERV, K_GETFLOATV, K_GETOTHER, K_UNMAP,
+};
+typedef struct {
+    uint8_t ok, kind, live, track;          /* live: run, never recorded; track: client array state */
+    int8_t pidx;                            /* an argument passed by pointer that is copied */
+    uint8_t pkind;                          /* 0: pbytes; 1: glBufferData's size; 2: glBufferSubData's */
+    uint32_t pbytes;
+} Cls;
+static Cls g_cls[HLE_COUNT];
+
+static int live_only(const char *n);
+static void pointer_arg(const char *n, int *idx, uint32_t *bytes, uint8_t *kind);
+
+static const Cls *cls(HleId id)
 {
-    if (!strcmp(n, "glBindFramebufferEXT") || !strcmp(n, "glBindFramebuffer")) {
+    Cls *k = &g_cls[id];
+    if (k->ok) return k;
+    const char *n = hle_name(id);
+    static const struct { const char *name; uint8_t kind; } T[] = {
+        { "glBindFramebufferEXT", K_BINDFB }, { "glBindFramebuffer", K_BINDFB },
+        { "glViewport", K_VIEWPORT }, { "glScissor", K_SCISSOR },
+        { "glFramebufferTexture2DEXT", K_FBTEX2D }, { "glFramebufferTexture2D", K_FBTEX2D },
+        { "glActiveTexture", K_ACTIVETEX }, { "glActiveTextureARB", K_ACTIVETEX }, { "glBindTexture", K_BINDTEX },
+        { "glEnable", K_ENABLE }, { "glDisable", K_DISABLE },
+        { "glDrawArrays", K_DRAWARRAYS }, { "glDrawElements", K_DRAWELEMENTS },
+        { "glBegin", K_BEGIN }, { "glEnd", K_END }, { "glMatrixMode", K_MATRIXMODE },
+        { "glLoadIdentity", K_LOADID }, { "glLoadMatrixf", K_LOADMATRIX }, { "glMultMatrixf", K_MULTMATRIX },
+        { "glOrtho", K_ORTHO }, { "gluOrtho2D", K_ORTHO2D }, { "glFrustum", K_FRUSTUM }, { "gluPerspective", K_PERSPECTIVE },
+        { "glPushMatrix", K_PUSHMATRIX }, { "glPopMatrix", K_POPMATRIX },
+        { "glTranslatef", K_TRANSLATE }, { "glScalef", K_SCALE },
+        { "glGetIntegerv", K_GETINTEGERV }, { "glGetFloatv", K_GETFLOATV },
+        { "glUnmapBufferARB", K_UNMAP }, { "glUnmapBuffer", K_UNMAP },
+    };
+    k->kind = K_OTHER;
+    for (unsigned i = 0; i < sizeof T / sizeof T[0]; i++)
+        if (!strcmp(n, T[i].name)) { k->kind = T[i].kind; break; }
+    if (k->kind == K_OTHER && !strncmp(n, "glDraw", 6)) k->kind = K_DRAWOTHER;
+    if (k->kind == K_OTHER && !strncmp(n, "glGet", 5)) k->kind = K_GETOTHER;
+    k->live = (uint8_t)live_only(n);
+    k->track = !strcmp(n, "glEnableClientState") || !strcmp(n, "glDisableClientState") ||
+               !strcmp(n, "glClientActiveTexture") || !strcmp(n, "glClientActiveTextureARB") ||
+               !strcmp(n, "glEnableVertexAttribArrayARB") || !strcmp(n, "glDisableVertexAttribArrayARB") ||
+               !strcmp(n, "glVertexPointer") || !strcmp(n, "glNormalPointer") || !strcmp(n, "glColorPointer") ||
+               !strcmp(n, "glTexCoordPointer") || !strcmp(n, "glVertexAttribPointerARB");
+    int idx; uint32_t bytes; uint8_t pk;
+    pointer_arg(n, &idx, &bytes, &pk);
+    k->pidx = (int8_t)idx; k->pbytes = bytes; k->pkind = pk;
+    k->ok = 1;
+    return k;
+}
+
+static int is_draw(int kind) { return kind == K_DRAWARRAYS || kind == K_DRAWELEMENTS || kind == K_DRAWOTHER; }
+
+/* Returns 1 when it did the call's work itself. */
+static int transform_call(CPU *c, HleId id, const char *n)
+{
+    int k = cls(id)->kind;
+    if (k == K_OTHER) return 0;
+    if (k == K_BINDFB) {
         bind_framebuffer(A32(0), A32(1));
         return 1;
     }
-    if (!strcmp(n, "glViewport") || !strcmp(n, "glScissor")) {
+    if (k == K_VIEWPORT || k == K_SCISSOR) {
         GLint x = AI32(0), y = AI32(1), w = AI32(2), h = AI32(3);
         if (n[2] == 'V') { g_vp[0] = x; g_vp[1] = y; g_vp[2] = w; g_vp[3] = h; }
         GLint X = (GLint)lroundf(x * g_sx), Y = (GLint)lroundf(y * g_sy);
@@ -404,12 +470,12 @@ static int transform_call(CPU *c, const char *n)
         else { glScissor(X, Y, W, H); g_scissor[0] = X; g_scissor[1] = Y; g_scissor[2] = W; g_scissor[3] = H; }
         return 1;
     }
-    if (!strcmp(n, "glFramebufferTexture2DEXT") || !strcmp(n, "glFramebufferTexture2D")) {
+    if (k == K_FBTEX2D) {
         scale_target(A32(2), A32(3));
         return 0;
     }
-    if (!strcmp(n, "glActiveTexture") || !strcmp(n, "glActiveTextureARB")) { g_active_unit = A32(0); return 0; }
-    if (!strcmp(n, "glBindTexture")) {
+    if (k == K_ACTIVETEX) { g_active_unit = A32(0); return 0; }
+    if (k == K_BINDTEX) {
         unsigned u = g_active_unit - GL_TEXTURE0;
         if (A32(0) == GL_TEXTURE_RECTANGLE_ARB) {
             if (u == 0) g_unit0_rect = A32(1);
@@ -417,17 +483,17 @@ static int transform_call(CPU *c, const char *n)
         }
         return 0;
     }
-    if ((!strcmp(n, "glEnable") || !strcmp(n, "glDisable")) && A32(0) == GL_TEXTURE_RECTANGLE_ARB) {
+    if ((k == K_ENABLE || k == K_DISABLE) && A32(0) == GL_TEXTURE_RECTANGLE_ARB) {
         unsigned bit = 1u << ((g_active_unit - GL_TEXTURE0) & 31);
         if (n[2] == 'E') g_rect_on |= bit; else g_rect_on &= ~bit;
         return 0;
     }
-    if (!strcmp(n, "glEnable") || !strcmp(n, "glDisable")) {
+    if (k == K_ENABLE || k == K_DISABLE) {
         if (A32(0) == GL_SCISSOR_TEST) g_scissor_on = n[2] == 'E';
         if (A32(0) == GL_TEXTURE_2D && g_active_unit == GL_TEXTURE0) g_tex2d_on = n[2] == 'E';
         return 0;
     }
-    if (g_on && (!strncmp(n, "glDraw", 6) || !strcmp(n, "glBegin"))) {
+    if (g_on && (is_draw(k) || k == K_BEGIN)) {
         /* Screen content or not, decided per draw: 2D that is not a pass over
          * a render target, and 3D drawn into the HUD's target. */
         int persp = is_perspective(g_proj[g_proj_top]);
@@ -441,49 +507,49 @@ static int transform_call(CPU *c, const char *n)
         fixed_function_rect();
         return 0;
     }
-    if (!strcmp(n, "glMatrixMode")) { g_mode = A32(0); return 0; }
+    if (k == K_MATRIXMODE) { g_mode = A32(0); return 0; }
     if (g_mode != GL_PROJECTION) return 0;
 
     float *top = g_proj[g_proj_top], m[16];
-    if (!strcmp(n, "glLoadIdentity")) mat_identity(top);
-    else if (!strcmp(n, "glLoadMatrixf")) { const float *p = (const float *)APTR(0); if (p) memcpy(top, p, 64); }
-    else if (!strcmp(n, "glMultMatrixf")) { const float *p = (const float *)APTR(0); if (p) mat_mul(top, top, p); }
-    else if (!strcmp(n, "glOrtho")) { mat_ortho(m, gl_arg_d(c, 0), gl_arg_d(c, 2), gl_arg_d(c, 4), gl_arg_d(c, 6), gl_arg_d(c, 8), gl_arg_d(c, 10)); mat_mul(top, top, m); }
-    else if (!strcmp(n, "gluOrtho2D")) { mat_ortho(m, gl_arg_d(c, 0), gl_arg_d(c, 2), gl_arg_d(c, 4), gl_arg_d(c, 6), -1, 1); mat_mul(top, top, m); }
-    else if (!strcmp(n, "glFrustum")) { mat_frustum(m, gl_arg_d(c, 0), gl_arg_d(c, 2), gl_arg_d(c, 4), gl_arg_d(c, 6), gl_arg_d(c, 8), gl_arg_d(c, 10)); mat_mul(top, top, m); }
-    else if (!strcmp(n, "gluPerspective")) {
+    if (k == K_LOADID) mat_identity(top);
+    else if (k == K_LOADMATRIX) { const float *p = (const float *)APTR(0); if (p) memcpy(top, p, 64); }
+    else if (k == K_MULTMATRIX) { const float *p = (const float *)APTR(0); if (p) mat_mul(top, top, p); }
+    else if (k == K_ORTHO) { mat_ortho(m, gl_arg_d(c, 0), gl_arg_d(c, 2), gl_arg_d(c, 4), gl_arg_d(c, 6), gl_arg_d(c, 8), gl_arg_d(c, 10)); mat_mul(top, top, m); }
+    else if (k == K_ORTHO2D) { mat_ortho(m, gl_arg_d(c, 0), gl_arg_d(c, 2), gl_arg_d(c, 4), gl_arg_d(c, 6), -1, 1); mat_mul(top, top, m); }
+    else if (k == K_FRUSTUM) { mat_frustum(m, gl_arg_d(c, 0), gl_arg_d(c, 2), gl_arg_d(c, 4), gl_arg_d(c, 6), gl_arg_d(c, 8), gl_arg_d(c, 10)); mat_mul(top, top, m); }
+    else if (k == K_PERSPECTIVE) {
         double zn = gl_arg_d(c, 4), t = zn * tan(gl_arg_d(c, 0) * M_PI / 360), r = t * gl_arg_d(c, 2);
         mat_frustum(m, -r, r, -t, t, zn, gl_arg_d(c, 6)); mat_mul(top, top, m);
     }
-    else if (!strcmp(n, "glPushMatrix")) { if (g_proj_top < 31) { memcpy(g_proj[g_proj_top + 1], top, 64); g_proj_top++; } glPushMatrix(); return 1; }
-    else if (!strcmp(n, "glPopMatrix")) { if (g_proj_top > 0) g_proj_top--; glPopMatrix(); load_projection(); return 1; }
-    else if (!strcmp(n, "glTranslatef")) { mat_identity(m); m[12] = argf(c, 0); m[13] = argf(c, 1); m[14] = argf(c, 2); mat_mul(top, top, m); }
-    else if (!strcmp(n, "glScalef")) { mat_identity(m); m[0] = argf(c, 0); m[5] = argf(c, 1); m[10] = argf(c, 2); mat_mul(top, top, m); }
+    else if (k == K_PUSHMATRIX) { if (g_proj_top < 31) { memcpy(g_proj[g_proj_top + 1], top, 64); g_proj_top++; } glPushMatrix(); return 1; }
+    else if (k == K_POPMATRIX) { if (g_proj_top > 0) g_proj_top--; glPopMatrix(); load_projection(); return 1; }
+    else if (k == K_TRANSLATE) { mat_identity(m); m[12] = argf(c, 0); m[13] = argf(c, 1); m[14] = argf(c, 2); mat_mul(top, top, m); }
+    else if (k == K_SCALE) { mat_identity(m); m[0] = argf(c, 0); m[5] = argf(c, 1); m[10] = argf(c, 2); mat_mul(top, top, m); }
     else return 0;
     load_projection();
     return 1;
 }
 
 /* Answers the game must get in its own terms. */
-static void fix_query(CPU *c, const char *n)
+static void fix_query(CPU *c, int k)
 {
-    if (!strcmp(n, "glGetIntegerv") && A32(0) == GL_VIEWPORT) {
+    if (k == K_GETINTEGERV && A32(0) == GL_VIEWPORT) {
         GLint *o = (GLint *)APTR(1); if (o) memcpy(o, g_vp, sizeof g_vp);
-    } else if (!strcmp(n, "glGetIntegerv") && (A32(0) == GL_FRAMEBUFFER_BINDING)) {
+    } else if (k == K_GETINTEGERV && (A32(0) == GL_FRAMEBUFFER_BINDING)) {
         GLint *o = (GLint *)APTR(1); if (o) *o = (GLint)g_game_fb;
-    } else if (!strcmp(n, "glGetFloatv") && A32(0) == GL_PROJECTION_MATRIX) {
+    } else if (k == K_GETFLOATV && A32(0) == GL_PROJECTION_MATRIX) {
         float *o = (float *)APTR(1); if (o) memcpy(o, g_proj[g_proj_top], 64);
-    } else if (!strcmp(n, "glGetFloatv") && A32(0) == GL_VIEWPORT) {
+    } else if (k == K_GETFLOATV && A32(0) == GL_VIEWPORT) {
         float *o = (float *)APTR(1); if (o) for (int i = 0; i < 4; i++) o[i] = (float)g_vp[i];
     }
 }
 
 static void exec(CPU *c, HleId id, HleHandler fn)
 {
-    const char *n = hle_name(id);
-    if (!transform_call(c, n)) fn(c);
-    if (!strncmp(n, "glDraw", 6) || !strcmp(n, "glEnd")) { fixed_function_rect_done(); clip_done(); }
-    if (!g_replaying && n[2] == 'G' && n[3] == 'e' && n[4] == 't') fix_query(c, n);
+    int k = cls(id)->kind;
+    if (!transform_call(c, id, hle_name(id))) fn(c);
+    if (is_draw(k) || k == K_END) { fixed_function_rect_done(); clip_done(); }
+    if (!g_replaying && (k == K_GETINTEGERV || k == K_GETFLOATV)) fix_query(c, k);
 }
 
 /* ---- recording ---- */
@@ -512,7 +578,7 @@ static int live_only(const char *n)
 
 /* Arguments the game passes by pointer that are small enough to copy:
  * (argument index, bytes). Bytes 0: not a pointer worth copying. */
-static void pointer_arg(const char *n, CPU *c, int *idx, uint32_t *bytes)
+static void pointer_arg(const char *n, int *idx, uint32_t *bytes, uint8_t *kind)
 {
     static const struct { const char *name; int idx; uint32_t bytes; } T[] = {
         { "glLoadMatrixf", 0, 64 }, { "glMultMatrixf", 0, 64 },
@@ -525,11 +591,11 @@ static void pointer_arg(const char *n, CPU *c, int *idx, uint32_t *bytes)
         { "glVertex2fv", 0, 8 }, { "glTexCoord2fv", 0, 8 }, { "glMultiTexCoord2fvARB", 1, 8 },
         { "glMultiTexCoord2fv", 1, 8 }, { "glVertexAttrib4fvARB", 1, 16 }, { "glClipPlane", 1, 32 },
     };
-    *idx = -1; *bytes = 0;
+    *idx = -1; *bytes = 0; *kind = 0;
     for (unsigned i = 0; i < sizeof T / sizeof T[0]; i++)
         if (!strcmp(n, T[i].name)) { *idx = T[i].idx; *bytes = T[i].bytes; return; }
-    if (!strcmp(n, "glBufferDataARB") || !strcmp(n, "glBufferData")) { *idx = 2; *bytes = A32(1); }
-    else if (!strcmp(n, "glBufferSubDataARB") || !strcmp(n, "glBufferSubData")) { *idx = 3; *bytes = A32(2); }
+    if (!strcmp(n, "glBufferDataARB") || !strcmp(n, "glBufferData")) { *idx = 2; *kind = 1; }
+    else if (!strcmp(n, "glBufferSubDataARB") || !strcmp(n, "glBufferSubData")) { *idx = 3; *kind = 2; }
 }
 
 static int type_bytes(GLenum t)
@@ -577,10 +643,10 @@ static void track_arrays(CPU *c, const char *n)
 static Op *op_new(void);
 
 /* Before a draw is recorded: copy the client memory it reads. */
-static int snapshot_draw(CPU *c, const char *n, uint32_t *args_va)
+static int snapshot_draw(CPU *c, int kind, uint32_t *args_va)
 {
-    int elements = !strcmp(n, "glDrawElements");
-    if (!elements && strcmp(n, "glDrawArrays")) return 1;
+    int elements = kind == K_DRAWELEMENTS;
+    if (!elements && kind != K_DRAWARRAYS) return 1;
     uint32_t lo, hi;
     if (!elements) {
         if (AI32(2) <= 0) return 1;
@@ -666,7 +732,8 @@ static Op *op_new(void)
 
 static void record(CPU *c, HleId id, HleHandler fn, const char *n)
 {
-    if (!strcmp(n, "glUnmapBufferARB") || !strcmp(n, "glUnmapBuffer")) {
+    const Cls *k = cls(id);
+    if (k->kind == K_UNMAP) {
         /* The data the game wrote into the mapping, as it stood at unmap. */
         void *shadow; int size;
         if (!gl_map_shadow(A32(0), &shadow, &size) || size <= 0) return;
@@ -677,17 +744,17 @@ static void record(CPU *c, HleId id, HleHandler fn, const char *n)
         o->kind = OP_UNMAP; o->target = A32(0); o->va = va; o->n = (uint32_t)size;
         return;
     }
-    if (live_only(n)) return;
-    track_arrays(c, n);
+    if (k->live) return;
+    if (k->track) track_arrays(c, n);
     uint32_t va = arena_take(ARGS * 4);
     if (!va) { g_overflow++; return; }
     memcpy(G2H(va), G2H(c->esp), ARGS * 4);
     /* the copies of the draw's vertices go in before the draw itself */
-    if (!snapshot_draw(c, n, &va)) { g_overflow++; return; }
+    if (!snapshot_draw(c, k->kind, &va)) { g_overflow++; return; }
     Op *o = op_new();
     if (!o) { g_overflow++; return; }
-    int idx; uint32_t bytes;
-    pointer_arg(n, c, &idx, &bytes);
+    int idx = k->pidx;
+    uint32_t bytes = k->pkind == 1 ? A32(1) : k->pkind == 2 ? A32(2) : k->pbytes;
     if (idx >= 0 && bytes && A32(idx)) {
         if (bytes > (4u << 20)) { g_nops--; return; }       /* a load-time upload: not per frame */
         uint32_t copy = arena_take(bytes);
@@ -712,6 +779,43 @@ static void trace_draw(const char *n)
     glReadPixels(vp[0] + vp[2] / 2, vp[1] + vp[3] / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
     fprintf(stderr, "[px] %u fb %u %s rect %u hud %d -> %02x%02x%02x%02x\n", k++, g_game_fb, n,
             g_unit0_rect, g_loaded_hud, px[0], px[1], px[2], px[3]);
+    if (!g_game_fb) {
+        GLint sb[4] = { 0 };
+        glGetIntegerv(GL_SCISSOR_BOX, sb);
+        fprintf(stderr, "[px]   eye %d viewport %d,%d %dx%d scissor %d %d,%d %dx%d tan %.2f %.2f %.2f %.2f persp %.3f %.3f screen %.1f m\n",
+                g_eye, vp[0], vp[1], vp[2], vp[3], glIsEnabled(GL_SCISSOR_TEST), sb[0], sb[1], sb[2], sb[3],
+                g_tan[g_eye][0], g_tan[g_eye][1], g_tan[g_eye][2], g_tan[g_eye][3],
+                g_last_persp[0], g_last_persp[5], g_screen_dist);
+        GLint df = 0, bs = 0, bd = 0, af = 0; GLboolean dm = 0, cm[4] = { 0 };
+        glGetIntegerv(GL_DEPTH_FUNC, &df); glGetBooleanv(GL_DEPTH_WRITEMASK, &dm);
+        glGetIntegerv(GL_BLEND_SRC, &bs); glGetIntegerv(GL_BLEND_DST, &bd);
+        glGetBooleanv(GL_COLOR_WRITEMASK, cm); glGetIntegerv(GL_ALPHA_TEST_FUNC, &af);
+        fprintf(stderr, "[px]   depth %d func %#x mask %d  blend %d %#x %#x  alpha test %d %#x  colour mask %d%d%d%d  cull %d stencil %d\n",
+                glIsEnabled(GL_DEPTH_TEST), df, dm, glIsEnabled(GL_BLEND), bs, bd, glIsEnabled(GL_ALPHA_TEST), af,
+                cm[0], cm[1], cm[2], cm[3], glIsEnabled(GL_CULL_FACE), glIsEnabled(GL_STENCIL_TEST));
+#ifdef LINDBERGH_GL4ES
+        {   /* the texture as the GLES driver sees it */
+            typedef void (*Iv)(GLenum, GLint *);
+            typedef void (*TIv)(GLenum, GLenum, GLint *);
+            typedef void (*TLIv)(GLenum, GLint, GLenum, GLint *);
+            typedef void (*Act)(GLenum);
+            Iv get = (Iv)eglGetProcAddress("glGetIntegerv");
+            TIv tp = (TIv)eglGetProcAddress("glGetTexParameteriv");
+            TLIv tl = (TLIv)eglGetProcAddress("glGetTexLevelParameteriv");
+            Act act = (Act)eglGetProcAddress("glActiveTexture");
+            GLint au = 0; get(GL_ACTIVE_TEXTURE, &au); act(GL_TEXTURE0);
+            GLint b = 0, mn = 0, mg = 0, ws = 0, wt = 0, w = 0, h = 0, w1 = 0, base = 0, maxl = 0, prog = 0;
+            get(GL_TEXTURE_BINDING_2D, &b); get(GL_CURRENT_PROGRAM, &prog);
+            tp(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, &mn); tp(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, &mg);
+            tp(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, &ws); tp(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, &wt);
+            tp(GL_TEXTURE_2D, 0x813C /* BASE_LEVEL */, &base); tp(GL_TEXTURE_2D, 0x813D /* MAX_LEVEL */, &maxl);
+            if (tl) { tl(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w); tl(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &h); tl(GL_TEXTURE_2D, 1, GL_TEXTURE_WIDTH, &w1); }
+            act((GLenum)au);
+            fprintf(stderr, "[px]   GLES unit 0: texture %d %dx%d (level 1 %d) min %#x mag %#x wrap %#x %#x levels %d..%d, program %d\n",
+                    b, w, h, w1, mn, mg, ws, wt, base, maxl, prog);
+        }
+#endif
+    }
     Arr *col = &g_arr[ARR_COLOR], *tc = &g_arr[ARR_TEX0];
     if (g_unit0_rect && col->on && col->ptr && !col->vbo && col->type == GL_UNSIGNED_BYTE) {
         const unsigned char *b = (const unsigned char *)GP(col->ptr);
@@ -731,7 +835,61 @@ static void trace_draw(const char *n)
     }
 }
 
+/* LINDBERGH_GLPROF: the time each GL import takes, game's calls only (the
+ * second eye's replay is timed by the host), summed and printed every 300
+ * frames with the costliest few. */
+static int g_glprof = -1;
+static double g_glprof_ns[HLE_COUNT];
+static unsigned g_glprof_n[HLE_COUNT];
+static unsigned g_glprof_f0;
+static double g_glprof_rec_ns;          /* of which recording for the second eye */
+static double now_ns(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec * 1e9 + t.tv_nsec;
+}
+
+static void glprof_report(void)
+{
+    if (g_glprof <= 0 || g_frame - g_glprof_f0 < 300) return;
+    double frames = g_frame - g_glprof_f0, total = 0, calls = 0;
+    for (unsigned i = 0; i < HLE_COUNT; i++) total += g_glprof_ns[i], calls += g_glprof_n[i];
+    extern double g_arb_draw_ns;
+    fprintf(stderr, "[glprof] frames %u..%u: GL %.1f ms (recording %.1f, ARB programs %.1f), %.0f calls per frame; costliest:",
+            g_glprof_f0, g_frame, total / frames / 1e6, g_glprof_rec_ns / frames / 1e6, g_arb_draw_ns / frames / 1e6, calls / frames);
+    g_glprof_rec_ns = g_arb_draw_ns = 0;
+    for (int k = 0; k < 10; k++) {
+        unsigned best = 0;
+        for (unsigned i = 1; i < HLE_COUNT; i++) if (g_glprof_ns[i] > g_glprof_ns[best]) best = i;
+        if (g_glprof_ns[best] <= 0) break;
+        fprintf(stderr, " %s %.2f ms/%.0f", hle_name((HleId)best), g_glprof_ns[best] / frames / 1e6, g_glprof_n[best] / frames);
+        g_glprof_ns[best] = -g_glprof_ns[best];
+    }
+    fputc('\n', stderr);
+    memset(g_glprof_ns, 0, sizeof g_glprof_ns);
+    memset(g_glprof_n, 0, sizeof g_glprof_n);
+    g_glprof_f0 = g_frame;
+}
+
+int stereo_glprof_on(void)
+{
+    if (g_glprof < 0) { const char *v = getenv("LINDBERGH_GLPROF"); g_glprof = v && *v && *v != '0'; }
+    return g_glprof;
+}
+
+static void stereo_gl_call_inner(CPU *c, HleId id, HleHandler fn);
 static void stereo_gl_call(CPU *c, HleId id, HleHandler fn)
+{
+    stereo_glprof_on();
+    if (!g_glprof) { stereo_gl_call_inner(c, id, fn); return; }
+    double t0 = now_ns();
+    stereo_gl_call_inner(c, id, fn);
+    g_glprof_ns[id] += now_ns() - t0;
+    g_glprof_n[id]++;
+}
+
+static void stereo_gl_call_inner(CPU *c, HleId id, HleHandler fn)
 {
     if ((long)g_frame == g_map_frame) {
         uint32_t a[6]; for (int i = 0; i < 6; i++) a[i] = A32(i);
@@ -755,7 +913,11 @@ static void stereo_gl_call(CPU *c, HleId id, HleHandler fn)
     }
     if (!g_on) { fn(c); return; }
     const char *n = hle_name(id);
-    record(c, id, fn, n);
+    if (g_glprof > 0) {
+        double t0 = now_ns();
+        record(c, id, fn, n);
+        g_glprof_rec_ns += now_ns() - t0;
+    } else record(c, id, fn, n);
     exec(c, id, fn);
     trace_draw(n);
 }
@@ -849,6 +1011,7 @@ void stereo_frame_end(void)
 
 void stereo_frame_begin(void)
 {
+    glprof_report();
     if (!g_on) return;
     g_nops = 0;
     g_nfmt = 0;
