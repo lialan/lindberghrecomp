@@ -81,7 +81,7 @@ static float    g_proj[32][16];         /* the game's projection stack */
 static int      g_proj_top;
 static float    g_last_persp[16] = { 1.732f, 0, 0, 0, 0, 2.309f, 0, 0, 0, 0, -1, -1, 0, 0, -0.02f, 0 };
                                         /* the game's last perspective (its usual one to start) */
-static const float g_screen_lens[2] = { 1.732f, 2.309f };
+static float    g_screen_lens[2] = { 1.732f, 2.309f };   /* the screen's lens: the game camera's, as last seen */
                                         /* the HUD's screen is sized by the game's usual lens, not
                                          * its current one: menus zoom the camera to 3.7 and back,
                                          * and the 2D shrank and grew with it */
@@ -1647,6 +1647,15 @@ void stereo_frame_begin(void)
         memset(g_menu_vp, 0, sizeof g_menu_vp);
         if (strcmp(sig, last_hud)) fprintf(stderr, "[hud] frame %u: %s\n", g_frame, sig);
         strcpy(last_hud, sig);
+    }
+    /* The screen is as wide as the game camera's view: the game turns the gun's
+     * point on its screen into a shot through its own lens, so a screen of
+     * any other width aims every shot off the centre's way (fixed at 1.73,
+     * the jungle's 2.41 put shots ~30% wide of the laser). A flat picture -
+     * a menu, a scope - keeps the size it had: those cameras zoom. */
+    if (!g_flat && g_scene_draws > 0 && is_perspective(g_last_persp) && g_last_persp[0] > 0.3f && g_last_persp[0] < 8.0f) {
+        g_screen_lens[0] = g_last_persp[0];
+        g_screen_lens[1] = g_last_persp[5];
     }
     g_hud2d = g_pass2d = 0;
     g_zoom_draws = g_hudfb_draws = 0;
