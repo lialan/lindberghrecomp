@@ -748,6 +748,12 @@ void xr_frame_begin(void)
     uint32_t n = 0;
     views_ok = XR_SUCCEEDED(xrLocateViews(session, &vl, &vs, 2, &n, views)) &&
                (vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT);
+    if (views_ok && getenv("LINDBERGH_POSE_LOG")) {
+        XrQuaternionf q = views[0].pose.orientation;
+        fprintf(stderr, "[pose] frame %u: q %.5f %.5f %.5f %.5f pos %.4f %.4f %.4f t %lld\n", g_frame, q.x, q.y, q.z, q.w,
+                views[0].pose.position.x, views[0].pose.position.y, views[0].pose.position.z,
+                (long long)frame.predictedDisplayTime);
+    }
     if (views_ok) {
         for (int i = 0; i < 2; i++) {
             /* A symmetric frustum covering the eye's own: the same pixel then

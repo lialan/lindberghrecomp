@@ -149,9 +149,41 @@ static int gl_token_call_entry(CPU *c, uint32_t va)
     return 0;
 }
 
+/* LINDBERGH_TRACE_RANGE=lo,hi (hex): the guest functions in that range each
+ * frame called, printed whenever the set changes - which of the game's
+ * screen filters run, say */
+extern unsigned g_frame;
+static void range_trace(uint32_t va)
+{
+    static int on = -1;
+    static uint32_t lo, hi, cur[32], prev[32];
+    static int ncur, nprev;
+    static unsigned at;
+    if (on < 0) {
+        const char *v = getenv("LINDBERGH_TRACE_RANGE");
+        on = v && *v;
+        if (on) { lo = (uint32_t)strtoul(v, (char **)&v, 16); if (*v == ',') v++; hi = (uint32_t)strtoul(v, NULL, 16); }
+    }
+    if (!on) return;
+    if (g_frame != at) {
+        int same = ncur == nprev;
+        for (int i = 0; same && i < ncur; i++) same = cur[i] == prev[i];
+        if (!same) {
+            fprintf(stderr, "[range] frame %u:", at);
+            for (int i = 0; i < ncur; i++) fprintf(stderr, " %#x", cur[i]);
+            fprintf(stderr, "\n");
+        }
+        memcpy(prev, cur, sizeof cur); nprev = ncur; ncur = 0; at = g_frame;
+    }
+    if (va < lo || va > hi) return;
+    for (int i = 0; i < ncur; i++) if (cur[i] == va) return;
+    if (ncur < 32) { int i = ncur++; while (i > 0 && cur[i - 1] > va) { cur[i] = cur[i - 1]; i--; } cur[i] = va; }
+}
+
 void dispatch(CPU *c, uint32_t va)
 {
     guest_trace_dispatch(va);
+    range_trace(va);
     int watched = watch_check(c, va);
 
     if (++g_depth > g_depth_max) g_depth_max = g_depth;

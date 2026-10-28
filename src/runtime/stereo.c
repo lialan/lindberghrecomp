@@ -26,9 +26,9 @@
  * LINDBERGH_STEREO=1 turns it on (the Quest host does so itself); on a
  * desktop the two eyes are shown side by side. LINDBERGH_FRAMEMAP=<frame>
  * lists that frame's GL calls with their first arguments.
- * LINDBERGH_MENU_DRAWS=<n> (120): a frame with fewer world draws looks like a
+ * LINDBERGH_MENU_DRAWS=<n> (0, off): a frame with fewer world draws looks like a
  * menu; LINDBERGH_SCENE_STATS=1 reports the count every 50 frames.
- * LINDBERGH_ZOOM_LENS=<x> (4): 3D drawn with a longer lens (projection x
+ * LINDBERGH_ZOOM_LENS=<x> (8): 3D drawn with a longer lens, for 6 frames running, (projection x
  * scale; the game's usual is 1.7-2.4, its sniper scope 11.4) is a magnified
  * view, put on the screen like the HUD.
  */
@@ -95,11 +95,14 @@ static int      g_clipped;              /* a screen draw is clipped to the scree
 static GLint    g_eye_vp[4];            /* the viewport GL has, in eye pixels */
 static unsigned g_scene_draws;          /* 3D draws in the world this frame */
 static float    g_lens_seen;            /* the longest lens (projection x scale) drawn with this frame */
-static float    g_zoom_lens = 4.0f;     /* a longer one is a zoomed view (the game's own is 1.7-2.4) */
+static float    g_zoom_lens = 8.0f;     /* a longer one is a zoomed view: the sniper scope is 11.4, the
+                                         * game's own camera 1.7-2.4 and its zooms on a target up to ~6 */
+static unsigned g_zoom_frames;          /* frames in a row drawn with such a lens */
 static int      g_menu;                 /* a menu: its 3D belongs on the screen too */
 static int      g_tex2d_on;             /* GL_TEXTURE_2D enabled on unit 0 (frame map) */
 static unsigned g_menu_frames;          /* frames in a row that looked like a menu */
-static unsigned g_menu_draws = 120;     /* fewer world draws than this looks like a menu */
+static unsigned g_menu_draws = 0;       /* fewer world draws than this looks like a menu; 0: off -
+                                         * sparse gameplay scenes tripped it, flattening the world */
 static unsigned g_zoom_draws, g_hudfb_draws;   /* this frame's 3D sent to the screen, for LINDBERGH_MODE_LOG */
 static float    g_near_seen;            /* the nearest near plane of this frame's world draws */
 static GLuint   g_world_fb = ~0u, g_world_fb_next = ~0u;   /* the target the world was drawn into last frame */
@@ -652,7 +655,7 @@ static int transform_call(CPU *c, HleId id, const char *n)
         /* A long lens - the sniper scope, a cutscene's close-up - is a
          * magnified view the eye's own frustum would undo: it goes on the
          * screen too, framed by the scope the game draws there. */
-        int zoom = persp && g_proj[g_proj_top][0] > g_zoom_lens;
+        int zoom = persp && g_proj[g_proj_top][0] > g_zoom_lens && g_zoom_frames >= 6;
         if (persp && !g_replaying) { if (zoom) g_zoom_draws++; if (g_game_fb == g_hud_fb) g_hudfb_draws++; }
         int hud = persp ? g_game_fb == g_hud_fb || g_menu || zoom
                         : !g_unit0_rect || !covers_viewport(c, n);
@@ -1239,6 +1242,42 @@ static void write_ppm(const char *name, int w, int h, const unsigned char *rgba)
 
 static void dump_targets(void)
 {
+    /* LINDBERGH_EYE_DUMP=<first>,<count>: the left eye's image every frame
+     * of a run, as eye_<frame>.ppm - for finding what flickers */
+    static long e0 = -2, en;
+    if (e0 == -2) {
+        const char *v = getenv("LINDBERGH_EYE_DUMP");
+        e0 = v && *v ? atol(v) : -1;
+        en = v && strchr(v, ',') ? atol(strchr(v, ',') + 1) : 1;
+    }
+    if (e0 >= 0 && (long)g_frame >= e0 && (long)g_frame < e0 + en) {
+        GLint w = g_ew, h = g_eh;
+        unsigned char *px = malloc((size_t)w * h * 4);
+        int ok = 0;
+#ifdef LINDBERGH_GL4ES
+        if (px && g_mv) ok = gl4es_multiview_read(g_eye_tex[0], GL_TEXTURE_RECTANGLE_ARB, 0, px);
+#endif
+        if (ok) { char name[64]; snprintf(name, sizeof name, "eye_%u.ppm", g_frame); write_ppm(name, w, h, px); }
+        free(px);
+#ifdef LINDBERGH_GL4ES
+        /* LINDBERGH_EYE_DUMP_TEX=a,b,...: those render targets every frame too */
+        const char *xt = getenv("LINDBERGH_EYE_DUMP_TEX");
+        for (const char *q = xt; g_mv && q && *q; q = strchr(q, ',') ? strchr(q, ',') + 1 : NULL) {
+            GLuint tex = (GLuint)atoi(q);
+            GLint tw = 0, th = 0, was = 0;
+            glGetIntegerv(GL_TEXTURE_BINDING_RECTANGLE_ARB, &was);
+            glBindTexture(GL_TEXTURE_RECTANGLE_ARB, tex);
+            glGetTexLevelParameteriv(GL_TEXTURE_RECTANGLE_ARB, 0, GL_TEXTURE_WIDTH, &tw);
+            glGetTexLevelParameteriv(GL_TEXTURE_RECTANGLE_ARB, 0, GL_TEXTURE_HEIGHT, &th);
+            glBindTexture(GL_TEXTURE_RECTANGLE_ARB, (GLuint)was);
+            unsigned char *tp = tw > 0 && th > 0 ? malloc((size_t)tw * th * 4) : NULL;
+            if (tp && gl4es_multiview_read(tex, GL_TEXTURE_RECTANGLE_ARB, 0, tp)) {
+                char name[64]; snprintf(name, sizeof name, "t%u_%u.ppm", tex, g_frame); write_ppm(name, tw, th, tp);
+            }
+            free(tp);
+        }
+#endif
+    }
     static long at = -2;
     if (at == -2) { const char *v = getenv("LINDBERGH_RT_DUMP"); at = v && *v ? atol(v) : -1; }
     if ((long)g_frame != at) return;
@@ -1348,6 +1387,8 @@ void stereo_frame_begin(void)
         last_sig = sig;
     }
     g_zoom_draws = g_hudfb_draws = 0;
+    /* a scope is held; a lens passing through on a camera move is not one */
+    g_zoom_frames = g_lens_seen > g_zoom_lens ? g_zoom_frames + 1 : 0;
     g_lens_seen = 0;
     g_near_seen = 0;
     g_scene_draws = 0;

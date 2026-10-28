@@ -1184,6 +1184,7 @@ static void cache_save(GLuint prog, const char *path)
 }
 #endif
 
+extern unsigned g_frame;
 static struct timespec g_link_t0;
 static Linked *link_pair(GLuint vid, GLuint fid)
 {
@@ -1445,6 +1446,14 @@ static void upload(Linked *l)
             GLint bound = 0;
             glGetIntegerv(GL_TEXTURE_BINDING_RECTANGLE_ARB, &bound);
             int big = stereo_is_render_target((GLuint)bound);
+            if (getenv("LINDBERGH_RECT_LOG")) {
+                static unsigned seen[256]; static int ns;
+                unsigned key = (unsigned)bound * 2u + (unsigned)big;
+                int k = 0; while (k < ns && seen[k] != key) k++;
+                if (k == ns && ns < 256) { seen[ns++] = key;
+                    fprintf(stderr, "[rect] frame %u: unit %d texture %d is %dx%d, %s\n", g_frame, u, bound, w, h,
+                            big ? "a render target (scaled)" : "not a render target"); }
+            }
             if (w > 0 && h > 0) { norm[u][0] = (big ? rx : 1) / (float)w; norm[u][1] = (big ? ry : 1) / (float)h; }
         }
         glActiveTexture((GLenum)active);
