@@ -311,8 +311,13 @@ static void h_glProgramLocalParameter4fARB(CPU *c)
     arb_local(A32(0), A32(1), v);
     glProgramLocalParameter4fARB(A32(0), A32(1), v[0], v[1], v[2], v[3]);
 }
-static void h_glEnable(CPU *c)  { if (!arb_enable(A32(0), 1)) glEnable(A32(0)); }
-static void h_glDisable(CPU *c) { if (!arb_enable(A32(0), 0)) glDisable(A32(0)); }
+#ifdef LINDBERGH_GL4ES
+#define RECT_SEEN(cap) do { if ((cap) == GL_TEXTURE_RECTANGLE_ARB) arb_rect_enable_seen(); } while (0)
+#else
+#define RECT_SEEN(cap) do { } while (0)
+#endif
+static void h_glEnable(CPU *c)  { RECT_SEEN(A32(0)); if (!arb_enable(A32(0), 1)) glEnable(A32(0)); }
+static void h_glDisable(CPU *c) { RECT_SEEN(A32(0)); if (!arb_enable(A32(0), 0)) glDisable(A32(0)); }
 static void h_glIsEnabled(CPU *c)
 {
     int on;
@@ -320,6 +325,57 @@ static void h_glIsEnabled(CPU *c)
 }
 static void h_glPushAttrib(CPU *c) { arb_push_attrib(A32(0)); glPushAttrib(A32(0)); }
 static void h_glPopAttrib(CPU *c)  { arb_pop_attrib(); glPopAttrib(); }
+
+#ifdef LINDBERGH_GL4ES
+/* GLES has no assembly programs. Every one is translated to GLSL here
+ * (arbprog.c), so the driver never sees them: it is told nothing, and the
+ * game's checks are answered as a desktop driver that took them would. */
+static void es_glProgramStringARB(CPU *c) { arb_set_source(A32(0), (const char *)APTR(3), AI32(2)); }
+static void es_glBindProgramARB(CPU *c)  { arb_bind(A32(0), A32(1)); }
+static void es_glDeleteProgramsARB(CPU *c)
+{
+    GLsizei n = AI32(0);
+    const GLuint *ids = (const GLuint *)APTR(1);
+    for (GLsizei i = 0; ids && i < n; i++) arb_delete(0, ids[i]);
+}
+static void es_glProgramEnvParameter4fvARB(CPU *c)
+{
+    const float *v = (const float *)APTR(2);
+    if (v) arb_env(A32(0), A32(1), v);
+}
+static void es_glProgramLocalParameter4fvARB(CPU *c)
+{
+    const float *v = (const float *)APTR(2);
+    if (v) arb_local(A32(0), A32(1), v);
+}
+static void es_glProgramLocalParameter4fARB(CPU *c)
+{
+    float v[4] = { gl_arg_f(c, 2), gl_arg_f(c, 3), gl_arg_f(c, 4), gl_arg_f(c, 5) };
+    arb_local(A32(0), A32(1), v);
+}
+static void es_glGetProgramivARB(CPU *c)
+{
+    GLint *out = (GLint *)APTR(2);
+    if (!out) return;
+    switch (A32(1)) {
+    case GL_PROGRAM_BINDING_ARB: *out = (GLint)arb_bound(A32(0)); return;
+    case GL_PROGRAM_UNDER_NATIVE_LIMITS_ARB: *out = 1; return;
+    case GL_PROGRAM_LENGTH_ARB: {
+        const char *src = arb_get_source(A32(0), arb_bound(A32(0)));
+        *out = src ? (GLint)strlen(src) : 0;
+        return;
+    }
+    }
+    glGetProgramivARB(A32(0), A32(1), out);
+}
+static void es_glGetIntegerv(CPU *c)
+{
+    GLint *out = (GLint *)APTR(1);
+    if (!out) return;
+    if (A32(0) == GL_PROGRAM_ERROR_POSITION_ARB) { *out = -1; return; }
+    glGetIntegerv(A32(0), out);
+}
+#endif
 
 /* ---- GLU, and the double-precision matrix calls ---- */
 static void h_glOrtho(CPU *c)
@@ -393,6 +449,16 @@ void hle_register_gl(void)
     hle_bind("gluOrtho2D", h_gluOrtho2D);
     hle_bind("gluPerspective", h_gluPerspective);
     hle_bind("gluErrorString", h_gluErrorString);
+#ifdef LINDBERGH_GL4ES
+    hle_bind("glProgramStringARB", es_glProgramStringARB);
+    hle_bind("glBindProgramARB", es_glBindProgramARB);
+    hle_bind("glDeleteProgramsARB", es_glDeleteProgramsARB);
+    hle_bind("glProgramEnvParameter4fvARB", es_glProgramEnvParameter4fvARB);
+    hle_bind("glProgramLocalParameter4fvARB", es_glProgramLocalParameter4fvARB);
+    hle_bind("glProgramLocalParameter4fARB", es_glProgramLocalParameter4fARB);
+    hle_bind("glGetProgramivARB", es_glGetProgramivARB);
+    hle_bind("glGetIntegerv", es_glGetIntegerv);
+#endif
     stereo_init();
 }
 

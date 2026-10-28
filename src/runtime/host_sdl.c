@@ -34,6 +34,16 @@ static void mac_activate(void)
 
 #include "gl_posix.h"
 #include "host_settings.h"
+
+#if defined(__ANDROID__)
+/* Meta Quest: GL through gl4es, frames to the headset (host_xr.c) */
+#include <gl4esinit.h>
+int  xr_init(void);
+void xr_frame_begin(void);
+void xr_frame_end(void);
+
+static void APIENTRY_GL4ES main_fb_size(int *w, int *h) { *w = 640; *h = 480; }
+#endif
 #include "stereo.h"
 
 #define DEFAULT_W 640
@@ -288,6 +298,16 @@ void host_cabinet_input(CabinetInput *out)
     }
 }
 
+/* A headset's controllers (host_xr.c): where the gun points, in the game's
+ * pixels, and the cabinet buttons held. */
+void host_vr_input(int gun_x, int gun_y, unsigned held, int coin)
+{
+    g_mouse_x = gun_x; g_mouse_y = gun_y;
+    g_cab_latch |= held & ~g_held;
+    g_held = held;
+    if (coin) g_cab.coins[0]++;
+}
+
 /* The board has reported the switches: latched taps have been seen. */
 void host_cabinet_switches_read(void)
 {
@@ -470,10 +490,19 @@ int host_window_open(const char *title)
     g_win.w = env_int("LINDBERGH_WIDTH", g_hint_w ? g_hint_w : DEFAULT_W);
     g_win.h = env_int("LINDBERGH_HEIGHT", g_hint_h ? g_hint_h : DEFAULT_H);
 
+#if defined(__ANDROID__)
+    /* GLES 3 under gl4es, which plays the 2.1 context the game expects. The
+     * headset keeps running while the activity is paused. */
+    SDL_SetHint(SDL_HINT_ANDROID_BLOCK_ON_PAUSE, "0");
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+#else
     /* The game is a 2007 fixed-function + ARB-program GL program: a 2.1
      * compatibility context is what it was written for. */
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
+#endif
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
     SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
@@ -502,7 +531,18 @@ int host_gl_context(void)
         fprintf(stderr, "[window] SDL_GL_CreateContext: %s\n", SDL_GetError());
         return 0;
     }
+#if defined(__ANDROID__)
+    set_getprocaddress(SDL_GL_GetProcAddress);
+    set_getmainfbsize(main_fb_size);
+    initialize_gl4es();
+    if (!xr_init()) {
+        fprintf(stderr, "[window] no headset session - nothing to show the game on\n");
+        return 0;
+    }
+    xr_frame_begin();
+#else
     SDL_GL_SetSwapInterval(env_int("LINDBERGH_VSYNC", 0));   /* the game paces itself; macOS stalls vsync swaps for hidden windows */
+#endif
     fprintf(stderr, "[window] GL context ready: %s / %s\n",
             (const char *)glGetString(GL_RENDERER), (const char *)glGetString(GL_VERSION));
     stereo_frame_begin();
@@ -569,14 +609,24 @@ static void maybe_screenshot(void)
 
 void host_swap(void)
 {
+#if defined(__ANDROID__)
+    stereo_frame_end();                 /* the second eye, then both to the headset */
+    xr_frame_end();
+#else
     if (stereo_enabled()) {             /* draw the second eye, show both */
         stereo_frame_end();
         stereo_present_desktop(g_win.w, g_win.h);
     }
+#endif
     maybe_screenshot();
     maybe_peek();
     g_frame++;
+#if defined(__ANDROID__)
+    xr_frame_begin();
+    if (0) {
+#else
     if (g_win.win) {
+#endif
         /* Present the window's own framebuffer whatever the game left bound:
          * it ends a frame with one of its offscreen FBOs current, which the
          * Lindbergh's driver ignored at swap and Apple's does not. */

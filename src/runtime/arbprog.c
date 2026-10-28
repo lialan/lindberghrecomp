@@ -754,8 +754,13 @@ static int emit_instr(Tr *t, char *stmt)
         if (target == 5) {
             /* Rectangle textures are sampled in texels; the game's render
              * targets are, and stereo.c draws them at the eye's size. */
+#ifdef LINDBERGH_GL4ES
+            if (proj) snprintf(r, sizeof r, "texture2D(sr_%d, %s.xy / %s.w * u_rect_norm[%d])", unit, X(0), X(0), unit);
+            else      snprintf(r, sizeof r, "texture2D(sr_%d, %s.xy * u_rect_norm[%d])", unit, X(0), unit);
+#else
             if (proj) snprintf(r, sizeof r, "texture2DRectProj(sr_%d, vec4(%s.xy * u_rect_scale, %s.zw))", unit, X(0), X(0));
             else      snprintf(r, sizeof r, "texture2DRect(sr_%d, %s.xy * u_rect_scale)", unit, X(0));
+#endif
         } else if (proj && target != 4)
             snprintf(r, sizeof r, "%sProj(%s%d, %s)", fnb[target], sm[target], unit, X(0));
         else if (bias)
@@ -951,20 +956,36 @@ static char *translate(int stage, const char *src_in, Tr *t)
         bput(&g, "#version 120\n");
         int rect = 0;
         for (int u = 0; u < 16; u++) if (t->tex_target[u] == 5) rect = 1;
+#ifdef LINDBERGH_GL4ES
+        /* GLES has no rectangle textures: gl4es keeps them as 2D ones, which
+         * are sampled in normalised coordinates - u_rect_norm[unit] is the
+         * game's texel size of what is bound there. */
+        if (rect) bput(&g, "uniform vec2 u_rect_norm[16];\n");
+#else
         if (rect) bput(&g, "#extension GL_ARB_texture_rectangle : enable\n"
                            "uniform vec2 u_rect_scale;\n");    /* render targets drawn larger (stereo.c) */
+#endif
         const char *P = stage ? "f" : "v";
         if (t->env_hi >= 0) bput(&g, "uniform vec4 %s_env[%d];\n", P, t->env_hi + 1);
         if (t->local_hi >= 0) bput(&g, "uniform vec4 %s_loc[%d];\n", P, t->local_hi + 1);
         for (int m = 0; m < t->nmat; m++) bput(&g, "uniform vec4 %s_m%d[4];\n", P, m);
+        if (!stage && !t->nmat) bput(&g, "uniform mat4 u_reproj;\n");
+#ifdef LINDBERGH_GL4ES
+        static const char *const sty[] = { "", "sampler1D s1_", "sampler2D s2_", "sampler3D s3_",
+                                           "samplerCube sc_", "sampler2D sr_" };
+#else
         static const char *const sty[] = { "", "sampler1D s1_", "sampler2D s2_", "sampler3D s3_",
                                            "samplerCube sc_", "sampler2DRect sr_" };
+#endif
         for (int u = 0; u < 16; u++) if (t->tex_target[u]) bput(&g, "uniform %s%d;\n", sty[t->tex_target[u]], u);
         for (int a = 1; a < 16; a++) if (t->attrib_used[a]) bput(&g, "attribute vec4 va_%d;\n", a);
         bput(&g, "vec4 arb_lit(vec4 s) {\n"
                  "  float d = max(s.x, 0.0), sp = max(s.y, 0.0), e = clamp(s.w, -128.0, 128.0);\n"
                  "  return vec4(1.0, d, s.x > 0.0 ? (sp > 0.0 ? pow(sp, e) : 0.0) : 0.0, 1.0);\n}\n");
         bput(&g, "%s", t->decl.p ? t->decl.p : "");
+        /* gl4es puts its own declarations above the line before main(): make
+         * that line a global, never the end of a function like arb_lit. */
+        bput(&g, "const float arb_one = 1.0;\n");
         bput(&g, "void main() {\n  vec4 r = vec4(0.0), cc = vec4(0.0);\n  bvec4 m = bvec4(false);\n");
         if (t->has_flow) bput(&g, "  int pc = 0, sp = 0;\n  int stk[16];\n");
         if (stage == 0) {
@@ -978,6 +999,10 @@ static char *translate(int stage, const char *src_in, Tr *t)
         bput(&g, "%s", t->body.p ? t->body.p : "");
         if (stage == 0) {
             bput(&g, "  gl_FogFragCoord = o_fog.x;\n  gl_PointSize = o_psize.x;\n");
+            /* A program that takes its whole transform from the game's own
+             * constants has the game's projection baked in: swap it for the
+             * eye's (stereo.c; identity when not in stereo). */
+            if (!t->nmat) bput(&g, "  gl_Position = u_reproj * gl_Position;\n");
         } else {
             if (t->fog_mode) {
                 const char *f = t->fog_mode == 1 ? "(gl_Fog.end - gl_FogFragCoord) * gl_Fog.scale" :
@@ -1012,7 +1037,8 @@ typedef struct {
     int    ok;
     MatRef mat[2][16]; int nmat[2];
     int    env_hi[2], local_hi[2];
-    GLint  u_env[2], u_loc[2], u_mat[2][16], u_rect;
+    GLint  u_env[2], u_loc[2], u_mat[2][16], u_rect, u_reproj;
+    unsigned rect_units;                /* texture units sampled as rectangles */
     unsigned up_env[2], up_loc[2];      /* generations last uploaded */
 } Linked;
 
@@ -1081,6 +1107,7 @@ static Linked *link_pair(GLuint vid, GLuint fid)
         free(glsl);
         if (!sh[st]) { pp[st]->failed = 1; l->ok = 0; return l; }
         memcpy(l->mat[st], t.mat, sizeof t.mat);
+        for (int u = 0; u < 16; u++) if (t.tex_target[u] == 5) l->rect_units |= 1u << u;
         l->nmat[st] = t.nmat;
         l->env_hi[st] = t.env_hi;
         l->local_hi[st] = t.local_hi;
@@ -1126,7 +1153,12 @@ static Linked *link_pair(GLuint vid, GLuint fid)
             l->u_mat[st][m] = glGetUniformLocation(l->prog, nm);
         }
     }
+#ifdef LINDBERGH_GL4ES
+    l->u_rect = glGetUniformLocation(l->prog, "u_rect_norm");
+#else
     l->u_rect = glGetUniformLocation(l->prog, "u_rect_scale");
+#endif
+    l->u_reproj = glGetUniformLocation(l->prog, "u_reproj");
     static const char *const pre[] = { "s1_", "s2_", "s3_", "sc_", "sr_" };
     for (int u = 0; u < 16; u++)
         for (int k = 0; k < 5; k++) {
@@ -1206,7 +1238,28 @@ static void stack_matrix(int which, int index, float *m)
 
 static void upload(Linked *l)
 {
+    if (l->u_reproj >= 0) { float m[16]; stereo_reproject(m); glUniformMatrix4fv(l->u_reproj, 1, GL_FALSE, m); }
+#ifdef LINDBERGH_GL4ES
+    if (l->u_rect >= 0) {
+        float rx, ry, norm[16][2];
+        stereo_rect_scale(&rx, &ry);
+        GLint active = GL_TEXTURE0;
+        glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+        for (int u = 0; u < 16; u++) {
+            norm[u][0] = norm[u][1] = 1;
+            if (!(l->rect_units & (1u << u))) continue;
+            GLint w = 0, h = 0;
+            glActiveTexture(GL_TEXTURE0 + u);
+            glGetTexLevelParameteriv(GL_TEXTURE_RECTANGLE_ARB, 0, GL_TEXTURE_WIDTH, &w);
+            glGetTexLevelParameteriv(GL_TEXTURE_RECTANGLE_ARB, 0, GL_TEXTURE_HEIGHT, &h);
+            if (w > 0 && h > 0) { norm[u][0] = rx / (float)w; norm[u][1] = ry / (float)h; }
+        }
+        glActiveTexture((GLenum)active);
+        glUniform2fv(l->u_rect, 16, &norm[0][0]);
+    }
+#else
     if (l->u_rect >= 0) { float rx, ry; stereo_rect_scale(&rx, &ry); glUniform2f(l->u_rect, rx, ry); }
+#endif
     for (int st = 0; st < 2; st++) {
         GLuint id = st ? l->fid : l->vid;
         if (!id) continue;
@@ -1332,8 +1385,42 @@ void arb_use_glsl(GLuint prog) { g_game_glsl = prog; }
 
 /* Before every draw: the game's own GLSL program wins, as it does in GL;
  * otherwise the enabled assembly stages, translated. */
+#ifdef LINDBERGH_GL4ES
+/* Units given a rectangle enable for the last program draw, undone at the
+ * next draw - after glEnd for glBegin. */
+static unsigned g_rect_forced;
+
+static void rect_enables(unsigned want)
+{
+    if (want == g_rect_forced) return;
+    GLint active = GL_TEXTURE0;
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+    for (int u = 0; u < 16; u++) {
+        unsigned bit = 1u << u;
+        if ((want ^ g_rect_forced) & bit) {
+            glActiveTexture(GL_TEXTURE0 + u);
+            if (want & bit) { if (glIsEnabled(GL_TEXTURE_RECTANGLE_ARB)) want &= ~bit; else glEnable(GL_TEXTURE_RECTANGLE_ARB); }
+            else glDisable(GL_TEXTURE_RECTANGLE_ARB);
+        }
+    }
+    glActiveTexture((GLenum)active);
+    g_rect_forced = want;
+}
+
+/* The game set a rectangle enable itself: it is the game's now. */
+void arb_rect_enable_seen(void)
+{
+    GLint active = GL_TEXTURE0;
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+    g_rect_forced &= ~(1u << ((unsigned)active - GL_TEXTURE0));
+}
+#endif
+
 void arb_before_draw(void)
 {
+#ifdef LINDBERGH_GL4ES
+    rect_enables(0);
+#endif
     if (!arb_active()) return;
     if (g_game_glsl) { glUseProgram(g_game_glsl); return; }
     GLuint vid = g_enabled[0] ? g_bound[0] : 0;
@@ -1404,12 +1491,21 @@ void arb_before_draw(void)
         glDisable(GL_FRAGMENT_PROGRAM_ARB);
         glUseProgram(l->prog);
         upload(l);
+#ifdef LINDBERGH_GL4ES
+        rect_enables(l->rect_units);
+#endif
         return;
     }
     /* not translatable: the driver's own assembly path, as before */
     glUseProgram(0);
     if (vid) glEnable(GL_VERTEX_PROGRAM_ARB); else glDisable(GL_VERTEX_PROGRAM_ARB);
     if (fid) glEnable(GL_FRAGMENT_PROGRAM_ARB); else glDisable(GL_FRAGMENT_PROGRAM_ARB);
+}
+
+GLuint arb_bound(GLenum target)
+{
+    int st = stage_of(target);
+    return st >= 0 ? g_bound[st] : 0;
 }
 
 const char *arb_get_source(GLenum target, GLuint id)
