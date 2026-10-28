@@ -140,7 +140,9 @@ static void cfg_load(void)
 static XrInstance  instance;
 static XrSystemId  sys;
 static XrSession   session;
-static XrSpace     local;
+static XrSpace     local;          /* LOCAL, re-anchored on the head (anchor_head) */
+static XrSpace     local_base;     /* LOCAL as the headset keeps it */
+static int         anchor_pending = 1;
 static XrSessionState state = XR_SESSION_STATE_UNKNOWN;
 static int         running;
 static XrFrameState frame = { XR_TYPE_FRAME_STATE };
@@ -485,6 +487,8 @@ static int poll_events(void)
                 fprintf(stderr, "[xr] session over - exiting\n");
                 exit(0);
             }
+        } else if (ev.type == XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING) {
+            anchor_pending = 1;         /* recentred: the game camera follows */
         } else if (ev.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) {
             exit(0);
         }
@@ -577,6 +581,7 @@ int xr_init(void)
     XrReferenceSpaceCreateInfo rc = { XR_TYPE_REFERENCE_SPACE_CREATE_INFO };
     rc.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
     rc.poseInReferenceSpace.orientation.w = 1;
+    XRCHECK(xrCreateReferenceSpace(session, &rc, &local_base));
     XRCHECK(xrCreateReferenceSpace(session, &rc, &local));
     if (!input_init()) return 0;
 
@@ -684,6 +689,42 @@ static void view_matrix(XrPosef p, float m[16])
     m[12] = rt[0]; m[13] = rt[1]; m[14] = rt[2]; m[15] = 1;
 }
 
+/* LOCAL's origin is wherever the headset was last recentred, not where the
+ * player's head is; the game camera sat at that origin, so a player a step
+ * away from it saw the game from inside a wall. The space the game is drawn
+ * in is anchored on the head instead - its place, and its facing turned
+ * level - when play starts and whenever the player recentres. The screen
+ * and the gun live in the same space, so the aim follows. */
+static void anchor_head(XrViewLocateInfo *vl)
+{
+    XrView v[2] = { { XR_TYPE_VIEW }, { XR_TYPE_VIEW } };
+    XrViewState vs = { XR_TYPE_VIEW_STATE };
+    uint32_t n = 0;
+    vl->space = local_base;
+    if (XR_FAILED(xrLocateViews(session, vl, &vs, 2, &n, v)) ||
+        !(vs.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) ||
+        !(vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)) return;
+    XrQuaternionf q = v[0].pose.orientation;
+    const float back[3] = { 0, 0, -1 };
+    float f[3];
+    qrot(q, back, f);
+    float yaw = atan2f(-f[0], -f[2]);
+    XrReferenceSpaceCreateInfo rc = { XR_TYPE_REFERENCE_SPACE_CREATE_INFO };
+    rc.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+    rc.poseInReferenceSpace.orientation = (XrQuaternionf){ 0, sinf(yaw / 2), 0, cosf(yaw / 2) };
+    rc.poseInReferenceSpace.position.x = (v[0].pose.position.x + v[1].pose.position.x) / 2;
+    rc.poseInReferenceSpace.position.y = (v[0].pose.position.y + v[1].pose.position.y) / 2;
+    rc.poseInReferenceSpace.position.z = (v[0].pose.position.z + v[1].pose.position.z) / 2;
+    XrSpace s;
+    if (XR_FAILED(xrCreateReferenceSpace(session, &rc, &s))) return;
+    xrDestroySpace(local);
+    local = s;
+    anchor_pending = 0;
+    fprintf(stderr, "[xr] game camera anchored on the head at %.2f %.2f %.2f m, facing %.0f deg\n",
+            rc.poseInReferenceSpace.position.x, rc.poseInReferenceSpace.position.y,
+            rc.poseInReferenceSpace.position.z, yaw * 57.2958f);
+}
+
 void xr_frame_begin(void)
 {
     poll_events();
@@ -697,7 +738,9 @@ void xr_frame_begin(void)
 
     XrViewLocateInfo vl = { XR_TYPE_VIEW_LOCATE_INFO };
     vl.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
-    vl.displayTime = frame.predictedDisplayTime; vl.space = local;
+    vl.displayTime = frame.predictedDisplayTime;
+    if (anchor_pending) anchor_head(&vl);
+    vl.space = local;
     XrViewState vs = { XR_TYPE_VIEW_STATE };
     uint32_t n = 0;
     views_ok = XR_SUCCEEDED(xrLocateViews(session, &vl, &vs, 2, &n, views)) &&
