@@ -81,6 +81,10 @@ static float    g_proj[32][16];         /* the game's projection stack */
 static int      g_proj_top;
 static float    g_last_persp[16] = { 1.732f, 0, 0, 0, 0, 2.309f, 0, 0, 0, 0, -1, -1, 0, 0, -0.02f, 0 };
                                         /* the game's last perspective (its usual one to start) */
+static const float g_screen_lens[2] = { 1.732f, 2.309f };
+                                        /* the HUD's screen is sized by the game's usual lens, not
+                                         * its current one: menus zoom the camera to 3.7 and back,
+                                         * and the 2D shrank and grew with it */
 static int      g_loaded_hud;           /* the projection GL has is the HUD's screen */
 static GLuint   g_unit0_rect;           /* render target bound to texture unit 0 */
 static GLenum   g_active_unit = GL_TEXTURE0;
@@ -106,6 +110,8 @@ static unsigned g_menu_draws = 0;       /* fewer world draws than this looks lik
 static unsigned g_zoom_draws, g_hudfb_draws;   /* this frame's 3D sent to the screen, for LINDBERGH_MODE_LOG */
 static float    g_near_seen;            /* the nearest near plane of this frame's world draws */
 static GLuint   g_world_fb = ~0u, g_world_fb_next = ~0u;   /* the target the world was drawn into last frame */
+static unsigned g_hud2d, g_pass2d;      /* this frame's 2D draws put on the screen / left as passes (LINDBERGH_HUD_LOG) */
+static float    g_hud_lens;             /* the lens the screen was sized by at this frame's first 2D draw on it */
 
 /* ---- the recording ---- */
 enum { OP_CALL, OP_UNMAP, OP_PTR };
@@ -172,7 +178,7 @@ static void effective_projection(const float *p, int hud, float *out)
     if (!hud) { memcpy(out, p, 64); return; }
     float d = g_screen_dist, sc[16];
     mat_identity(sc);                   /* game NDC -> a point on the screen */
-    sc[0] = d / g_last_persp[0]; sc[5] = d / g_last_persp[5];
+    sc[0] = d / g_screen_lens[0]; sc[5] = d / g_screen_lens[1];
     sc[10] = -0.02f * d;                /* a sliver of depth keeps the game's depth order */
     sc[14] = -d;
     mat_frustum(e, -t[0] * 0.01f, t[1] * 0.01f, -t[2] * 0.01f, t[3] * 0.01f, 0.01f, 1000.0f);
@@ -445,7 +451,7 @@ static void clip_to_screen(void)
     mat_mul(m, e, g_view[g_eye]);
     float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
     for (int k = 0; k < 4; k++) {
-        float p[3] = { (k & 1 ? 1 : -1) * d / g_last_persp[0], (k & 2 ? 1 : -1) * d / g_last_persp[5], -d };
+        float p[3] = { (k & 1 ? 1 : -1) * d / g_screen_lens[0], (k & 2 ? 1 : -1) * d / g_screen_lens[1], -d };
         float cx = m[0] * p[0] + m[4] * p[1] + m[8] * p[2] + m[12];
         float cy = m[1] * p[0] + m[5] * p[1] + m[9] * p[2] + m[13];
         float cw = m[3] * p[0] + m[7] * p[1] + m[11] * p[2] + m[15];
@@ -539,6 +545,68 @@ typedef struct {
     uint32_t pbytes;
 } Cls;
 static Cls g_cls[HLE_COUNT];
+
+/* ---- the game's menu screens ----
+ * The menus are 3D: panels, the soldier and his rifle, all drawn with the
+ * game camera, which swings and zooms between screens. In the room they
+ * tilted and slid past the edge of view; on the screen, where the arcade
+ * monitor showed them, they hold still. Neither draw counts nor render
+ * targets tell a menu from a quiet moment of play, but the game itself does:
+ * in game mode it runs one state function a frame, GameLoop while playing,
+ * GameInstruction, GameWeaponSelect and so on while a menu is up. */
+uint32_t stereo_state_lo = ~0u, stereo_state_hi;
+static uint32_t g_state_va[48];
+static unsigned g_nstate, g_nmenu;      /* the first g_nmenu are menus */
+static unsigned g_state_frame = ~0u;    /* the frame a menu state last ran */
+static uint32_t g_state_last;
+
+static void watch_states(void)
+{
+    static const char *menus[] = {
+        "Calibration", "Instruction", "Card", "Custom", "MatchUpSelect", "CharacterSelect", "WeaponSelect",
+        "Information", "Entry", "StartWait", "StageSelect", "WaitCard", "NameEntry", "Ranking", "Record",
+        "Password", "Result",
+    };
+    static const char *play[] = {   /* reported in LINDBERGH_HUD_LOG only */
+        "Init", "Opening", "RoundStart", "Loop", "RoundResult", "Replay", "SceneClear", "ChallengerComes",
+        "TimeUp", "Continue", "Close", "Ending", "CleanUp", "Pause", "Start", "Exit", "Over", "StageClear",
+    };
+    if (g_nstate) return;
+    for (int pass = 0; pass < 2; pass++) {
+        const char **l = pass ? play : menus;
+        int n = pass ? (int)(sizeof play / sizeof *play) : (int)(sizeof menus / sizeof *menus);
+        for (int i = 0; i < n && g_nstate < 48; i++) {
+            char name[64];
+            snprintf(name, sizeof name, "_Z%zuGame%sP8GAMEWORK", strlen(l[i]) + 4, l[i]);
+            uint32_t va = guest_symbol(name);
+            if (!va) continue;
+            g_state_va[g_nstate++] = va;
+            if (va < stereo_state_lo) stereo_state_lo = va;
+            if (va > stereo_state_hi) stereo_state_hi = va;
+        }
+        if (!pass) g_nmenu = g_nstate;
+    }
+    fprintf(stderr, "[stereo] %u menu states of %u found\n", g_nmenu, g_nstate);
+}
+
+void stereo_guest_state(uint32_t va)
+{
+    for (unsigned i = 0; i < g_nstate; i++) {
+        if (g_state_va[i] != va) continue;
+        if (i < g_nmenu) g_state_frame = g_frame;
+        else g_state_frame = ~0u;
+        if (va != g_state_last && getenv("LINDBERGH_HUD_LOG"))
+            fprintf(stderr, "[state] frame %u: %#x (%s)\n", g_frame, va, i < g_nmenu ? "menu" : "play");
+        g_state_last = va;
+        return;
+    }
+}
+
+/* a menu state ran this frame or the last (outside game mode, none runs) */
+static int menu_state(void)
+{
+    return g_state_frame != ~0u && g_frame - g_state_frame <= 1;
+}
 
 static int live_only(const char *n);
 static void pointer_arg(const char *n, int *idx, uint32_t *bytes, uint8_t *kind);
@@ -657,9 +725,10 @@ static int transform_call(CPU *c, HleId id, const char *n)
          * screen too, framed by the scope the game draws there. */
         int zoom = persp && g_proj[g_proj_top][0] > g_zoom_lens && g_zoom_frames >= 6;
         if (persp && !g_replaying) { if (zoom) g_zoom_draws++; if (g_game_fb == g_hud_fb) g_hudfb_draws++; }
-        int hud = persp ? g_game_fb == g_hud_fb || g_menu || zoom
+        int hud = persp ? g_game_fb == g_hud_fb || menu_state() || g_menu || zoom
                         : !g_unit0_rect || !covers_viewport(c, n);
         if (hud && !is_perspective(g_proj[g_proj_top]) && !g_replaying) g_hud_fb_next = g_game_fb;
+        if (!persp && !g_replaying) { if (hud) { if (!g_hud2d) g_hud_lens = g_last_persp[0]; g_hud2d++; } else g_pass2d++; }
         if (hud && !persp && letterbox_bar(c, n)) return 1;
         if (hud != g_loaded_hud) { g_loaded_hud = hud; load_projection(); }
         if (hud) clip_to_screen();
@@ -1244,19 +1313,27 @@ static void dump_targets(void)
 {
     /* LINDBERGH_EYE_DUMP=<first>,<count>: the left eye's image every frame
      * of a run, as eye_<frame>.ppm - for finding what flickers */
-    static long e0 = -2, en;
+    static long e0 = -2, en, es = 1;
     if (e0 == -2) {
         const char *v = getenv("LINDBERGH_EYE_DUMP");
         e0 = v && *v ? atol(v) : -1;
         en = v && strchr(v, ',') ? atol(strchr(v, ',') + 1) : 1;
+        const char *s2 = v && strchr(v, ',') ? strchr(strchr(v, ',') + 1, ',') : NULL;
+        if (s2) es = atol(s2 + 1) > 0 ? atol(s2 + 1) : 1;   /* ,<stride>: every stride-th frame, a quarter the size */
     }
-    if (e0 >= 0 && (long)g_frame >= e0 && (long)g_frame < e0 + en) {
+    if (e0 >= 0 && (long)g_frame >= e0 && (long)g_frame < e0 + en && ((long)g_frame - e0) % es == 0) {
         GLint w = g_ew, h = g_eh;
         unsigned char *px = malloc((size_t)w * h * 4);
         int ok = 0;
 #ifdef LINDBERGH_GL4ES
         if (px && g_mv) ok = gl4es_multiview_read(g_eye_tex[0], GL_TEXTURE_RECTANGLE_ARB, 0, px);
 #endif
+        if (ok && es > 1) {
+            int qw = w / 4, qh = h / 4;
+            for (int y = 0; y < qh; y++)
+                for (int x = 0; x < qw; x++) memcpy(px + ((size_t)y * qw + x) * 4, px + ((size_t)y * 4 * w + x * 4) * 4, 4);
+            w = qw; h = qh;
+        }
         if (ok) { char name[64]; snprintf(name, sizeof name, "eye_%u.ppm", g_frame); write_ppm(name, w, h, px); }
         free(px);
 #ifdef LINDBERGH_GL4ES
@@ -1386,6 +1463,18 @@ void stereo_frame_begin(void)
                     g_frame, g_menu, g_zoom_draws, g_hudfb_draws, g_scene_draws, g_lens_seen);
         last_sig = sig;
     }
+    static int hud_log = -1;
+    static char last_hud[160];
+    if (hud_log < 0) { const char *v = getenv("LINDBERGH_HUD_LOG"); hud_log = v && *v && *v != '0'; }
+    if (hud_log) {
+        char sig[160];
+        snprintf(sig, sizeof sig, "HUD target %d, world target %d, 2D on screen %u, passes %u, 3D into HUD %u, menu state %d",
+                 (int)g_hud_fb_next, (int)g_world_fb_next, g_hud2d, g_pass2d, g_hudfb_draws,
+                 menu_state());
+        if (strcmp(sig, last_hud)) fprintf(stderr, "[hud] frame %u: %s\n", g_frame, sig);
+        strcpy(last_hud, sig);
+    }
+    g_hud2d = g_pass2d = 0;
     g_zoom_draws = g_hudfb_draws = 0;
     /* a scope is held; a lens passing through on a camera move is not one */
     g_zoom_frames = g_lens_seen > g_zoom_lens ? g_zoom_frames + 1 : 0;
@@ -1496,7 +1585,7 @@ int stereo_ray_to_screen(const float o[3], const float d[3], float *x, float *y)
     float t = (-g_screen_dist - o[2]) / d[2];
     if (t <= 0) return 0;
     float hx = o[0] + t * d[0], hy = o[1] + t * d[1];
-    float u = hx * g_last_persp[0] / g_screen_dist, v = hy * g_last_persp[5] / g_screen_dist;
+    float u = hx * g_screen_lens[0] / g_screen_dist, v = hy * g_screen_lens[1] / g_screen_dist;
     *x = GAME_W * 0.5f * (1 + u);
     *y = GAME_H * 0.5f * (1 - v);
     return 1;
@@ -1558,6 +1647,7 @@ void stereo_init(void)
  * replaces all of it every frame. */
 void stereo_start(void)
 {
+    watch_states();
     if (g_on) return;
     void *a = guest_alloc(ARENA_SIZE, 64);
     if (!a) { fprintf(stderr, "[stereo] no guest memory for the recording - stereo off\n"); return; }

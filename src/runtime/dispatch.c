@@ -17,6 +17,7 @@
 #include <stdlib.h>
 
 #include "lindbergh_rt.h"
+#include "stereo.h"
 #include "recomp_funcs_list.h"
 #include "recomp_plt.h"
 
@@ -185,6 +186,7 @@ void dispatch(CPU *c, uint32_t va)
     guest_trace_dispatch(va);
     range_trace(va);
     int watched = watch_check(c, va);
+    if (va >= stereo_state_lo && va <= stereo_state_hi) stereo_guest_state(va);
 
     if (++g_depth > g_depth_max) g_depth_max = g_depth;
     if (g_depth > DEPTH_LIMIT) {

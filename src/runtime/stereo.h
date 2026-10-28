@@ -1,3 +1,4 @@
+#include <stdint.h>
 /*
  * stereo.h - drawing each frame once per eye (stereo.c), and what a VR host
  * tells it about the eyes.
@@ -38,6 +39,11 @@ int stereo_is_render_target(unsigned tex);
 /* For vertex programs with the game's projection in their own constants. */
 void stereo_reproject(float out[16]);
 void stereo_present_desktop(int win_w, int win_h);
+/* The game's menu screens, by the state function the game runs each frame
+ * while one is up: its 3D goes on the screen with the menu's 2D. dispatch()
+ * passes on every guest call inside [stereo_state_lo, stereo_state_hi]. */
+extern uint32_t stereo_state_lo, stereo_state_hi;
+void stereo_guest_state(uint32_t va);
 
 /* hle_gl_posix.c: a live glMapBuffer's guest shadow, for the recording */
 int gl_map_shadow(unsigned target, void **shadow, int *size);
