@@ -56,6 +56,7 @@
 #include "lindbergh_rt.h"
 #include "stereo.h"
 #include "xr_overlay.h"
+#include "xr_menu.h"
 
 /* host_sdl.c: the gun and the cabinet's buttons, from the controllers */
 void host_vr_input(int gun_x, int gun_y, unsigned held, int coin);
@@ -100,28 +101,50 @@ static int gl_load(void)
 enum { LASER_ON, LASER_DOT, LASER_OFF };
 static const char *const LASER_NAME[] = { "laser", "dot", "off" };
 
+static const char *const SIGHT_NAME[] = { "none", "reddot", "holo" };
+
 static struct {
     float scale, screen;
     int   resolution, refresh, left_handed, laser, auto_coins;
-} cfg = { 1.0f, 3.0f, 1440, 120, 0, LASER_ON, 1 };
+    int   sight, crosshair, show_gun;         /* XO_SIGHT_*; the game's own sight; the gun model */
+} cfg = { 1.0f, 3.0f, 1440, 120, 0, LASER_ON, 1, XO_SIGHT_NONE, 1, 1 };
 
 static void cfg_save(void)
 {
     FILE *f = fopen("vr.cfg", "w");
     if (!f) return;
-    fprintf(f, "scale %g\nscreen %g\nresolution %d\nrefresh %d\nhand %s\nlaser %s\ncoins %s\n",
+    fprintf(f, "scale %g\nscreen %g\nresolution %d\nrefresh %d\nhand %s\nlaser %s\ncoins %s\n"
+               "sight %s\ncrosshair %s\ngun %s\n",
             cfg.scale, cfg.screen, cfg.resolution, cfg.refresh, cfg.left_handed ? "left" : "right",
-            LASER_NAME[cfg.laser], cfg.auto_coins ? "auto" : "manual");
+            LASER_NAME[cfg.laser], cfg.auto_coins ? "auto" : "manual",
+            SIGHT_NAME[cfg.sight], cfg.crosshair ? "on" : "off", cfg.show_gun ? "on" : "off");
     fclose(f);
 }
+
+static void cfg_set(const char *key, const char *val);
 
 static void cfg_load(void)
 {
     FILE *f = fopen("vr.cfg", "r");
     if (!f) f = fopen("../vr.cfg", "r");    /* beside the game: where adb can put one */
-    if (!f) return;
     char key[32], val[32];
-    while (fscanf(f, "%31s %31s", key, val) == 2) {
+    while (f && fscanf(f, "%31s %31s", key, val) == 2) cfg_set(key, val);
+    if (f) fclose(f);
+    /* LINDBERGH_XR_SET="key=value,...": for this run only, not saved (testing) */
+    const char *e = getenv("LINDBERGH_XR_SET");
+    while (e && *e) {
+        if (sscanf(e, "%31[^=]=%31[^,]", key, val) == 2) cfg_set(key, val);
+        e = strchr(e, ',');
+        if (e) e++;
+    }
+    if (cfg.scale <= 0) cfg.scale = 1;
+    if (cfg.screen <= 0.2f) cfg.screen = 3;
+    if (cfg.resolution < 512 || cfg.resolution > 4096) cfg.resolution = 1440;
+}
+
+static void cfg_set(const char *key, const char *val)
+{
+    {
         if (!strcmp(key, "scale")) cfg.scale = (float)atof(val);
         else if (!strcmp(key, "screen")) cfg.screen = (float)atof(val);
         else if (!strcmp(key, "resolution")) cfg.resolution = atoi(val);
@@ -129,11 +152,10 @@ static void cfg_load(void)
         else if (!strcmp(key, "hand")) cfg.left_handed = !strcmp(val, "left");
         else if (!strcmp(key, "laser")) cfg.laser = !strcmp(val, "dot") ? LASER_DOT : !strcmp(val, "off") ? LASER_OFF : LASER_ON;
         else if (!strcmp(key, "coins")) cfg.auto_coins = strcmp(val, "manual") != 0;
+        else if (!strcmp(key, "sight")) cfg.sight = !strcmp(val, "reddot") ? XO_SIGHT_RED_DOT : !strcmp(val, "holo") ? XO_SIGHT_HOLO : XO_SIGHT_NONE;
+        else if (!strcmp(key, "crosshair")) cfg.crosshair = strcmp(val, "off") != 0;
+        else if (!strcmp(key, "gun")) cfg.show_gun = strcmp(val, "off") != 0;
     }
-    fclose(f);
-    if (cfg.scale <= 0) cfg.scale = 1;
-    if (cfg.screen <= 0.2f) cfg.screen = 3;
-    if (cfg.resolution < 512 || cfg.resolution > 4096) cfg.resolution = 1440;
 }
 
 /* ---- the session ---- */
@@ -339,6 +361,119 @@ static int fake_gun(void)
     return fake;
 }
 
+/* ---- the settings panel ----
+ * The left controller's menu button opens it to the player's left, turned
+ * towards them, the game's screen still in view (the arcade's own Test menu
+ * is worked from here too). Point the gun at a row and pull the trigger;
+ * the game gets no input meanwhile. */
+enum { M_SIGHT, M_LASER, M_CROSSHAIR, M_GUN, M_HAND, M_SCREEN, M_RATE, M_COINS, M_COIN, M_RECENTRE,
+       M_TEST, M_SERVICE, M_CLOSE, M_COUNT };
+static struct {
+    int open, hover, dirty;
+    float c[3], right[3], up[3], n[3], hw, hh;  /* where it hangs, in LOCAL metres */
+    int test_frames, service_frames, coin;
+} menu;
+static float rates[16];
+static int nrates;
+
+static void menu_items(XmItem *it)
+{
+    static const char *const sight[] = { "Point shooting", "Red dot", "Holographic" };
+    static const char *const laser[] = { "Laser and dot", "Dot only", "Off" };
+    static const char *const labels[M_COUNT] = {
+        "Sight", "Laser", "Game crosshair", "Gun model", "Gun hand", "Screen distance", "Display rate",
+        "Coins", "Insert a coin", "Recentre view", "Arcade Test button (select)",
+        "Arcade Service button (next)", "Close" };
+    for (int i = 0; i < M_COUNT; i++) { it[i].label = labels[i]; it[i].value[0] = 0; }
+    snprintf(it[M_SIGHT].value, 40, "%s", sight[cfg.sight]);
+    snprintf(it[M_LASER].value, 40, "%s", laser[cfg.laser]);
+    snprintf(it[M_CROSSHAIR].value, 40, "%s", cfg.crosshair ? "Shown" : "Hidden");
+    snprintf(it[M_GUN].value, 40, "%s", cfg.show_gun ? "Shown" : "Hidden");
+    snprintf(it[M_HAND].value, 40, "%s", gun_hand == HAND_L ? "Left" : "Right");
+    snprintf(it[M_SCREEN].value, 40, "%.1f m", cfg.screen);
+    snprintf(it[M_RATE].value, 40, "%d Hz", cfg.refresh);
+    snprintf(it[M_COINS].value, 40, "%s", cfg.auto_coins ? "Automatic" : "By menu");
+}
+
+static void menu_paint(void)
+{
+    static unsigned char img[XM_W * XM_H * 4];
+    XmItem it[M_COUNT];
+    menu_items(it);
+    xm_paint(img, "Ghost Squad Evolution VR - settings", it, M_COUNT, menu.hover,
+             "Point and pull the trigger. Menu button: close.");
+    xo_panel_upload(img, XM_W, XM_H);
+    menu.dirty = 0;
+}
+
+static void menu_place(void)
+{
+    float head[3], f[3];
+    const float back[3] = { 0, 0, -1 };
+    for (int i = 0; i < 3; i++) head[i] = 0.5f * ((&views[0].pose.position.x)[i] + (&views[1].pose.position.x)[i]);
+    qrot(views[0].pose.orientation, back, f);
+    float yaw = atan2f(-f[0], -f[2]) + 0.55f;   /* about 30 degrees to the left */
+    float fwd[3] = { -sinf(yaw), 0, -cosf(yaw) };
+    for (int i = 0; i < 3; i++) menu.c[i] = head[i] + fwd[i] * 0.95f;
+    menu.c[1] = head[1] - 0.12f;
+    for (int i = 0; i < 3; i++) menu.n[i] = -fwd[i];
+    menu.up[0] = 0; menu.up[1] = 1; menu.up[2] = 0;
+    menu.right[0] = menu.up[1] * menu.n[2] - menu.up[2] * menu.n[1];
+    menu.right[1] = menu.up[2] * menu.n[0] - menu.up[0] * menu.n[2];
+    menu.right[2] = menu.up[0] * menu.n[1] - menu.up[1] * menu.n[0];
+    menu.hw = 0.33f; menu.hh = menu.hw * XM_H / XM_W;
+}
+
+/* where the ray meets the panel: 0..1 from its top left; 0 if it misses */
+static int menu_hit(const float p[3], const float d[3], float *u, float *v, float hit[3])
+{
+    float dn = d[0] * menu.n[0] + d[1] * menu.n[1] + d[2] * menu.n[2];
+    if (dn > -1e-4f) return 0;
+    float t = ((menu.c[0] - p[0]) * menu.n[0] + (menu.c[1] - p[1]) * menu.n[1] + (menu.c[2] - p[2]) * menu.n[2]) / dn;
+    if (t <= 0) return 0;
+    float r[3];
+    for (int i = 0; i < 3; i++) { hit[i] = p[i] + d[i] * t; r[i] = hit[i] - menu.c[i]; }
+    float x = (r[0] * menu.right[0] + r[1] * menu.right[1] + r[2] * menu.right[2]) / menu.hw;
+    float y = (r[0] * menu.up[0] + r[1] * menu.up[1] + r[2] * menu.up[2]) / menu.hh;
+    *u = (x + 1) * 0.5f; *v = (1 - y) * 0.5f;
+    return x >= -1 && x <= 1 && y >= -1 && y <= 1;
+}
+
+static void menu_choose(int item)
+{
+    static const float screens[] = { 2.0f, 2.5f, 3.0f, 4.0f, 5.0f };
+    switch (item) {
+    case M_SIGHT: cfg.sight = (cfg.sight + 1) % 3; break;
+    case M_LASER: cfg.laser = (cfg.laser + 1) % 3; break;
+    case M_CROSSHAIR: cfg.crosshair = !cfg.crosshair; stereo_show_game_sight(cfg.crosshair); break;
+    case M_GUN: cfg.show_gun = !cfg.show_gun; break;
+    case M_HAND: gun_hand = 1 - gun_hand; cfg.left_handed = gun_hand == HAND_L; break;
+    case M_SCREEN: {
+        int k = 0;
+        while (k < 5 && screens[k] <= cfg.screen + 0.01f) k++;
+        cfg.screen = screens[k % 5];
+        stereo_set_screen_distance(cfg.screen * cfg.scale);
+        break;
+    }
+    case M_RATE:
+        if (nrates) {
+            int k = 0;
+            while (k < nrates && rates[k] <= cfg.refresh + 0.5f) k++;
+            cfg.refresh = (int)(rates[k % nrates] + 0.5f);
+            if (request_rate) request_rate(session, (float)cfg.refresh);
+        }
+        break;
+    case M_COINS: cfg.auto_coins = !cfg.auto_coins; break;
+    case M_COIN: menu.coin = 1; break;
+    case M_RECENTRE: anchor_pending = 1; break;
+    case M_TEST: menu.test_frames = 12; break;
+    case M_SERVICE: menu.service_frames = 12; break;
+    case M_CLOSE: menu.open = 0; break;
+    }
+    cfg_save();
+    menu.dirty = 1;
+}
+
 static void input_frame(XrTime t)
 {
     XrActiveActionSet as = { set, XR_NULL_PATH };
@@ -354,7 +489,15 @@ static void input_frame(XrTime t)
         /* pulling the trigger on the other hand moves the gun there */
         if (trig[h] && !prev[h][0] && h != gun_hand) gun_hand = h;
     }
-    int menu = get_bool(a_menu, HAND_L);
+    int menu_btn = get_bool(a_menu, HAND_L);
+    static int fake_menu = -1;          /* LINDBERGH_XR_FAKE_MENU=1 with the stand-in gun: the panel open, no clicks */
+    if (fake_menu < 0) { const char *v = getenv("LINDBERGH_XR_FAKE_MENU"); fake_menu = v && *v == '1'; }
+    if (fake_menu && !menu.open && views_ok) { menu.open = 1; menu_place(); menu.hover = -1; menu.dirty = 1; }
+    if (menu_btn && !prev[HAND_L][6]) {
+        menu.open = !menu.open;
+        fprintf(stderr, "[xr] settings panel %s\n", menu.open ? "open" : "closed");
+        if (menu.open) { menu_place(); menu.hover = -1; menu.dirty = 1; }
+    }
     int g = gun_hand;
 
     float gx = -100000, gy = -100000;
@@ -376,6 +519,14 @@ static void input_frame(XrTime t)
         float cy = cosf(yaw / 2), sy = sinf(yaw / 2), cp = cosf(pitch / 2), sp = sinf(pitch / 2);
         loc.pose.orientation = (XrQuaternionf){ sp * cy, cp * sy, -sp * sy, cp * cy };
         loc.pose.position = (XrVector3f){ 0.16f, -0.22f, -0.28f };
+        static int ads = -1;            /* LINDBERGH_XR_FAKE_ADS=1: shouldered, looking through the sight */
+        if (ads < 0) { const char *v = getenv("LINDBERGH_XR_FAKE_ADS"); ads = v && *v == '1'; }
+        if (ads) {
+            loc.pose.position = (XrVector3f){ 0.0f, -0.080f, -0.16f };
+            yaw *= 0.15f; pitch = 0.0f; reload = 0;
+            cy = cosf(yaw / 2); sy = sinf(yaw / 2); cp = 1; sp = 0;
+            loc.pose.orientation = (XrQuaternionf){ sp * cy, cp * sy, -sp * sy, cp * cy };
+        }
         trig[g] = reload || fmod(s, 1.0) < 0.5;
         located = 1;
     }
@@ -401,12 +552,25 @@ static void input_frame(XrTime t)
         for (int i = 0; i < 3; i++) xo.end[i] = p[i] + d[i] * reach;
         xo.beam = cfg.laser == LASER_ON;
         xo.dot = aimed && cfg.laser != LASER_OFF;
+        if (menu.open) {        /* the laser points at the panel; the game is not aimed at */
+            float u, v, hit[3];
+            int on = menu_hit(p, d, &u, &v, hit);
+            int row = on ? xm_row_at(u, v, M_COUNT) : -1;
+            if (row != menu.hover) { menu.hover = row; menu.dirty = 1; }
+            if (on) memcpy(xo.end, hit, sizeof hit);
+            xo.beam = 1; xo.dot = on;
+            if (trig[g] && !prev[g][0] && row >= 0 && !fake_menu) { menu_choose(row); rumble(g, 0.25f, 15); }
+            aimed = 0; gx = gy = -100000;
+        }
     }
+    xo.sight = cfg.show_gun ? cfg.sight : XO_SIGHT_NONE;
+    xo.show_gun = cfg.show_gun;
+    if (menu.open && menu.dirty) menu_paint();
 
     /* firing: a kick, a flash and a pulse ten times a second while held on
      * the screen - the cabinet gun's recoil */
     static XrTime fire_start;
-    int firing = trig[g] && aimed;
+    int firing = trig[g] && aimed && !menu.open;
     if (firing && !prev[g][0]) fire_start = t;
     float phase = firing ? fmodf((float)((t - fire_start) / 1000000) / 100.0f, 1.0f) : 1.0f;
     static float last_phase = 1.0f;
@@ -415,43 +579,74 @@ static void input_frame(XrTime t)
     if (firing && (phase < last_phase)) rumble(g, 0.7f, 35);
     last_phase = phase;
 
-    /* the other hand's upper button, held for a second: laser, dot, off (a
-     * held press, so a stray tap can't hide the aim) */
+    /* the other hand's upper button (Y for the right-handed), held for a
+     * second, opens and closes the settings panel too */
     int off = 1 - g;
-    static XrTime laser_held;
-    if (btn_b[off] && !prev[off][3]) laser_held = t;
-    if (btn_b[off] && laser_held && t - laser_held >= 1000000000) {
-        laser_held = 0;
-        cfg.laser = (cfg.laser + 1) % 3;
-        cfg_save();
+    static XrTime panel_held;
+    if (btn_b[off] && !prev[off][3]) panel_held = t;
+    if (btn_b[off] && panel_held && t - panel_held >= 1000000000) {
+        panel_held = 0;
+        menu.open = !menu.open;
+        if (menu.open) { menu_place(); menu.hover = -1; menu.dirty = 1; }
         rumble(off, 0.3f, 20);
-        fprintf(stderr, "[xr] aim aid: %s\n", LASER_NAME[cfg.laser]);
+        fprintf(stderr, "[xr] settings panel %s (held button)\n", menu.open ? "open" : "closed");
+    }
+
+    /* every button change, and the controllers the runtime reports: for
+     * finding a button that does not come through */
+    {
+        static int last[2][6] = { { -1 } };
+        int now[2][6];
+        for (int h = 0; h < 2; h++) {
+            now[h][0] = trig[h]; now[h][1] = grip[h]; now[h][2] = btn_a[h]; now[h][3] = btn_b[h];
+            now[h][4] = stick[h]; now[h][5] = h == HAND_L ? menu_btn : 0;
+        }
+        if (memcmp(now, last, sizeof now)) {
+            fprintf(stderr, "[xr] buttons L t%d g%d x%d y%d s%d m%d  R t%d g%d a%d b%d s%d\n", now[0][0], now[0][1],
+                    now[0][2], now[0][3], now[0][4], now[0][5], now[1][0], now[1][1], now[1][2], now[1][3], now[1][4]);
+            memcpy(last, now, sizeof now);
+        }
+        static int told;
+        if (!told) {
+            told = 1;
+            for (int h = 0; h < 2; h++) {
+                XrInteractionProfileState ip = { XR_TYPE_INTERACTION_PROFILE_STATE };
+                char name[XR_MAX_PATH_LENGTH] = "?"; uint32_t len = 0;
+                if (XR_SUCCEEDED(xrGetCurrentInteractionProfile(session, hand_path[h], &ip)) && ip.interactionProfile)
+                    xrPathToString(instance, ip.interactionProfile, sizeof name, &len, name);
+                fprintf(stderr, "[xr] %s hand: %s\n", h == HAND_L ? "left" : "right", name);
+            }
+        }
     }
 
     unsigned held = 0;
     if (firing) held |= CAB_P1_TRIGGER;
-    if (trig[g] && !aimed) held |= CAB_P1_RELOAD;  /* the arcade's reload: fire off the screen */
-    if (grip[g]) held |= CAB_P1_RELOAD;
-    if (btn_a[g]) held |= CAB_P1_ACTION;
-    if (btn_b[g]) held |= CAB_P1_FIREMODE;
-    int start = stick[0] || stick[1];
+    if (trig[g] && !aimed && !menu.open) held |= CAB_P1_RELOAD;  /* the arcade's reload: fire off the screen */
+    if (grip[g] && !menu.open) held |= CAB_P1_RELOAD;
+    if (btn_a[g] && !menu.open) held |= CAB_P1_ACTION;
+    if (btn_b[g] && !menu.open) held |= CAB_P1_FIREMODE;
+    if (menu.test_frames) { menu.test_frames--; held |= CAB_TEST; }
+    if (menu.service_frames) { menu.service_frames--; held |= CAB_SERVICE; }
+    int start = (stick[0] || stick[1]) && !menu.open;
     /* the stand-in gun presses Start for a moment every ten seconds too */
     if (fake_gun() && fmod((double)t / 1e9, 10.0) < 0.2) start = 1;
     if (start) held |= CAB_P1_START;
     /* Coins: the left menu button, and with automatic coins one at start-up
      * and one with every press of Start - Start alone plays and continues. */
     static unsigned frames;
-    int coin = menu && !prev[HAND_L][6];
+    int coin = menu.coin;
+    menu.coin = 0;
     if (cfg.auto_coins && ((++frames == 240) || (start && !prev[HAND_L][7]))) coin = 1;
     prev[HAND_L][7] = start;
+    stereo_set_gun((int)gx, (int)gy);
     host_vr_input((int)gx, (int)gy, held, coin);
 
-    if (trig[g] && !aimed && !prev[g][0]) rumble(g, 0.3f, 40);
+    if (trig[g] && !aimed && !prev[g][0] && !menu.open) rumble(g, 0.3f, 40);
     for (int h = 0; h < 2; h++) {
         prev[h][0] = trig[h]; prev[h][1] = grip[h]; prev[h][2] = btn_a[h];
         prev[h][3] = btn_b[h]; prev[h][4] = stick[h];
     }
-    prev[HAND_L][6] = menu;
+    prev[HAND_L][6] = menu_btn;
 }
 
 /* ---- events ---- */
@@ -471,8 +666,9 @@ static int poll_events(void)
                 if (XR_SUCCEEDED(xrBeginSession(session, &bi))) {
                     running = 1;
                     if (enumerate_rates) {
-                        float rates[16]; uint32_t n = 0;
+                        uint32_t n = 0;
                         if (XR_SUCCEEDED(enumerate_rates(session, 16, &n, rates))) {
+                            nrates = (int)n;
                             fprintf(stderr, "[xr] display rates:");
                             for (uint32_t k = 0; k < n; k++) fprintf(stderr, " %.0f", rates[k]);
                             fprintf(stderr, "\n");
@@ -507,6 +703,7 @@ int xr_init(void)
 {
     if (!gl_load()) { fprintf(stderr, "[xr] cannot load GLES\n"); return 0; }
     cfg_load();
+    stereo_show_game_sight(cfg.crosshair);
 
     JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
     JavaVM *vm = NULL;
@@ -847,6 +1044,18 @@ void xr_frame_end(void)
                 mat4_mul(vp, proj, view);
                 float eye_pos[3] = { views[i].pose.position.x, views[i].pose.position.y, views[i].pose.position.z };
                 xo_draw(&xo, vp, eye_pos, (int)e->w, (int)e->h);
+                if (menu.open) {
+                    float pm[16], m[16];
+                    memset(pm, 0, sizeof pm);
+                    for (int k = 0; k < 3; k++) {
+                        pm[k] = menu.right[k] * menu.hw; pm[4 + k] = menu.up[k] * menu.hh;
+                        pm[8 + k] = menu.n[k]; pm[12 + k] = menu.c[k];
+                    }
+                    pm[15] = 1;
+                    mat4_mul(m, vp, pm);
+                    xo_draw_panel(m, (int)e->w, (int)e->h);
+                    xo_draw(&xo, vp, eye_pos, (int)e->w, (int)e->h);   /* the gun and laser over the panel */
+                }
             }
             XrSwapchainImageReleaseInfo ri = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
             xrReleaseSwapchainImage(e->chain, &ri);

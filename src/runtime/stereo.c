@@ -112,6 +112,16 @@ static float    g_near_seen;            /* the nearest near plane of this frame'
 static GLuint   g_world_fb = ~0u, g_world_fb_next = ~0u;   /* the target the world was drawn into last frame */
 static unsigned g_hud2d, g_pass2d;      /* this frame's 2D draws put on the screen / left as passes (LINDBERGH_HUD_LOG) */
 static float    g_hud_lens;
+/* The game's own sight: the small 2D sprite drawn where the gun points.
+ * Learnt as the texture such draws use, frame after frame, while the gun
+ * moves; hidden on request (stereo_show_game_sight) by skipping draws of
+ * that texture at the gun's place. */
+static GLuint   g_tex2d_bound;          /* GL_TEXTURE_2D bound on unit 0 */
+static float    g_gun_ndc[2] = { -9, -9 };   /* where the gun points, in the game's NDC */
+static int      g_show_sight = 1;
+static GLuint   g_sight_tex, g_sight_cand;
+static unsigned g_sight_hits, g_sight_frame;
+static float    g_sight_from[2];
 static GLint    g_menu_vp[4];           /* this frame's first sub-viewport a screen 3D draw used (LINDBERGH_HUD_LOG) */             /* the lens the screen was sized by at this frame's first 2D draw on it */
 
 /* ---- the recording ---- */
@@ -705,6 +715,32 @@ static const Cls *cls(HleId id)
 static int is_draw(int kind) { return kind == K_DRAWARRAYS || kind == K_DRAWELEMENTS || kind == K_DRAWOTHER; }
 
 /* Returns 1 when it did the call's work itself. */
+/* Is this 2D draw the game's sight? Learns it, and says whether to skip it. */
+static int sight_draw(CPU *c, const char *n)
+{
+    if (g_gun_ndc[0] < -2 || !g_tex2d_on || !g_tex2d_bound) return 0;
+    float b[4];
+    if (!ndc_box(c, n, b)) return 0;
+    float w = b[2] - b[0], h = b[3] - b[1];
+    if (w > 0.4f || h > 0.5f) return 0;
+    float cx = (b[0] + b[2]) * 0.5f - g_gun_ndc[0], cy = (b[1] + b[3]) * 0.5f - g_gun_ndc[1];
+    if (cx * cx * 100 + cy * cy * 56 > 0.02f) return 0;    /* centred on the gun, within a few pixels */
+    if (!g_sight_tex) {
+        if (g_tex2d_bound != g_sight_cand) {
+            g_sight_cand = g_tex2d_bound; g_sight_hits = 0;
+            g_sight_from[0] = g_gun_ndc[0]; g_sight_from[1] = g_gun_ndc[1];
+        }
+        if (g_frame != g_sight_frame) { g_sight_frame = g_frame; g_sight_hits++; }
+        float mx = g_gun_ndc[0] - g_sight_from[0], my = g_gun_ndc[1] - g_sight_from[1];
+        if (g_sight_hits >= 30 && mx * mx + my * my > 0.01f) {   /* followed a moving gun */
+            g_sight_tex = g_sight_cand;
+            fprintf(stderr, "[stereo] frame %u: the game's sight is texture %u\n", g_frame, g_sight_tex);
+        }
+        return 0;
+    }
+    return !g_show_sight && g_tex2d_bound == g_sight_tex;
+}
+
 static int transform_call(CPU *c, HleId id, const char *n)
 {
     int k = cls(id)->kind;
@@ -747,6 +783,7 @@ static int transform_call(CPU *c, HleId id, const char *n)
     if (k == K_ACTIVETEX) { g_active_unit = A32(0); return 0; }
     if (k == K_BINDTEX) {
         unsigned u = g_active_unit - GL_TEXTURE0;
+        if (A32(0) == GL_TEXTURE_2D && u == 0) g_tex2d_bound = A32(1);
         if (A32(0) == GL_TEXTURE_RECTANGLE_ARB) {
             if (u == 0) g_unit0_rect = A32(1);
             if (u < 8) g_rect_bound[u] = A32(1);
@@ -784,6 +821,7 @@ static int transform_call(CPU *c, HleId id, const char *n)
         if (offscreen_fb(g_game_fb) || g_flat) hud = 2;  /* the game's own projection, untouched */
         if (hud == 1 && !is_perspective(g_proj[g_proj_top]) && !g_replaying) g_hud_fb_next = g_game_fb;
         if (!persp && !g_replaying) { if (hud) { if (!g_hud2d) g_hud_lens = g_last_persp[0]; g_hud2d++; } else g_pass2d++; }
+        if (hud == 1 && !persp && !g_replaying && sight_draw(c, n)) return 1;
         if (hud == 1 && !persp && letterbox_bar(c, n)) return 1;
         if (hud != g_loaded_hud) { g_loaded_hud = hud; load_projection(); }
         if (hud == 1 && persp && !g_menu_vp[2] && (g_vp[2] != GAME_W || g_vp[3] != GAME_H)) memcpy(g_menu_vp, g_vp, sizeof g_vp);
@@ -1056,7 +1094,7 @@ static void trace_draw(const char *n)
     static long at = -2;
     if (at == -2) { const char *v = getenv("LINDBERGH_RT_DUMP"); at = v && *v ? atol(v) : -1; }
 #ifdef LINDBERGH_GL4ES
-    gl4es_mv_trace = (long)g_frame == at && getenv("LIBGL_MV_CHECK");
+    gl4es_mv_trace = ((long)g_frame == at || (long)g_frame == g_rt_dump_at) && getenv("LIBGL_MV_CHECK");
 #endif
     if ((long)g_frame != at || (strncmp(n, "glDraw", 6) && strcmp(n, "glEnd"))) return;
     static unsigned k;
@@ -1316,6 +1354,9 @@ static void stereo_gl_call_inner(CPU *c, HleId id, HleHandler fn)
         return;
     }
 #endif
+    /* the client arrays' state, for telling what a 2D draw covers (with two
+     * passes record() keeps it) */
+    if (g_mv && cls(id)->track) track_arrays(c, n);
     if (!g_mv) {
         if (g_glprof > 0) {
             double t0 = now_ns();
@@ -1746,4 +1787,17 @@ void stereo_start(void)
     }
     g_on = 1;
     fprintf(stderr, "[stereo] on: %dx%d per eye (x%.2f, x%.2f of the game's 640x480)\n", g_ew, g_eh, g_sx, g_sy);
+}
+
+void stereo_set_gun(int x, int y)
+{
+    if (x < -1000 || y < -1000) { g_gun_ndc[0] = g_gun_ndc[1] = -9; return; }
+    g_gun_ndc[0] = x / (GAME_W * 0.5f) - 1;
+    g_gun_ndc[1] = 1 - y / (GAME_H * 0.5f);
+}
+
+void stereo_show_game_sight(int show)
+{
+    g_show_sight = show;
+    fprintf(stderr, "[stereo] game sight %s (texture %u)\n", show ? "shown" : "hidden", g_sight_tex);
 }

@@ -43,59 +43,82 @@ static struct {
     F(void, ActiveTexture, (GLenum)) F(void, BindTexture, (GLenum, GLuint)) F(void, Uniform1i, (GLint, GLint))
     F(void, GenSamplers, (GLsizei, GLuint *)) F(void, BindSampler, (GLuint, GLuint))
     F(void, SamplerParameteri, (GLuint, GLenum, GLint)) F(void, ClearColor, (GLfloat, GLfloat, GLfloat, GLfloat))
+    F(void, DepthRangef, (GLfloat, GLfloat)) F(void, GetFloatv, (GLenum, GLfloat *)) F(void, Uniform2f, (GLint, GLfloat, GLfloat))
+    F(void, TexImage2D, (GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *))
+    F(void, GenTextures, (GLsizei, GLuint *)) F(void, TexParameteri, (GLenum, GLenum, GLint))
 #undef F
 } gl;
 
 static GLuint prog_gun, prog_beam, vao_gun, vbo_gun, vao_beam, vbo_beam;
 static GLuint prog_screen[2], vao_screen, vbo_screen, smp_screen;   /* [0] a 2D texture, [1] a layer of an array */
 static GLint u_screen_mvp[2], u_screen_tex[2];
-static GLint u_gun_mvp, u_gun_model, u_beam_mvp, u_beam_color;
+static GLuint prog_panel;
+static GLint u_panel_mvp, u_panel_tex;
+static GLint u_gun_mvp, u_gun_model, u_beam_mvp, u_beam_color, u_beam_shape;
 static int gun_verts;
 
-/* ---- the gun: boxes (centre, half size, colour), barrel along -Z ---- */
-static const struct { float c[3], h[3], rgb[3]; } PARTS[] = {
-    { {  0.000f, -0.026f,  0.030f }, { 0.021f, 0.028f, 0.115f }, { 0.20f, 0.21f, 0.22f } },  /* receiver */
-    { {  0.000f,  0.006f,  0.045f }, { 0.012f, 0.005f, 0.075f }, { 0.10f, 0.10f, 0.11f } },  /* top rail */
-    { {  0.000f,  0.020f,  0.095f }, { 0.008f, 0.010f, 0.012f }, { 0.08f, 0.08f, 0.09f } },  /* rear sight */
-    { {  0.000f, -0.016f, -0.120f }, { 0.017f, 0.019f, 0.050f }, { 0.13f, 0.14f, 0.15f } },  /* handguard */
-    { {  0.000f,  0.010f, -0.150f }, { 0.003f, 0.012f, 0.004f }, { 0.08f, 0.08f, 0.09f } },  /* front sight */
-    { {  0.000f, -0.006f, -0.205f }, { 0.007f, 0.007f, 0.040f }, { 0.06f, 0.06f, 0.07f } },  /* barrel */
-    { {  0.000f, -0.006f, -0.250f }, { 0.010f, 0.010f, 0.010f }, { 0.04f, 0.04f, 0.05f } },  /* muzzle */
-    { {  0.000f, -0.100f, -0.030f }, { 0.011f, 0.050f, 0.019f }, { 0.11f, 0.11f, 0.12f } },  /* magazine */
-    { {  0.000f, -0.095f,  0.085f }, { 0.014f, 0.045f, 0.020f }, { 0.09f, 0.09f, 0.10f } },  /* pistol grip */
-    { {  0.000f, -0.066f,  0.045f }, { 0.004f, 0.012f, 0.022f }, { 0.09f, 0.09f, 0.10f } },  /* trigger guard */
-    { {  0.000f, -0.030f,  0.225f }, { 0.012f, 0.032f, 0.080f }, { 0.12f, 0.12f, 0.13f } },  /* stock */
-    { {  0.000f, -0.034f,  0.310f }, { 0.016f, 0.045f, 0.008f }, { 0.07f, 0.07f, 0.08f } },  /* butt pad */
+/* ---- the gun ----
+ * Quaternius' SubmachineGun_2 (CC0), made into xr_gun_model.h by
+ * quest/tools/obj2gun.py: barrel along -Z on the aim ray, the rail on top.
+ * A sight goes on the rail, built from boxes here: its glass is where the
+ * reticle shows. */
+#include "xr_gun_model.h"
+
+typedef struct { float c[3], h[3], rgb[3]; } Box;
+#define OPTIC_Y (GUN_RAIL_Y + 0.030f)   /* the sight line, above the bore */
+static const Box RED_DOT[] = {          /* a tube sight, like an Aimpoint */
+    { { 0, GUN_RAIL_Y + 0.006f, 0.030f }, { 0.011f, 0.006f, 0.018f }, { 0.10f, 0.10f, 0.11f } },   /* mount */
+    { { 0, OPTIC_Y + 0.017f, 0.030f }, { 0.017f, 0.003f, 0.032f }, { 0.16f, 0.16f, 0.17f } },      /* tube: top */
+    { { 0, OPTIC_Y - 0.017f, 0.030f }, { 0.017f, 0.003f, 0.032f }, { 0.16f, 0.16f, 0.17f } },      /* bottom */
+    { { -0.017f, OPTIC_Y, 0.030f }, { 0.003f, 0.017f, 0.032f }, { 0.16f, 0.16f, 0.17f } },         /* sides */
+    { { 0.017f, OPTIC_Y, 0.030f }, { 0.003f, 0.017f, 0.032f }, { 0.16f, 0.16f, 0.17f } },
+    { { 0.020f, OPTIC_Y, 0.030f }, { 0.004f, 0.006f, 0.006f }, { 0.12f, 0.12f, 0.13f } },         /* turret */
 };
+static const Box HOLO[] = {             /* a window sight, like an EOTech */
+    { { 0, GUN_RAIL_Y + 0.008f, 0.032f }, { 0.017f, 0.008f, 0.048f }, { 0.12f, 0.12f, 0.13f } },   /* body */
+    { { -0.019f, OPTIC_Y + 0.002f, 0.018f }, { 0.003f, 0.020f, 0.022f }, { 0.15f, 0.15f, 0.16f } },/* hood: sides */
+    { { 0.019f, OPTIC_Y + 0.002f, 0.018f }, { 0.003f, 0.020f, 0.022f }, { 0.15f, 0.15f, 0.16f } },
+    { { 0, OPTIC_Y + 0.020f, 0.018f }, { 0.022f, 0.003f, 0.022f }, { 0.15f, 0.15f, 0.16f } },      /* hood: top */
+    { { 0.008f, GUN_RAIL_Y + 0.018f, 0.064f }, { 0.007f, 0.004f, 0.010f }, { 0.08f, 0.08f, 0.09f } },/* buttons */
+};
+/* each sight's glass: centre z and half width, half height, around the sight line */
+static const float GLASS[3][3] = { { 0, 0, 0 }, { 0.010f, 0.014f, 0.014f }, { 0.004f, 0.016f, 0.017f } };
 
-/* position, normal, colour per vertex */
-static float mesh[sizeof PARTS / sizeof PARTS[0] * 36 * 9];
+static float mesh[(GUN_VERTS + 8 * 36) * 9];
 
-static void build_gun(void)
+static void add_boxes(int *n, const Box *bx, int count)
 {
     static const int face[6][4] = { { 1, 3, 7, 5 }, { 0, 4, 6, 2 }, { 2, 6, 7, 3 },
                                     { 0, 1, 5, 4 }, { 4, 5, 7, 6 }, { 0, 2, 3, 1 } };
     static const float nrm[6][3] = { { 1, 0, 0 }, { -1, 0, 0 }, { 0, 1, 0 }, { 0, -1, 0 }, { 0, 0, 1 }, { 0, 0, -1 } };
-    int n = 0;
-    for (unsigned p = 0; p < sizeof PARTS / sizeof PARTS[0]; p++) {
+    for (int p = 0; p < count; p++) {
         float v[8][3];
         for (int k = 0; k < 8; k++)
             for (int a = 0; a < 3; a++)
-                v[k][a] = PARTS[p].c[a] + ((k >> a) & 1 ? PARTS[p].h[a] : -PARTS[p].h[a]);
+                v[k][a] = bx[p].c[a] + ((k >> a) & 1 ? bx[p].h[a] : -bx[p].h[a]);
         for (int f = 0; f < 6; f++) {
             static const int tri[6] = { 0, 1, 2, 0, 2, 3 };
             for (int t = 0; t < 6; t++) {
-                float *o = &mesh[n++ * 9];
+                float *o = &mesh[(*n)++ * 9];
                 memcpy(o, v[face[f][tri[t]]], 12);
                 memcpy(o + 3, nrm[f], 12);
-                memcpy(o + 6, PARTS[p].rgb, 12);
+                memcpy(o + 6, bx[p].rgb, 12);
             }
         }
     }
-    gun_verts = n;
 }
 
-/* ---- set-up ---- */
+static int cur_sight = -1;
+static void build_gun(int sight)
+{
+    memcpy(mesh, GUN_MESH, sizeof GUN_MESH);
+    int n = GUN_VERTS;
+    if (sight == XO_SIGHT_RED_DOT) add_boxes(&n, RED_DOT, (int)(sizeof RED_DOT / sizeof *RED_DOT));
+    if (sight == XO_SIGHT_HOLO) add_boxes(&n, HOLO, (int)(sizeof HOLO / sizeof *HOLO));
+    gun_verts = n;
+    cur_sight = sight;
+}
+
 static GLuint shader(GLenum type, const char *src)
 {
     GLuint s = gl.CreateShader(type);
@@ -130,7 +153,8 @@ int xo_init(void)
     L(VertexAttribPointer) L(EnableVertexAttribArray) L(DrawArrays) L(Enable) L(Disable) L(IsEnabled)
     L(GetIntegerv) L(GetBooleanv) L(BlendFuncSeparate) L(DepthMask) L(DepthFunc) L(ColorMask) L(Viewport)
     L(Clear) L(ClearDepthf) L(FrontFace) L(CullFace) L(ActiveTexture) L(BindTexture) L(Uniform1i)
-    L(GenSamplers) L(BindSampler) L(SamplerParameteri) L(ClearColor)
+    L(GenSamplers) L(BindSampler) L(SamplerParameteri) L(ClearColor) L(DepthRangef) L(GetFloatv) L(Uniform2f)
+    L(TexImage2D) L(GenTextures) L(TexParameteri)
 #undef L
     prog_gun = program(
         "#version 300 es\nlayout(location=0) in vec3 p; layout(location=1) in vec3 n; layout(location=2) in vec3 c;\n"
@@ -146,11 +170,15 @@ int xo_init(void)
     prog_beam = program(
         "#version 300 es\nlayout(location=0) in vec3 p; layout(location=1) in vec2 uv;\n"
         "uniform mat4 mvp; out vec2 t; void main() { t = uv; gl_Position = mvp * vec4(p, 1.0); }\n",
-        "#version 300 es\nprecision mediump float; in vec2 t; uniform vec4 color; out vec4 o;\n"
-        "void main() { float d = length(t); float a = clamp(1.0 - d, 0.0, 1.0); o = vec4(color.rgb, color.a * a * a); }\n",
+        "#version 300 es\nprecision mediump float; in vec2 t; uniform vec4 color; uniform vec2 shape; out vec4 o;\n"
+        "void main() { float d = length(t);\n"
+        "  float a = shape.y > 0.0 ? clamp(1.0 - abs(d - shape.x) / shape.y, 0.0, 1.0)  /* a ring */\n"
+        "                          : clamp(1.0 - d, 0.0, 1.0);\n"
+        "  o = vec4(color.rgb, color.a * a * a); }\n",
         "p", "uv", NULL);
     u_beam_mvp = gl.GetUniformLocation(prog_beam, "mvp");
     u_beam_color = gl.GetUniformLocation(prog_beam, "color");
+    u_beam_shape = gl.GetUniformLocation(prog_beam, "shape");
 
     for (int a = 0; a < 2; a++) {
         prog_screen[a] = program(
@@ -164,6 +192,13 @@ int xo_init(void)
         u_screen_mvp[a] = gl.GetUniformLocation(prog_screen[a], "mvp");
         u_screen_tex[a] = gl.GetUniformLocation(prog_screen[a], "tex");
     }
+    prog_panel = program(   /* the panel's picture: row 0 at the top */
+        "#version 300 es\nlayout(location=0) in vec2 p; uniform mat4 mvp; out vec2 t;\n"
+        "void main() { t = vec2(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5); gl_Position = mvp * vec4(p, 0.0, 1.0); }\n",
+        "#version 300 es\nprecision mediump float; in vec2 t; uniform sampler2D tex; out vec4 o;\n"
+        "void main() { o = texture(tex, t); }\n", "p", NULL, NULL);
+    u_panel_mvp = gl.GetUniformLocation(prog_panel, "mvp");
+    u_panel_tex = gl.GetUniformLocation(prog_panel, "tex");
     static const float quad[8] = { -1, -1, 1, -1, -1, 1, 1, 1 };
     gl.GenVertexArrays(1, &vao_screen);
     gl.GenBuffers(1, &vbo_screen);
@@ -178,12 +213,12 @@ int xo_init(void)
     gl.SamplerParameteri(smp_screen, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     gl.SamplerParameteri(smp_screen, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
-    build_gun();
+    build_gun(XO_SIGHT_NONE);
     gl.GenVertexArrays(1, &vao_gun);
     gl.GenBuffers(1, &vbo_gun);
     gl.BindVertexArray(vao_gun);
     gl.BindBuffer(GL_ARRAY_BUFFER, vbo_gun);
-    gl.BufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(gun_verts * 9 * sizeof(float)), mesh, GL_STATIC_DRAW);
+    gl.BufferData(GL_ARRAY_BUFFER, (GLsizeiptr)sizeof mesh, mesh, GL_DYNAMIC_DRAW);
     for (int a = 0; a < 3; a++) {
         gl.VertexAttribPointer((GLuint)a, 3, GL_FLOAT, GL_FALSE, 36, (const void *)(uintptr_t)(a * 12));
         gl.EnableVertexAttribArray((GLuint)a);
@@ -279,11 +314,21 @@ static void beam(const float *vp, const float eye[3], const float a[3], const fl
     gl.BufferData(GL_ARRAY_BUFFER, sizeof q, q, GL_DYNAMIC_DRAW);
     gl.UniformMatrix4fv(u_beam_mvp, 1, GL_FALSE, vp);
     gl.Uniform4f(u_beam_color, r, g, bl, alpha);
+    gl.Uniform2f(u_beam_shape, 0, 0);
     gl.DrawArrays(GL_TRIANGLES, 0, 6);
 }
 
 /* A round spot at p facing the eye, radius rad. */
+/* A round spot at p facing the eye, radius rad; with thick > 0 a ring at
+ * ring (both in units of rad). */
+static void spot_shape(const float *vp, const float eye[3], const float p[3], float rad, float r, float g, float b, float alpha,
+                       float ring, float thick);
 static void spot(const float *vp, const float eye[3], const float p[3], float rad, float r, float g, float b, float alpha)
+{
+    spot_shape(vp, eye, p, rad, r, g, b, alpha, 0, 0);
+}
+static void spot_shape(const float *vp, const float eye[3], const float p[3], float rad, float r, float g, float b, float alpha,
+                       float ring, float thick)
 {
     float f[3] = { eye[0] - p[0], eye[1] - p[1], eye[2] - p[2] };
     float l = sqrtf(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]);
@@ -304,6 +349,28 @@ static void spot(const float *vp, const float eye[3], const float p[3], float ra
     gl.BufferData(GL_ARRAY_BUFFER, sizeof q, q, GL_DYNAMIC_DRAW);
     gl.UniformMatrix4fv(u_beam_mvp, 1, GL_FALSE, vp);
     gl.Uniform4f(u_beam_color, r, g, b, alpha);
+    gl.Uniform2f(u_beam_shape, ring, thick);
+    gl.DrawArrays(GL_TRIANGLES, 0, 6);
+}
+
+/* The sight's glass, in the gun's space through model: a quad at depth 1
+ * where the reticle may show (depth cleared to 0 first, so nothing else). */
+static void glass(const float *vp, const float *model, int sight, float r, float g, float b, float a)
+{
+    const float *gz = GLASS[sight];
+    float q[6][5];
+    static const float c[6][2] = { { -1, -1 }, { 1, -1 }, { 1, 1 }, { -1, -1 }, { 1, 1 }, { -1, 1 } };
+    for (int k = 0; k < 6; k++) {
+        float lp[3] = { c[k][0] * gz[1], OPTIC_Y + c[k][1] * gz[2], gz[0] };
+        for (int i = 0; i < 3; i++)
+            q[k][i] = model[i] * lp[0] + model[4 + i] * lp[1] + model[8 + i] * lp[2] + model[12 + i];
+        q[k][3] = 0; q[k][4] = 0;
+    }
+    gl.BindBuffer(GL_ARRAY_BUFFER, vbo_beam);
+    gl.BufferData(GL_ARRAY_BUFFER, sizeof q, q, GL_DYNAMIC_DRAW);
+    gl.UniformMatrix4fv(u_beam_mvp, 1, GL_FALSE, vp);
+    gl.Uniform4f(u_beam_color, r, g, b, a);
+    gl.Uniform2f(u_beam_shape, 0, 0);
     gl.DrawArrays(GL_TRIANGLES, 0, 6);
 }
 
@@ -315,9 +382,16 @@ void xo_draw(const XoFrame *f, const float viewproj[16], const float eye_pos[3],
     gl.Viewport(0, 0, w, h);
     gl.ColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 
-    if (f->gun_valid) {
+    float model[16];
+    int sight = f->sight;
+    if (f->gun_valid && sight != cur_sight) {
+        build_gun(sight);
+        gl.BindBuffer(GL_ARRAY_BUFFER, vbo_gun);
+        gl.BufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(gun_verts * 9 * sizeof(float)), mesh, GL_DYNAMIC_DRAW);
+    }
+    if (f->gun_valid && f->show_gun) {
         /* the gun: depth-tested against itself only, always in front of the game */
-        float model[16], mvp[16], kick[16];
+        float mvp[16], kick[16];
         pose_matrix(f->gun_q, f->gun_p, model);
         memset(kick, 0, 64); kick[0] = kick[5] = kick[10] = kick[15] = 1;
         kick[14] = f->recoil;                       /* back along the barrel */
@@ -335,6 +409,39 @@ void xo_draw(const XoFrame *f, const float viewproj[16], const float eye_pos[3],
         gl.UniformMatrix4fv(u_gun_model, 1, GL_FALSE, model);
         gl.BindVertexArray(vao_gun);
         gl.DrawArrays(GL_TRIANGLES, 0, gun_verts);
+    }
+
+    /* The sight's reticle: at the point the gun hits on the screen, seen only
+     * through the glass - like a real red dot zeroed at the screen. The glass
+     * marks depth 1 where everything else was cleared to 0, and the reticle is
+     * drawn where the depth is 1. */
+    if (f->gun_valid && f->show_gun && sight != XO_SIGHT_NONE) {
+        gl.UseProgram(prog_beam);
+        gl.BindVertexArray(vao_beam);
+        gl.Disable(GL_CULL_FACE);
+        gl.ClearDepthf(0);
+        gl.DepthMask(GL_TRUE);
+        gl.Clear(GL_DEPTH_BUFFER_BIT);
+        gl.Enable(GL_DEPTH_TEST);
+        gl.DepthRangef(1, 1);
+        gl.DepthFunc(GL_ALWAYS);
+        gl.Enable(GL_BLEND);
+        gl.BlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
+        glass(viewproj, model, sight, 0.55f, 0.75f, 0.85f, 0.10f);     /* a faint tint */
+        gl.DepthMask(GL_FALSE);
+        gl.DepthFunc(GL_EQUAL);
+        float dx = f->end[0] - eye_pos[0], dy = f->end[1] - eye_pos[1], dz = f->end[2] - eye_pos[2];
+        float dist = sqrtf(dx * dx + dy * dy + dz * dz);
+        if (sight == XO_SIGHT_RED_DOT)          /* a 2 MOA dot */
+            spot(viewproj, eye_pos, f->end, 0.0012f * dist, 1.0f, 0.08f, 0.05f, 1.0f);
+        else {                                  /* a 65 MOA ring round a 1 MOA dot */
+            spot_shape(viewproj, eye_pos, f->end, 0.0105f * dist, 1.0f, 0.10f, 0.06f, 0.95f, 0.90f, 0.08f);
+            spot(viewproj, eye_pos, f->end, 0.0009f * dist, 1.0f, 0.10f, 0.06f, 1.0f);
+        }
+        gl.DepthRangef(0, 1);
+        gl.ClearDepthf(1);
+        gl.DepthMask(GL_TRUE);
+        gl.Clear(GL_DEPTH_BUFFER_BIT);
     }
 
     /* laser and flash over everything; blended, not added, so the red still
@@ -388,6 +495,55 @@ void xo_draw_screen(const float mvp[16], unsigned tex, int array_layer0, int w, 
     gl.DrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     gl.BindSampler(0, 0);
     gl.BindTexture(target, (GLuint)bound);
+    gl.ActiveTexture((GLenum)unit);
+    if (scissor) gl.Enable(GL_SCISSOR_TEST);
+    restore(&s);
+}
+
+/* ---- the settings panel ---- */
+static GLuint panel_tex;
+
+void xo_panel_upload(const unsigned char *rgba, int w, int h)
+{
+    if (!prog_screen[0]) return;
+    GLint unit = 0, bound = 0;
+    gl.GetIntegerv(GL_ACTIVE_TEXTURE, &unit);
+    gl.ActiveTexture(GL_TEXTURE0);
+    gl.GetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
+    if (!panel_tex) gl.GenTextures(1, &panel_tex);
+    gl.BindTexture(GL_TEXTURE_2D, panel_tex);
+    gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+    gl.BindTexture(GL_TEXTURE_2D, (GLuint)bound);
+    gl.ActiveTexture((GLenum)unit);
+}
+
+/* The panel on the quad -1..1 placed by mvp, blended over the eye's image. */
+void xo_draw_panel(const float mvp[16], int w, int h)
+{
+    if (!prog_screen[0] || !panel_tex) return;
+    Saved s;
+    save(&s);
+    GLint unit = 0, bound = 0;
+    gl.GetIntegerv(GL_ACTIVE_TEXTURE, &unit);
+    gl.ActiveTexture(GL_TEXTURE0);
+    gl.GetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
+    GLboolean scissor = gl.IsEnabled(GL_SCISSOR_TEST);
+    gl.Disable(GL_SCISSOR_TEST);
+    gl.Viewport(0, 0, w, h);
+    gl.ColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    gl.Disable(GL_DEPTH_TEST);
+    gl.Disable(GL_CULL_FACE);
+    gl.Enable(GL_BLEND);
+    gl.BlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
+    gl.UseProgram(prog_panel);
+    gl.UniformMatrix4fv(u_panel_mvp, 1, GL_FALSE, mvp);
+    gl.Uniform1i(u_panel_tex, 0);
+    gl.BindTexture(GL_TEXTURE_2D, panel_tex);
+    gl.BindSampler(0, smp_screen);
+    gl.BindVertexArray(vao_screen);
+    gl.DrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    gl.BindSampler(0, 0);
+    gl.BindTexture(GL_TEXTURE_2D, (GLuint)bound);
     gl.ActiveTexture((GLenum)unit);
     if (scissor) gl.Enable(GL_SCISSOR_TEST);
     restore(&s);

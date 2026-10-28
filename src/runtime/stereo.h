@@ -48,6 +48,10 @@ extern uint32_t stereo_state_lo, stereo_state_hi;
  * from the game camera stereo_screen gives. */
 int  stereo_flat_frame(void);
 void stereo_screen(float *half_w, float *half_h, float *dist);
+/* Where the gun points this frame, in the game's 640x480 (off the screen:
+ * below -1000); and whether the game's own sight is drawn. */
+void stereo_set_gun(int x, int y);
+void stereo_show_game_sight(int show);
 void stereo_guest_state(uint32_t va);
 
 /* hle_gl_posix.c: a live glMapBuffer's guest shadow, for the recording */
