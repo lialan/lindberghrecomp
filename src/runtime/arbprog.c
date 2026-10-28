@@ -1133,7 +1133,7 @@ static void cache_path(char *out, size_t n, const char *v, const char *f)
         drv = fnv(drv, (const char *)glGetString(GL_VERSION));
         drv = fnv(drv, "arbprog 1");
 #ifdef LINDBERGH_GL4ES
-        if (gl4es_mv_shaders) drv = fnv(drv, "multiview 7");   /* gl4es makes other shaders of the same GLSL */
+        if (gl4es_mv_shaders) drv = fnv(drv, "multiview 8");   /* gl4es makes other shaders of the same GLSL */
         if (gl4es_mv_shaders && getenv("LIBGL_MV_NOCLIP")) drv = fnv(drv, "noclip");
 #endif
         mkdir("../shadercache", 0755);
