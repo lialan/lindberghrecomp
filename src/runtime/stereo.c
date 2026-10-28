@@ -193,7 +193,11 @@ static void effective_projection(const float *p, int hud, float *out)
     sc[0] = d / g_screen_lens[0]; sc[5] = d / g_screen_lens[1];
     sc[10] = -0.02f * d;                /* a sliver of depth keeps the game's depth order */
     sc[14] = -d;
-    mat_frustum(e, -t[0] * 0.01f, t[1] * 0.01f, -t[2] * 0.01f, t[3] * 0.01f, 0.01f, 1000.0f);
+    /* near and far close around the screen: everything on it lies within
+     * that sliver, and a 1 cm near plane left the depth buffer only ~1300
+     * steps there - a scoped view's whole scene fought over them */
+    float zn = 0.25f * d, zf = 4.0f * d;
+    mat_frustum(e, -t[0] * zn, t[1] * zn, -t[2] * zn, t[3] * zn, zn, zf);
     mat_mul(ev, e, g_view[g_eye]);
     mat_mul(ev, ev, sc);
     mat_mul(out, ev, p);
@@ -725,6 +729,16 @@ static int sight_draw(CPU *c, const char *n)
     float w = b[2] - b[0], h = b[3] - b[1];
     if (w > 0.4f || h > 0.5f) return 0;
     float cx = (b[0] + b[2]) * 0.5f - g_gun_ndc[0], cy = (b[1] + b[3]) * 0.5f - g_gun_ndc[1];
+    {   /* LINDBERGH_SIGHT_LOG=1: small sprites near the gun, and how far off it, in game pixels */
+        static int on = -1;
+        if (on < 0) { const char *v = getenv("LINDBERGH_SIGHT_LOG"); on = v && *v == '1'; }
+        static unsigned last;
+        if (on && g_frame - last >= 30 && fabsf(cx) < 0.3f && fabsf(cy) < 0.3f && w < 0.15f && h < 0.2f) {
+            last = g_frame;
+            fprintf(stderr, "[sight] frame %u tex %u size %.0fx%.0f off %+.1f %+.1f px (gun %.0f,%.0f)\n", g_frame, g_tex2d_bound,
+                    w * 320, h * 240, cx * 320, -cy * 240, (g_gun_ndc[0] + 1) * 320, (1 - g_gun_ndc[1]) * 240);
+        }
+    }
     if (cx * cx * 100 + cy * cy * 56 > 0.02f) return 0;    /* centred on the gun, within a few pixels */
     if (!g_sight_tex) {
         if (g_tex2d_bound != g_sight_cand) {
