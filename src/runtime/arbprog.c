@@ -29,6 +29,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <time.h>
+#include <sys/stat.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -1083,6 +1084,74 @@ static GLint array_len(GLuint prog, const char *name, GLint want)
     return want;
 }
 
+#ifdef LINDBERGH_GL4ES
+/* ---- compiled programs kept on disk ----
+ * Building a program pair takes the Quest's driver 30-110 ms, a visible hitch
+ * the first time each scene draws. A built program's binary is kept in
+ * ../shadercache (beside the game, in the app's own folder), named by a hash
+ * of both stages' GLSL and the driver's own name and version; the next start
+ * loads it instead. A binary the driver no longer takes is built again. */
+static uint64_t fnv(uint64_t h, const char *p)
+{
+    for (; *p; p++) h = (h ^ (unsigned char)*p) * 1099511628211ull;
+    return (h ^ 0xff) * 1099511628211ull;
+}
+
+static void cache_path(char *out, size_t n, const char *v, const char *f)
+{
+    static uint64_t drv;
+    if (!drv) {
+        drv = fnv(1469598103934665603ull, (const char *)glGetString(GL_RENDERER));
+        drv = fnv(drv, (const char *)glGetString(GL_VERSION));
+        drv = fnv(drv, "arbprog 1");
+        mkdir("../shadercache", 0755);
+    }
+    uint64_t h = fnv(fnv(drv, v ? v : ""), f ? f : "");
+    snprintf(out, n, "../shadercache/%016llx.bin", (unsigned long long)h);
+}
+
+static int cache_load(GLuint prog, const char *path)
+{
+    FILE *fl = fopen(path, "rb");
+    if (!fl) return 0;
+    GLenum fmt = 0;
+    long len = 0;
+    void *data = NULL;
+    if (fread(&fmt, sizeof fmt, 1, fl) == 1 && !fseek(fl, 0, SEEK_END) && (len = ftell(fl) - (long)sizeof fmt) > 0 &&
+        !fseek(fl, sizeof fmt, SEEK_SET) && (data = malloc((size_t)len)) && fread(data, 1, (size_t)len, fl) != (size_t)len) {
+        free(data); data = NULL;
+    }
+    fclose(fl);
+    if (!data) return 0;
+    glProgramBinary(prog, fmt, data, (GLsizei)len);
+    free(data);
+    GLint ok = 0;
+    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+    while (glGetError() != GL_NO_ERROR) {}
+    return ok;
+}
+
+static void cache_save(GLuint prog, const char *path)
+{
+    GLint len = 0;
+    glGetProgramiv(prog, GL_PROGRAM_BINARY_LENGTH, &len);
+    if (len <= 0) return;
+    void *data = malloc((size_t)len);
+    if (!data) return;
+    GLsizei got = 0;
+    GLenum fmt = 0;
+    glGetProgramBinary(prog, len, &got, &fmt, data);
+    char tmp[512];
+    snprintf(tmp, sizeof tmp, "%s.part", path);
+    FILE *fl = got > 0 ? fopen(tmp, "wb") : NULL;
+    if (fl) {
+        int ok = fwrite(&fmt, sizeof fmt, 1, fl) == 1 && fwrite(data, 1, (size_t)got, fl) == (size_t)got;
+        if (fclose(fl) == 0 && ok) rename(tmp, path); else remove(tmp);
+    }
+    free(data);
+}
+#endif
+
 static struct timespec g_link_t0;
 static Linked *link_pair(GLuint vid, GLuint fid)
 {
@@ -1105,6 +1174,7 @@ static Linked *link_pair(GLuint vid, GLuint fid)
     if (g_dump < 0) { const char *d = getenv("LINDBERGH_ARB_DUMP"); g_dump = d && *d && *d != '0'; }
 
     GLuint sh[2] = { 0, 0 };
+    char *glsl_s[2] = { NULL, NULL };
     ArbProg *pp[2] = { vp, fp };
     GLuint ids[2] = { vid, fid };
     for (int st = 0; st < 2; st++) {
@@ -1120,9 +1190,7 @@ static Linked *link_pair(GLuint vid, GLuint fid)
             return l;
         }
         if (g_dump) fprintf(stderr, "[arb] %s program %u ->\n%s\n", st ? "fragment" : "vertex", ids[st], glsl);
-        sh[st] = compile(st ? GL_FRAGMENT_SHADER : GL_VERTEX_SHADER, glsl, st, ids[st]);
-        free(glsl);
-        if (!sh[st]) { pp[st]->failed = 1; l->ok = 0; return l; }
+        glsl_s[st] = glsl;
         memcpy(l->mat[st], t.mat, sizeof t.mat);
         for (int u = 0; u < 16; u++) if (t.tex_target[u] == 5) l->rect_units |= 1u << u;
         l->nmat[st] = t.nmat;
@@ -1138,17 +1206,65 @@ static Linked *link_pair(GLuint vid, GLuint fid)
         }
     }
     if (!l->prog) l->prog = glCreateProgram();
-    for (int st = 0; st < 2; st++) if (sh[st]) glAttachShader(l->prog, sh[st]);
-    glLinkProgram(l->prog);
-    for (int st = 0; st < 2; st++) if (sh[st]) glDeleteShader(sh[st]);
     GLint ok = 0;
-    glGetProgramiv(l->prog, GL_LINK_STATUS, &ok);
+    struct timespec t_link, t_tr;
+    clock_gettime(CLOCK_MONOTONIC, &t_tr);
+#ifdef LINDBERGH_GL4ES
+    char path[512] = "";
+    if (glsl_s[0] && glsl_s[1]) cache_path(path, sizeof path, glsl_s[0], glsl_s[1]);
+    if (*path) {
+        /* gl4es converts a shader when its source is set and keeps it for the
+         * variants it builds later (alpha test and the like): attach the
+         * shaders with their source, unbuilt, and load the program */
+        for (int st = 0; st < 2; st++) {
+            sh[st] = glCreateShader(st ? GL_FRAGMENT_SHADER : GL_VERTEX_SHADER);
+            const char *src = glsl_s[st];
+            glShaderSource(sh[st], 1, &src, NULL);
+            glAttachShader(l->prog, sh[st]);
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t_link);
+        ok = cache_load(l->prog, path);
+    }
+#endif
+    if (!ok) {
+        for (int st = 0; st < 2; st++) {
+            if (!glsl_s[st]) continue;
+            int attached = sh[st] != 0;
+            if (attached) {
+                glCompileShader(sh[st]);
+                GLint c_ok = 0;
+                glGetShaderiv(sh[st], GL_COMPILE_STATUS, &c_ok);
+                if (!c_ok) {
+                    char log[4096] = "";
+                    glGetShaderInfoLog(sh[st], sizeof log, NULL, log);
+                    fprintf(stderr, "[arb] %s program %u: translated GLSL does not compile:\n%s\n----\n%s\n----\n",
+                            st ? "fragment" : "vertex", ids[st], log, glsl_s[st]);
+                    glDeleteShader(sh[st]); sh[st] = 0;
+                }
+            } else sh[st] = compile(st ? GL_FRAGMENT_SHADER : GL_VERTEX_SHADER, glsl_s[st], st, ids[st]);
+            if (!sh[st]) {
+                pp[st]->failed = 1; l->ok = 0;
+                for (int k = 0; k < 2; k++) { if (sh[k]) glDeleteShader(sh[k]); free(glsl_s[k]); }
+                return l;
+            }
+            if (!attached) glAttachShader(l->prog, sh[st]);
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t_link);
+        glLinkProgram(l->prog);
+        glGetProgramiv(l->prog, GL_LINK_STATUS, &ok);
+#ifdef LINDBERGH_GL4ES
+        if (ok && *path) cache_save(l->prog, path);
+#endif
+    }
+    for (int st = 0; st < 2; st++) { if (sh[st]) glDeleteShader(sh[st]); free(glsl_s[st]); }
     if (getenv("LINDBERGH_LATENCY")) {        /* linking waits on the driver */
         static double total; static unsigned n;
         struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
         double ms = (t1.tv_sec - g_link_t0.tv_sec) * 1e3 + (t1.tv_nsec - g_link_t0.tv_nsec) / 1e6;
         total += ms; n++;
-        if (ms > 5) fprintf(stderr, "[lat] linking v%u/f%u took %.0f ms (%u links, %.0f ms so far)\n", vid, fid, ms, n, total);
+        double lk = (t1.tv_sec - t_link.tv_sec) * 1e3 + (t1.tv_nsec - t_link.tv_nsec) / 1e6;
+        double tr = (t_tr.tv_sec - g_link_t0.tv_sec) * 1e3 + (t_tr.tv_nsec - g_link_t0.tv_nsec) / 1e6;
+        if (ms > 5) fprintf(stderr, "[lat] linking v%u/f%u took %.0f ms: translating %.0f, linking %.0f (%u links, %.0f ms so far)\n", vid, fid, ms, tr, lk, n, total);
     }
     if (!ok) {
         char log[2048] = "";

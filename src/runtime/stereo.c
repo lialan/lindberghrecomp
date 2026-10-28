@@ -843,6 +843,8 @@ static double g_glprof_ns[HLE_COUNT];
 static unsigned g_glprof_n[HLE_COUNT];
 static unsigned g_glprof_f0;
 static double g_glprof_rec_ns;          /* of which recording for the second eye */
+static double g_frame_ns[HLE_COUNT];    /* this frame's, to name what a slow frame spent */
+static double g_frame_t0;
 static double now_ns(void)
 {
     struct timespec t;
@@ -850,8 +852,21 @@ static double now_ns(void)
     return t.tv_sec * 1e9 + t.tv_nsec;
 }
 
+static void glprof_frame(void)
+{
+    double now = now_ns(), all = g_frame_t0 ? now - g_frame_t0 : 0, gl = 0;
+    unsigned best = 0;
+    for (unsigned i = 0; i < HLE_COUNT; i++) { gl += g_frame_ns[i]; if (g_frame_ns[i] > g_frame_ns[best]) best = i; }
+    if (all > 40e6)
+        fprintf(stderr, "[glprof] frame %u took %.0f ms, GL %.0f ms of it, most in %s (%.0f ms)\n", g_frame,
+                all / 1e6, gl / 1e6, hle_name((HleId)best), g_frame_ns[best] / 1e6);
+    memset(g_frame_ns, 0, sizeof g_frame_ns);
+    g_frame_t0 = now;
+}
+
 static void glprof_report(void)
 {
+    if (g_glprof > 0) glprof_frame();
     if (g_glprof <= 0 || g_frame - g_glprof_f0 < 300) return;
     double frames = g_frame - g_glprof_f0, total = 0, calls = 0;
     for (unsigned i = 0; i < HLE_COUNT; i++) total += g_glprof_ns[i], calls += g_glprof_n[i];
@@ -885,7 +900,9 @@ static void stereo_gl_call(CPU *c, HleId id, HleHandler fn)
     if (!g_glprof) { stereo_gl_call_inner(c, id, fn); return; }
     double t0 = now_ns();
     stereo_gl_call_inner(c, id, fn);
-    g_glprof_ns[id] += now_ns() - t0;
+    double dt = now_ns() - t0;
+    g_glprof_ns[id] += dt;
+    g_frame_ns[id] += dt;
     g_glprof_n[id]++;
 }
 
