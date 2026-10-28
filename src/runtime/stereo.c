@@ -1324,8 +1324,9 @@ void stereo_frame_begin(void)
     g_nfmt = 0;
     g_arena_used = 0;
     /* Menus put a few 3D models among 2D panels and the arcade monitor's edge
-     * framed them; the game world takes far more draws. Half a second of
-     * menu-sized frames turns the 3D into screen content, a quarter second
+     * framed them; the game world takes far more draws. Two seconds of
+     * menu-sized frames turns the 3D into screen content (gameplay has
+     * sparse moments of a second or so; a menu stays), a quarter second
      * of world-sized ones turns it back (one busy frame used to flip it). */
     static unsigned world_frames;
     if (g_scene_draws >= g_menu_draws) {
@@ -1333,7 +1334,7 @@ void stereo_frame_begin(void)
         if (++world_frames >= 15) g_menu = 0;
     } else {
         world_frames = 0;
-        if (++g_menu_frames >= 30) g_menu = 1;
+        if (++g_menu_frames >= 120) g_menu = 1;
     }
     if (getenv("LINDBERGH_SCENE_STATS") && g_frame % 30 == 0)
         fprintf(stderr, "[stereo] frame %u: %u world draws%s, lens %.2f, near %.4f\n", g_frame, g_scene_draws, g_menu ? " (menu)" : "", g_lens_seen, g_near_seen);
