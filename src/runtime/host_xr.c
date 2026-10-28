@@ -22,7 +22,9 @@
  *   scale 1.0           game units per metre
  *   screen 3.0          distance of the HUD's screen, in metres
  *   resolution 1440     the longer side of each eye's image, in pixels
- *   refresh 90          display rate to ask for (72, 80, 90, 120)
+ *   refresh 120         display rate to ask for (72, 80, 90, 120); the game
+ *                       draws at 60, so 120 shows every frame twice - evenly
+ *                       - where 72 or 90 repeat some and not others (judder)
  *   hand right          the gun hand (a trigger on the other hand moves it)
  *   laser laser         aim aid: laser (beam and dot), dot, or off; holding
  *                       the off hand's upper button for a second cycles it
@@ -101,7 +103,7 @@ static const char *const LASER_NAME[] = { "laser", "dot", "off" };
 static struct {
     float scale, screen;
     int   resolution, refresh, left_handed, laser, auto_coins;
-} cfg = { 1.0f, 3.0f, 1440, 90, 0, LASER_ON, 1 };
+} cfg = { 1.0f, 3.0f, 1440, 120, 0, LASER_ON, 1 };
 
 static void cfg_save(void)
 {
@@ -463,6 +465,14 @@ static int poll_events(void)
                 bi.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
                 if (XR_SUCCEEDED(xrBeginSession(session, &bi))) {
                     running = 1;
+                    if (enumerate_rates) {
+                        float rates[16]; uint32_t n = 0;
+                        if (XR_SUCCEEDED(enumerate_rates(session, 16, &n, rates))) {
+                            fprintf(stderr, "[xr] display rates:");
+                            for (uint32_t k = 0; k < n; k++) fprintf(stderr, " %.0f", rates[k]);
+                            fprintf(stderr, "\n");
+                        }
+                    }
                     if (request_rate && cfg.refresh) {
                         XrResult r = request_rate(session, (float)cfg.refresh);
                         fprintf(stderr, "[xr] asked for %d Hz: %d\n", cfg.refresh, (int)r);
