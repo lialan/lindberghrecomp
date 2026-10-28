@@ -771,7 +771,13 @@ static int transform_call(CPU *c, HleId id, const char *n)
          * sees, so outside it last frame's pixels stayed and dragged along
          * whenever the camera or the head moved. Clear the colour too. */
         GLbitfield mask = A32(0);
-        if ((mask & GL_DEPTH_BUFFER_BIT) && !(mask & GL_COLOR_BUFFER_BIT) && g_game_fb == g_world_fb) {
+        /* Only the frame's first such clear, and not for a flat picture: the
+         * game clears depth again to draw over its finished scene (the
+         * scope's reload), and clearing the colour there wiped the scene. */
+        static unsigned cleared_frame = ~0u;
+        if ((mask & GL_DEPTH_BUFFER_BIT) && !(mask & GL_COLOR_BUFFER_BIT) && g_game_fb == g_world_fb &&
+            !g_flat && cleared_frame != g_frame) {
+            cleared_frame = g_frame;
             GLfloat cc[4];
             glGetFloatv(GL_COLOR_CLEAR_VALUE, cc);
             glClearColor(0, 0, 0, 1);
@@ -1601,10 +1607,10 @@ void stereo_frame_begin(void)
     static int mode_log = -1, last_sig = -1;
     if (mode_log < 0) { const char *v = getenv("LINDBERGH_MODE_LOG"); mode_log = v && *v && *v != '0'; }
     if (mode_log) {
-        int sig = g_menu | (g_zoom_draws ? 2 : 0) | (g_hudfb_draws ? 4 : 0);
+        int sig = g_menu | (g_zoom_draws ? 2 : 0) | (g_hudfb_draws ? 4 : 0) | (g_flat ? 8 : 0);
         if (sig != last_sig)
-            fprintf(stderr, "[mode] frame %u: menu %d, zoom draws %u, 3D into HUD target %u, world draws %u, lens %.2f\n",
-                    g_frame, g_menu, g_zoom_draws, g_hudfb_draws, g_scene_draws, g_lens_seen);
+            fprintf(stderr, "[mode] frame %u: flat %d, menu %d, zoom draws %u, 3D into HUD target %u, world draws %u, lens %.2f\n",
+                    g_frame, g_flat, g_menu, g_zoom_draws, g_hudfb_draws, g_scene_draws, g_lens_seen);
         last_sig = sig;
     }
     static int hud_log = -1;
@@ -1631,7 +1637,11 @@ void stereo_frame_begin(void)
         if (flat_env < 0) { const char *v = getenv("LINDBERGH_FLAT_MENUS"); flat_env = !v || *v != '0'; }
         static int flat_all = -1;       /* LINDBERGH_FLAT_ALL=1: everything flat, the arcade's picture - for comparing */
         if (flat_all < 0) { const char *v = getenv("LINDBERGH_FLAT_ALL"); flat_all = v && *v == '1'; }
-        g_flat = flat_all || (flat_env && menu_state());
+        /* A scope held up is a flat picture too: the arcade's own image on
+         * the screen, nothing around it. Put on the screen as 3D, the game's
+         * full-screen haze passes ran over the empty room and turned it a
+         * flat lavender. */
+        g_flat = flat_all || (flat_env && (menu_state() || g_zoom_frames >= 6));
     }
     g_hud_fb = g_hud_fb_next;           /* 3D drawn there this frame is screen content */
     g_world_fb = g_world_fb_next;

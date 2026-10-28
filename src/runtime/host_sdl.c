@@ -266,9 +266,51 @@ static void cabinet_autostart(void)
     }
 }
 
+/* LINDBERGH_SCRIPT=<file>: scripted play, for reaching a scene unattended.
+ * Each line "<from> <to> <x> <y> <buttons, hex> [coins]": from game frame
+ * <from> up to <to>, the gun at x,y on the 640x480 screen (negative: off it)
+ * with those cabinet buttons held; coins go in once, at <from>. */
+static void cabinet_script(void)
+{
+    static int loaded;
+    static struct { unsigned from, to; int x, y; unsigned buttons, coins; } ln[256];
+    static int n;
+    if (!loaded) {
+        loaded = 1;
+        const char *path = getenv("LINDBERGH_SCRIPT");
+        FILE *f = path && *path ? fopen(path, "r") : NULL;
+        char buf[160];
+        while (f && n < 256 && fgets(buf, sizeof buf, f)) {
+            unsigned c = 0;
+            if (buf[0] == '#') continue;
+            if (sscanf(buf, "%u %u %d %d %x %u", &ln[n].from, &ln[n].to, &ln[n].x, &ln[n].y, &ln[n].buttons, &c) >= 5) {
+                ln[n].coins = c;
+                n++;
+            }
+        }
+        if (f) { fclose(f); fprintf(stderr, "[cab] script: %d lines from %s\n", n, path); }
+        else if (path && *path) fprintf(stderr, "[cab] script %s not found\n", path);
+    }
+    if (!n) return;
+    g_scripted = 1;
+    g_auto = 0;
+    int w = g_win.w ? g_win.w : DEFAULT_W, h = g_win.h ? g_win.h : DEFAULT_H;
+    g_mouse_x = -100000; g_mouse_y = -100000;
+    for (int i = 0; i < n; i++) {
+        if (g_frame < ln[i].from || g_frame > ln[i].to) continue;
+        if (ln[i].x == -2) {    /* x -2: sweep the screen, as LINDBERGH_AUTOGUN does */
+            double t = g_frame / 90.0;
+            g_mouse_x = (int)(w / 2 + w / 3 * cos(t)); g_mouse_y = (int)(h / 2 + h / 4 * sin(t * 1.7));
+        } else if (ln[i].x >= 0 && ln[i].y >= 0) { g_mouse_x = ln[i].x * w / 640; g_mouse_y = ln[i].y * h / 480; }
+        g_auto |= ln[i].buttons;
+        if (g_frame == ln[i].from) g_cab.coins[0] += ln[i].coins;
+    }
+}
+
 void host_cabinet_input(CabinetInput *out)
 {
     cabinet_autostart();
+    cabinet_script();
     HostSettings *st = settings();
     double w = g_win.w ? g_win.w : DEFAULT_W, h = g_win.h ? g_win.h : DEFAULT_H;
     if (g_calib == 1)      { g_cab.gun_x = (int)(CAL_AX * w); g_cab.gun_y = (int)(CAL_AY * h); }

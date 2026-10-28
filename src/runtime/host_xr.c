@@ -21,6 +21,8 @@
  * Settings, one per line in vr.cfg next to the game:
  *   scale 1.0           game units per metre
  *   screen 3.0          distance of the HUD's screen, in metres
+ *   aim 15              how far along the laser the game's shot meets it, in
+ *                       metres (the game fires from the head, the laser from the gun)
  *   resolution 2280     the longer side of each eye's image, in pixels
  *   width 2064          each eye's width; 0 keeps the headset's own proportions
  *   refresh 120         display rate to ask for (72, 80, 90, 120); the game
@@ -105,18 +107,18 @@ static const char *const LASER_NAME[] = { "laser", "dot", "off" };
 static const char *const SIGHT_NAME[] = { "none", "reddot", "holo" };
 
 static struct {
-    float scale, screen;
+    float scale, screen, aim;            /* aim: where the laser and the game's shot meet, metres */
     int   resolution, width, refresh, left_handed, laser, auto_coins;
     int   sight, crosshair, show_gun;         /* XO_SIGHT_*; the game's own sight; the gun model */
-} cfg = { 1.0f, 3.0f, 2280, 2064, 120, 0, LASER_ON, 1, XO_SIGHT_NONE, 1, 1 };
+} cfg = { 1.0f, 3.0f, 15.0f, 2280, 2064, 120, 0, LASER_ON, 1, XO_SIGHT_NONE, 1, 1 };
 
 static void cfg_save(void)
 {
     FILE *f = fopen("vr.cfg", "w");
     if (!f) return;
-    fprintf(f, "scale %g\nscreen %g\nresolution %d\nwidth %d\nrefresh %d\nhand %s\nlaser %s\ncoins %s\n"
+    fprintf(f, "scale %g\nscreen %g\naim %g\nresolution %d\nwidth %d\nrefresh %d\nhand %s\nlaser %s\ncoins %s\n"
                "sight %s\ncrosshair %s\ngun %s\n",
-            cfg.scale, cfg.screen, cfg.resolution, cfg.width, cfg.refresh, cfg.left_handed ? "left" : "right",
+            cfg.scale, cfg.screen, cfg.aim, cfg.resolution, cfg.width, cfg.refresh, cfg.left_handed ? "left" : "right",
             LASER_NAME[cfg.laser], cfg.auto_coins ? "auto" : "manual",
             SIGHT_NAME[cfg.sight], cfg.crosshair ? "on" : "off", cfg.show_gun ? "on" : "off");
     fclose(f);
@@ -140,6 +142,7 @@ static void cfg_load(void)
     }
     if (cfg.scale <= 0) cfg.scale = 1;
     if (cfg.screen <= 0.2f) cfg.screen = 3;
+    if (cfg.aim < 1.0f || cfg.aim > 200.0f) cfg.aim = 15.0f;
     if (cfg.resolution < 512 || cfg.resolution > 4096) cfg.resolution = 2280;
     if (cfg.width < 0 || cfg.width > 4096) cfg.width = 0;
 }
@@ -149,6 +152,7 @@ static void cfg_set(const char *key, const char *val)
     {
         if (!strcmp(key, "scale")) cfg.scale = (float)atof(val);
         else if (!strcmp(key, "screen")) cfg.screen = (float)atof(val);
+        else if (!strcmp(key, "aim")) cfg.aim = (float)atof(val);
         else if (!strcmp(key, "resolution")) cfg.resolution = atoi(val);
         else if (!strcmp(key, "width")) cfg.width = atoi(val);
         else if (!strcmp(key, "refresh")) cfg.refresh = atoi(val);
@@ -553,8 +557,15 @@ static void input_frame(XrTime t)
         float d[3], p[3] = { loc.pose.position.x, loc.pose.position.y, loc.pose.position.z };
         float o[3] = { p[0] * cfg.scale, p[1] * cfg.scale, p[2] * cfg.scale };
         qrot(loc.pose.orientation, fwd, d);
-        float x, y;
-        if (stereo_ray_to_screen(o, d, &x, &y) && x >= 0 && x < 640 && y >= 0 && y < 480) {
+        /* The game fires from its camera - the head, where it was anchored -
+         * through a point on its screen. The laser leaves the gun, a hand's
+         * length away, so the two lines meet at one distance only: the
+         * point cfg.aim metres along the laser, which the game is aimed
+         * through. At the screen's own 5 m a soldier 12 m off was missed by
+         * half a metre with the gun at the hip. */
+        float x, y, ah[3] = { 0, 0, 0 }, at = d[2] < -1e-4f ? (-cfg.aim * cfg.scale - o[2]) / d[2] : -1, ax[3];
+        for (int i = 0; i < 3; i++) ax[i] = o[i] + d[i] * at;
+        if (at > 0 && stereo_ray_to_screen(ah, ax, &x, &y) && x >= 0 && x < 640 && y >= 0 && y < 480) {
             gx = x; gy = y; aimed = 1;
         }
         /* the overlay: the gun on the aim pose, the laser to the game's screen */
@@ -566,7 +577,7 @@ static void input_frame(XrTime t)
         qrot(loc.pose.orientation, tip, m);
         for (int i = 0; i < 3; i++) xo.muzzle[i] = p[i] + m[i];
         float reach = 5.0f;
-        if (aimed) reach = (-cfg.screen - p[2]) / d[2];
+        if (aimed) reach = (-cfg.aim - p[2]) / d[2];
         for (int i = 0; i < 3; i++) xo.end[i] = p[i] + d[i] * reach;
         xo.beam = cfg.laser == LASER_ON;
         xo.dot = aimed && cfg.laser != LASER_OFF;
