@@ -73,6 +73,7 @@ static struct {
     void (*BindRenderbuffer)(GLenum, GLuint);
     void (*RenderbufferStorage)(GLenum, GLenum, GLsizei, GLsizei);
     void (*FramebufferRenderbuffer)(GLenum, GLenum, GLenum, GLuint);
+    void (*FramebufferTextureLayer)(GLenum, GLenum, GLuint, GLint, GLint);
 } gl;
 
 static int gl_load(void)
@@ -84,6 +85,7 @@ static int gl_load(void)
     L(BindFramebuffer) L(GenFramebuffers) L(FramebufferTexture2D) L(CheckFramebufferStatus)
     L(BlitFramebuffer) L(GetIntegerv) L(IsEnabled) L(Enable) L(Disable) L(GetString)
     L(GenRenderbuffers) L(BindRenderbuffer) L(RenderbufferStorage) L(FramebufferRenderbuffer)
+    L(FramebufferTextureLayer)
 #undef L
     return 1;
 }
@@ -268,6 +270,14 @@ static void qrot(XrQuaternionf q, const float v[3], float out[3])
 }
 
 /* Cabinet bits, as in lindbergh_rt.h */
+/* LINDBERGH_XR_FAKE_GUN=1: a stand-in for a controller (see below) */
+static int fake_gun(void)
+{
+    static int fake = -1;
+    if (fake < 0) { const char *v = getenv("LINDBERGH_XR_FAKE_GUN"); fake = v && *v && *v != '0'; }
+    return fake;
+}
+
 static void input_frame(XrTime t)
 {
     XrActiveActionSet as = { set, XR_NULL_PATH };
@@ -293,9 +303,7 @@ static void input_frame(XrTime t)
     int located = XR_SUCCEEDED(xrLocateSpace(aim_space[g], local, t, &loc)) &&
                   (loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) &&
                   (loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT);
-    static int fake = -1;
-    if (fake < 0) { const char *v = getenv("LINDBERGH_XR_FAKE_GUN"); fake = v && *v && *v != '0'; }
-    if (!located && fake) {
+    if (!located && fake_gun()) {
         /* LINDBERGH_XR_FAKE_GUN=1, for a headset or emulator without
          * controllers: a gun at the right hip sweeping across the screen,
          * firing in half-second bursts, and for one second in six pointed at
@@ -362,6 +370,8 @@ static void input_frame(XrTime t)
     if (btn_a[g]) held |= CAB_P1_ACTION;
     if (btn_b[g]) held |= CAB_P1_FIREMODE;
     int start = stick[0] || stick[1];
+    /* the stand-in gun presses Start for a moment every ten seconds too */
+    if (fake_gun() && fmod((double)t / 1e9, 10.0) < 0.2) start = 1;
     if (start) held |= CAB_P1_START;
     /* Coins: the left menu button, and with automatic coins one at start-up
      * and one with every press of Start - Start alone plays and continues. */
@@ -658,7 +668,9 @@ void xr_frame_end(void)
             wi.timeout = XR_INFINITE_DURATION;
             xrWaitSwapchainImage(e->chain, &wi);
             gl.BindFramebuffer(GL_READ_FRAMEBUFFER, read_fb);
-            gl.FramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, stereo_eye_texture(i), 0);
+            unsigned layers = stereo_eye_array();     /* multiview: both eyes in one texture */
+            if (layers) gl.FramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, layers, 0, i);
+            else gl.FramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, stereo_eye_texture(i), 0);
             gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, e->fb[e->acquired]);
             gl.BlitFramebuffer(0, 0, (GLint)e->w, (GLint)e->h, 0, 0, (GLint)e->w, (GLint)e->h,
                                GL_COLOR_BUFFER_BIT, GL_NEAREST);

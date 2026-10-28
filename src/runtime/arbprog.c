@@ -35,6 +35,10 @@
 
 #include "gl_posix.h"
 #include "arbprog.h"
+#ifdef LINDBERGH_GL4ES
+extern int gl4es_mv_shaders;      /* gl4es' multiview (multiview.c in quest/gl4es.patch) */
+extern int gl4es_mv_trace;
+#endif
 #include "stereo.h"
 
 #ifndef GL_MATRIX0_ARB
@@ -756,7 +760,10 @@ static int emit_instr(Tr *t, char *stmt)
             /* Rectangle textures are sampled in texels; the game's render
              * targets are, and stereo.c draws them at the eye's size. */
 #ifdef LINDBERGH_GL4ES
-            if (proj) snprintf(r, sizeof r, "texture2D(sr_%d, %s.xy / %s.w * u_rect_norm[%d])", unit, X(0), X(0), unit);
+            /* multiview: the render target's layer for the view being drawn */
+            if (gl4es_mv_shaders && proj) snprintf(r, sizeof r, "texture2D(sr_%d, vec3(%s.xy / %s.w * u_rect_norm[%d], gl4es_layer))", unit, X(0), X(0), unit);
+            else if (gl4es_mv_shaders) snprintf(r, sizeof r, "texture2D(sr_%d, vec3(%s.xy * u_rect_norm[%d], gl4es_layer))", unit, X(0), unit);
+            else if (proj) snprintf(r, sizeof r, "texture2D(sr_%d, %s.xy / %s.w * u_rect_norm[%d])", unit, X(0), X(0), unit);
             else      snprintf(r, sizeof r, "texture2D(sr_%d, %s.xy * u_rect_norm[%d])", unit, X(0), unit);
 #else
             if (proj) snprintf(r, sizeof r, "texture2DRectProj(sr_%d, vec4(%s.xy * u_rect_scale, %s.zw))", unit, X(0), X(0));
@@ -824,6 +831,16 @@ static int is_decl(const char *s, const char *kw)
 }
 
 /* Translate one program to a GLSL shader. Returns malloc'd source or NULL. */
+/* every write of result.depth copies fragment.position.z */
+static int depth_passthrough(const char *body)
+{
+    static const char pat[] = "r = (gl_FragCoord).zzzz;\n      o_dep.z = r.z;";
+    int writes = 0, copies = 0;
+    for (const char *p = body; p && (p = strstr(p, "o_dep")); p += 5) writes++;
+    for (const char *p = body; p && (p = strstr(p, pat)); p += sizeof pat - 1) copies++;
+    return writes > 0 && writes == copies;
+}
+
 static char *translate(int stage, const char *src_in, Tr *t)
 {
     memset(t, 0, sizeof *t);
@@ -970,11 +987,13 @@ static char *translate(int stage, const char *src_in, Tr *t)
         if (t->env_hi >= 0) bput(&g, "uniform vec4 %s_env[%d];\n", P, t->env_hi + 1);
         if (t->local_hi >= 0) bput(&g, "uniform vec4 %s_loc[%d];\n", P, t->local_hi + 1);
         for (int m = 0; m < t->nmat; m++) bput(&g, "uniform vec4 %s_m%d[4];\n", P, m);
-        if (!stage && !t->nmat) bput(&g, "uniform mat4 u_reproj;\n");
 #ifdef LINDBERGH_GL4ES
-        static const char *const sty[] = { "", "sampler1D s1_", "sampler2D s2_", "sampler3D s3_",
-                                           "samplerCube sc_", "sampler2D sr_" };
+        /* multiview: one matrix per view, and render targets as two layers */
+        if (!stage && !t->nmat) bput(&g, gl4es_mv_shaders ? "uniform mat4 u_reproj[2];\n" : "uniform mat4 u_reproj;\n");
+        const char *sty[] = { "", "sampler1D s1_", "sampler2D s2_", "sampler3D s3_",
+                              "samplerCube sc_", gl4es_mv_shaders ? "sampler2DArray sr_" : "sampler2D sr_" };
 #else
+        if (!stage && !t->nmat) bput(&g, "uniform mat4 u_reproj;\n");
         static const char *const sty[] = { "", "sampler1D s1_", "sampler2D s2_", "sampler3D s3_",
                                            "samplerCube sc_", "sampler2DRect sr_" };
 #endif
@@ -1003,6 +1022,11 @@ static char *translate(int stage, const char *src_in, Tr *t)
             /* A program that takes its whole transform from the game's own
              * constants has the game's projection baked in: swap it for the
              * eye's (stereo.c; identity when not in stereo). */
+#ifdef LINDBERGH_GL4ES
+            /* multiview: gl4es clips to the game's screen from gl4es_mvPre */
+            if (!t->nmat && gl4es_mv_shaders) bput(&g, "  gl4es_mvPre = gl_Position;\n  gl_Position = u_reproj[gl_ViewID_OVR] * gl_Position;\n");
+            else
+#endif
             if (!t->nmat) bput(&g, "  gl_Position = u_reproj * gl_Position;\n");
         } else {
             if (t->fog_mode) {
@@ -1012,7 +1036,11 @@ static char *translate(int stage, const char *src_in, Tr *t)
                 bput(&g, "  o_col.rgb = mix(gl_Fog.color.rgb, o_col.rgb, clamp(%s, 0.0, 1.0));\n", f);
             }
             bput(&g, "  gl_FragColor = o_col;\n");
-            if (t->writes_depth) bput(&g, "  gl_FragDepth = o_dep.z;\n");
+            /* The game's programs write the depth they were given
+             * (MOV result.depth.z, fragment.position.z): that changes nothing
+             * but costs the GPU its early depth test, and through mediump on
+             * GLSL ES 3.00 it rounds the depth away - skip it. */
+            if (t->writes_depth && !depth_passthrough(t->body.p)) bput(&g, "  gl_FragDepth = o_dep.z;\n");
         }
         bput(&g, "}\n");
         free(src);
@@ -1104,6 +1132,10 @@ static void cache_path(char *out, size_t n, const char *v, const char *f)
         drv = fnv(1469598103934665603ull, (const char *)glGetString(GL_RENDERER));
         drv = fnv(drv, (const char *)glGetString(GL_VERSION));
         drv = fnv(drv, "arbprog 1");
+#ifdef LINDBERGH_GL4ES
+        if (gl4es_mv_shaders) drv = fnv(drv, "multiview 7");   /* gl4es makes other shaders of the same GLSL */
+        if (gl4es_mv_shaders && getenv("LIBGL_MV_NOCLIP")) drv = fnv(drv, "noclip");
+#endif
         mkdir("../shadercache", 0755);
     }
     uint64_t h = fnv(fnv(drv, v ? v : ""), f ? f : "");
@@ -1280,7 +1312,12 @@ static Linked *link_pair(GLuint vid, GLuint fid)
         const char *P = st ? "f" : "v";
         char nm[32];
         snprintf(nm, sizeof nm, "%s_env", P); l->u_env[st] = glGetUniformLocation(l->prog, nm);
-        if (l->u_env[st] >= 0) l->env_hi[st] = array_len(l->prog, nm, l->env_hi[st] + 1) - 1;
+        if (l->u_env[st] >= 0) {
+            int want = l->env_hi[st] + 1;
+            l->env_hi[st] = array_len(l->prog, nm, want) - 1;
+            if (l->env_hi[st] + 1 < want && getenv("LINDBERGH_ARB_ARRAYS"))
+                fprintf(stderr, "[arb] pair v%u/f%u: %s %d of %d kept\n", vid, fid, nm, l->env_hi[st] + 1, want);
+        }
         snprintf(nm, sizeof nm, "%s_loc", P); l->u_loc[st] = glGetUniformLocation(l->prog, nm);
         if (l->u_loc[st] >= 0) l->local_hi[st] = array_len(l->prog, nm, l->local_hi[st] + 1) - 1;
         for (int m = 0; m < l->nmat[st]; m++) {
@@ -1295,6 +1332,12 @@ static Linked *link_pair(GLuint vid, GLuint fid)
     l->u_rect = glGetUniformLocation(l->prog, "u_rect_scale");
 #endif
     l->u_reproj = glGetUniformLocation(l->prog, "u_reproj");
+#ifdef LINDBERGH_GL4ES
+    if (gl4es_mv_shaders && l->u_reproj >= 0) {
+        static int shown;
+        if (shown++ < 5) fprintf(stderr, "[arbprog] u_reproj at %d, %d matrices as the driver keeps it\n", l->u_reproj, array_len(l->prog, "u_reproj", 2));
+    }
+#endif
     static const char *const pre[] = { "s1_", "s2_", "s3_", "sc_", "sr_" };
     for (int u = 0; u < 16; u++)
         for (int k = 0; k < 5; k++) {
@@ -1374,6 +1417,13 @@ static void stack_matrix(int which, int index, float *m)
 
 static void upload(Linked *l)
 {
+#ifdef LINDBERGH_GL4ES
+    if (l->u_reproj >= 0 && gl4es_mv_shaders) {
+        float m[32];
+        stereo_reproject_view(0, m); stereo_reproject_view(1, m + 16);
+        glUniformMatrix4fv(l->u_reproj, 2, GL_FALSE, m);
+    } else
+#endif
     if (l->u_reproj >= 0) { float m[16]; stereo_reproject(m); glUniformMatrix4fv(l->u_reproj, 1, GL_FALSE, m); }
 #ifdef LINDBERGH_GL4ES
     if (l->u_rect >= 0) {
@@ -1392,6 +1442,9 @@ static void upload(Linked *l)
         }
         glActiveTexture((GLenum)active);
         glUniform2fv(l->u_rect, l->n_rect, &norm[0][0]);
+        if (gl4es_mv_trace)
+            fprintf(stderr, "[arb] u_rect_norm at %d, %d of them: %g %g / %g %g, error %#x\n", l->u_rect, l->n_rect,
+                    norm[0][0], norm[0][1], norm[3][0], norm[3][1], glGetError());
     }
 #else
     if (l->u_rect >= 0) { float rx, ry; stereo_rect_scale(&rx, &ry); glUniform2f(l->u_rect, rx, ry); }

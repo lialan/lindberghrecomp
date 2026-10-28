@@ -30,6 +30,7 @@
  * menu; LINDBERGH_SCENE_STATS=1 reports the count every 50 frames.
  */
 
+#include <dlfcn.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -42,6 +43,15 @@
 #include <EGL/egl.h>
 #endif
 #include "arbprog.h"
+#ifdef LINDBERGH_GL4ES
+/* gl4es' multiview (multiview.c in quest/gl4es.patch) */
+int gl4es_multiview_enable(void);
+void gl4es_multiview_set(const float m[3][16], int clip);
+unsigned gl4es_multiview_array(unsigned texture);
+int gl4es_multiview_read(unsigned texture, GLenum target, int layer, void *out);
+extern int gl4es_mv_trace;
+void gl4es_multiview_read_pixel(int x, int y, unsigned char out[4]);
+#endif
 
 extern unsigned g_frame;
 
@@ -50,6 +60,8 @@ extern unsigned g_frame;
 
 /* ---- eyes ---- */
 static int      g_on;
+static int      g_mv;                   /* both eyes in one pass (GL_OVR_multiview2): no second eye to replay */
+static float    g_mvR[3][16];           /* the views' matrices last given to GL, and back to the game's clip space */
 static int      g_eye;                  /* the eye being drawn */
 static int      g_ew = 1024, g_eh = 1024;
 static float    g_sx, g_sy;             /* eye pixels per game pixel */
@@ -158,10 +170,76 @@ static void effective_projection(const float *p, int hud, float *out)
     mat_mul(out, ev, p);
 }
 
+static int mat_invert(const float *m, float *out);
+
+/* Multiview: GL is given the first eye's projection, as when the eyes are
+ * drawn one at a time, so the first view is exactly that; the second view's
+ * matrix takes the first eye's clip space to its own (the two frusta differ
+ * by the eyes' offset, so it is near identity). Worked out in double: going
+ * through the game's own projection instead loses the far plane to rounding,
+ * as the game's is all but infinite. A third matrix takes the first eye's
+ * clip space back to the game's, where the arcade screen is -1..1, for
+ * clipping screen content (clip_to_screen). */
+static int mat_invert(const float *m, float *out);
+
+static void mat_mul_d(double *out, const double *a, const double *b)
+{
+    double r[16];
+    for (int c = 0; c < 4; c++)
+        for (int rr = 0; rr < 4; rr++)
+            r[c * 4 + rr] = a[rr] * b[c * 4] + a[4 + rr] * b[c * 4 + 1] + a[8 + rr] * b[c * 4 + 2] + a[12 + rr] * b[c * 4 + 3];
+    memcpy(out, r, sizeof r);
+}
+
+static int mat_invert_d(const double *m, double *o)
+{
+    double a[4][8];
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 8; c++) a[r][c] = c < 4 ? m[c * 4 + r] : (c - 4 == r);
+    for (int c = 0; c < 4; c++) {
+        int piv = c;
+        for (int r = c + 1; r < 4; r++) if (fabs(a[r][c]) > fabs(a[piv][c])) piv = r;
+        if (fabs(a[piv][c]) < 1e-30) return 0;
+        for (int k = 0; k < 8; k++) { double t = a[c][k]; a[c][k] = a[piv][k]; a[piv][k] = t; }
+        double d = a[c][c];
+        for (int k = 0; k < 8; k++) a[c][k] /= d;
+        for (int r = 0; r < 4; r++) {
+            if (r == c) continue;
+            double f = a[r][c];
+            for (int k = 0; k < 8; k++) a[r][k] -= f * a[c][k];
+        }
+    }
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++) o[c * 4 + r] = a[r][c + 4];
+    return 1;
+}
+
+static void view_matrices(const float *p, float *eye0)
+{
+    float eff1[16];
+    g_eye = 1; effective_projection(p, g_loaded_hud, eff1);
+    g_eye = 0; effective_projection(p, g_loaded_hud, eye0);
+#ifdef LINDBERGH_GL4ES
+    double e0[16], e1[16], pd[16], inv[16], r[16];
+    for (int i = 0; i < 16; i++) { e0[i] = eye0[i]; e1[i] = eff1[i]; pd[i] = p[i]; }
+    mat_identity(g_mvR[0]);
+    mat_identity(g_mvR[1]);
+    mat_identity(g_mvR[2]);
+    if (mat_invert_d(e0, inv)) {
+        mat_mul_d(r, e1, inv);
+        for (int i = 0; i < 16; i++) g_mvR[1][i] = (float)r[i];
+        mat_mul_d(r, pd, inv);
+        for (int i = 0; i < 16; i++) g_mvR[2][i] = (float)r[i];
+    }
+    gl4es_multiview_set((const float (*)[16])g_mvR, g_clipped);
+#endif
+}
+
 static void load_projection(void)
 {
     float m[16];
-    effective_projection(g_proj[g_proj_top], g_loaded_hud, m);
+    if (g_mv) view_matrices(g_proj[g_proj_top], m);
+    else effective_projection(g_proj[g_proj_top], g_loaded_hud, m);
     if (g_mode != GL_PROJECTION) glMatrixMode(GL_PROJECTION);
     glLoadMatrixf(m);
     if (g_mode != GL_PROJECTION) glMatrixMode(g_mode);
@@ -210,8 +288,40 @@ static void bind_framebuffer(GLenum target, GLuint fb)
     glBindFramebuffer(target, fb ? fb : g_eye_fbo[g_eye]);
 }
 
+/* Multiview, wanted unless LINDBERGH_MULTIVIEW=0: one framebuffer for both
+ * eyes, its colour and depth rectangle textures that gl4es keeps as two
+ * layers. Turned on before the game makes any program or render target. */
+static void eye_targets_multiview(void)
+{
+#ifdef LINDBERGH_GL4ES
+    static int tried;
+    if (!tried) {
+        tried = 1;
+        const char *v = getenv("LINDBERGH_MULTIVIEW");
+        g_mv = !(v && *v == '0') && gl4es_multiview_enable();
+        fprintf(stderr, "[stereo] %s\n", g_mv ? "multiview: both eyes in one pass" : "second eye replayed");
+    }
+    if (!g_mv || g_eye_fbo[0]) return;
+    glGenTextures(2, g_eye_tex);
+    glBindTexture(GL_TEXTURE_RECTANGLE_ARB, g_eye_tex[0]);
+    glTexImage2D(GL_TEXTURE_RECTANGLE_ARB, 0, GL_RGBA, g_ew, g_eh, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glBindTexture(GL_TEXTURE_RECTANGLE_ARB, g_eye_tex[1]);
+    glTexImage2D(GL_TEXTURE_RECTANGLE_ARB, 0, GL_DEPTH_COMPONENT, g_ew, g_eh, 0, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, NULL);
+    glBindTexture(GL_TEXTURE_RECTANGLE_ARB, 0);
+    glGenFramebuffers(1, &g_eye_fbo[0]);
+    glBindFramebuffer(GL_FRAMEBUFFER, g_eye_fbo[0]);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_RECTANGLE_ARB, g_eye_tex[0], 0);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_RECTANGLE_ARB, g_eye_tex[1], 0);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+        fprintf(stderr, "[stereo] multiview eye framebuffer incomplete\n");
+    g_eye_fbo[1] = g_eye_fbo[0];
+#endif
+}
+
 static void eye_targets(void)
 {
+    eye_targets_multiview();
+    if (g_mv) return;
     for (int i = 0; i < 2; i++) {
         if (g_eye_fbo[i] || g_external[i]) continue;
         glGenTextures(1, &g_eye_tex[i]);
@@ -311,6 +421,13 @@ static int letterbox_bar(CPU *c, const char *n)
  * screen in front of the player, the scissor box around that screen does. */
 static void clip_to_screen(void)
 {
+#ifdef LINDBERGH_GL4ES
+    if (g_mv) {     /* the screen is -1..1 in the game's clip space: the views' clip distances */
+        g_clipped = 1;
+        gl4es_multiview_set((const float (*)[16])g_mvR, 1);
+        return;
+    }
+#endif
     float m[16], e[16], d = g_screen_dist;
     const float *t = g_tan[g_eye];
     mat_frustum(e, -t[0] * 0.01f, t[1] * 0.01f, -t[2] * 0.01f, t[3] * 0.01f, 0.01f, 1000.0f);
@@ -344,6 +461,9 @@ static void clip_done(void)
 {
     if (!g_clipped) return;
     g_clipped = 0;
+#ifdef LINDBERGH_GL4ES
+    if (g_mv) { gl4es_multiview_set((const float (*)[16])g_mvR, 0); return; }
+#endif
     if (g_scissor_on) glScissor(g_scissor[0], g_scissor[1], g_scissor[2], g_scissor[3]);
     else glDisable(GL_SCISSOR_TEST);
 }
@@ -771,14 +891,42 @@ static void trace_draw(const char *n)
 {
     static long at = -2;
     if (at == -2) { const char *v = getenv("LINDBERGH_RT_DUMP"); at = v && *v ? atol(v) : -1; }
+#ifdef LINDBERGH_GL4ES
+    gl4es_mv_trace = (long)g_frame == at && getenv("LIBGL_MV_CHECK");
+#endif
     if ((long)g_frame != at || (strncmp(n, "glDraw", 6) && strcmp(n, "glEnd"))) return;
     static unsigned k;
     unsigned char px[4] = { 0, 0, 0, 0 };
     GLint vp[4];
     glGetIntegerv(GL_VIEWPORT, vp);
-    glReadPixels(vp[0] + vp[2] / 2, vp[1] + vp[3] / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
-    fprintf(stderr, "[px] %u fb %u %s rect %u hud %d -> %02x%02x%02x%02x\n", k++, g_game_fb, n,
-            g_unit0_rect, g_loaded_hud, px[0], px[1], px[2], px[3]);
+    /* LINDBERGH_PX_AT=x,y: where, as fractions of the viewport (the centre) */
+    static float fx = -1, fy;
+    if (fx < 0) { const char *a = getenv("LINDBERGH_PX_AT"); fx = 0.5f; fy = 0.5f; if (a) sscanf(a, "%f,%f", &fx, &fy); }
+    GLint qx = vp[0] + (GLint)(vp[2] * fx), qy = vp[1] + (GLint)(vp[3] * fy);
+#ifdef LINDBERGH_GL4ES
+    if (g_mv) gl4es_multiview_read_pixel(qx, qy, px);
+    else
+#endif
+    glReadPixels(qx, qy, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    GLint dfn = 0; GLboolean dwm = 0;
+    glGetIntegerv(GL_DEPTH_FUNC, &dfn); glGetBooleanv(GL_DEPTH_WRITEMASK, &dwm);
+    int von = 0, fon = 0;
+    arb_is_enabled(GL_VERTEX_PROGRAM_ARB, &von); arb_is_enabled(GL_FRAGMENT_PROGRAM_ARB, &fon);
+    GLuint vpid = von ? arb_bound(GL_VERTEX_PROGRAM_ARB) : 0, fpid = fon ? arb_bound(GL_FRAGMENT_PROGRAM_ARB) : 0;
+    fprintf(stderr, "[px] %u fb %u %s rect %u hud %d -> %02x%02x%02x%02x  depth %d %#x %d cull %d vp %u fp %u\n", k++, g_game_fb, n,
+            g_unit0_rect, g_loaded_hud, px[0], px[1], px[2], px[3], glIsEnabled(GL_DEPTH_TEST), dfn, dwm, glIsEnabled(GL_CULL_FACE), vpid, fpid);
+    static unsigned char seen[4096];
+    if (vpid && vpid < 4096 && !seen[vpid]) {
+        seen[vpid] = 1;
+        const char *src = arb_get_source(GL_VERTEX_PROGRAM_ARB, vpid);
+        fprintf(stderr, "[px] vertex program %u:\n%s\n[px] end\n", vpid, src ? src : "(none)");
+    }
+    static unsigned char fseen[4096];
+    if (fpid && fpid < 4096 && !fseen[fpid]) {
+        fseen[fpid] = 1;
+        const char *src = arb_get_source(GL_FRAGMENT_PROGRAM_ARB, fpid);
+        fprintf(stderr, "[px] fragment program %u:\n%s\n[px] end\n", fpid, src ? src : "(none)");
+    }
     if (!g_game_fb) {
         GLint sb[4] = { 0 };
         glGetIntegerv(GL_SCISSOR_BOX, sb);
@@ -813,6 +961,44 @@ static void trace_draw(const char *n)
             act((GLenum)au);
             fprintf(stderr, "[px]   GLES unit 0: texture %d %dx%d (level 1 %d) min %#x mag %#x wrap %#x %#x levels %d..%d, program %d\n",
                     b, w, h, w1, mn, mg, ws, wt, base, maxl, prog);
+            if (g_mv) {     /* the arrays each unit has, and where the program's samplers look */
+                typedef GLint (*Loc)(GLuint, const char *);
+                typedef void (*GU)(GLuint, GLint, GLint *);
+                /* the driver's own: eglGetProcAddress may hand back gl4es' */
+                void *lib = dlopen("libGLESv3.so", RTLD_NOW | RTLD_NOLOAD);
+                if (!lib) lib = dlopen("libGLESv3.so", RTLD_NOW);
+                Loc loc = (Loc)dlsym(lib, "glGetUniformLocation");
+                GU gu = (GU)dlsym(lib, "glGetUniformiv");
+                act = (Act)dlsym(lib, "glActiveTexture");
+                get = (Iv)dlsym(lib, "glGetIntegerv");
+                tp = (TIv)dlsym(lib, "glGetTexParameteriv");
+                tl = (TLIv)dlsym(lib, "glGetTexLevelParameteriv");
+                get(GL_ACTIVE_TEXTURE, &au);
+                get(GL_CURRENT_PROGRAM, &prog);
+                for (int u = 0; u < 4; u++) {
+                    GLint a = 0, smin = 0, l = 0, v = -1, aw = 0, ah = 0, ad = 0, af = 0;
+                    char nm[8];
+                    act(GL_TEXTURE0 + u); get(0x8C1D /*GL_TEXTURE_BINDING_2D_ARRAY*/, &a);
+                    if (a) {
+                        tp(0x8C1A, GL_TEXTURE_MIN_FILTER, &smin);
+                        tl(0x8C1A, 0, GL_TEXTURE_WIDTH, &aw); tl(0x8C1A, 0, GL_TEXTURE_HEIGHT, &ah);
+                        tl(0x8C1A, 0, 0x8071 /*GL_TEXTURE_DEPTH*/, &ad); tl(0x8C1A, 0, GL_TEXTURE_INTERNAL_FORMAT, &af);
+                    }
+                    snprintf(nm, sizeof nm, "sr_%d", u);
+                    l = loc((GLuint)prog, nm);
+                    if (l >= 0) gu((GLuint)prog, l, &v);
+                    fprintf(stderr, "[px]   unit %d: array %d %dx%dx%d format %#x min %#x; sampler sr_%d at %d = %d\n", u, a, aw, ah, ad, af, smin, u, l, v);
+                }
+                typedef void (*GUf)(GLuint, GLint, GLfloat *);
+                GUf guf = (GUf)dlsym(lib, "glGetUniformfv");
+                for (int u = 0; u < 4; u++) {
+                    char nm[24]; snprintf(nm, sizeof nm, "u_rect_norm[%d]", u);
+                    GLint l = loc((GLuint)prog, nm); GLfloat v[2] = { -1, -1 };
+                    if (l >= 0) guf((GLuint)prog, l, v);
+                    fprintf(stderr, "[px]   %s at %d = %g %g\n", nm, l, v[0], v[1]);
+                }
+                act((GLenum)au);
+            }
         }
 #endif
     }
@@ -930,11 +1116,26 @@ static void stereo_gl_call_inner(CPU *c, HleId id, HleHandler fn)
     }
     if (!g_on) { fn(c); return; }
     const char *n = hle_name(id);
-    if (g_glprof > 0) {
-        double t0 = now_ns();
-        record(c, id, fn, n);
-        g_glprof_rec_ns += now_ns() - t0;
-    } else record(c, id, fn, n);
+#ifdef LINDBERGH_GL4ES
+    if (gl4es_mv_trace) {   /* the dump frame with LIBGL_MV_CHECK: which call fails */
+        static GLenum (*err)(void);
+        if (!err) { void *lib = dlopen("libGLESv3.so", RTLD_NOW); err = (GLenum (*)(void))dlsym(lib, "glGetError"); }
+        while (err() != GL_NO_ERROR) ;
+        if (!g_mv) record(c, id, fn, n);
+        exec(c, id, fn);
+        GLenum e = err();
+        if (e) fprintf(stderr, "[mv] %s %#x %#x %#x -> GL error %#x\n", n, A32(0), A32(1), A32(2), e);
+        trace_draw(n);
+        return;
+    }
+#endif
+    if (!g_mv) {
+        if (g_glprof > 0) {
+            double t0 = now_ns();
+            record(c, id, fn, n);
+            g_glprof_rec_ns += now_ns() - t0;
+        } else record(c, id, fn, n);
+    }
     exec(c, id, fn);
     trace_draw(n);
 }
@@ -1002,10 +1203,17 @@ static void dump_targets(void)
         }
         if (w <= 0 || h <= 0 || ifmt == GL_DEPTH_COMPONENT || ifmt == GL_DEPTH_COMPONENT24 ||
             ifmt == GL_DEPTH_COMPONENT16 || ifmt == GL_DEPTH_COMPONENT32 || ifmt == GL_DEPTH24_STENCIL8) continue;
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, tg, tex, 0);
         unsigned char *px = malloc((size_t)w * h * 4);
         if (!px) continue;
-        glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+#ifdef LINDBERGH_GL4ES
+        if (g_mv) {     /* the left eye's layer */
+            if (!gl4es_multiview_read(tex, tg, 0, px)) { free(px); continue; }
+        } else
+#endif
+        {
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, tg, tex, 0);
+            glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        }
         char name[64];
         snprintf(name, sizeof name, i < g_nscaled ? "rt_%u.ppm" : "rt_eye.ppm", tex);
         write_ppm(name, w, h, px);
@@ -1013,6 +1221,29 @@ static void dump_targets(void)
         fprintf(stderr, "[stereo] frame %u: wrote %s (%dx%d%s, status %#x)\n", g_frame, name, w, h,
                 tg == GL_TEXTURE_2D ? "" : " rect", glCheckFramebufferStatus(GL_FRAMEBUFFER));
     }
+#ifdef LINDBERGH_GL4ES
+    /* LINDBERGH_DUMP_TEX=a,b,...: rectangle textures that are not render
+     * targets too, as their first layer holds them */
+    const char *xt = getenv("LINDBERGH_DUMP_TEX");
+    for (const char *q = xt; g_mv && q && *q; q = strchr(q, ',') ? strchr(q, ',') + 1 : NULL) {
+        GLuint tex = (GLuint)atoi(q);
+        GLint w = 0, h = 0, was = 0;
+        glGetIntegerv(GL_TEXTURE_BINDING_RECTANGLE_ARB, &was);
+        glBindTexture(GL_TEXTURE_RECTANGLE_ARB, tex);
+        glGetTexLevelParameteriv(GL_TEXTURE_RECTANGLE_ARB, 0, GL_TEXTURE_WIDTH, &w);
+        glGetTexLevelParameteriv(GL_TEXTURE_RECTANGLE_ARB, 0, GL_TEXTURE_HEIGHT, &h);
+        glBindTexture(GL_TEXTURE_RECTANGLE_ARB, (GLuint)was);
+        unsigned char *px = w > 0 && h > 0 ? malloc((size_t)w * h * 4) : NULL;
+        if (px && gl4es_multiview_read(tex, GL_TEXTURE_RECTANGLE_ARB, 0, px)) {
+            char name[64];
+            snprintf(name, sizeof name, "tex_%u.ppm", tex);
+            write_ppm(name, w, h, px);
+            fprintf(stderr, "[stereo] frame %u: wrote %s (%dx%d), first texels %d %d %d, middle %d %d %d\n", g_frame, name, w, h,
+                    px[0], px[1], px[2], px[(w / 2) * 4], px[(w / 2) * 4 + 1], px[(w / 2) * 4 + 2]);
+        }
+        free(px);
+    }
+#endif
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
     glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prev);
     glDeleteFramebuffers(1, &fb);
@@ -1022,7 +1253,7 @@ void stereo_frame_end(void)
 {
     if (!g_on) return;
     dump_targets();
-    replay(1);
+    if (!g_mv) replay(1);
     if (g_overflow) { fprintf(stderr, "[stereo] frame %u: recording overflowed %u times\n", g_frame, g_overflow); g_overflow = 0; }
 }
 
@@ -1114,6 +1345,16 @@ static int mat_invert(const float *m, float *out)
 /* For a vertex program with the game's projection baked into its constants:
  * clip space as the game made it -> clip space for this eye. The game's
  * projection is taken to be the one it has loaded. */
+void stereo_reproject_view(int v, float out[16])
+{
+    int e = g_eye;
+    g_eye = v;
+    stereo_reproject(out);
+    g_eye = e;
+}
+
+int stereo_multiview(void) { return g_mv; }
+
 void stereo_reproject(float out[16])
 {
     mat_identity(out);
@@ -1147,6 +1388,9 @@ void stereo_rect_scale(float *x, float *y)
 }
 
 unsigned stereo_eye_texture(int eye) { return g_eye_tex[eye]; }
+#ifdef LINDBERGH_GL4ES
+unsigned stereo_eye_array(void) { return g_mv ? gl4es_multiview_array(g_eye_tex[0]) : 0; }
+#endif
 unsigned stereo_eye_framebuffer(int eye) { return g_eye_fbo[eye]; }
 
 /* Desktop check: both eyes side by side in the window. */

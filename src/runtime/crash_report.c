@@ -367,6 +367,27 @@ void guest_install_thread_handlers(void)
  * stall; the game keeps running. */
 #include <pthread.h>
 extern unsigned g_frame;
+/* Android's runtime keeps SIGUSR1 blocked in every thread for itself */
+#ifdef __ANDROID__
+#define WATCHDOG_SIG SIGUSR2
+#include <unwind.h>
+static _Unwind_Reason_Code unwind_one(struct _Unwind_Context *c, void *arg)
+{
+    int *n = arg;
+    uintptr_t pc = _Unwind_GetIP(c);
+    if (!pc || (*n)++ >= 40) return _URC_END_OF_STACK;
+    Dl_info di;
+    if (dladdr((void *)pc, &di) && di.dli_fname) {
+        const char *f = strrchr(di.dli_fname, '/');
+        fprintf(stderr, "  #%02d %s+%#lx %s\n", *n - 1, f ? f + 1 : di.dli_fname,
+                (unsigned long)(pc - (uintptr_t)di.dli_fbase), di.dli_sname ? di.dli_sname : "");
+    } else
+        fprintf(stderr, "  #%02d %p\n", *n - 1, (void *)pc);
+    return _URC_NO_REASON;
+}
+#else
+#define WATCHDOG_SIG SIGUSR1
+#endif
 static pthread_t g_main_thread;
 
 static void on_watchdog_signal(int sig, siginfo_t *si, void *uc)
@@ -374,6 +395,10 @@ static void on_watchdog_signal(int sig, siginfo_t *si, void *uc)
     (void)sig; (void)si;
     guest_report_state("watchdog: no frame presented - main thread is here");
     host_report_pc(uc);
+#ifdef __ANDROID__
+    int n = 0;      /* offsets in the unstripped libmain.so (build-quest) name them */
+    _Unwind_Backtrace(unwind_one, &n);
+#endif
 }
 
 static void *watchdog(void *arg)
@@ -387,7 +412,7 @@ static void *watchdog(void *arg)
         if (++still >= secs && !told) {
             told = 1;
             fprintf(stderr, "\n[watchdog] frame %u has not advanced for %u s\n", f, still);
-            pthread_kill(g_main_thread, SIGUSR1);
+            pthread_kill(g_main_thread, WATCHDOG_SIG);
         }
     }
     return NULL;
@@ -407,7 +432,10 @@ void guest_install_crash_handler(void)
             memset(&wa, 0, sizeof wa);
             wa.sa_sigaction = on_watchdog_signal;
             wa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESTART;
-            sigaction(SIGUSR1, &wa, NULL);
+            sigaction(WATCHDOG_SIG, &wa, NULL);
+            sigset_t un;
+            sigemptyset(&un); sigaddset(&un, WATCHDOG_SIG);
+            pthread_sigmask(SIG_UNBLOCK, &un, NULL);
             pthread_t t;
             pthread_create(&t, NULL, watchdog, (void *)(uintptr_t)secs);
             pthread_detach(t);

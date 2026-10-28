@@ -25,6 +25,11 @@ int  stereo_ray_to_screen(const float o[3], const float d[3], float *x, float *y
 /* The game's own camera, as tangents of half its field of view. */
 void stereo_game_camera(float *tan_x, float *tan_y);
 unsigned stereo_eye_texture(int eye);
+/* multiview: both eyes' image as one two-layer array, as the driver knows it
+ * (0 when the eyes are drawn one at a time) */
+unsigned stereo_eye_array(void);
+int stereo_multiview(void);
+void stereo_reproject_view(int view, float out[16]);
 unsigned stereo_eye_framebuffer(int eye);
 /* Rectangle-texture coordinates are scaled by this (1 when not in stereo). */
 void stereo_rect_scale(float *x, float *y);
