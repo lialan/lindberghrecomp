@@ -366,7 +366,7 @@ static int fake_gun(void)
  * towards them, the game's screen still in view (the arcade's own Test menu
  * is worked from here too). Point the gun at a row and pull the trigger;
  * the game gets no input meanwhile. */
-enum { M_SIGHT, M_LASER, M_CROSSHAIR, M_GUN, M_HAND, M_SCREEN, M_RATE, M_COINS, M_COIN, M_RECENTRE,
+enum { M_SIGHT, M_LASER, M_CROSSHAIR, M_GUN, M_HAND, M_SCREEN, M_RATE, M_RES, M_COINS, M_COIN, M_RECENTRE,
        M_TEST, M_SERVICE, M_CLOSE, M_COUNT };
 static struct {
     int open, hover, dirty;
@@ -374,6 +374,7 @@ static struct {
     int test_frames, service_frames, coin;
 } menu;
 static float rates[16];
+static int running_resolution;   /* the eye size this run was set up with */
 static int nrates;
 
 static void menu_items(XmItem *it)
@@ -381,7 +382,7 @@ static void menu_items(XmItem *it)
     static const char *const sight[] = { "Point shooting", "Red dot", "Holographic" };
     static const char *const laser[] = { "Laser and dot", "Dot only", "Off" };
     static const char *const labels[M_COUNT] = {
-        "Sight", "Laser", "Game crosshair", "Gun model", "Gun hand", "Screen distance", "Display rate",
+        "Sight", "Laser", "Game crosshair", "Gun model", "Gun hand", "Screen distance", "Display rate", "Resolution per eye",
         "Coins", "Insert a coin", "Recentre view", "Arcade Test button (select)",
         "Arcade Service button (next)", "Close" };
     for (int i = 0; i < M_COUNT; i++) { it[i].label = labels[i]; it[i].value[0] = 0; }
@@ -392,6 +393,8 @@ static void menu_items(XmItem *it)
     snprintf(it[M_HAND].value, 40, "%s", gun_hand == HAND_L ? "Left" : "Right");
     snprintf(it[M_SCREEN].value, 40, "%.1f m", cfg.screen);
     snprintf(it[M_RATE].value, 40, "%d Hz", cfg.refresh);
+    if (cfg.resolution == running_resolution) snprintf(it[M_RES].value, 40, "%d", cfg.resolution);
+    else snprintf(it[M_RES].value, 40, "%d (on restart)", cfg.resolution);
     snprintf(it[M_COINS].value, 40, "%s", cfg.auto_coins ? "Automatic" : "By menu");
 }
 
@@ -463,6 +466,14 @@ static void menu_choose(int item)
             if (request_rate) request_rate(session, (float)cfg.refresh);
         }
         break;
+    case M_RES: {
+        /* the eye images are set up once, so this takes effect next launch */
+        static const int sizes[] = { 1216, 1440, 1680, 1920, 2208 };
+        int k = 0;
+        while (k < 5 && sizes[k] <= cfg.resolution) k++;
+        cfg.resolution = sizes[k % 5];
+        break;
+    }
     case M_COINS: cfg.auto_coins = !cfg.auto_coins; break;
     case M_COIN: menu.coin = 1; break;
     case M_RECENTRE: anchor_pending = 1; break;
@@ -802,6 +813,7 @@ int xr_init(void)
     uint32_t nv = 0;
     XRCHECK(xrEnumerateViewConfigurationViews(instance, sys, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 2, &nv, vc));
     uint32_t w = vc[0].recommendedImageRectWidth, h = vc[0].recommendedImageRectHeight;
+    running_resolution = cfg.resolution;
     float f = (float)cfg.resolution / (float)(w > h ? w : h);
     w = (uint32_t)(w * f) & ~3u; h = (uint32_t)(h * f) & ~3u;
     if (w > vc[0].maxImageRectWidth) w = vc[0].maxImageRectWidth;

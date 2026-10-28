@@ -438,6 +438,7 @@ static void dtor_cond(void *p)  { pthread_cond_destroy((pthread_cond_t *)p); }
 #define MOWN 256
 static struct { volatile uint32_t va; volatile unsigned long tid; volatile int depth; } g_mown[MOWN];
 static __thread uint32_t t_waiting;
+static __thread uint32_t t_cond_mutex; static __thread int t_cond_depth;  /* sleeping on a condition */
 static int mown_slot(uint32_t va)
 {
     unsigned h = (va >> 2) * 2654435761u % MOWN;
@@ -480,6 +481,8 @@ void guest_mutex_report(void)
         fprintf(stderr, "waiting for guest mutex %#x, held by thread %#lx (depth %d)\n", t_waiting,
                 k >= 0 ? g_mown[k].tid : 0, k >= 0 ? g_mown[k].depth : 0);
     }
+    if (t_cond_mutex)
+        fprintf(stderr, "sleeping on a condition with guest mutex %#x, locked %d deep\n", t_cond_mutex, t_cond_depth);
     for (int i = 0; i < MOWN; i++)
         if (g_mown[i].va && g_mown[i].depth > 0 && g_mown[i].tid == (unsigned long)pthread_self())
             fprintf(stderr, "holding guest mutex %#x (depth %d)\n", g_mown[i].va, g_mown[i].depth);
@@ -495,11 +498,13 @@ static int cond_release(uint32_t va, int *depth)
     int k = mown_slot(va);
     *depth = k >= 0 ? g_mown[k].depth : 0;
     if (k >= 0) { g_mown[k].depth = 0; g_mown[k].tid = 0; }
+    t_cond_mutex = va; t_cond_depth = *depth;
     return k;
 }
 static void cond_reacquire(int k, int depth)
 {
     if (k >= 0) { g_mown[k].tid = (unsigned long)pthread_self(); g_mown[k].depth = depth; }
+    t_cond_mutex = 0;
 }
 static void h_cond_wait(CPU *c)
 {
