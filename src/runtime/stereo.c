@@ -99,8 +99,10 @@ static float    g_zoom_lens = 4.0f;     /* a longer one is a zoomed view (the ga
 static int      g_menu;                 /* a menu: its 3D belongs on the screen too */
 static int      g_tex2d_on;             /* GL_TEXTURE_2D enabled on unit 0 (frame map) */
 static unsigned g_menu_frames;          /* frames in a row that looked like a menu */
-static unsigned g_menu_draws = 120;
-static unsigned g_zoom_draws, g_hudfb_draws;   /* this frame's 3D sent to the screen, for LINDBERGH_MODE_LOG */     /* fewer world draws than this looks like a menu */
+static unsigned g_menu_draws = 120;     /* fewer world draws than this looks like a menu */
+static unsigned g_zoom_draws, g_hudfb_draws;   /* this frame's 3D sent to the screen, for LINDBERGH_MODE_LOG */
+static float    g_near_seen;            /* the nearest near plane of this frame's world draws */
+static GLuint   g_world_fb = ~0u, g_world_fb_next = ~0u;   /* the target the world was drawn into last frame */
 
 /* ---- the recording ---- */
 enum { OP_CALL, OP_UNMAP, OP_PTR };
@@ -525,7 +527,7 @@ enum {
     K_OTHER, K_BINDFB, K_VIEWPORT, K_SCISSOR, K_FBTEX2D, K_ACTIVETEX, K_BINDTEX, K_ENABLE, K_DISABLE,
     K_DRAWARRAYS, K_DRAWELEMENTS, K_DRAWOTHER, K_BEGIN, K_END, K_MATRIXMODE,
     K_LOADID, K_LOADMATRIX, K_MULTMATRIX, K_ORTHO, K_ORTHO2D, K_FRUSTUM, K_PERSPECTIVE,
-    K_PUSHMATRIX, K_POPMATRIX, K_TRANSLATE, K_SCALE, K_GETINTEGERV, K_GETFLOATV, K_GETOTHER, K_UNMAP,
+    K_PUSHMATRIX, K_POPMATRIX, K_TRANSLATE, K_SCALE, K_GETINTEGERV, K_GETFLOATV, K_GETOTHER, K_UNMAP, K_CLEAR,
 };
 typedef struct {
     uint8_t ok, kind, live, track;          /* live: run, never recorded; track: client array state */
@@ -556,7 +558,7 @@ static const Cls *cls(HleId id)
         { "glPushMatrix", K_PUSHMATRIX }, { "glPopMatrix", K_POPMATRIX },
         { "glTranslatef", K_TRANSLATE }, { "glScalef", K_SCALE },
         { "glGetIntegerv", K_GETINTEGERV }, { "glGetFloatv", K_GETFLOATV },
-        { "glUnmapBufferARB", K_UNMAP }, { "glUnmapBuffer", K_UNMAP },
+        { "glUnmapBufferARB", K_UNMAP }, { "glUnmapBuffer", K_UNMAP }, { "glClear", K_CLEAR },
     };
     k->kind = K_OTHER;
     for (unsigned i = 0; i < sizeof T / sizeof T[0]; i++)
@@ -586,6 +588,23 @@ static int transform_call(CPU *c, HleId id, const char *n)
     if (k == K_BINDFB) {
         bind_framebuffer(A32(0), A32(1));
         return 1;
+    }
+    if (k == K_CLEAR) {
+        /* The game clears its world target's depth but not its colour: on
+         * the cabinet the 3D covered all of its view. The eye sees far wider
+         * than the game's camera and the game draws only what that camera
+         * sees, so outside it last frame's pixels stayed and dragged along
+         * whenever the camera or the head moved. Clear the colour too. */
+        GLbitfield mask = A32(0);
+        if ((mask & GL_DEPTH_BUFFER_BIT) && !(mask & GL_COLOR_BUFFER_BIT) && g_game_fb == g_world_fb) {
+            GLfloat cc[4];
+            glGetFloatv(GL_COLOR_CLEAR_VALUE, cc);
+            glClearColor(0, 0, 0, 1);
+            glClear(mask | GL_COLOR_BUFFER_BIT);
+            glClearColor(cc[0], cc[1], cc[2], cc[3]);
+            return 1;
+        }
+        return 0;
     }
     if (k == K_VIEWPORT || k == K_SCISSOR) {
         GLint x = AI32(0), y = AI32(1), w = AI32(2), h = AI32(3);
@@ -623,8 +642,13 @@ static int transform_call(CPU *c, HleId id, const char *n)
         /* Screen content or not, decided per draw: 2D that is not a pass over
          * a render target, and 3D drawn into the HUD's target. */
         int persp = is_perspective(g_proj[g_proj_top]);
-        if (persp && g_game_fb != g_hud_fb && !g_replaying) g_scene_draws++;
+        if (persp && g_game_fb != g_hud_fb && !g_replaying) { g_scene_draws++; g_world_fb_next = g_game_fb; }
         if (persp && g_proj[g_proj_top][0] > g_lens_seen) g_lens_seen = g_proj[g_proj_top][0];
+        if (persp && !g_replaying && g_game_fb != g_hud_fb) {
+            const float *P = g_proj[g_proj_top];
+            float zn = P[14] / (P[10] - 1.0f);          /* the camera's near plane */
+            if (zn > 0 && (g_near_seen == 0 || zn < g_near_seen)) g_near_seen = zn;
+        }
         /* A long lens - the sniper scope, a cutscene's close-up - is a
          * magnified view the eye's own frustum would undo: it goes on the
          * screen too, framed by the scope the game draws there. */
@@ -1311,8 +1335,8 @@ void stereo_frame_begin(void)
         world_frames = 0;
         if (++g_menu_frames >= 30) g_menu = 1;
     }
-    if (getenv("LINDBERGH_SCENE_STATS") && g_frame % 50 == 0)
-        fprintf(stderr, "[stereo] frame %u: %u world draws%s, lens %.2f\n", g_frame, g_scene_draws, g_menu ? " (menu)" : "", g_lens_seen);
+    if (getenv("LINDBERGH_SCENE_STATS") && g_frame % 30 == 0)
+        fprintf(stderr, "[stereo] frame %u: %u world draws%s, lens %.2f, near %.4f\n", g_frame, g_scene_draws, g_menu ? " (menu)" : "", g_lens_seen, g_near_seen);
     static int mode_log = -1, last_sig = -1;
     if (mode_log < 0) { const char *v = getenv("LINDBERGH_MODE_LOG"); mode_log = v && *v && *v != '0'; }
     if (mode_log) {
@@ -1324,8 +1348,10 @@ void stereo_frame_begin(void)
     }
     g_zoom_draws = g_hudfb_draws = 0;
     g_lens_seen = 0;
+    g_near_seen = 0;
     g_scene_draws = 0;
     g_hud_fb = g_hud_fb_next;           /* 3D drawn there this frame is screen content */
+    g_world_fb = g_world_fb_next;
     g_hud_fb_next = ~0u;
     g_eye = 0;
     /* The game's state carries over from the end of the frame; only the
