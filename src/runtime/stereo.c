@@ -268,8 +268,15 @@ static void view_matrices(const float *p, float *eye0)
 #endif
 }
 
+/* The projection GL has is loaded lazily, at the next draw: the game builds
+ * one from several calls (identity, ortho, a multiply...), and each load is a
+ * matrix for both eyes written to the GPU - pushes and pops alone cost
+ * ~2 ms a frame when every call loaded it. */
+static int g_proj_dirty;
+
 static void load_projection(void)
 {
+    g_proj_dirty = 0;
     float m[16];
     if (g_mv) view_matrices(g_proj[g_proj_top], m);
     else effective_projection(g_proj[g_proj_top], g_loaded_hud, m);
@@ -942,7 +949,8 @@ static int transform_call(CPU *c, HleId id, const char *n)
         if (!persp && !g_replaying) { if (hud) { if (!g_hud2d) g_hud_lens = g_last_persp[0]; g_hud2d++; } else g_pass2d++; }
         if (hud == 1 && !persp && !g_replaying && sight_draw(c, n)) return 1;
         if (hud == 1 && !persp && letterbox_bar(c, n)) return 1;
-        if (hud != g_loaded_hud) { g_loaded_hud = hud; load_projection(); }
+        if (hud != g_loaded_hud) { g_loaded_hud = hud; g_proj_dirty = 1; }
+        if (g_proj_dirty) load_projection();
         if (hud == 1 && persp && !g_menu_vp[2] && (g_vp[2] != GAME_W || g_vp[3] != GAME_H)) memcpy(g_menu_vp, g_vp, sizeof g_vp);
         if (hud == 1) clip_to_screen();
         /* The game's 2D all sits at one depth and is drawn with LEQUAL, so on
@@ -972,12 +980,12 @@ static int transform_call(CPU *c, HleId id, const char *n)
         double zn = gl_arg_d(c, 4), t = zn * tan(gl_arg_d(c, 0) * M_PI / 360), r = t * gl_arg_d(c, 2);
         mat_frustum(m, -r, r, -t, t, zn, gl_arg_d(c, 6)); mat_mul(top, top, m);
     }
-    else if (k == K_PUSHMATRIX) { if (g_proj_top < 31) { memcpy(g_proj[g_proj_top + 1], top, 64); g_proj_top++; } glPushMatrix(); return 1; }
-    else if (k == K_POPMATRIX) { if (g_proj_top > 0) g_proj_top--; glPopMatrix(); load_projection(); return 1; }
+    else if (k == K_PUSHMATRIX) { if (g_proj_top < 31) { memcpy(g_proj[g_proj_top + 1], top, 64); g_proj_top++; } return 1; }
+    else if (k == K_POPMATRIX) { if (g_proj_top > 0) g_proj_top--; g_proj_dirty = 1; return 1; }
     else if (k == K_TRANSLATE) { mat_identity(m); m[12] = argf(c, 0); m[13] = argf(c, 1); m[14] = argf(c, 2); mat_mul(top, top, m); }
     else if (k == K_SCALE) { mat_identity(m); m[0] = argf(c, 0); m[5] = argf(c, 1); m[10] = argf(c, 2); mat_mul(top, top, m); }
     else return 0;
-    load_projection();
+    g_proj_dirty = 1;
     return 1;
 }
 

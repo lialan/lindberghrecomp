@@ -517,9 +517,52 @@ static void h_dongle_valid(CPU *c)
     RET(1);
 }
 
+#if defined(__ANDROID__)
+/* Ghost Squad Evolution paces itself: idle_wait_func spins on the wall clock
+ * until 16.683 ms (59.94 Hz) have passed since the frame began. The headset
+ * shows 120 Hz, two display frames per game frame at exactly 60: at 59.94 the
+ * game slid through the display's phase, and each time it crossed a display
+ * frame one game frame was shown once and the next three times - judder.
+ * The frame target is read only by the waits there, so for the call it is
+ * the display's own (host_frame_period_ms: the headset's period times its
+ * frames per game frame). Pacing by the display alone was tried: the game
+ * then begins a frame only when the headset releases it, too late to finish
+ * in two display frames. The same constant elsewhere (main_loop_func's frame
+ * ratios) is untouched. LINDBERGH_GAME_PACING=1 keeps the game's own. */
+#define FRAME_TARGET_VA 0x081c1d40u
+static void (*g_idle_wait)(CPU *);
+static void h_idle_wait(CPU *c)
+{
+    uint32_t keep = rd32(FRAME_TARGET_VA), now;
+    extern float host_frame_period_ms(void);
+    float t = host_frame_period_ms();
+    if (!(t > 5.0f && t < 40.0f)) memcpy(&t, &keep, 4);
+    memcpy(&now, &t, 4);
+    wr32(FRAME_TARGET_VA, now);
+    push32(c, 0xDEADBEEFu);                 /* the return slot its ret pops */
+    g_idle_wait(c);
+    wr32(FRAME_TARGET_VA, keep);
+}
+static int pace_by_display(void)
+{
+    const char *v = getenv("LINDBERGH_GAME_PACING");
+    if (v && *v == '1') return 0;
+    uint32_t va = guest_symbol("_Z14idle_wait_funcv");
+    extern void (*dispatch_lifted(uint32_t va))(CPU *);
+    uint32_t bits = va ? rd32(FRAME_TARGET_VA) : 0;
+    float target;
+    memcpy(&target, &bits, 4);
+    if (!va || target < 16.6f || target > 16.8f || !(g_idle_wait = dispatch_lifted(va))) return 0;
+    return guest_override("_Z14idle_wait_funcv", h_idle_wait);
+}
+#endif
+
 void hle_register_sega(void)
 {
     int n = 0;
+#if defined(__ANDROID__)
+    if (pace_by_display()) fprintf(stderr, "[sega] idle_wait_func: paced by the headset, not the wall clock\n");
+#endif
 
     /* Ghost Squad Evolution gates its whole boot on this one predicate;
      * a game without these symbols simply does not get the override. */

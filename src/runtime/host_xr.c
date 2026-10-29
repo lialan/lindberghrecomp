@@ -889,7 +889,7 @@ int xr_init(void)
     gl.GenFramebuffers(1, &read_fb);
 
     overlay_ok = xo_init();
-    stereo_set_aim_hook(aim_probe);
+    { const char *v = getenv("LINDBERGH_AIM_PROBE"); if (!v || *v != '0') stereo_set_aim_hook(aim_probe); }   /* =0: aim at cfg.aim */
     stereo_eye_size((int)w, (int)h);
     stereo_set_screen_distance(cfg.screen * cfg.scale);
     stereo_start();
@@ -978,6 +978,21 @@ static void anchor_head(XrViewLocateInfo *vl)
             rc.poseInReferenceSpace.position.z, yaw * 57.2958f);
 }
 
+/* The display's frame period, and what a game frame lasts on it: as many of
+ * them as make up 1/60 s (two at 120 Hz) - the game's own pacing aims at it */
+static XrDuration display_period_ns;
+static int phase_kick;      /* one game frame longer by half a display frame, to move off its edge */
+float host_frame_period_ms(void)
+{
+    if (display_period_ns <= 0) return 0;
+    double per = 1e9 / 60.0 / (double)display_period_ns;
+    long k = (long)(per + 0.5);
+    if (k < 1 || fabs(per - k) >= 0.05) return 0;
+    double ms = k * display_period_ns / 1e6;
+    if (phase_kick) { phase_kick = 0; ms += display_period_ns / 2e6; }
+    return (float)ms;
+}
+
 void xr_frame_begin(void)
 {
     poll_events();
@@ -987,7 +1002,32 @@ void xr_frame_begin(void)
     if (XR_FAILED(xrWaitFrame(session, &wi, &frame))) return;
     XrFrameBeginInfo bi = { XR_TYPE_FRAME_BEGIN_INFO };
     if (XR_FAILED(xrBeginFrame(session, &bi))) return;
+    if (frame.predictedDisplayPeriod > 0) display_period_ns = frame.predictedDisplayPeriod;
     in_frame = 1;
+    {   /* pacing as the display sees it: display frames per game frame */
+        static XrTime prev; static unsigned hist[5], n;
+        if (prev && frame.predictedDisplayPeriod > 0) {
+            long k = (long)((frame.predictedDisplayTime - prev + frame.predictedDisplayPeriod / 2) / frame.predictedDisplayPeriod);
+            hist[k < 1 ? 0 : k > 4 ? 4 : k]++;
+            /* The game's frames begin on the wall clock at the display's own
+             * rate: if they sit on the edge of a display frame, jitter shows
+             * one once and the next three times, and goes on doing so. Two
+             * such within half a second: one longer frame moves them to the
+             * middle, where they stay. */
+            static unsigned last_odd, f;
+            f++;
+            long want = (long)(1e9 / 60.0 / frame.predictedDisplayPeriod + 0.5);
+            if (k != want) {
+                if (last_odd && f - last_odd < 30) { phase_kick = 1; last_odd = 0; }
+                else last_odd = f;
+            }
+            if (++n == 300) {
+                fprintf(stderr, "[pace] display frames per game frame: 1: %u, 2: %u, 3: %u, 4+: %u\n", hist[1] + hist[0], hist[2], hist[3], hist[4]);
+                memset(hist, 0, sizeof hist); n = 0;
+            }
+        }
+        prev = frame.predictedDisplayTime;
+    }
 
     XrViewLocateInfo vl = { XR_TYPE_VIEW_LOCATE_INFO };
     vl.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;

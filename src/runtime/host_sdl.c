@@ -625,6 +625,9 @@ static void maybe_peek(void)
     fprintf(stderr, "%s\n", line);
 }
 
+static unsigned g_late17, g_late25;
+static double   g_worst;
+
 static void maybe_screenshot(void)
 {
     const char *path = getenv("LINDBERGH_SHOT");
@@ -720,6 +723,10 @@ void host_swap(void)
         static Uint64 prev; Uint64 now = SDL_GetPerformanceCounter();
         double ms = prev ? (now - prev) * 1000.0 / SDL_GetPerformanceFrequency() : 0; prev = now;
         if (ms > 40 && env_int("LINDBERGH_LATENCY", 0)) fprintf(stderr, "[lat] frame %u took %.0f ms\n", g_frame, ms);
+        /* pacing, for the 5-second report: frames late for 60 Hz, and the worst */
+        if (ms > 17.5) g_late17++;
+        if (ms > 25.0) g_late25++;
+        if (ms > g_worst) g_worst = ms;
     }
     {   /* frame rate, every 5 seconds */
         static Uint32 t0; static unsigned f0;
@@ -728,9 +735,11 @@ void host_swap(void)
         else if (now - t0 >= 5000) {
 #if defined(__ANDROID__)
             unsigned n = g_frame - f0 ? g_frame - f0 : 1;
-            fprintf(stderr, "[perf] frame %u, %.1f fps; ms per frame: game %.1f, second eye %.1f, submit %.1f, headset wait %.1f\n",
+            fprintf(stderr, "[perf] frame %u, %.1f fps; ms per frame: game %.1f, second eye %.1f, submit %.1f, headset wait %.1f;"
+                            " late %u (over 25 ms %u), worst %.0f ms\n",
                     g_frame, (g_frame - f0) * 1000.0 / (now - t0),
-                    g_t_game / n, g_t_eye2 / n, g_t_submit / n, g_t_wait / n);
+                    g_t_game / n, g_t_eye2 / n, g_t_submit / n, g_t_wait / n, g_late17, g_late25, g_worst);
+            g_late17 = g_late25 = 0; g_worst = 0;
             g_t_game = g_t_eye2 = g_t_submit = g_t_wait = 0;
 #else
             fprintf(stderr, "[perf] frame %u, %.1f fps\n", g_frame,

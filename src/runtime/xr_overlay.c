@@ -565,7 +565,7 @@ void xo_draw_panel(const float mvp[16], int w, int h)
  * The world's depth at a few pixels along the gun's ray, read back through a
  * ring of pixel buffers two frames later, so the GPU is never waited on. */
 #define PROBE_MAX 64
-#define PROBE_RING 3
+#define PROBE_RING 5
 static GLuint prog_probe, probe_fb, probe_tex, probe_pbo[PROBE_RING], probe_smp;
 static GLint u_probe_px, u_probe_d;
 static struct { int n, pending; GLsync fence; float z[PROBE_MAX], t[PROBE_MAX], zn, zf; } probe_slot[PROBE_RING];
@@ -622,9 +622,12 @@ float xo_probe(unsigned depth_array, const float (*px)[2], const float *z, const
     float hit = -2;
     int o = (int)(probe_k % PROBE_RING);
     if (probe_slot[o].pending) {
+        /* not drawn yet: no answer, and no new question either - reading it
+         * now would wait on the GPU */
+        GLenum st = gl.ClientWaitSync(probe_slot[o].fence, 0, 0);
+        if (st != GL_ALREADY_SIGNALED && st != GL_CONDITION_SATISFIED) return -2;
         GLint pb = 0;
         gl.GetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &pb);
-        gl.ClientWaitSync(probe_slot[o].fence, 0, 0);
         gl.DeleteSync(probe_slot[o].fence);
         gl.BindBuffer(GL_PIXEL_PACK_BUFFER, probe_pbo[o]);
         const unsigned char *b = gl.MapBufferRange(GL_PIXEL_PACK_BUFFER, 0, PROBE_MAX * 4, GL_MAP_READ_BIT);

@@ -200,6 +200,8 @@ uint32_t   guest_symbol(const char *name);
 int        guest_override(const char *name, HleHandler fn);
 int        guest_override_va(const char *name, uint32_t va, HleHandler fn);
 HleHandler guest_find_override(uint32_t va);
+int        guest_find_override_index(uint32_t va);
+HleHandler guest_override_at(int i);
 void       hle_register_vidmode(void);
 void       hle_register_matrix(void);
 void       hle_register_console(void);

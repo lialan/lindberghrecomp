@@ -54,6 +54,8 @@ int guest_override_va(const char *name, uint32_t va, HleHandler fn)
         fprintf(stderr, "[override] table full, %s not installed\n", name);
         return 0;
     }
+    extern void dispatch_cache_clear(void);
+    dispatch_cache_clear();
     g_ov[g_ov_n].va = va;
     g_ov[g_ov_n].fn = fn;
     g_ov[g_ov_n].name = name;
@@ -70,6 +72,16 @@ HleHandler guest_find_override(uint32_t va)
         if (g_ov[i].va == va) return g_ov[i].fn;
     return NULL;
 }
+
+/* For dispatch's cache: an override by its index (-1: none) */
+int guest_find_override_index(uint32_t va)
+{
+    if (va < g_ov_lo || va > g_ov_hi) return -1;
+    for (int i = 0; i < g_ov_n; i++)
+        if (g_ov[i].va == va) return i;
+    return -1;
+}
+HleHandler guest_override_at(int i) { return g_ov[i].fn; }
 
 uint32_t guest_override_lo(void) { return g_ov_lo; }
 uint32_t guest_override_hi(void) { return g_ov_hi; }

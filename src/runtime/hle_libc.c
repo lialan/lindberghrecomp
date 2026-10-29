@@ -19,6 +19,7 @@
  * mapped where it was linked, so a guest pointer IS a host pointer.
  */
 
+#include <pthread.h>
 #include <ctype.h>
 #include <math.h>
 #include <stdio.h>
@@ -628,6 +629,22 @@ static void h_time(CPU *c)
 }
 static void h_gettimeofday(CPU *c)
 {
+    {   /* LINDBERGH_TIME_LOG=1: how often the game asks, per frame */
+        static int on = -1; static unsigned n, f0; extern unsigned g_frame;
+        if (on < 0) { const char *v = getenv("LINDBERGH_TIME_LOG"); on = v && *v == '1'; }
+        static uint32_t from[64]; static unsigned cnt[64];
+        if (on) {
+            uint32_t ra = rd32(c->esp - 4);   /* the return address, just popped */
+            int k = 0; while (k < 64 && from[k] && from[k] != ra) k++;
+            if (k < 64) { from[k] = ra; cnt[k]++; }
+        }
+        if (on && ++n && g_frame - f0 >= 300) {
+            fprintf(stderr, "[time] gettimeofday %.1f per frame, from", n / 300.0);
+            for (int i = 0; i < 64 && from[i]; i++) { if (cnt[i] > 1000) fprintf(stderr, " %#x:%u", from[i], cnt[i]); cnt[i] = 0; }
+            fprintf(stderr, " (thread %lu)\n", (unsigned long)pthread_self());
+            n = 0; f0 = g_frame;
+        }
+    }
     struct timespec ts;
     timespec_get(&ts, TIME_UTC);
     if (A32(0)) {
