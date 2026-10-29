@@ -547,6 +547,14 @@ static void h_dipsw_get(CPU *c)
     RET(0);
 }
 
+static int region_value(void)
+{
+    const char *v = getenv("LINDBERGH_REGION");
+    if (v && *v) return atoi(v);
+    return g_country ? 1 : 0;
+}
+static void h_region(CPU *c) { RET(region_value()); }
+
 void hle_register_sega(void)
 {
     int n = 0;
@@ -632,6 +640,12 @@ void hle_register_sega(void)
         if (guest_override("_Z25get_arcade_region_countryv", h_country)) {
             n++;
             fprintf(stderr, "[sega] country %d (%s)\n", g_country, g_country ? "English" : "Japanese");
+        }
+        /* The House of the Dead 4 asks CConfigMgr::GetRegion - 0 Japan,
+         * 1 USA, 2 export - and shows English for anything but Japan. */
+        if (guest_override("_ZN10CConfigMgr9GetRegionEv", h_region)) {
+            n++;
+            fprintf(stderr, "[sega] region %d\n", region_value());
         }
     }
 

@@ -220,7 +220,9 @@ static void cabinet_autostart(void)
      * The House of the Dead 4 takes two to start. */
     static int want = -1;
     if (want < 0) want = env_int("LINDBERGH_AUTOSTART", 1);
-    if (!coined && g_frame > 240 && g_frame % 60u == 0) {
+    static unsigned last_coin_frame;
+    if (!coined && g_frame > 240 && g_frame % 60u == 0 && g_frame != last_coin_frame) {
+        last_coin_frame = g_frame;
         g_cab.coins[0]++;
         fprintf(stderr, "[cab] autostart: coin inserted at frame %u\n", g_frame);
         static int n;
@@ -293,6 +295,13 @@ void host_cabinet_input(CabinetInput *out)
             lx = out->gun_x; ly = out->gun_y;
         }
     }
+}
+
+/* The buttons the board would report now, without the bookkeeping of a read:
+ * for a game hook that needs one switch (a gun's reload) between reads. */
+unsigned host_cabinet_buttons(void)
+{
+    return g_auto | (g_scripted ? 0 : g_held | g_cab_latch);
 }
 
 /* The board has reported the switches: latched taps have been seen. */
