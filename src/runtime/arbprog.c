@@ -847,6 +847,18 @@ static char *translate(int stage, const char *src_in, Tr *t)
     t->stage = stage;
     t->env_hi = t->local_hi = -1;
     char *src = strdup(src_in);
+    {   /* "texture [2]": the grammar allows space before a subscript; the
+         * parsers below expect none (the plane's air shimmer was rejected) */
+        char *w = src;
+        for (char *r = src; *r; r++) {
+            if (*r == ' ' || *r == '\t') {
+                char *q = r; while (*q == ' ' || *q == '\t') q++;
+                if (*q == '[') { r = q - 1; continue; }
+            }
+            *w++ = *r;
+        }
+        *w = 0;
+    }
     char *p = src;
     while (*p && *p != '\n') p++;              /* drop the !!ARBxp1.0 line */
     static Stmt st[4096];
@@ -989,11 +1001,11 @@ static char *translate(int stage, const char *src_in, Tr *t)
         for (int m = 0; m < t->nmat; m++) bput(&g, "uniform vec4 %s_m%d[4];\n", P, m);
 #ifdef LINDBERGH_GL4ES
         /* multiview: one matrix per view, and render targets as two layers */
-        if (!stage && !t->nmat) bput(&g, gl4es_mv_shaders ? "uniform mat4 u_reproj[2];\n" : "uniform mat4 u_reproj;\n");
+        if (!stage && !t->nmat && !t->pos_invariant) bput(&g, gl4es_mv_shaders ? "uniform mat4 u_reproj[2];\n" : "uniform mat4 u_reproj;\n");
         const char *sty[] = { "", "sampler1D s1_", "sampler2D s2_", "sampler3D s3_",
                               "samplerCube sc_", gl4es_mv_shaders ? "sampler2DArray sr_" : "sampler2D sr_" };
 #else
-        if (!stage && !t->nmat) bput(&g, "uniform mat4 u_reproj;\n");
+        if (!stage && !t->nmat && !t->pos_invariant) bput(&g, "uniform mat4 u_reproj;\n");
         static const char *const sty[] = { "", "sampler1D s1_", "sampler2D s2_", "sampler3D s3_",
                                            "samplerCube sc_", "sampler2DRect sr_" };
 #endif
@@ -1024,10 +1036,10 @@ static char *translate(int stage, const char *src_in, Tr *t)
              * eye's (stereo.c; identity when not in stereo). */
 #ifdef LINDBERGH_GL4ES
             /* multiview: gl4es clips to the game's screen from gl4es_mvPre */
-            if (!t->nmat && gl4es_mv_shaders) bput(&g, "  gl4es_mvPre = gl_Position;\n  gl_Position = u_reproj[gl_ViewID_OVR] * gl_Position;\n");
+            if (!t->nmat && !t->pos_invariant && gl4es_mv_shaders) bput(&g, "  gl4es_mvPre = gl_Position;\n  gl_Position = u_reproj[gl_ViewID_OVR] * gl_Position;\n");
             else
 #endif
-            if (!t->nmat) bput(&g, "  gl_Position = u_reproj * gl_Position;\n");
+            if (!t->nmat && !t->pos_invariant) bput(&g, "  gl_Position = u_reproj * gl_Position;\n");
         } else {
             if (t->fog_mode) {
                 const char *f = t->fog_mode == 1 ? "(gl_Fog.end - gl_FogFragCoord) * gl_Fog.scale" :
@@ -1222,6 +1234,7 @@ static Linked *link_pair(GLuint vid, GLuint fid)
             pp[st]->failed = 1;
             fprintf(stderr, "[arb] %s program %u not translated (%s); using the driver's path\n",
                     st ? "fragment" : "vertex", ids[st], t.err);
+            if (g_dump > 0) fprintf(stderr, "[arb] its source:\n%s\n", pp[st]->src);
             l->ok = 0;
             return l;
         }

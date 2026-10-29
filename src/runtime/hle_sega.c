@@ -17,6 +17,7 @@
  */
 
 #include <stdio.h>
+#include <time.h>
 #include <string.h>
 
 #include "lindbergh_rt.h"
@@ -540,8 +541,20 @@ static void h_idle_wait(CPU *c)
     memcpy(&now, &t, 4);
     wr32(FRAME_TARGET_VA, now);
     push32(c, 0xDEADBEEFu);                 /* the return slot its ret pops */
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
     g_idle_wait(c);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
     wr32(FRAME_TARGET_VA, keep);
+    {   /* headroom: how long the frame waited, for the 5-second report */
+        static double sum, lo = 1e9; static unsigned n, tight;
+        double ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+        sum += ms; if (ms < lo) lo = ms; if (ms < 1.0) tight++;
+        if (++n == 300) {
+            fprintf(stderr, "[idle] frame wait: mean %.1f ms, least %.1f ms, under 1 ms %u of 300\n", sum / n, lo, tight);
+            sum = 0; lo = 1e9; n = 0; tight = 0;
+        }
+    }
 }
 static int pace_by_display(void)
 {
@@ -591,9 +604,91 @@ static int widen_culling(void)
     return guest_override("_Z30dxMakePerspectiveViewingVolumeffff", h_view_volume);
 }
 
+/* LINDBERGH_GOD=1: the player takes no damage - for test runs that must
+ * reach the end of a mission. */
+static void h_no_damage(CPU *c) { RET(0); }
+
+/* The player's route. A mission is a chain of routes (a static table of 76,
+ * each a path, the next route and an area); the player's record holds the
+ * current one. LINDBERGH_ROUTE_LOG=1 reports each change; LINDBERGH_ROUTE=N
+ * puts the player on route N a second into the mission - a jump, e.g. to
+ * a mission's last scene. */
+#define PLAYER0_VA   0x086617e0u
+#define ROUTE_TABLE  0x08276ea0u
+static void (*g_game_loop)(CPU *);
+static int g_route_jump = -1, g_route_log;
+static int player_route(void)
+{
+    uint32_t pw = rd32(PLAYER0_VA + 0xf4);
+    if (!pw) return -1;
+    uint32_t r = rd32(pw + 0x100);
+    for (int i = 0; r && i < 76; i++) if (rd32(ROUTE_TABLE + 4u * i) == r) return i;
+    return -1;
+}
+static void h_game_loop(CPU *c)
+{
+    static int last = -2, loops;
+    extern unsigned g_frame;
+    int r = player_route();
+    if (g_route_log && r != last)
+        fprintf(stderr, "[route] frame %u: route %d (path %d, area %d)\n", g_frame, r,
+                r >= 0 ? (int)rd32(rd32(ROUTE_TABLE + 4u * r) + 4) : -1, r >= 0 ? (int)rd32(rd32(ROUTE_TABLE + 4u * r) + 16) : -1);
+    last = r;
+    if (r >= 0) loops++; else loops = 0;
+    if (g_route_jump >= 0 && loops == 60) {
+        uint32_t fn = guest_symbol("_Z19set_player_route_idii");
+        uint32_t a[2] = { 0, (uint32_t)g_route_jump };
+        uint32_t ok = fn ? guest_call(c, fn, a, 2) : 0;
+        uint32_t path = rd32(rd32(PLAYER0_VA + 0xf4) + 0x108);    /* its path: start and end frame */
+        int p0 = path ? (int)rd32(path) : 0, p1 = path ? (int)rd32(path + 4) : 0;
+        fprintf(stderr, "[route] frame %u: jumped to route %d (%s), its path frames %d..%d\n", g_frame, g_route_jump, ok ? "ok" : "refused", p0, p1);
+        g_route_jump = -1;
+        const char *pf = getenv("LINDBERGH_PATHFRAME");   /* and this far along it (negative: from its end) */
+        uint32_t fs = guest_symbol("_Z20set_player_pathframeif");
+        if (ok && pf && *pf && fs) {
+            float f = (float)atof(pf);
+            f += f < 0 ? p1 : p0;
+            uint32_t b2[2] = { 0, 0 };
+            memcpy(&b2[1], &f, 4);
+            guest_call(c, fs, b2, 2);
+            fprintf(stderr, "[route] frame %u: path frame set to %.0f\n", g_frame, f);
+        }
+    }
+    {   /* LINDBERGH_SHIMMER=<strength>: the plane finale's air shimmer, in any scene - for testing it */
+        static float sh = -1;
+        if (sh < 0) { const char *v = getenv("LINDBERGH_SHIMMER"); sh = v && *v ? (float)atof(v) : 0; }
+        if (sh > 0 && loops >= 60) {
+            uint32_t g = guest_symbol("_Z12efcSetGlobaliifPv"), w = guest_symbol("_Z17efcSetShimmerWarpf");
+            float one = 1.0f; uint32_t a[4] = { 7, 1, 0, 0 }, b1[1];
+            memcpy(&a[2], &one, 4); memcpy(&b1[0], &sh, 4);
+            if (loops == 60 && g) fprintf(stderr, "[sega] shimmer on: %u\n", guest_call(c, g, a, 4));
+            if (w) guest_call(c, w, b1, 1);
+        }
+    }
+    push32(c, 0xDEADBEEFu);
+    g_game_loop(c);
+}
+static int watch_route(void)
+{
+    const char *j = getenv("LINDBERGH_ROUTE"), *l = getenv("LINDBERGH_ROUTE_LOG");
+    g_route_log = l && *l == '1';
+    if (j && *j) g_route_jump = atoi(j);
+    if (!g_route_log && g_route_jump < 0 && !getenv("LINDBERGH_SHIMMER")) return 0;
+    uint32_t va = guest_symbol("_Z8GameLoopP8GAMEWORK");
+    extern void (*dispatch_lifted(uint32_t va))(CPU *);
+    if (!va || !(g_game_loop = dispatch_lifted(va))) return 0;
+    return guest_override("_Z8GameLoopP8GAMEWORK", h_game_loop);
+}
+
 void hle_register_sega(void)
 {
     int n = 0;
+    if (watch_route()) fprintf(stderr, "[sega] route log/jump on\n");
+    {
+        const char *g = getenv("LINDBERGH_GOD");
+        if (g && *g == '1' && guest_override("_Z26check_player_damage_enablei", h_no_damage))
+            fprintf(stderr, "[sega] the player takes no damage (LINDBERGH_GOD)\n");
+    }
     if (widen_culling()) fprintf(stderr, "[sega] model culling widened to %.0f degrees\n", g_cull_fov);
 #if defined(__ANDROID__)
     if (pace_by_display()) fprintf(stderr, "[sega] idle_wait_func: paced by the headset, not the wall clock\n");

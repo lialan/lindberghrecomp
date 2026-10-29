@@ -1122,7 +1122,9 @@ void xr_frame_end(void)
             } else
                 gl.BlitFramebuffer(0, 0, (GLint)e->w, (GLint)e->h, 0, 0, (GLint)e->w, (GLint)e->h,
                                    GL_COLOR_BUFFER_BIT, GL_NEAREST);
-            if (i == 0 && g_frame % 600 == 300) {
+            static int colour_check = -1;   /* LINDBERGH_COLOUR_CHECK=1: reading back stalls the GPU, a hitch each time */
+            if (colour_check < 0) { const char *v = getenv("LINDBERGH_COLOUR_CHECK"); colour_check = v && *v == '1'; }
+            if (colour_check && i == 0 && g_frame % 600 == 300) {
                 /* the game's centre pixel, and what the copy stored in the
                  * swapchain: equal unless the copy encoded it as sRGB again */
                 unsigned char a[4] = { 0 }, b[4] = { 0 };

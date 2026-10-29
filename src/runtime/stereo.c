@@ -1390,13 +1390,15 @@ static void glprof_frame(void)
     double now = now_ns(), all = g_frame_t0 ? now - g_frame_t0 : 0, gl = 0;
     unsigned best = 0;
     for (unsigned i = 0; i < HLE_COUNT; i++) { gl += g_frame_ns[i]; if (g_frame_ns[i] > g_frame_ns[best]) best = i; }
-    if (all > 40e6)
+    static double slow = -1;            /* LINDBERGH_GLPROF_SLOW=<ms>: which frames to name (40) */
+    if (slow < 0) { const char *v = getenv("LINDBERGH_GLPROF_SLOW"); slow = (v && *v ? atof(v) : 40) * 1e6; }
+    if (all > slow)
         fprintf(stderr, "[glprof] frame %u took %.0f ms, GL %.0f ms of it, most in %s (%.0f ms)\n", g_frame,
                 all / 1e6, gl / 1e6, hle_name((HleId)best), g_frame_ns[best] / 1e6);
 #ifdef LINDBERGH_GL4ES
     {   /* buffer uploads: the driver's, and gl4es' own copy */
         extern double gl4es_drawprof[4], gl4es_bufprof_copy, gl4es_bufprof_bytes;
-        if (all > 40e6 && gl4es_bufprof_bytes > 0)
+        if (all > slow && gl4es_bufprof_bytes > 0)
             fprintf(stderr, "[glprof]   buffers: %.1f MB, driver %.0f ms, gl4es' copy %.0f ms\n",
                     gl4es_bufprof_bytes / 1e6, gl4es_drawprof[3] / 1e6, gl4es_bufprof_copy / 1e6);
         gl4es_bufprof_bytes = gl4es_bufprof_copy = gl4es_drawprof[3] = 0;
@@ -1464,6 +1466,22 @@ static void stereo_gl_call(CPU *c, HleId id, HleHandler fn)
 
 static void stereo_gl_call_inner(CPU *c, HleId id, HleHandler fn)
 {
+    {   /* A render target drawn larger still reports the size the game made
+         * it: the plane's air shimmer builds its lookups from the size it is
+         * told, in texels, which the lookups then scaled a second time. */
+        static signed char tlp[HLE_COUNT];
+        if (!tlp[id]) tlp[id] = strcmp(hle_name(id), "glGetTexLevelParameteriv") ? 2 : 1;
+        if (tlp[id] == 1 && g_on && A32(0) == GL_TEXTURE_RECTANGLE_ARB && A32(1) == 0 &&
+            (A32(2) == GL_TEXTURE_WIDTH || A32(2) == GL_TEXTURE_HEIGHT)) {
+            GLint b = 0;
+            glGetIntegerv(0x84F6 /* GL_TEXTURE_BINDING_RECTANGLE_ARB */, &b);
+            for (unsigned i = 0; b && i < g_nscaled; i++)
+                if (g_scaled[i] == (GLuint)b) {
+                    wr32(A32(3), (uint32_t)(A32(2) == GL_TEXTURE_WIDTH ? g_scaled_w[i] : g_scaled_h[i]));
+                    return;
+                }
+        }
+    }
     if ((long)g_frame == g_map_frame) {
         uint32_t a[6]; for (int i = 0; i < 6; i++) a[i] = A32(i);
         const char *nm = hle_name(id);
