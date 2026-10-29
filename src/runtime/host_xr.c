@@ -764,20 +764,22 @@ int xr_init(void)
     li.applicationVM = vm; li.applicationContext = activity;
     XRCHECK(init((XrLoaderInitInfoBaseHeaderKHR *)&li));
 
-    const char *ext[4] = { XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME, XR_KHR_OPENGL_ES_ENABLE_EXTENSION_NAME };
+    const char *ext[5] = { XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME, XR_KHR_OPENGL_ES_ENABLE_EXTENSION_NAME };
     uint32_t next = 2, n = 0;
     xrEnumerateInstanceExtensionProperties(NULL, 0, &n, NULL);
     XrExtensionProperties *props = calloc(n ? n : 1, sizeof *props);
     for (uint32_t i = 0; i < n; i++) props[i].type = XR_TYPE_EXTENSION_PROPERTIES;
     xrEnumerateInstanceExtensionProperties(NULL, n, &n, props);
-    int have_rate = 0, have_perf = 0;
+    int have_rate = 0, have_perf = 0, have_thread = 0;
     for (uint32_t i = 0; i < n; i++) {
+        if (!strcmp(props[i].extensionName, XR_KHR_ANDROID_THREAD_SETTINGS_EXTENSION_NAME)) have_thread = 1;
         if (!strcmp(props[i].extensionName, XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME)) have_rate = 1;
         if (!strcmp(props[i].extensionName, XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME)) have_perf = 1;
     }
     free(props);
     if (have_rate) ext[next++] = XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME;
     if (have_perf) ext[next++] = XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME;
+    if (have_thread) ext[next++] = XR_KHR_ANDROID_THREAD_SETTINGS_EXTENSION_NAME;
 
     XrInstanceCreateInfoAndroidKHR ai = { XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR };
     ai.applicationVM = vm; ai.applicationActivity = activity;
@@ -824,6 +826,15 @@ int xr_init(void)
     if (set_perf_level) {
         XrResult r = set_perf_level(session, XR_PERF_SETTINGS_DOMAIN_CPU_EXT, XR_PERF_SETTINGS_LEVEL_SUSTAINED_HIGH_EXT);
         fprintf(stderr, "[xr] CPU at sustained high clocks: %s\n", XR_SUCCEEDED(r) ? "yes" : "refused");
+    }
+    /* That thread is also the one that renders: registered as the
+     * renderer, the runtime schedules it ahead of other work - the hitches
+     * left are a frame now and then losing its core for a few ms. */
+    if (have_thread) {
+        PFN_xrSetAndroidApplicationThreadKHR set_thread = NULL;
+        xrGetInstanceProcAddr(instance, "xrSetAndroidApplicationThreadKHR", (PFN_xrVoidFunction *)&set_thread);
+        XrResult r = set_thread ? set_thread(session, XR_ANDROID_THREAD_TYPE_RENDERER_MAIN_KHR, (uint32_t)gettid()) : XR_ERROR_FUNCTION_UNSUPPORTED;
+        fprintf(stderr, "[xr] game thread %d registered as the renderer: %s\n", (int)gettid(), XR_SUCCEEDED(r) ? "yes" : "refused");
     }
 
     XrReferenceSpaceCreateInfo rc = { XR_TYPE_REFERENCE_SPACE_CREATE_INFO };
