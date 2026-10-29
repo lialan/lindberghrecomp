@@ -491,6 +491,14 @@ static void pump(void)
             fprintf(stderr, "[window] closed by the user\n");
             host_quit();
         case SDL_WINDOWEVENT:
+#if defined(__APPLE__)
+            /* SDL refreshes the GL context on a resize, which can drop the
+             * fixed drawable size: pin it again */
+            if (e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED && g_win.gl) {
+                fprintf(stderr, "[window] resized to %dx%d\n", e.window.data1, e.window.data2);
+                host_mac_fix_surface(g_win.win, g_win.w, g_win.h);
+            }
+#endif
             if (e.window.event == SDL_WINDOWEVENT_FOCUS_GAINED) fprintf(stderr, "[window] focus gained\n");
             if (e.window.event == SDL_WINDOWEVENT_FOCUS_LOST)   fprintf(stderr, "[window] focus lost\n");
             if (e.window.event == SDL_WINDOWEVENT_ENTER) { fprintf(stderr, "[window] pointer entered\n"); g_pointer_in = 1; }
@@ -731,6 +739,12 @@ static double since_mark(void)
 
 void host_swap(void)
 {
+    {   /* LINDBERGH_RESIZE_AT=frame,WxH: resize the window then - a test */
+        static int at = -1, rw, rh;
+        if (at < 0) { const char *v = getenv("LINDBERGH_RESIZE_AT"); at = 0;
+                      if (v) sscanf(v, "%d,%dx%d", &at, &rw, &rh); }
+        if (at && g_frame == (unsigned)at && g_win.win) SDL_SetWindowSize(g_win.win, rw, rh);
+    }
 #if defined(__ANDROID__)
     g_t_game += since_mark();
     stereo_frame_end();                 /* the second eye, then both to the headset */
