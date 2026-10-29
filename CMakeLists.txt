@@ -54,6 +54,7 @@ function(lindbergh_runtime target generated_dir)
             "${LINDBERGH_RUNTIME_DIR}/host_settings.c"
             "${LINDBERGH_RUNTIME_DIR}/hle_gl_posix.c"
             "${LINDBERGH_RUNTIME_DIR}/arbprog.c"
+            "${LINDBERGH_RUNTIME_DIR}/glsl_pp.c"
             "${LINDBERGH_RUNTIME_DIR}/stereo.c"
             "${LINDBERGH_RUNTIME_DIR}/hle_openal.c"
             "${LINDBERGH_RUNTIME_DIR}/hle_glx_posix.c"

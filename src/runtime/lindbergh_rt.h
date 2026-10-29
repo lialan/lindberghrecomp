@@ -95,6 +95,13 @@ typedef void (*GlHook)(CPU *c, HleId id, HleHandler fn);
 extern GlHook g_gl_hook;
 extern unsigned char g_gl_ids[];
 
+/* GL entry points a game fetches by name (glXGetProcAddressARB) instead of
+ * importing get ids of their own after the imports' - HLE_COUNT up to
+ * HLE_ID_MAX - so the hook sees calls through them too, by the same name. */
+#define HLE_NAMED_MAX 512
+#define HLE_ID_MAX (HLE_COUNT + HLE_NAMED_MAX)
+HleId hle_named_id(const char *name);   /* HLE_ID_MAX when out of room */
+
 /* The PLT stub address for a named import, or 0. What glXGetProcAddressARB
  * hands back, so the guest's indirect call through it routes like any other. */
 uint32_t hle_plt_address(const char *name);

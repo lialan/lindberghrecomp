@@ -21,9 +21,23 @@
 static const char *const g_names[] = { HLE_IMPORTS(HLE_NAME) SOLIB_IMPORTS(HLE_NAME) };
 #undef HLE_NAME
 
+static const char *g_named_ids[HLE_NAMED_MAX];
+static unsigned g_nnamed_ids;
+
+HleId hle_named_id(const char *name)
+{
+    for (unsigned i = 0; i < g_nnamed_ids; i++)
+        if (strcmp(g_named_ids[i], name) == 0) return (HleId)(HLE_COUNT + i);
+    if (g_nnamed_ids == HLE_NAMED_MAX) return (HleId)HLE_ID_MAX;
+    g_named_ids[g_nnamed_ids] = strdup(name);
+    return (HleId)(HLE_COUNT + g_nnamed_ids++);
+}
+
 const char *hle_name(HleId id)
 {
-    return (unsigned)id < HLE_COUNT ? g_names[id] : "<bad id>";
+    if ((unsigned)id < HLE_COUNT) return g_names[id];
+    if ((unsigned)id < HLE_COUNT + g_nnamed_ids) return g_named_ids[id - HLE_COUNT];
+    return "<bad id>";
 }
 
 HleHandler g_hle_handlers[HLE_COUNT];

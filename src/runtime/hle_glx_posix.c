@@ -22,6 +22,7 @@
 #include <string.h>
 
 #include "gl_posix.h"
+#include "stereo.h"
 
 /* Tokens for things the game only hands back. Distinctive in a crash dump. */
 #define TOK_WINDOW   0x58570001u      /* "XW" */
@@ -89,7 +90,7 @@ static int ensure_window(void)
 
 /* ---- pbuffers ---- */
 #define MAX_PB 32
-static struct { GLuint fb, color, depth; int w, h; } g_pb[MAX_PB];
+static struct { GLuint fb, color, depth; int w, h, depth_tex; } g_pb[MAX_PB];
 
 static int pb_index(uint32_t tok)
 {
@@ -124,16 +125,29 @@ static void h_glXCreatePbuffer(CPU *c)
     glGetIntegerv(GL_RENDERBUFFER_BINDING, &prev_rb);
     glGenFramebuffers(1, &g_pb[i].fb);
     glGenTextures(1, &g_pb[i].color);
-    glGenRenderbuffers(1, &g_pb[i].depth);
     glBindTexture(GL_TEXTURE_2D, g_pb[i].color);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-    glBindRenderbuffer(GL_RENDERBUFFER, g_pb[i].depth);
-    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, w, h);
     glBindFramebuffer(GL_FRAMEBUFFER, g_pb[i].fb);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_pb[i].color, 0);
+#ifdef LINDBERGH_GL4ES
+    /* In the headset gl4es draws both eyes at once into two-layer copies of
+     * the textures a framebuffer has; a renderbuffer has one layer, and the
+     * pair was incomplete. Depth and stencil are a texture too. */
+    glGenTextures(1, &g_pb[i].depth);
+    glBindTexture(GL_TEXTURE_2D, g_pb[i].depth);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, w, h, 0, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, NULL);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, g_pb[i].depth, 0);
+    g_pb[i].depth_tex = 1;
+#else
+    glGenRenderbuffers(1, &g_pb[i].depth);
+    glBindRenderbuffer(GL_RENDERBUFFER, g_pb[i].depth);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, w, h);
     glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, g_pb[i].depth);
     glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, g_pb[i].depth);
+#endif
     GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
     glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prev_fb);
     glBindTexture(GL_TEXTURE_2D, (GLuint)prev_tex);
@@ -150,7 +164,8 @@ static void h_glXDestroyPbuffer(CPU *c)
     if (i < 0) return;
     glDeleteFramebuffers(1, &g_pb[i].fb);
     glDeleteTextures(1, &g_pb[i].color);
-    glDeleteRenderbuffers(1, &g_pb[i].depth);
+    if (g_pb[i].depth_tex) glDeleteTextures(1, &g_pb[i].depth);
+    else glDeleteRenderbuffers(1, &g_pb[i].depth);
     memset(&g_pb[i], 0, sizeof g_pb[i]);
 }
 
@@ -184,11 +199,24 @@ static void h_glXDestroyContext(CPU *c) { (void)c; }
  * changes is the drawable, which picks the framebuffer. */
 static void h_glXMakeCurrent(CPU *c)
 {
+    {   /* LINDBERGH_FRAMEMAP: which drawable the frame's draws go to */
+        static long map = -2;
+        if (map == -2) { const char *v = getenv("LINDBERGH_FRAMEMAP"); map = v && *v ? atol(v) : -1; }
+        extern unsigned g_frame;
+        if ((long)g_frame == map || (long)g_frame == map + 1)
+            fprintf(stderr, "[map] frame %u glXMakeCurrent drawable %#x context %#x\n", g_frame, A32(1), A32(2));
+    }
     if (!A32(2)) { RET(1); return; }
     if (!ensure_window()) { RET(0); return; }
     int i = pb_index(A32(1));
     g_drawable_pb = i > 0 ? i : 0;
-    glBindFramebuffer(GL_FRAMEBUFFER, i > 0 ? g_pb[i].fb : 0);
+    /* In the headset a pbuffer is the eyes too. The House of the Dead 4
+     * draws its whole 3D scene into one, copies it into a texture and draws
+     * that over the window under its HUD: drawn into the eyes directly, the
+     * scene is seen from each of them, and stereo.c leaves out the copy laid
+     * back over it. */
+    if (stereo_enabled()) stereo_bind_window();
+    else glBindFramebuffer(GL_FRAMEBUFFER, i > 0 ? g_pb[i].fb : 0);
     {
         static int said;
         if (!said++) fprintf(stderr, "[glX] context current\n");

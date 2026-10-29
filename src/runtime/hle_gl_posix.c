@@ -16,6 +16,7 @@
 
 #include "gl_posix.h"
 #include "arbprog.h"
+#include "glsl_pp.h"
 #include "stereo.h"
 
 int g_gl_trace;
@@ -371,11 +372,40 @@ static void h_glCompileShaderARB(CPU *c)
     glCompileShader(sh);
     GLint ok = 0;
     glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+    {   /* LINDBERGH_SHADER_DUMP_ALL=<dir>: every shader's source, as compiled */
+        const char *dir = getenv("LINDBERGH_SHADER_DUMP_ALL");
+        GLint len = 0;
+        if (dir && *dir) glGetShaderiv(sh, GL_SHADER_SOURCE_LENGTH, &len);
+        char *all = len > 0 ? malloc((size_t)len + 1) : NULL;
+        if (all) {
+            char path[1024];
+            GLint type = 0;
+            glGetShaderiv(sh, GL_SHADER_TYPE, &type);
+            glGetShaderSource(sh, len + 1, NULL, all);
+            snprintf(path, sizeof path, "%s/%s_%u.glsl", dir, type == GL_VERTEX_SHADER ? "vs" : "fs", sh);
+            FILE *f = fopen(path, "w");
+            if (f) { fputs(all, f); fclose(f); }
+            free(all);
+        }
+    }
     if (!ok) {
         char log[2048] = "", src[400] = "";
         glGetShaderInfoLog(sh, sizeof log, NULL, log);
         glGetShaderSource(sh, sizeof src, NULL, src);
         fprintf(stderr, "[gl] shader %u failed to compile: %s\n  source starts: %.200s\n", sh, log, src);
+        /* LINDBERGH_SHADER_DUMP=<dir>: the whole source, as shader_<n>.glsl */
+        const char *dir = getenv("LINDBERGH_SHADER_DUMP");
+        GLint len = 0;
+        glGetShaderiv(sh, GL_SHADER_SOURCE_LENGTH, &len);
+        char *all = dir && *dir && len > 0 ? malloc((size_t)len + 1) : NULL;
+        if (all) {
+            char path[1024];
+            glGetShaderSource(sh, len + 1, NULL, all);
+            snprintf(path, sizeof path, "%s/shader_%u.glsl", dir, sh);
+            FILE *f = fopen(path, "w");
+            if (f) { fputs(all, f); fprintf(f, "\n/* %s */\n", log); fclose(f); }
+            free(all);
+        }
     }
 }
 
@@ -464,7 +494,27 @@ static void h_glShaderSourceARB(CPU *c)
     }
     host[0] = has_version ? "" : "#version 120\n";
     hl[0] = (GLint)strlen(host[0]);
+#ifdef LINDBERGH_GL4ES
+    /* GLSL ES rejects an #if on a name that is not a macro, which desktop
+     * GLSL reads as 0: the conditionals are decided here (glsl_pp.c) */
+    {
+        size_t total = 1;
+        for (GLsizei i = 0; i <= n; i++) total += (size_t)hl[i];
+        char *all = malloc(total), *w = all;
+        for (GLsizei i = 0; i <= n; i++) { memcpy(w, host[i], (size_t)hl[i]); w += hl[i]; }
+        *w = 0;
+        if (glsl_has_conditionals(all)) {
+            char *done = glsl_resolve_conditionals(all);
+            free(all);
+            all = done;
+        }
+        const GLchar *one = all;
+        glShaderSource(sh, 1, &one, NULL);
+        free(all);
+    }
+#else
     glShaderSource(sh, n + 1, host, hl);
+#endif
     for (GLsizei i = 0; i < n; i++) free(copy[i]);
 }
 

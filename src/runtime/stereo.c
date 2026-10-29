@@ -52,6 +52,8 @@ int gl4es_multiview_enable(void);
 void gl4es_multiview_set(const float m[3][16], int clip);
 unsigned gl4es_multiview_array(unsigned texture);
 int gl4es_multiview_read(unsigned texture, GLenum target, int layer, void *out);
+int gl4es_multiview_copy(unsigned src, int layer, int sx0, int sy0, int sx1, int sy1,
+                         unsigned dst, int level, int dx0, int dy0, int dx1, int dy1);
 extern int gl4es_mv_trace;
 void gl4es_multiview_read_pixel(int x, int y, unsigned char out[4]);
 #endif
@@ -666,7 +668,7 @@ enum {
     K_OTHER, K_BINDFB, K_VIEWPORT, K_SCISSOR, K_FBTEX2D, K_ACTIVETEX, K_BINDTEX, K_ENABLE, K_DISABLE,
     K_DRAWARRAYS, K_DRAWELEMENTS, K_DRAWOTHER, K_BEGIN, K_END, K_MATRIXMODE,
     K_LOADID, K_LOADMATRIX, K_MULTMATRIX, K_ORTHO, K_ORTHO2D, K_FRUSTUM, K_PERSPECTIVE,
-    K_PUSHMATRIX, K_POPMATRIX, K_TRANSLATE, K_SCALE, K_GETINTEGERV, K_GETFLOATV, K_GETOTHER, K_UNMAP, K_CLEAR,
+    K_PUSHMATRIX, K_POPMATRIX, K_TRANSLATE, K_SCALE, K_GETINTEGERV, K_GETFLOATV, K_GETOTHER, K_UNMAP, K_CLEAR, K_COPYTEXSUB, K_COPYTEX,
 };
 typedef struct {
     uint8_t ok, kind, live, track;          /* live: run, never recorded; track: client array state */
@@ -674,7 +676,7 @@ typedef struct {
     uint8_t pkind;                          /* 0: pbytes; 1: glBufferData's size; 2: glBufferSubData's */
     uint32_t pbytes;
 } Cls;
-static Cls g_cls[HLE_COUNT];
+static Cls g_cls[HLE_ID_MAX];
 
 /* ---- the game's menu screens ----
  * The menus are 3D: panels, the soldier and his rifle, all drawn with the
@@ -782,11 +784,12 @@ static const Cls *cls(HleId id)
         { "glTranslatef", K_TRANSLATE }, { "glScalef", K_SCALE },
         { "glGetIntegerv", K_GETINTEGERV }, { "glGetFloatv", K_GETFLOATV },
         { "glUnmapBufferARB", K_UNMAP }, { "glUnmapBuffer", K_UNMAP }, { "glClear", K_CLEAR },
+        { "glCopyTexSubImage2D", K_COPYTEXSUB }, { "glCopyTexImage2D", K_COPYTEX },
     };
     k->kind = K_OTHER;
     for (unsigned i = 0; i < sizeof T / sizeof T[0]; i++)
         if (!strcmp(n, T[i].name)) { k->kind = T[i].kind; break; }
-    if (k->kind == K_OTHER && !strncmp(n, "glDraw", 6)) k->kind = K_DRAWOTHER;
+    if (k->kind == K_OTHER && (!strncmp(n, "glDraw", 6) || !strncmp(n, "glMultiDraw", 11))) k->kind = K_DRAWOTHER;
     if (k->kind == K_OTHER && !strncmp(n, "glGet", 5)) k->kind = K_GETOTHER;
     k->live = (uint8_t)live_only(n);
     k->track = !strcmp(n, "glEnableClientState") || !strcmp(n, "glDisableClientState") ||
@@ -959,10 +962,73 @@ static int weapon_draw(void)
     return 1;
 }
 
+/* ---- copies of the window ----
+ * A game without framebuffer objects (The House of the Dead 4) draws into
+ * the window and copies what it drew into textures, glCopyTexSubImage2D:
+ * a small copy of the scene for its glare, the whole picture to draw back
+ * over itself through its screen filters. The window is the eyes here, at
+ * the eye's resolution: the copy takes the region the game means, scaled
+ * back to the texture's size, from the first eye. A copy of the whole
+ * screen drawn back over it would cover both eyes' scene with one eye's
+ * flat picture; the scene is already there, so that draw is left out. */
+#define MAX_SCREEN_COPIES 8
+static GLuint   g_screen_copy[MAX_SCREEN_COPIES];
+static unsigned g_nscreen_copy;
+static int      g_skip_begin;           /* inside a glBegin/glEnd that is left out */
+
+static int screen_copy(GLuint tex)
+{
+    for (unsigned i = 0; i < g_nscreen_copy; i++) if (g_screen_copy[i] == tex) return 1;
+    return 0;
+}
+
+static int copy_from_eyes(CPU *c, int k)
+{
+#ifdef LINDBERGH_GL4ES
+    if (!g_mv || g_game_fb != 0 || A32(0) != GL_TEXTURE_2D) return 0;
+    GLint tex = 0;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
+    GLint level = AI32(1), xo = 0, yo = 0, x, y, w, h;
+    if (k == K_COPYTEXSUB) { xo = AI32(2); yo = AI32(3); x = AI32(4); y = AI32(5); w = AI32(6); h = AI32(7); }
+    else {
+        GLenum ifmt = A32(2);
+        if (ifmt == GL_DEPTH_COMPONENT || ifmt == GL_DEPTH_COMPONENT16 || ifmt == GL_DEPTH_COMPONENT24 ||
+            ifmt == GL_DEPTH_COMPONENT32) return 0;
+        x = AI32(3); y = AI32(4); w = AI32(5); h = AI32(6);
+        glTexImage2D(GL_TEXTURE_2D, level, ifmt, w, h, 0,
+                     ifmt == GL_RGB || ifmt == GL_RGB8 || ifmt == 3 ? GL_RGB : GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    }
+    if (!tex || w <= 0 || h <= 0) return 1;
+    int X0 = (int)lroundf(x * g_sx), Y0 = (int)lroundf(y * g_sy);
+    int X1 = (int)lroundf((x + w) * g_sx), Y1 = (int)lroundf((y + h) * g_sy);
+    gl4es_multiview_copy(g_eye_tex[0], 0, X0, Y0, X1, Y1, (GLuint)tex, level, xo, yo, xo + w, yo + h);
+    if (w >= GAME_W * 9 / 10 && h >= GAME_H * 9 / 10 && !screen_copy((GLuint)tex) && g_nscreen_copy < MAX_SCREEN_COPIES) {
+        g_screen_copy[g_nscreen_copy++] = (GLuint)tex;
+        fprintf(stderr, "[stereo] frame %u: texture %d is a copy of the whole screen\n", g_frame, tex);
+    }
+    return 1;
+#else
+    (void)c; (void)k;
+    return 0;
+#endif
+}
+
+/* glXMakeCurrent: the window (or a pbuffer standing in for it) is the eyes */
+void stereo_bind_window(void) { bind_framebuffer(GL_FRAMEBUFFER, 0); }
+
 static int transform_call(CPU *c, HleId id, const char *n)
 {
     int k = cls(id)->kind;
+    if (g_skip_begin) {
+        if (k == K_END) g_skip_begin = 0;
+        return 1;
+    }
     if (k == K_OTHER) return 0;
+    if (g_on && (k == K_COPYTEXSUB || k == K_COPYTEX)) return copy_from_eyes(c, k);
+    if (g_on && g_mv && (is_draw(k) || k == K_BEGIN) && g_tex2d_on && g_nscreen_copy && screen_copy(g_tex2d_bound)) {
+        if (k == K_BEGIN) g_skip_begin = 1;
+        return 1;
+    }
     if (k == K_BINDFB) {
         bind_framebuffer(A32(0), A32(1));
         return 1;
@@ -976,10 +1042,13 @@ static int transform_call(CPU *c, HleId id, const char *n)
         GLbitfield mask = A32(0);
         /* Only the frame's first such clear, and not for a flat picture: the
          * game clears depth again to draw over its finished scene (the
-         * scope's reload), and clearing the colour there wiped the scene. */
-        static unsigned cleared_frame = ~0u;
+         * scope's reload), and clearing the colour there wiped the scene.
+         * Nor in a frame that cleared its colour already: The House of the
+         * Dead 4 clears depth alone only for its HUD, over the scene. */
+        static unsigned cleared_frame = ~0u, colour_frame = ~0u;
+        if ((mask & GL_COLOR_BUFFER_BIT) && g_game_fb == g_world_fb) colour_frame = g_frame;
         if ((mask & GL_DEPTH_BUFFER_BIT) && !(mask & GL_COLOR_BUFFER_BIT) && g_game_fb == g_world_fb &&
-            !g_flat && cleared_frame != g_frame) {
+            !g_flat && cleared_frame != g_frame && colour_frame != g_frame) {
             cleared_frame = g_frame;
             GLfloat cc[4];
             glGetFloatv(GL_COLOR_CLEAR_VALUE, cc);
@@ -1476,11 +1545,11 @@ static void trace_draw(const char *n)
  * second eye's replay is timed by the host), summed and printed every 300
  * frames with the costliest few. */
 static int g_glprof = -1;
-static double g_glprof_ns[HLE_COUNT];
-static unsigned g_glprof_n[HLE_COUNT];
+static double g_glprof_ns[HLE_ID_MAX];
+static unsigned g_glprof_n[HLE_ID_MAX];
 static unsigned g_glprof_f0;
 static double g_glprof_rec_ns;          /* of which recording for the second eye */
-static double g_frame_ns[HLE_COUNT];    /* this frame's, to name what a slow frame spent */
+static double g_frame_ns[HLE_ID_MAX];    /* this frame's, to name what a slow frame spent */
 static double g_frame_t0;
 static double now_ns(void)
 {
@@ -1493,7 +1562,7 @@ static void glprof_frame(void)
 {
     double now = now_ns(), all = g_frame_t0 ? now - g_frame_t0 : 0, gl = 0;
     unsigned best = 0;
-    for (unsigned i = 0; i < HLE_COUNT; i++) { gl += g_frame_ns[i]; if (g_frame_ns[i] > g_frame_ns[best]) best = i; }
+    for (unsigned i = 0; i < HLE_ID_MAX; i++) { gl += g_frame_ns[i]; if (g_frame_ns[i] > g_frame_ns[best]) best = i; }
     static double slow = -1;            /* LINDBERGH_GLPROF_SLOW=<ms>: which frames to name (40) */
     if (slow < 0) { const char *v = getenv("LINDBERGH_GLPROF_SLOW"); slow = (v && *v ? atof(v) : 40) * 1e6; }
     if (all > slow)
@@ -1517,14 +1586,14 @@ static void glprof_report(void)
     if (g_glprof > 0) glprof_frame();
     if (g_glprof <= 0 || g_frame - g_glprof_f0 < 300) return;
     double frames = g_frame - g_glprof_f0, total = 0, calls = 0;
-    for (unsigned i = 0; i < HLE_COUNT; i++) total += g_glprof_ns[i], calls += g_glprof_n[i];
+    for (unsigned i = 0; i < HLE_ID_MAX; i++) total += g_glprof_ns[i], calls += g_glprof_n[i];
     extern double g_arb_draw_ns;
     fprintf(stderr, "[glprof] frames %u..%u: GL %.1f ms (recording %.1f, ARB programs %.1f), %.0f calls per frame; costliest:",
             g_glprof_f0, g_frame, total / frames / 1e6, g_glprof_rec_ns / frames / 1e6, g_arb_draw_ns / frames / 1e6, calls / frames);
     g_glprof_rec_ns = g_arb_draw_ns = 0;
     for (int k = 0; k < 10; k++) {
         unsigned best = 0;
-        for (unsigned i = 1; i < HLE_COUNT; i++) if (g_glprof_ns[i] > g_glprof_ns[best]) best = i;
+        for (unsigned i = 1; i < HLE_ID_MAX; i++) if (g_glprof_ns[i] > g_glprof_ns[best]) best = i;
         if (g_glprof_ns[best] <= 0) break;
         fprintf(stderr, " %s %.2f ms/%.0f", hle_name((HleId)best), g_glprof_ns[best] / frames / 1e6, g_glprof_n[best] / frames);
         g_glprof_ns[best] = -g_glprof_ns[best];
@@ -1559,6 +1628,19 @@ static void stereo_gl_call_inner(CPU *c, HleId id, HleHandler fn);
 static void stereo_gl_call(CPU *c, HleId id, HleHandler fn)
 {
     stereo_glprof_on();
+#ifdef LINDBERGH_GL4ES
+    if ((long)g_frame == g_map_frame && g_mv) {
+        /* the frame map: the eye's centre pixel after each draw */
+        const char *nm = hle_name(id);
+        stereo_gl_call_inner(c, id, fn);
+        if (!strncmp(nm, "glDraw", 6) || !strncmp(nm, "glMultiDraw", 11) || !strcmp(nm, "glEnd")) {
+            unsigned char px[4];
+            gl4es_multiview_read_pixel(g_ew / 2, g_eh / 2, px);
+            fprintf(stderr, "[map]   centre now %u %u %u %u (fb %u)\n", px[0], px[1], px[2], px[3], g_game_fb);
+        }
+        return;
+    }
+#endif
     if (!g_glprof) { stereo_gl_call_inner(c, id, fn); return; }
     double t0 = now_ns();
     stereo_gl_call_inner(c, id, fn);
@@ -1573,7 +1655,7 @@ static void stereo_gl_call_inner(CPU *c, HleId id, HleHandler fn)
     {   /* A render target drawn larger still reports the size the game made
          * it: the plane's air shimmer builds its lookups from the size it is
          * told, in texels, which the lookups then scaled a second time. */
-        static signed char tlp[HLE_COUNT];
+        static signed char tlp[HLE_ID_MAX];
         if (!tlp[id]) tlp[id] = strcmp(hle_name(id), "glGetTexLevelParameteriv") ? 2 : 1;
         if (tlp[id] == 1 && g_on && A32(0) == GL_TEXTURE_RECTANGLE_ARB && A32(1) == 0 &&
             (A32(2) == GL_TEXTURE_WIDTH || A32(2) == GL_TEXTURE_HEIGHT)) {
@@ -1589,7 +1671,7 @@ static void stereo_gl_call_inner(CPU *c, HleId id, HleHandler fn)
     if ((long)g_frame == g_map_frame) {
         uint32_t a[6]; for (int i = 0; i < 6; i++) a[i] = A32(i);
         const char *nm = hle_name(id);
-        if (!strncmp(nm, "glDraw", 6) || !strcmp(nm, "glBegin")) {
+        if (!strncmp(nm, "glDraw", 6) || !strncmp(nm, "glMultiDraw", 11) || !strcmp(nm, "glBegin")) {
             /* what a draw has bound, to tell a full-screen pass from the HUD */
             GLint t2 = 0, tr = 0, fp = 0, vp = 0, unit = 0;
             glGetIntegerv(GL_ACTIVE_TEXTURE, &unit); glActiveTexture(GL_TEXTURE0);
@@ -1729,8 +1811,23 @@ static void dump_targets(void)
         }
 #endif
     }
-    static long at = -2;
-    if (at == -2) { const char *v = getenv("LINDBERGH_RT_DUMP"); at = v && *v ? atol(v) : -1; }
+    static long at = -2, every;
+    if (at == -2) {
+        const char *v = getenv("LINDBERGH_RT_DUMP"); at = v && *v ? atol(v) : -1;
+        v = getenv("LINDBERGH_EYE_DUMP_EVERY"); every = v && *v ? atol(v) : 0;
+    }
+    if (every > 0 && g_frame > 0 && g_frame % (unsigned long)every == 0) {
+        /* LINDBERGH_EYE_DUMP_EVERY=N: the first eye every N frames, eye_<frame>.ppm */
+        unsigned char *px = malloc((size_t)g_ew * g_eh * 4);
+#ifdef LINDBERGH_GL4ES
+        if (px && g_mv && gl4es_multiview_read(g_eye_tex[0], GL_TEXTURE_RECTANGLE_ARB, 0, px)) {
+            char name[64];
+            snprintf(name, sizeof name, "eye_%u.ppm", g_frame);
+            write_ppm(name, g_ew, g_eh, px);
+        }
+#endif
+        free(px);
+    }
     if ((long)g_frame != at && (long)g_frame != g_rt_dump_at) return;
     GLint prev = 0;
     glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev);

@@ -13,6 +13,8 @@ int  stereo_wide(int *w, int *h, float *k); /* its size, and the 4:3 picture's s
 int  stereo_enabled(void);
 void stereo_frame_begin(void);          /* before the game draws a frame */
 void stereo_frame_end(void);            /* at the swap: draws the second eye */
+/* glXMakeCurrent: draw into the eyes, as the window does */
+void stereo_bind_window(void);
 
 void stereo_eye_size(int w, int h);
 /* The host's own framebuffer for an eye (an XR swapchain image). */
