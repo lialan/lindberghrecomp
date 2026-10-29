@@ -72,6 +72,7 @@ void hle_register_all(void)
         fprintf(stderr, "[unbound] %d of %d imports have no body\n", n, (int)HLE_COUNT);
         exit(0);
     }
+    { void gl_arg_trace_install(void); gl_arg_trace_install(); }
 }
 
 /* Survey mode. Aborting on the first unimplemented import is the right default

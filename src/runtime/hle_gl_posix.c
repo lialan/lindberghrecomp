@@ -75,8 +75,11 @@ void gl_check_error(const char *name)
     }
 }
 
+/* LINDBERGH_GL_TRACE=1 names every GL call; =N (N > 1) only those of frame N */
 void gl_trace_call(const char *name)
 {
+    extern unsigned g_frame;
+    if (g_gl_trace > 1 && g_frame != (unsigned)g_gl_trace) return;
     fprintf(stderr, "[gl] %s\n", name);
     fflush(stderr);
 }
@@ -472,7 +475,7 @@ static void h_gluErrorString(CPU *c)
 void hle_register_gl(void)
 {
     const char *t = getenv("LINDBERGH_GL_TRACE");
-    g_gl_trace = t && *t && *t != '0';
+    g_gl_trace = t && *t ? atoi(t) : 0;
     t = getenv("LINDBERGH_GLERR");
     g_gl_errcheck = t && *t && *t != '0';
 
@@ -572,3 +575,42 @@ __attribute__((weak)) void gl_register_generated(void) { }
 
 /* Cg (hle_cg.c) is Windows-only so far; this game does not use it. */
 void hle_register_cg(void) { }
+
+/* ---- LINDBERGH_GL_TRACE=N: the arguments too, for the calls that place
+ * things on the screen (matrices, viewport, immediate vertices). Each wraps
+ * the handler already bound. */
+static float targf(CPU *c, int i) { uint32_t b = A32(i); float f; memcpy(&f, &b, 4); return f; }
+static double targd(CPU *c, int i) { uint64_t b = (uint64_t)A32(i) | (uint64_t)A32(i + 1) << 32; double d; memcpy(&d, &b, 8); return d; }
+static int trace_now(void) { extern unsigned g_frame; return g_gl_trace > 1 && g_frame == (unsigned)g_gl_trace; }
+#define WRAP(nm, body) \
+    static HleHandler o_##nm; \
+    static void w_##nm(CPU *c) { if (trace_now()) { body; } o_##nm(c); }
+WRAP(glMatrixMode, fprintf(stderr, "[gla] glMatrixMode %#x\n", A32(0)))
+WRAP(glLoadIdentity, fprintf(stderr, "[gla] glLoadIdentity\n"))
+WRAP(glPushMatrix, fprintf(stderr, "[gla] glPushMatrix\n"))
+WRAP(glPopMatrix, fprintf(stderr, "[gla] glPopMatrix\n"))
+WRAP(glScalef, fprintf(stderr, "[gla] glScalef %g %g %g\n", targf(c,0), targf(c,1), targf(c,2)))
+WRAP(glTranslatef, fprintf(stderr, "[gla] glTranslatef %g %g %g\n", targf(c,0), targf(c,1), targf(c,2)))
+WRAP(glViewport, fprintf(stderr, "[gla] glViewport %d %d %d %d\n", (int)A32(0), (int)A32(1), (int)A32(2), (int)A32(3)))
+WRAP(glScissor, fprintf(stderr, "[gla] glScissor %d %d %d %d\n", (int)A32(0), (int)A32(1), (int)A32(2), (int)A32(3)))
+WRAP(glOrtho, fprintf(stderr, "[gla] glOrtho %g %g %g %g %g %g\n", targd(c,0), targd(c,2), targd(c,4), targd(c,6), targd(c,8), targd(c,10)))
+WRAP(glVertex3f, fprintf(stderr, "[gla] glVertex3f %g %g %g\n", targf(c,0), targf(c,1), targf(c,2)))
+WRAP(glBegin, fprintf(stderr, "[gla] glBegin %#x\n", A32(0)))
+WRAP(glVertex3fv, { const float *v = (const float *)APTR(0); fprintf(stderr, "[gla] glVertex3fv %g %g %g\n", v[0], v[1], v[2]); })
+WRAP(glLoadMatrixf, { const float *m = (const float *)APTR(0);
+    fprintf(stderr, "[gla] glLoadMatrixf"); for (int i = 0; i < 16; i++) fprintf(stderr, " %g", m[i]); fprintf(stderr, "\n"); })
+WRAP(glMultMatrixf, { const float *m = (const float *)APTR(0);
+    fprintf(stderr, "[gla] glMultMatrixf"); for (int i = 0; i < 16; i++) fprintf(stderr, " %g", m[i]); fprintf(stderr, "\n"); })
+
+void gl_arg_trace_install(void)
+{
+    if (g_gl_trace <= 1) return;
+    for (unsigned i = 0; i < HLE_COUNT; i++) {
+        const char *n = hle_name((HleId)i);
+#define HOOK(nm) if (!strcmp(n, #nm) && g_hle_handlers[i]) { o_##nm = g_hle_handlers[i]; g_hle_handlers[i] = w_##nm; }
+        HOOK(glMatrixMode) HOOK(glLoadIdentity) HOOK(glPushMatrix) HOOK(glPopMatrix) HOOK(glScalef)
+        HOOK(glTranslatef) HOOK(glViewport) HOOK(glScissor) HOOK(glOrtho) HOOK(glVertex3f) HOOK(glBegin)
+        HOOK(glVertex3fv) HOOK(glLoadMatrixf) HOOK(glMultMatrixf)
+#undef HOOK
+    }
+}
