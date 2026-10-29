@@ -574,9 +574,10 @@ static void input_frame(XrTime t)
         /* Better still, the point the laser actually reaches: the world's
          * depth along it, read back from the GPU (aim_hit_t). A flat frame -
          * a scope, a menu - is a picture on the screen: aimed at where the
-         * laser meets it. */
+         * laser meets it. So is CQC, whose markers are 2D on the screen while
+         * the enemy stands a metre away. */
         float x, y, ah[3] = { 0, 0, 0 }, at, ax[3];
-        int flat = stereo_flat_frame();
+        int flat = stereo_flat_frame() || stereo_cqc_active();
         if (flat) at = d[2] < -1e-4f ? (-cfg.screen * cfg.scale - o[2]) / d[2] : -1;
         else if (aim_hit_t > 0) at = aim_hit_t;
         else at = d[2] < -1e-4f ? (-cfg.aim * cfg.scale - o[2]) / d[2] : -1;
@@ -605,6 +606,9 @@ static void input_frame(XrTime t)
             if (row != menu.hover) { menu.hover = row; menu.dirty = 1; }
             if (on) memcpy(xo.end, hit, sizeof hit);
             xo.beam = 1; xo.dot = on;
+            if (trig[g] && !prev[g][0])     /* every pull on the panel, for a click that seems lost */
+                fprintf(stderr, "[xr] panel trigger: %s hand, %s at %.2f,%.2f, row %d\n", g == HAND_L ? "left" : "right",
+                        on ? "on the panel" : "off it", on ? u : -1, on ? v : -1, row);
             if (trig[g] && !prev[g][0] && row >= 0 && !fake_menu) { menu_choose(row); rumble(g, 0.25f, 15); }
             aimed = 0; gx = gy = -100000;
         }

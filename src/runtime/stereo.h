@@ -58,6 +58,11 @@ void stereo_screen(float *half_w, float *half_h, float *dist);
  * below -1000); and whether the game's own sight is drawn. */
 void stereo_set_gun(int x, int y);
 void stereo_show_game_sight(int show);
+/* a sniping event (qte_ctrl_snipe) ran this frame: its zoom steps are scopes */
+void stereo_snipe_running(void);
+/* CQC (qte_ctrl_grapple) ran this frame / within the last two */
+void stereo_cqc_running(void);
+int  stereo_cqc_active(void);
 /* The game's own gun (its reload animation) is hidden; how many of its draws
  * the last frame had. */
 unsigned stereo_game_gun_draws(void);

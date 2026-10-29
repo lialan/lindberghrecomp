@@ -103,6 +103,21 @@ static float    g_lens_seen;            /* the longest lens (projection x scale)
 static float    g_zoom_lens = 8.0f;     /* a longer one is a zoomed view: the sniper scope is 11.4, the
                                          * game's own camera 1.7-2.4 and its zooms on a target up to ~6 */
 static unsigned g_zoom_frames;          /* frames in a row drawn with such a lens */
+/* The sniping sections (the game's qte_ctrl_snipe, reported by hle_sega.c)
+ * zoom in steps, some well below 8: while one runs, any lens past this is
+ * its scope. */
+static float    g_snipe_lens = 3.2f;
+static unsigned g_snipe_frame = ~0u;    /* the last frame a sniping event ran */
+void stereo_snipe_running(void) { g_snipe_frame = g_frame; }
+/* CQC (qte_ctrl_grapple): its markers are 2D on the screen, so it is aimed
+ * on the screen's plane, not through the enemy a metre away */
+static unsigned g_cqc_frame = ~0u;
+void stereo_cqc_running(void) { g_cqc_frame = g_frame; }
+int stereo_cqc_active(void) { return g_cqc_frame != ~0u && g_frame - g_cqc_frame <= 2; }
+static float zoom_limit(void)
+{
+    return g_snipe_frame != ~0u && g_frame - g_snipe_frame <= 2 ? g_snipe_lens : g_zoom_lens;
+}
 static int      g_menu;                 /* a menu: its 3D belongs on the screen too */
 static int      g_tex2d_on;             /* GL_TEXTURE_2D enabled on unit 0 (frame map) */
 static unsigned g_menu_frames;          /* frames in a row that looked like a menu */
@@ -945,7 +960,7 @@ static int transform_call(CPU *c, HleId id, const char *n)
         /* A long lens - the sniper scope, a cutscene's close-up - is a
          * magnified view the eye's own frustum would undo: it goes on the
          * screen too, framed by the scope the game draws there. */
-        int zoom = persp && g_proj[g_proj_top][0] > g_zoom_lens && g_zoom_frames >= 6;
+        int zoom = persp && g_proj[g_proj_top][0] > zoom_limit() && g_zoom_frames >= 6;
         if (persp && !g_replaying) { if (zoom) g_zoom_draws++; if (g_game_fb == g_hud_fb) g_hudfb_draws++; }
         int hud = persp ? g_game_fb == g_hud_fb || menu_state() || g_menu || zoom
                         : !g_unit0_rect || !covers_viewport(c, n);
@@ -1767,14 +1782,14 @@ void stereo_frame_begin(void)
         g_weapon_frame_draws = g_weapon_draws;
         g_weapon_draws = 0;
     }
-    if (!g_flat && g_scene_draws > 0 && is_perspective(g_world_persp) && g_world_persp[0] > 0.3f && g_world_persp[0] < 8.0f) {
+    if (!g_flat && g_scene_draws > 0 && is_perspective(g_world_persp) && g_world_persp[0] > 0.3f && g_world_persp[0] < zoom_limit()) {
         g_screen_lens[0] = g_world_persp[0];
         g_screen_lens[1] = g_world_persp[5];
     }
     g_hud2d = g_pass2d = 0;
     g_zoom_draws = g_hudfb_draws = 0;
     /* a scope is held; a lens passing through on a camera move is not one */
-    g_zoom_frames = g_lens_seen > g_zoom_lens ? g_zoom_frames + 1 : 0;
+    g_zoom_frames = g_lens_seen > zoom_limit() ? g_zoom_frames + 1 : 0;
     g_lens_seen = 0;
     g_near_seen = 0;
     g_scene_draws = 0;

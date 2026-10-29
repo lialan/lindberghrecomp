@@ -23,6 +23,9 @@
 #include "lindbergh_rt.h"
 #if !defined(_WIN32)
 #include "host_settings.h"
+#ifndef _WIN32
+#include "stereo.h"
+#endif
 #endif
 
 /* The library's own success code. Every am* function returns 0 for success
@@ -665,15 +668,82 @@ static void h_game_loop(CPU *c)
             if (w) guest_call(c, w, b1, 1);
         }
     }
+    {   /* LINDBERGH_GUNACT_LOG=1: player 1's gun - its input words (held,
+         * pressed) and the 16 gun actions the game derives from them
+         * (is_gun_action; CQC asks for action 14) - on every change */
+        static int on = -1;
+        if (on < 0) { const char *v = getenv("LINDBERGH_GUNACT_LOG"); on = v && *v == '1'; }
+        if (on) {
+            enum { GUN0 = 0x8651e60 };
+            uint32_t in = rd32(GUN0 + 0x40);
+            uint32_t now[4] = { rd32(GUN0 + 0x64), in ? rd32(in + 4) : 0, in ? rd32(in + 8) : 0, rd32(GUN0 + 0x4) };
+            static uint32_t last[4];
+            if (memcmp(now, last, sizeof now)) {
+                fprintf(stderr, "[gunact] frame %u: actions %#x, held %#x, pressed %#x, gun flags %#x\n",
+                        g_frame, now[0], now[1], now[2], now[3]);
+                memcpy(last, now, sizeof now);
+            }
+        }
+    }
     push32(c, 0xDEADBEEFu);
     g_game_loop(c);
 }
+/* The sniping and CQC events always report to stereo.c: they change its
+ * scope test and how the gun is aimed. LINDBERGH_QTE_LOG=1: each frame of CQC (qte_ctrl_grapple) and of the
+ * sniping events (qte_ctrl_snipe): the markers CQC checks the gun against,
+ * in screen coordinates, and where the cabinet says the gun points. */
+static void (*g_qte_grapple)(CPU *), (*g_qte_snipe)(CPU *);
+static void qte_log(const char *what, uint32_t q)
+{
+    extern unsigned g_frame;
+    CabinetInput in;
+    host_cabinet_input(&in);
+    char marks[256] = "";
+    int n = (int)rd32(q + 0x38), len = 0;
+    for (int i = 0; i < n && i < 8 && len < 200; i++) {
+        uint32_t e = q + 0x40 + 0x14u * i;
+        len += snprintf(marks + len, sizeof marks - len, " %d@%d,%d", (int16_t)rd32(e) , (int16_t)rd32(e + 4), (int16_t)rd32(e + 6));
+    }
+    fprintf(stderr, "[qte] frame %u: %s, state %d, gun %d,%d buttons %#x, %d marks:%s\n", g_frame, what,
+            (int)rd32(q + 4), in.gun_x, in.gun_y, in.buttons, n, marks);
+}
+static int g_qte_log;
+static void h_qte_grapple(CPU *c)
+{
+#ifndef _WIN32
+    stereo_cqc_running();
+#endif
+    if (g_qte_log) qte_log("CQC", A32(0));
+    push32(c, 0xDEADBEEFu);
+    g_qte_grapple(c);
+}
+static void h_qte_snipe(CPU *c)
+{
+#ifndef _WIN32
+    stereo_snipe_running();
+#endif
+    if (g_qte_log) qte_log("snipe", A32(0));
+    push32(c, 0xDEADBEEFu);
+    g_qte_snipe(c);
+}
+static int watch_qte(void)
+{
+    const char *v = getenv("LINDBERGH_QTE_LOG");
+    g_qte_log = v && *v == '1';
+    extern void (*dispatch_lifted(uint32_t va))(CPU *);
+    uint32_t g = guest_symbol("_Z16qte_ctrl_grappleP3QTE"), s = guest_symbol("_Z14qte_ctrl_snipeP3QTE");
+    int n = 0;
+    if (g && (g_qte_grapple = dispatch_lifted(g))) n += guest_override("_Z16qte_ctrl_grappleP3QTE", h_qte_grapple);
+    if (s && (g_qte_snipe = dispatch_lifted(s))) n += guest_override("_Z14qte_ctrl_snipeP3QTE", h_qte_snipe);
+    return n;
+}
+
 static int watch_route(void)
 {
     const char *j = getenv("LINDBERGH_ROUTE"), *l = getenv("LINDBERGH_ROUTE_LOG");
     g_route_log = l && *l == '1';
     if (j && *j) g_route_jump = atoi(j);
-    if (!g_route_log && g_route_jump < 0 && !getenv("LINDBERGH_SHIMMER")) return 0;
+    if (!g_route_log && g_route_jump < 0 && !getenv("LINDBERGH_SHIMMER") && !getenv("LINDBERGH_GUNACT_LOG")) return 0;
     uint32_t va = guest_symbol("_Z8GameLoopP8GAMEWORK");
     extern void (*dispatch_lifted(uint32_t va))(CPU *);
     if (!va || !(g_game_loop = dispatch_lifted(va))) return 0;
@@ -684,6 +754,7 @@ void hle_register_sega(void)
 {
     int n = 0;
     if (watch_route()) fprintf(stderr, "[sega] route log/jump on\n");
+    if (watch_qte()) fprintf(stderr, "[sega] sniping events watched%s\n", g_qte_log ? ", CQC and sniping logged" : "");
     {
         const char *g = getenv("LINDBERGH_GOD");
         if (g && *g == '1' && guest_override("_Z26check_player_damage_enablei", h_no_damage))
