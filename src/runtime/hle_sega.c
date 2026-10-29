@@ -522,7 +522,8 @@ static void h_dongle_valid(CPU *c)
  * game sizes everything it draws from them; with no answer it falls back to
  * 640x480 whatever the window is. So the bits are the window's size:
  *   0x00 640x480   0x20 800x480   0x40 1024x768  0x60 1280x768
- *   0x80 800x600   0xA0 1024x600  0xC0 1280x1024 0xE0 1280x720
+ *   0x80 800x600   0xA0 1024x600  0xC0 1280x1024 0xE0 1280x720 (1360x768
+ *   to House of the Dead 4, which renders and aims for that)
  * LINDBERGH_DIPSW=<hex> sets the whole byte instead. */
 static void h_dipsw_get(CPU *c)
 {
@@ -534,6 +535,7 @@ static void h_dipsw_get(CPU *c)
             static const struct { int w, h, bits; } res[] = {
                 { 640, 480, 0x00 }, { 800, 480, 0x20 }, { 1024, 768, 0x40 }, { 1280, 768, 0x60 },
                 { 800, 600, 0x80 }, { 1024, 600, 0xA0 }, { 1280, 1024, 0xC0 }, { 1280, 720, 0xE0 },
+                { 1360, 768, 0xE0 },    /* what 0xE0 is to House of the Dead 4 */
             };
             int w, h;
             lindbergh_window_size(&w, &h);
