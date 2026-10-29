@@ -1,3 +1,4 @@
+#include <pthread.h>
 /*
  * host_sdl.c - the host window on a POSIX host, through SDL2.
  *
@@ -561,7 +562,14 @@ int host_window_open(const char *title)
     host_menu_install();
 #endif
     SDL_RaiseWindow(g_win.win);
-    fprintf(stderr, "[window] game %dx%d, window %dx%d\n", g_win.w, g_win.h, dw, dh);
+    /* a crosshair: the shot goes to its centre, where the eye looks, not to
+     * the tip of an arrow */
+    {
+        SDL_Cursor *cur = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_CROSSHAIR);
+        if (cur) SDL_SetCursor(cur);
+    }
+    fprintf(stderr, "[window] game %dx%d, window %dx%d%s\n", g_win.w, g_win.h, dw, dh,
+            pthread_main_np() ? "" : " (NOT on the main thread)");
     return 1;
 }
 

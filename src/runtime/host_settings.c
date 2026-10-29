@@ -45,10 +45,20 @@ void settings_reset_controls(void)
 /* The game maps the gun through its own calibration, which stretches the raw
  * range: measured, the sight lands at 1.14x + 21, 1.06y + 17. The host sends
  * the inverse so the sight sits under the pointer. */
+static double g_aim_default[4] = { 1.139, 20.6, 1.056, 16.7 };
+
+/* A game whose gun needs no correction (or another one) says so before the
+ * settings load; "Reset Aim" returns to it too. */
+void host_aim_default(double sx, double ox, double sy, double oy)
+{
+    g_aim_default[0] = sx; g_aim_default[1] = ox;
+    g_aim_default[2] = sy; g_aim_default[3] = oy;
+}
+
 void settings_reset_aim(void)
 {
-    g_set.aim_sx = 1.139; g_set.aim_ox = 20.6;
-    g_set.aim_sy = 1.056; g_set.aim_oy = 16.7;
+    g_set.aim_sx = g_aim_default[0]; g_set.aim_ox = g_aim_default[1];
+    g_set.aim_sy = g_aim_default[2]; g_set.aim_oy = g_aim_default[3];
 }
 
 void settings_binding_name(int b, char *out, int n)
