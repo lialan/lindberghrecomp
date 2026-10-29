@@ -824,8 +824,11 @@ int xr_init(void)
      * CPU's sustained high clocks rather than the headset's power-saving
      * default. */
     if (set_perf_level) {
-        XrResult r = set_perf_level(session, XR_PERF_SETTINGS_DOMAIN_CPU_EXT, XR_PERF_SETTINGS_LEVEL_SUSTAINED_HIGH_EXT);
-        fprintf(stderr, "[xr] CPU at sustained high clocks: %s\n", XR_SUCCEEDED(r) ? "yes" : "refused");
+        const char *bv = getenv("LINDBERGH_CPU_BOOST");     /* test: the top clocks the runtime allows */
+        int boost = bv && *bv == '1';
+        XrResult r = set_perf_level(session, XR_PERF_SETTINGS_DOMAIN_CPU_EXT,
+                                    boost ? XR_PERF_SETTINGS_LEVEL_BOOST_EXT : XR_PERF_SETTINGS_LEVEL_SUSTAINED_HIGH_EXT);
+        fprintf(stderr, "[xr] CPU at %s clocks: %s\n", boost ? "boost" : "sustained high", XR_SUCCEEDED(r) ? "yes" : "refused");
     }
     /* That thread is also the one that renders: registered as the
      * renderer, the runtime schedules it ahead of other work - the hitches
