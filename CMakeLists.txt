@@ -54,6 +54,7 @@ function(lindbergh_runtime target generated_dir)
             "${LINDBERGH_RUNTIME_DIR}/host_settings.c"
             "${LINDBERGH_RUNTIME_DIR}/hle_gl_posix.c"
             "${LINDBERGH_RUNTIME_DIR}/arbprog.c"
+            "${LINDBERGH_RUNTIME_DIR}/stereo.c"
             "${LINDBERGH_RUNTIME_DIR}/hle_openal.c"
             "${LINDBERGH_RUNTIME_DIR}/hle_glx_posix.c"
             "${LINDBERGH_RUNTIME_DIR}/hud_widen.c"
@@ -107,6 +108,26 @@ function(lindbergh_runtime target generated_dir)
             -fno-strict-aliasing -fwrapv)
         find_package(SDL2 REQUIRED)
         target_link_libraries(${target} PRIVATE SDL2::SDL2 z)
+        if(ANDROID)
+            # Meta Quest: GL 2.1 through gl4es on GLES 3, OpenAL Soft, and
+            # the headset through OpenXR (host_xr.c). Paths to the three are
+            # given at configure time - see docs/QUEST.md.
+            foreach(v GL4ES_DIR OPENAL_DIR OPENXR_DIR)
+                if(NOT ${v})
+                    message(FATAL_ERROR "Android build: set -D${v}=... (docs/QUEST.md)")
+                endif()
+            endforeach()
+            target_sources(${target} PRIVATE "${LINDBERGH_RUNTIME_DIR}/host_xr.c"
+                "${LINDBERGH_RUNTIME_DIR}/xr_overlay.c" "${LINDBERGH_RUNTIME_DIR}/xr_menu.c")
+            target_compile_definitions(${target} PRIVATE LINDBERGH_GL4ES)
+            # printf and friends are handed the guest's own format strings
+            target_compile_options(${target} PRIVATE -Wno-format-security)
+            target_include_directories(${target} PRIVATE
+                "${GL4ES_DIR}/include" "${OPENAL_DIR}/include" "${OPENXR_DIR}/include")
+            target_link_libraries(${target} PRIVATE
+                "${GL4ES_LIB}" "${OPENAL_LIB}" "${OPENXR_LIB}" EGL log android dl m)
+            target_link_options(${target} PRIVATE "-Wl,-z,max-page-size=16384" "-Wl,--no-undefined")
+        endif()
         if(APPLE)
             target_link_libraries(${target} PRIVATE "-framework OpenGL" "-framework AppKit" "-framework OpenAL" objc)
             # the menu bar (Controls, Aim, Sound, Language)
@@ -122,7 +143,9 @@ endfunction()
 # Self-check: builds the runtime against stub generated headers and exercises
 # the parts that do not need a game - the dispatch table and the syscall layer.
 # guest_load() is covered by the first real title.
-enable_testing()
-add_executable(lindbergh_rt_selftest tests/selftest/selftest.c)
-lindbergh_runtime(lindbergh_rt_selftest "${CMAKE_CURRENT_SOURCE_DIR}/tests/selftest")
-add_test(NAME lindbergh_rt_selftest COMMAND lindbergh_rt_selftest)
+if(NOT ANDROID)     # it runs on the build machine
+    enable_testing()
+    add_executable(lindbergh_rt_selftest tests/selftest/selftest.c)
+    lindbergh_runtime(lindbergh_rt_selftest "${CMAKE_CURRENT_SOURCE_DIR}/tests/selftest")
+    add_test(NAME lindbergh_rt_selftest COMMAND lindbergh_rt_selftest)
+endif()

@@ -20,6 +20,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <unistd.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -368,13 +369,48 @@ void guest_install_thread_handlers(void)
  * stall; the game keeps running. */
 #include <pthread.h>
 extern unsigned g_frame;
+/* Android's runtime keeps SIGUSR1 blocked in every thread for itself */
+#ifdef __ANDROID__
+#define WATCHDOG_SIG SIGUSR2
+#include <unwind.h>
+static _Unwind_Reason_Code unwind_one(struct _Unwind_Context *c, void *arg)
+{
+    int *n = arg;
+    uintptr_t pc = _Unwind_GetIP(c);
+    if (!pc || (*n)++ >= 40) return _URC_END_OF_STACK;
+    Dl_info di;
+    if (dladdr((void *)pc, &di) && di.dli_fname) {
+        const char *f = strrchr(di.dli_fname, '/');
+        fprintf(stderr, "  #%02d %s+%#lx %s\n", *n - 1, f ? f + 1 : di.dli_fname,
+                (unsigned long)(pc - (uintptr_t)di.dli_fbase), di.dli_sname ? di.dli_sname : "");
+    } else
+        fprintf(stderr, "  #%02d %p\n", *n - 1, (void *)pc);
+    return _URC_NO_REASON;
+}
+#else
+#define WATCHDOG_SIG SIGUSR1
+#endif
 static pthread_t g_main_thread;
 
+#ifndef _WIN32
+unsigned guest_threads(pthread_t *out, unsigned max);
+#endif
+void guest_mutex_report(void);
 static void on_watchdog_signal(int sig, siginfo_t *si, void *uc)
 {
     (void)sig; (void)si;
-    guest_report_state("watchdog: no frame presented - main thread is here");
+    char why[96];
+    snprintf(why, sizeof why, "watchdog: no frame presented - %s thread %#lx is here",
+             pthread_equal(pthread_self(), g_main_thread) ? "main" : "guest", (unsigned long)pthread_self());
+    guest_report_state(why);
+#ifndef _WIN32
+    guest_mutex_report();
+#endif
     host_report_pc(uc);
+#ifdef __ANDROID__
+    int n = 0;      /* offsets in the unstripped libmain.so (build-quest) name them */
+    _Unwind_Backtrace(unwind_one, &n);
+#endif
 }
 
 static void *watchdog(void *arg)
@@ -388,7 +424,13 @@ static void *watchdog(void *arg)
         if (++still >= secs && !told) {
             told = 1;
             fprintf(stderr, "\n[watchdog] frame %u has not advanced for %u s\n", f, still);
-            pthread_kill(g_main_thread, SIGUSR1);
+            pthread_kill(g_main_thread, WATCHDOG_SIG);
+#ifndef _WIN32
+            /* and every other guest thread: a stall is often one waiting on another */
+            pthread_t th[64];
+            unsigned n = guest_threads(th, 64);
+            for (unsigned i = 0; i < n; i++) { sleep(1); pthread_kill(th[i], WATCHDOG_SIG); }
+#endif
         }
     }
     return NULL;
@@ -408,7 +450,10 @@ void guest_install_crash_handler(void)
             memset(&wa, 0, sizeof wa);
             wa.sa_sigaction = on_watchdog_signal;
             wa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESTART;
-            sigaction(SIGUSR1, &wa, NULL);
+            sigaction(WATCHDOG_SIG, &wa, NULL);
+            sigset_t un;
+            sigemptyset(&un); sigaddset(&un, WATCHDOG_SIG);
+            pthread_sigmask(SIG_UNBLOCK, &un, NULL);
             pthread_t t;
             pthread_create(&t, NULL, watchdog, (void *)(uintptr_t)secs);
             pthread_detach(t);
@@ -443,4 +488,20 @@ void lindbergh_todo(uint32_t va, const char *text)
     fprintf(stderr, "\n[recomp] unimplemented instruction at %#010x: %s\n", va, text);
     guest_report_state("unimplemented instruction");
     exit(44);
+}
+
+/* Ending the game at the platform's request. On Android exit() runs the
+ * libraries' teardown - OpenAL's among them - while the game's sound thread
+ * is still calling into it, which aborted on a destroyed mutex; the nvram is
+ * written as the game writes it, so there is nothing left to save: end the
+ * process at once. */
+void host_quit(void)
+{
+#ifdef __ANDROID__
+    fprintf(stderr, "[exit] quitting\n");
+    fflush(NULL);
+    _exit(0);
+#else
+    exit(0);
+#endif
 }

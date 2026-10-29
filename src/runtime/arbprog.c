@@ -29,11 +29,17 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <time.h>
+#include <sys/stat.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "gl_posix.h"
 #include "arbprog.h"
+#ifdef LINDBERGH_GL4ES
+extern int gl4es_mv_shaders;      /* gl4es' multiview (multiview.c in quest/gl4es.patch) */
+extern int gl4es_mv_trace;
+#endif
+#include "stereo.h"
 
 #ifndef GL_MATRIX0_ARB
 #define GL_MATRIX0_ARB 0x88C0
@@ -750,7 +756,20 @@ static int emit_instr(Tr *t, char *stmt)
         static const char *const fnb[] = { "", "texture1D", "texture2D", "texture3D", "textureCube", "texture2DRect" };
         static const char *const sw[] = { "", ".x", ".xy", ".xyz", ".xyz", ".xy" };
         static const char *const sm[] = { "", "s1_", "s2_", "s3_", "sc_", "sr_" };
-        if (proj && target != 4)
+        if (target == 5) {
+            /* Rectangle textures are sampled in texels; the game's render
+             * targets are, and stereo.c draws them at the eye's size. */
+#ifdef LINDBERGH_GL4ES
+            /* multiview: the render target's layer for the view being drawn */
+            if (gl4es_mv_shaders && proj) snprintf(r, sizeof r, "texture2D(sr_%d, vec3(%s.xy / %s.w * u_rect_norm[%d], gl4es_layer))", unit, X(0), X(0), unit);
+            else if (gl4es_mv_shaders) snprintf(r, sizeof r, "texture2D(sr_%d, vec3(%s.xy * u_rect_norm[%d], gl4es_layer))", unit, X(0), unit);
+            else if (proj) snprintf(r, sizeof r, "texture2D(sr_%d, %s.xy / %s.w * u_rect_norm[%d])", unit, X(0), X(0), unit);
+            else      snprintf(r, sizeof r, "texture2D(sr_%d, %s.xy * u_rect_norm[%d])", unit, X(0), unit);
+#else
+            if (proj) snprintf(r, sizeof r, "texture2DRectProj(sr_%d, vec4(%s.xy * u_rect_scale[%d], %s.zw))", unit, X(0), unit, X(0));
+            else      snprintf(r, sizeof r, "texture2DRect(sr_%d, %s.xy * u_rect_scale[%d])", unit, X(0), unit);
+#endif
+        } else if (proj && target != 4)
             snprintf(r, sizeof r, "%sProj(%s%d, %s)", fnb[target], sm[target], unit, X(0));
         else if (bias)
             snprintf(r, sizeof r, "%s(%s%d, %s%s, %s.w)", fnb[target], sm[target], unit, X(0), sw[target], X(0));
@@ -812,12 +831,34 @@ static int is_decl(const char *s, const char *kw)
 }
 
 /* Translate one program to a GLSL shader. Returns malloc'd source or NULL. */
+/* every write of result.depth copies fragment.position.z */
+static int depth_passthrough(const char *body)
+{
+    static const char pat[] = "r = (gl_FragCoord).zzzz;\n      o_dep.z = r.z;";
+    int writes = 0, copies = 0;
+    for (const char *p = body; p && (p = strstr(p, "o_dep")); p += 5) writes++;
+    for (const char *p = body; p && (p = strstr(p, pat)); p += sizeof pat - 1) copies++;
+    return writes > 0 && writes == copies;
+}
+
 static char *translate(int stage, const char *src_in, Tr *t)
 {
     memset(t, 0, sizeof *t);
     t->stage = stage;
     t->env_hi = t->local_hi = -1;
     char *src = strdup(src_in);
+    {   /* "texture [2]": the grammar allows space before a subscript; the
+         * parsers below expect none (the plane's air shimmer was rejected) */
+        char *w = src;
+        for (char *r = src; *r; r++) {
+            if (*r == ' ' || *r == '\t') {
+                char *q = r; while (*q == ' ' || *q == '\t') q++;
+                if (*q == '[') { r = q - 1; continue; }
+            }
+            *w++ = *r;
+        }
+        *w = 0;
+    }
     char *p = src;
     while (*p && *p != '\n') p++;              /* drop the !!ARBxp1.0 line */
     static Stmt st[4096];
@@ -945,19 +986,38 @@ static char *translate(int stage, const char *src_in, Tr *t)
         bput(&g, "#version 120\n");
         int rect = 0;
         for (int u = 0; u < 16; u++) if (t->tex_target[u] == 5) rect = 1;
-        if (rect) bput(&g, "#extension GL_ARB_texture_rectangle : enable\n");
+#ifdef LINDBERGH_GL4ES
+        /* GLES has no rectangle textures: gl4es keeps them as 2D ones, which
+         * are sampled in normalised coordinates - u_rect_norm[unit] is the
+         * game's texel size of what is bound there. */
+        if (rect) bput(&g, "uniform vec2 u_rect_norm[16];\n");
+#else
+        if (rect) bput(&g, "#extension GL_ARB_texture_rectangle : enable\n"
+                           "uniform vec2 u_rect_scale[16];\n");    /* per unit: render targets drawn larger (stereo.c) */
+#endif
         const char *P = stage ? "f" : "v";
         if (t->env_hi >= 0) bput(&g, "uniform vec4 %s_env[%d];\n", P, t->env_hi + 1);
         if (t->local_hi >= 0) bput(&g, "uniform vec4 %s_loc[%d];\n", P, t->local_hi + 1);
         for (int m = 0; m < t->nmat; m++) bput(&g, "uniform vec4 %s_m%d[4];\n", P, m);
+#ifdef LINDBERGH_GL4ES
+        /* multiview: one matrix per view, and render targets as two layers */
+        if (!stage && !t->nmat && !t->pos_invariant) bput(&g, gl4es_mv_shaders ? "uniform mat4 u_reproj[2];\n" : "uniform mat4 u_reproj;\n");
+        const char *sty[] = { "", "sampler1D s1_", "sampler2D s2_", "sampler3D s3_",
+                              "samplerCube sc_", gl4es_mv_shaders ? "sampler2DArray sr_" : "sampler2D sr_" };
+#else
+        if (!stage && !t->nmat && !t->pos_invariant) bput(&g, "uniform mat4 u_reproj;\n");
         static const char *const sty[] = { "", "sampler1D s1_", "sampler2D s2_", "sampler3D s3_",
                                            "samplerCube sc_", "sampler2DRect sr_" };
+#endif
         for (int u = 0; u < 16; u++) if (t->tex_target[u]) bput(&g, "uniform %s%d;\n", sty[t->tex_target[u]], u);
         for (int a = 1; a < 16; a++) if (t->attrib_used[a]) bput(&g, "attribute vec4 va_%d;\n", a);
         bput(&g, "vec4 arb_lit(vec4 s) {\n"
                  "  float d = max(s.x, 0.0), sp = max(s.y, 0.0), e = clamp(s.w, -128.0, 128.0);\n"
                  "  return vec4(1.0, d, s.x > 0.0 ? (sp > 0.0 ? pow(sp, e) : 0.0) : 0.0, 1.0);\n}\n");
         bput(&g, "%s", t->decl.p ? t->decl.p : "");
+        /* gl4es puts its own declarations above the line before main(): make
+         * that line a global, never the end of a function like arb_lit. */
+        bput(&g, "const float arb_one = 1.0;\n");
         bput(&g, "void main() {\n  vec4 r = vec4(0.0), cc = vec4(0.0);\n  bvec4 m = bvec4(false);\n");
         if (t->has_flow) bput(&g, "  int pc = 0, sp = 0;\n  int stk[16];\n");
         if (stage == 0) {
@@ -971,6 +1031,15 @@ static char *translate(int stage, const char *src_in, Tr *t)
         bput(&g, "%s", t->body.p ? t->body.p : "");
         if (stage == 0) {
             bput(&g, "  gl_FogFragCoord = o_fog.x;\n  gl_PointSize = o_psize.x;\n");
+            /* A program that takes its whole transform from the game's own
+             * constants has the game's projection baked in: swap it for the
+             * eye's (stereo.c; identity when not in stereo). */
+#ifdef LINDBERGH_GL4ES
+            /* multiview: gl4es clips to the game's screen from gl4es_mvPre */
+            if (!t->nmat && !t->pos_invariant && gl4es_mv_shaders) bput(&g, "  gl4es_mvPre = gl_Position;\n  gl_Position = u_reproj[gl_ViewID_OVR] * gl_Position;\n");
+            else
+#endif
+            if (!t->nmat && !t->pos_invariant) bput(&g, "  gl_Position = u_reproj * gl_Position;\n");
         } else {
             if (t->fog_mode) {
                 const char *f = t->fog_mode == 1 ? "(gl_Fog.end - gl_FogFragCoord) * gl_Fog.scale" :
@@ -979,7 +1048,11 @@ static char *translate(int stage, const char *src_in, Tr *t)
                 bput(&g, "  o_col.rgb = mix(gl_Fog.color.rgb, o_col.rgb, clamp(%s, 0.0, 1.0));\n", f);
             }
             bput(&g, "  gl_FragColor = o_col;\n");
-            if (t->writes_depth) bput(&g, "  gl_FragDepth = o_dep.z;\n");
+            /* The game's programs write the depth they were given
+             * (MOV result.depth.z, fragment.position.z): that changes nothing
+             * but costs the GPU its early depth test, and through mediump on
+             * GLSL ES 3.00 it rounds the depth away - skip it. */
+            if (t->writes_depth && !depth_passthrough(t->body.p)) bput(&g, "  gl_FragDepth = o_dep.z;\n");
         }
         bput(&g, "}\n");
         free(src);
@@ -1005,7 +1078,9 @@ typedef struct {
     int    ok;
     MatRef mat[2][16]; int nmat[2];
     int    env_hi[2], local_hi[2];
-    GLint  u_env[2], u_loc[2], u_mat[2][16];
+    GLint  u_env[2], u_loc[2], u_mat[2][16], u_rect, u_reproj;
+    GLint  n_rect;                          /* u_rect_norm's length as the driver keeps it */
+    unsigned rect_units;                /* texture units sampled as rectangles */
     unsigned up_env[2], up_loc[2];      /* generations last uploaded */
 } Linked;
 
@@ -1033,6 +1108,98 @@ static GLuint compile(GLenum type, const char *src, int stage, GLuint id)
     return sh;
 }
 
+/* An array uniform's length as the driver keeps it: drivers may shorten an
+ * array to the last element the code uses (Adreno does), and an upload longer
+ * than that is refused outright. want is the length the translation declared. */
+static GLint array_len(GLuint prog, const char *name, GLint want)
+{
+    GLint n = 0;
+    size_t k = strlen(name);
+    glGetProgramiv(prog, GL_ACTIVE_UNIFORMS, &n);
+    for (GLint i = 0; i < n; i++) {
+        char nm[64]; GLint sz = 0; GLenum ty;
+        glGetActiveUniform(prog, (GLuint)i, sizeof nm, NULL, &sz, &ty, nm);
+        if (!strncmp(nm, name, k) && (nm[k] == 0 || nm[k] == '[')) return sz > 0 && sz < want ? sz : want;
+    }
+    return want;
+}
+
+#ifdef LINDBERGH_GL4ES
+/* ---- compiled programs kept on disk ----
+ * Building a program pair takes the Quest's driver 30-110 ms, a visible hitch
+ * the first time each scene draws. A built program's binary is kept in
+ * ../shadercache (beside the game, in the app's own folder), named by a hash
+ * of both stages' GLSL and the driver's own name and version; the next start
+ * loads it instead. A binary the driver no longer takes is built again. */
+static uint64_t fnv(uint64_t h, const char *p)
+{
+    for (; *p; p++) h = (h ^ (unsigned char)*p) * 1099511628211ull;
+    return (h ^ 0xff) * 1099511628211ull;
+}
+
+static void cache_path(char *out, size_t n, const char *v, const char *f)
+{
+    static uint64_t drv;
+    if (!drv) {
+        drv = fnv(1469598103934665603ull, (const char *)glGetString(GL_RENDERER));
+        drv = fnv(drv, (const char *)glGetString(GL_VERSION));
+        drv = fnv(drv, "arbprog 1");
+#ifdef LINDBERGH_GL4ES
+        if (gl4es_mv_shaders) drv = fnv(drv, "multiview 9");   /* gl4es makes other shaders of the same GLSL */
+        if (gl4es_mv_shaders && getenv("LIBGL_MV_NOCLIP")) drv = fnv(drv, "noclip");
+#endif
+        mkdir("../shadercache", 0755);
+    }
+    uint64_t h = fnv(fnv(drv, v ? v : ""), f ? f : "");
+    snprintf(out, n, "../shadercache/%016llx.bin", (unsigned long long)h);
+}
+
+static int cache_load(GLuint prog, const char *path)
+{
+    static int off = -1;     /* LINDBERGH_ARB_NOCACHE=1: build every program afresh, to see what fails */
+    if (off < 0) { const char *v = getenv("LINDBERGH_ARB_NOCACHE"); off = v && *v == '1'; }
+    if (off) return 0;
+    FILE *fl = fopen(path, "rb");
+    if (!fl) return 0;
+    GLenum fmt = 0;
+    long len = 0;
+    void *data = NULL;
+    if (fread(&fmt, sizeof fmt, 1, fl) == 1 && !fseek(fl, 0, SEEK_END) && (len = ftell(fl) - (long)sizeof fmt) > 0 &&
+        !fseek(fl, sizeof fmt, SEEK_SET) && (data = malloc((size_t)len)) && fread(data, 1, (size_t)len, fl) != (size_t)len) {
+        free(data); data = NULL;
+    }
+    fclose(fl);
+    if (!data) return 0;
+    glProgramBinary(prog, fmt, data, (GLsizei)len);
+    free(data);
+    GLint ok = 0;
+    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+    while (glGetError() != GL_NO_ERROR) {}
+    return ok;
+}
+
+static void cache_save(GLuint prog, const char *path)
+{
+    GLint len = 0;
+    glGetProgramiv(prog, GL_PROGRAM_BINARY_LENGTH, &len);
+    if (len <= 0) return;
+    void *data = malloc((size_t)len);
+    if (!data) return;
+    GLsizei got = 0;
+    GLenum fmt = 0;
+    glGetProgramBinary(prog, len, &got, &fmt, data);
+    char tmp[512];
+    snprintf(tmp, sizeof tmp, "%s.part", path);
+    FILE *fl = got > 0 ? fopen(tmp, "wb") : NULL;
+    if (fl) {
+        int ok = fwrite(&fmt, sizeof fmt, 1, fl) == 1 && fwrite(data, 1, (size_t)got, fl) == (size_t)got;
+        if (fclose(fl) == 0 && ok) rename(tmp, path); else remove(tmp);
+    }
+    free(data);
+}
+#endif
+
+extern unsigned g_frame;
 static struct timespec g_link_t0;
 static Linked *link_pair(GLuint vid, GLuint fid)
 {
@@ -1055,6 +1222,7 @@ static Linked *link_pair(GLuint vid, GLuint fid)
     if (g_dump < 0) { const char *d = getenv("LINDBERGH_ARB_DUMP"); g_dump = d && *d && *d != '0'; }
 
     GLuint sh[2] = { 0, 0 };
+    char *glsl_s[2] = { NULL, NULL };
     ArbProg *pp[2] = { vp, fp };
     GLuint ids[2] = { vid, fid };
     for (int st = 0; st < 2; st++) {
@@ -1066,14 +1234,14 @@ static Linked *link_pair(GLuint vid, GLuint fid)
             pp[st]->failed = 1;
             fprintf(stderr, "[arb] %s program %u not translated (%s); using the driver's path\n",
                     st ? "fragment" : "vertex", ids[st], t.err);
+            if (g_dump > 0) fprintf(stderr, "[arb] its source:\n%s\n", pp[st]->src);
             l->ok = 0;
             return l;
         }
         if (g_dump) fprintf(stderr, "[arb] %s program %u ->\n%s\n", st ? "fragment" : "vertex", ids[st], glsl);
-        sh[st] = compile(st ? GL_FRAGMENT_SHADER : GL_VERTEX_SHADER, glsl, st, ids[st]);
-        free(glsl);
-        if (!sh[st]) { pp[st]->failed = 1; l->ok = 0; return l; }
+        glsl_s[st] = glsl;
         memcpy(l->mat[st], t.mat, sizeof t.mat);
+        for (int u = 0; u < 16; u++) if (t.tex_target[u] == 5) l->rect_units |= 1u << u;
         l->nmat[st] = t.nmat;
         l->env_hi[st] = t.env_hi;
         l->local_hi[st] = t.local_hi;
@@ -1087,17 +1255,65 @@ static Linked *link_pair(GLuint vid, GLuint fid)
         }
     }
     if (!l->prog) l->prog = glCreateProgram();
-    for (int st = 0; st < 2; st++) if (sh[st]) glAttachShader(l->prog, sh[st]);
-    glLinkProgram(l->prog);
-    for (int st = 0; st < 2; st++) if (sh[st]) glDeleteShader(sh[st]);
     GLint ok = 0;
-    glGetProgramiv(l->prog, GL_LINK_STATUS, &ok);
+    struct timespec t_link, t_tr;
+    clock_gettime(CLOCK_MONOTONIC, &t_tr);
+#ifdef LINDBERGH_GL4ES
+    char path[512] = "";
+    if (glsl_s[0] && glsl_s[1]) cache_path(path, sizeof path, glsl_s[0], glsl_s[1]);
+    if (*path) {
+        /* gl4es converts a shader when its source is set and keeps it for the
+         * variants it builds later (alpha test and the like): attach the
+         * shaders with their source, unbuilt, and load the program */
+        for (int st = 0; st < 2; st++) {
+            sh[st] = glCreateShader(st ? GL_FRAGMENT_SHADER : GL_VERTEX_SHADER);
+            const char *src = glsl_s[st];
+            glShaderSource(sh[st], 1, &src, NULL);
+            glAttachShader(l->prog, sh[st]);
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t_link);
+        ok = cache_load(l->prog, path);
+    }
+#endif
+    if (!ok) {
+        for (int st = 0; st < 2; st++) {
+            if (!glsl_s[st]) continue;
+            int attached = sh[st] != 0;
+            if (attached) {
+                glCompileShader(sh[st]);
+                GLint c_ok = 0;
+                glGetShaderiv(sh[st], GL_COMPILE_STATUS, &c_ok);
+                if (!c_ok) {
+                    char log[4096] = "";
+                    glGetShaderInfoLog(sh[st], sizeof log, NULL, log);
+                    fprintf(stderr, "[arb] %s program %u: translated GLSL does not compile:\n%s\n----\n%s\n----\n",
+                            st ? "fragment" : "vertex", ids[st], log, glsl_s[st]);
+                    glDeleteShader(sh[st]); sh[st] = 0;
+                }
+            } else sh[st] = compile(st ? GL_FRAGMENT_SHADER : GL_VERTEX_SHADER, glsl_s[st], st, ids[st]);
+            if (!sh[st]) {
+                pp[st]->failed = 1; l->ok = 0;
+                for (int k = 0; k < 2; k++) { if (sh[k]) glDeleteShader(sh[k]); free(glsl_s[k]); }
+                return l;
+            }
+            if (!attached) glAttachShader(l->prog, sh[st]);
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t_link);
+        glLinkProgram(l->prog);
+        glGetProgramiv(l->prog, GL_LINK_STATUS, &ok);
+#ifdef LINDBERGH_GL4ES
+        if (ok && *path) cache_save(l->prog, path);
+#endif
+    }
+    for (int st = 0; st < 2; st++) { if (sh[st]) glDeleteShader(sh[st]); free(glsl_s[st]); }
     if (getenv("LINDBERGH_LATENCY")) {        /* linking waits on the driver */
         static double total; static unsigned n;
         struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
         double ms = (t1.tv_sec - g_link_t0.tv_sec) * 1e3 + (t1.tv_nsec - g_link_t0.tv_nsec) / 1e6;
         total += ms; n++;
-        if (ms > 5) fprintf(stderr, "[lat] linking v%u/f%u took %.0f ms (%u links, %.0f ms so far)\n", vid, fid, ms, n, total);
+        double lk = (t1.tv_sec - t_link.tv_sec) * 1e3 + (t1.tv_nsec - t_link.tv_nsec) / 1e6;
+        double tr = (t_tr.tv_sec - g_link_t0.tv_sec) * 1e3 + (t_tr.tv_nsec - g_link_t0.tv_nsec) / 1e6;
+        if (ms > 5) fprintf(stderr, "[lat] linking v%u/f%u took %.0f ms: translating %.0f, linking %.0f (%u links, %.0f ms so far)\n", vid, fid, ms, tr, lk, n, total);
     }
     if (!ok) {
         char log[2048] = "";
@@ -1113,12 +1329,32 @@ static Linked *link_pair(GLuint vid, GLuint fid)
         const char *P = st ? "f" : "v";
         char nm[32];
         snprintf(nm, sizeof nm, "%s_env", P); l->u_env[st] = glGetUniformLocation(l->prog, nm);
+        if (l->u_env[st] >= 0) {
+            int want = l->env_hi[st] + 1;
+            l->env_hi[st] = array_len(l->prog, nm, want) - 1;
+            if (l->env_hi[st] + 1 < want && getenv("LINDBERGH_ARB_ARRAYS"))
+                fprintf(stderr, "[arb] pair v%u/f%u: %s %d of %d kept\n", vid, fid, nm, l->env_hi[st] + 1, want);
+        }
         snprintf(nm, sizeof nm, "%s_loc", P); l->u_loc[st] = glGetUniformLocation(l->prog, nm);
+        if (l->u_loc[st] >= 0) l->local_hi[st] = array_len(l->prog, nm, l->local_hi[st] + 1) - 1;
         for (int m = 0; m < l->nmat[st]; m++) {
             snprintf(nm, sizeof nm, "%s_m%d", P, m);
             l->u_mat[st][m] = glGetUniformLocation(l->prog, nm);
         }
     }
+#ifdef LINDBERGH_GL4ES
+    l->u_rect = glGetUniformLocation(l->prog, "u_rect_norm");
+    l->n_rect = l->u_rect >= 0 ? array_len(l->prog, "u_rect_norm", 16) : 0;
+#else
+    l->u_rect = glGetUniformLocation(l->prog, "u_rect_scale");
+#endif
+    l->u_reproj = glGetUniformLocation(l->prog, "u_reproj");
+#ifdef LINDBERGH_GL4ES
+    if (gl4es_mv_shaders && l->u_reproj >= 0) {
+        static int shown;
+        if (shown++ < 5) fprintf(stderr, "[arbprog] u_reproj at %d, %d matrices as the driver keeps it\n", l->u_reproj, array_len(l->prog, "u_reproj", 2));
+    }
+#endif
     static const char *const pre[] = { "s1_", "s2_", "s3_", "sc_", "sr_" };
     for (int u = 0; u < 16; u++)
         for (int k = 0; k < 5; k++) {
@@ -1198,6 +1434,71 @@ static void stack_matrix(int which, int index, float *m)
 
 static void upload(Linked *l)
 {
+#ifdef LINDBERGH_GL4ES
+    if (l->u_reproj >= 0 && gl4es_mv_shaders) {
+        float m[32];
+        stereo_reproject_view(0, m); stereo_reproject_view(1, m + 16);
+        glUniformMatrix4fv(l->u_reproj, 2, GL_FALSE, m);
+    } else
+#endif
+    if (l->u_reproj >= 0) { float m[16]; stereo_reproject(m); glUniformMatrix4fv(l->u_reproj, 1, GL_FALSE, m); }
+#ifdef LINDBERGH_GL4ES
+    if (l->u_rect >= 0) {
+        float rx, ry, norm[16][2];
+        stereo_rect_scale(&rx, &ry);
+        GLint active = GL_TEXTURE0;
+        glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+        for (int u = 0; u < 16; u++) {
+            norm[u][0] = norm[u][1] = 1;
+            if (!(l->rect_units & (1u << u))) continue;
+            GLint w = 0, h = 0;
+            glActiveTexture(GL_TEXTURE0 + u);
+            glGetTexLevelParameteriv(GL_TEXTURE_RECTANGLE_ARB, 0, GL_TEXTURE_WIDTH, &w);
+            glGetTexLevelParameteriv(GL_TEXTURE_RECTANGLE_ARB, 0, GL_TEXTURE_HEIGHT, &h);
+            /* only render targets were drawn larger; a texture the game
+             * filled itself (the 256x1 colour table of the final pass) is
+             * still its own size, and scaling its lookups washed every
+             * colour out */
+            GLint bound = 0;
+            glGetIntegerv(GL_TEXTURE_BINDING_RECTANGLE_ARB, &bound);
+            int big = stereo_is_render_target((GLuint)bound);
+            if (getenv("LINDBERGH_RECT_LOG")) {
+                static unsigned seen[256]; static int ns;
+                unsigned key = (unsigned)bound * 2u + (unsigned)big;
+                int k = 0; while (k < ns && seen[k] != key) k++;
+                if (k == ns && ns < 256) { seen[ns++] = key;
+                    fprintf(stderr, "[rect] frame %u: unit %d texture %d is %dx%d, %s\n", g_frame, u, bound, w, h,
+                            big ? "a render target (scaled)" : "not a render target"); }
+            }
+            if (w > 0 && h > 0) { norm[u][0] = (big ? rx : 1) / (float)w; norm[u][1] = (big ? ry : 1) / (float)h; }
+        }
+        glActiveTexture((GLenum)active);
+        glUniform2fv(l->u_rect, l->n_rect, &norm[0][0]);
+        if (gl4es_mv_trace)
+            fprintf(stderr, "[arb] u_rect_norm at %d, %d of them: %g %g / %g %g, error %#x\n", l->u_rect, l->n_rect,
+                    norm[0][0], norm[0][1], norm[3][0], norm[3][1], glGetError());
+    }
+#else
+    if (l->u_rect >= 0) {
+        /* only render targets were drawn larger; a texture the game filled
+         * itself (the 256x1 colour table of the final pass) is its own size,
+         * and scaling its lookups washed every colour out */
+        float rx, ry, sc[16][2];
+        stereo_rect_scale(&rx, &ry);
+        GLint active = GL_TEXTURE0;
+        glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+        for (int u = 0; u < 16; u++) {
+            sc[u][0] = sc[u][1] = 1;
+            if (!(l->rect_units & (1u << u)) || (rx == 1 && ry == 1)) continue;
+            GLint bound = 0;
+            glActiveTexture(GL_TEXTURE0 + u);
+            glGetIntegerv(GL_TEXTURE_BINDING_RECTANGLE_ARB, &bound);
+            if (stereo_is_render_target((GLuint)bound)) { sc[u][0] = rx; sc[u][1] = ry; }
+        }
+        glActiveTexture((GLenum)active);
+        glUniform2fv(l->u_rect, 16, &sc[0][0]);
+    }
+#endif
     for (int st = 0; st < 2; st++) {
         GLuint id = st ? l->fid : l->vid;
         if (!id) continue;
@@ -1268,6 +1569,9 @@ void arb_env(GLenum target, GLuint index, const float *v)
 {
     int st = stage_of(target);
     if (st < 0 || index >= MAX_ENV) return;
+    /* about half of the game's sets repeat the value already there, and a
+     * change means the whole array goes to the driver again at the next draw */
+    if (!memcmp(g_env[st][index], v, 16)) return;
     memcpy(g_env[st][index], v, 16);
     g_env_gen[st]++;
 }
@@ -1277,7 +1581,7 @@ void arb_local(GLenum target, GLuint index, const float *v)
     int st = stage_of(target);
     if (st < 0 || index >= MAX_LOCAL) return;
     ArbProg *p = prog_get(st, g_bound[st], 1);
-    if (!p) return;
+    if (!p || !memcmp(p->local[index], v, 16)) return;
     memcpy(p->local[index], v, 16);
     p->local_gen++;
 }
@@ -1323,8 +1627,55 @@ void arb_use_glsl(GLuint prog) { g_game_glsl = prog; }
 
 /* Before every draw: the game's own GLSL program wins, as it does in GL;
  * otherwise the enabled assembly stages, translated. */
+#ifdef LINDBERGH_GL4ES
+/* Units given a rectangle enable for the last program draw, undone at the
+ * next draw - after glEnd for glBegin. */
+static unsigned g_rect_forced;
+
+static void rect_enables(unsigned want)
+{
+    if (want == g_rect_forced) return;
+    GLint active = GL_TEXTURE0;
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+    for (int u = 0; u < 16; u++) {
+        unsigned bit = 1u << u;
+        if ((want ^ g_rect_forced) & bit) {
+            glActiveTexture(GL_TEXTURE0 + u);
+            if (want & bit) { if (glIsEnabled(GL_TEXTURE_RECTANGLE_ARB)) want &= ~bit; else glEnable(GL_TEXTURE_RECTANGLE_ARB); }
+            else glDisable(GL_TEXTURE_RECTANGLE_ARB);
+        }
+    }
+    glActiveTexture((GLenum)active);
+    g_rect_forced = want;
+}
+
+/* The game set a rectangle enable itself: it is the game's now. */
+void arb_rect_enable_seen(void)
+{
+    GLint active = GL_TEXTURE0;
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+    g_rect_forced &= ~(1u << ((unsigned)active - GL_TEXTURE0));
+}
+#endif
+
+double g_arb_draw_ns;                   /* LINDBERGH_GLPROF: time in arb_before_draw */
+static void before_draw(void);
 void arb_before_draw(void)
 {
+    extern int stereo_glprof_on(void);
+    if (!stereo_glprof_on()) { before_draw(); return; }
+    struct timespec a, b;
+    clock_gettime(CLOCK_MONOTONIC, &a);
+    before_draw();
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    g_arb_draw_ns += (b.tv_sec - a.tv_sec) * 1e9 + (b.tv_nsec - a.tv_nsec);
+}
+
+static void before_draw(void)
+{
+#ifdef LINDBERGH_GL4ES
+    rect_enables(0);
+#endif
     if (!arb_active()) return;
     if (g_game_glsl) { glUseProgram(g_game_glsl); return; }
     GLuint vid = g_enabled[0] ? g_bound[0] : 0;
@@ -1395,12 +1746,21 @@ void arb_before_draw(void)
         glDisable(GL_FRAGMENT_PROGRAM_ARB);
         glUseProgram(l->prog);
         upload(l);
+#ifdef LINDBERGH_GL4ES
+        rect_enables(l->rect_units);
+#endif
         return;
     }
     /* not translatable: the driver's own assembly path, as before */
     glUseProgram(0);
     if (vid) glEnable(GL_VERTEX_PROGRAM_ARB); else glDisable(GL_VERTEX_PROGRAM_ARB);
     if (fid) glEnable(GL_FRAGMENT_PROGRAM_ARB); else glDisable(GL_FRAGMENT_PROGRAM_ARB);
+}
+
+GLuint arb_bound(GLenum target)
+{
+    int st = stage_of(target);
+    return st >= 0 ? g_bound[st] : 0;
 }
 
 const char *arb_get_source(GLenum target, GLuint id)

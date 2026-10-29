@@ -36,6 +36,17 @@ static void mac_activate(void)
 #include "gl_posix.h"
 #include "host_settings.h"
 
+#if defined(__ANDROID__)
+/* Meta Quest: GL through gl4es, frames to the headset (host_xr.c) */
+#include <gl4esinit.h>
+int  xr_init(void);
+void xr_frame_begin(void);
+void xr_frame_end(void);
+
+static void APIENTRY_GL4ES main_fb_size(int *w, int *h) { *w = 640; *h = 480; }
+#endif
+#include "stereo.h"
+
 #define DEFAULT_W 640
 #define DEFAULT_H 480
 
@@ -56,10 +67,27 @@ void host_mac_fix_surface(SDL_Window *win, int w, int h);   /* host_menu_mac.m *
 #endif
 
 /* A pointer position in the window, in the game's pixels. */
+/* The picture the window shows: the game's own frame, or the widescreen
+ * image (stereo_wide) whose middle k of the width is the game's screen. */
+static void picture_size(int *w, int *h)
+{
+    if (!stereo_wide(w, h, NULL)) { *w = g_win.w; *h = g_win.h; }
+}
+
 static void to_game(int *x, int *y)
 {
     int ww = 0, wh = 0;
+    float k;
     if (g_win.win) SDL_GetWindowSize(g_win.win, &ww, &wh);
+    if (ww > 0 && wh > 0 && g_win.w > 0 && stereo_wide(NULL, NULL, &k)) {
+        /* the side strips are beyond the game's screen: kept to its edge,
+         * not off it, which is a reload */
+        double u = ((double)*x / ww - 0.5) / k + 0.5;
+        int gx = (int)(u * g_win.w);
+        *x = gx < 0 ? 0 : gx >= g_win.w ? g_win.w - 1 : gx;
+        *y = (int)((long)*y * g_win.h / wh);
+        return;
+    }
     if (ww > 0 && wh > 0 && g_win.w > 0) {
         *x = (int)((long)*x * g_win.w / ww);
         *y = (int)((long)*y * g_win.h / wh);
@@ -69,7 +97,13 @@ static void to_game(int *x, int *y)
 static void to_window(int *x, int *y)
 {
     int ww = 0, wh = 0;
+    float k;
     if (g_win.win) SDL_GetWindowSize(g_win.win, &ww, &wh);
+    if (ww > 0 && wh > 0 && g_win.w > 0 && stereo_wide(NULL, NULL, &k)) {
+        *x = (int)((((double)*x / g_win.w - 0.5) * k + 0.5) * ww);
+        *y = (int)((long)*y * wh / g_win.h);
+        return;
+    }
     if (ww > 0 && wh > 0 && g_win.w > 0) {
         *x = (int)((long)*x * ww / g_win.w);
         *y = (int)((long)*y * wh / g_win.h);
@@ -287,6 +321,7 @@ static void cabinet_autostart(void)
         if (press && g_frame % 120u >= 60u && g_frame % 120u < 75u) g_auto |= (unsigned)press;
         /* LINDBERGH_AUTOGUN=2: one second in four off the screen, with a
          * press of the gun's screen-out signal - the arcade's reload */
+        if (gun == 2) stereo_game_gun_reloading(g_frame % 240u >= 20u && g_frame % 240u < 110u);
         if (gun == 2 && g_frame % 240u < 60u) {
             g_mouse_x = -100000; g_mouse_y = -100000;
             g_auto &= ~CAB_P1_TRIGGER;
@@ -295,9 +330,60 @@ static void cabinet_autostart(void)
     }
 }
 
+/* LINDBERGH_SCRIPT=<file>: scripted play, for reaching a scene unattended.
+ * Each line "<from> <to> <x> <y> <buttons, hex> [coins]": from game frame
+ * <from> up to <to>, the gun at x,y on the 640x480 screen (negative: off it)
+ * with those cabinet buttons held; coins go in once, at <from>. */
+static void cabinet_script(void)
+{
+    static int loaded;
+    static struct { unsigned from, to; int x, y; unsigned buttons, coins; } ln[256];
+    static int n;
+    if (!loaded) {
+        loaded = 1;
+        const char *path = getenv("LINDBERGH_SCRIPT");
+        FILE *f = path && *path ? fopen(path, "r") : NULL;
+        char buf[160];
+        while (f && n < 256 && fgets(buf, sizeof buf, f)) {
+            unsigned c = 0;
+            if (buf[0] == '#') continue;
+            if (sscanf(buf, "%u %u %d %d %x %u", &ln[n].from, &ln[n].to, &ln[n].x, &ln[n].y, &ln[n].buttons, &c) >= 5) {
+                ln[n].coins = c;
+                n++;
+            }
+        }
+        if (f) { fclose(f); fprintf(stderr, "[cab] script: %d lines from %s\n", n, path); }
+        else if (path && *path) fprintf(stderr, "[cab] script %s not found\n", path);
+    }
+    if (!n) return;
+    int any = 0;
+    for (int i = 0; i < n; i++) any |= g_frame >= ln[i].from && g_frame <= ln[i].to;
+    static int was;
+    if (!any) {                 /* between the script's lines, the real gun (or LINDBERGH_AUTOGUN's) */
+        if (was) { g_scripted = 0; g_auto = 0; }
+        was = 0;
+        return;
+    }
+    was = 1;
+    g_scripted = 1;
+    g_auto = 0;
+    int w = g_win.w ? g_win.w : DEFAULT_W, h = g_win.h ? g_win.h : DEFAULT_H;
+    g_mouse_x = -100000; g_mouse_y = -100000;
+    for (int i = 0; i < n; i++) {
+        if (g_frame < ln[i].from || g_frame > ln[i].to) continue;
+        if (ln[i].x == -2) {    /* x -2: sweep the screen, as LINDBERGH_AUTOGUN does */
+            double t = g_frame / 90.0;
+            g_mouse_x = (int)(w / 2 + w / 3 * cos(t)); g_mouse_y = (int)(h / 2 + h / 4 * sin(t * 1.7));
+        } else if (ln[i].x >= 0 && ln[i].y >= 0) { g_mouse_x = ln[i].x * w / 640; g_mouse_y = ln[i].y * h / 480; }
+        g_auto |= ln[i].buttons;
+        if (g_frame == ln[i].from) g_cab.coins[0] += ln[i].coins;
+    }
+}
+
 void host_cabinet_input(CabinetInput *out)
 {
     cabinet_autostart();
+    cabinet_script();
     HostSettings *st = settings();
     double w = g_win.w ? g_win.w : DEFAULT_W, h = g_win.h ? g_win.h : DEFAULT_H;
     if (g_calib == 1)      { g_cab.gun_x = (int)(CAL_AX * w); g_cab.gun_y = (int)(CAL_AY * h); }
@@ -307,6 +393,9 @@ void host_cabinet_input(CabinetInput *out)
         g_cab.gun_x = (int)((g_mouse_x - st->aim_ox) / st->aim_sx);
         g_cab.gun_y = (int)((g_mouse_y - st->aim_oy) / st->aim_sy);
     }
+#if !defined(__ANDROID__)
+    if (stereo_wide(NULL, NULL, NULL)) stereo_set_gun(g_cab.gun_x, g_cab.gun_y);   /* the HUD keeps clear of it */
+#endif
     g_cab.screen_w = (int)w;
     g_cab.screen_h = (int)h;
     g_cab.buttons = g_auto | (g_scripted ? 0 : g_held);
@@ -332,6 +421,16 @@ void host_cabinet_input(CabinetInput *out)
 unsigned host_cabinet_buttons(void)
 {
     return g_auto | (g_scripted ? 0 : g_held | g_cab_latch);
+}
+
+/* A headset's controllers (host_xr.c): where the gun points, in the game's
+ * pixels, and the cabinet buttons held. */
+void host_vr_input(int gun_x, int gun_y, unsigned held, int coin)
+{
+    g_mouse_x = gun_x; g_mouse_y = gun_y;
+    g_cab_latch |= held & ~g_held;
+    g_held = held;
+    if (coin) g_cab.coins[0]++;
 }
 
 /* The board has reported the switches: latched taps have been seen. */
@@ -434,14 +533,14 @@ static void pump(void)
         switch (e.type) {
         case SDL_QUIT:
             fprintf(stderr, "[window] closed by the user\n");
-            exit(0);
+            host_quit();
         case SDL_WINDOWEVENT:
 #if defined(__APPLE__)
             /* SDL refreshes the GL context on a resize, which can drop the
              * fixed drawable size: pin it again */
             if (e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED && g_win.gl) {
                 fprintf(stderr, "[window] resized to %dx%d\n", e.window.data1, e.window.data2);
-                host_mac_fix_surface(g_win.win, g_win.w, g_win.h);
+                { int pw, ph; picture_size(&pw, &ph); host_mac_fix_surface(g_win.win, pw, ph); }
             }
 #endif
             if (e.window.event == SDL_WINDOWEVENT_FOCUS_GAINED) fprintf(stderr, "[window] focus gained\n");
@@ -527,10 +626,19 @@ int host_window_open(const char *title)
     g_win.w = env_int("LINDBERGH_WIDTH", g_hint_w ? g_hint_w : DEFAULT_W);
     g_win.h = env_int("LINDBERGH_HEIGHT", g_hint_h ? g_hint_h : DEFAULT_H);
 
+#if defined(__ANDROID__)
+    /* GLES 3 under gl4es, which plays the 2.1 context the game expects. The
+     * headset keeps running while the activity is paused. */
+    SDL_SetHint(SDL_HINT_ANDROID_BLOCK_ON_PAUSE, "0");
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+#else
     /* The game is a 2007 fixed-function + ARB-program GL program: a 2.1
      * compatibility context is what it was written for. */
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
+#endif
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
     SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
@@ -541,12 +649,13 @@ int host_window_open(const char *title)
     {
         const char *v = getenv("LINDBERGH_WINDOW");
         if (!(v && sscanf(v, "%dx%d", &dw, &dh) == 2 && dw > 0 && dh > 0)) {
-            dh = 1080; dw = (int)((long)dh * g_win.w / g_win.h);
+            int pw, ph; picture_size(&pw, &ph);
+            dh = 1080; dw = (int)((long)dh * pw / ph);
             SDL_Rect r;
             if (SDL_GetDisplayUsableBounds(0, &r) == 0 && r.h > 100) {
                 int maxh = r.h - 40, maxw = r.w - 40;
-                if (dh > maxh) { dh = maxh; dw = (int)((long)dh * g_win.w / g_win.h); }
-                if (dw > maxw) { dw = maxw; dh = (int)((long)dw * g_win.h / g_win.w); }
+                if (dh > maxh) { dh = maxh; dw = (int)((long)dh * pw / ph); }
+                if (dw > maxw) { dw = maxw; dh = (int)((long)dw * ph / pw); }
             }
         }
     }
@@ -569,7 +678,13 @@ int host_window_open(const char *title)
         if (cur) SDL_SetCursor(cur);
     }
     fprintf(stderr, "[window] game %dx%d, window %dx%d%s\n", g_win.w, g_win.h, dw, dh,
-            pthread_main_np() ? "" : " (NOT on the main thread)");
+            
+#if defined(__APPLE__)
+            pthread_main_np() ? "" : " (NOT on the main thread)"
+#else
+            ""
+#endif
+            );
     return 1;
 }
 
@@ -582,16 +697,28 @@ int host_gl_context(void)
         fprintf(stderr, "[window] SDL_GL_CreateContext: %s\n", SDL_GetError());
         return 0;
     }
+#if defined(__ANDROID__)
+    set_getprocaddress(SDL_GL_GetProcAddress);
+    set_getmainfbsize(main_fb_size);
+    initialize_gl4es();
+    if (!xr_init()) {
+        fprintf(stderr, "[window] no headset session - nothing to show the game on\n");
+        return 0;
+    }
+    xr_frame_begin();
+#else
 #if defined(__APPLE__)
-    host_mac_fix_surface(g_win.win, g_win.w, g_win.h);
+    { int pw, ph; picture_size(&pw, &ph); host_mac_fix_surface(g_win.win, pw, ph); }
     /* the context started with the window's size as its viewport and
      * scissor box, which the game reads back: make them its own */
     glViewport(0, 0, g_win.w, g_win.h);
     glScissor(0, 0, g_win.w, g_win.h);
 #endif
     SDL_GL_SetSwapInterval(env_int("LINDBERGH_VSYNC", 0));   /* the game paces itself; macOS stalls vsync swaps for hidden windows */
+#endif
     fprintf(stderr, "[window] GL context ready: %s / %s\n",
             (const char *)glGetString(GL_RENDERER), (const char *)glGetString(GL_VERSION));
+    stereo_frame_begin();
     return 1;
 }
 
@@ -619,6 +746,9 @@ static void maybe_peek(void)
     fprintf(stderr, "%s\n", line);
 }
 
+static unsigned g_late17, g_late25;
+static double   g_worst;
+
 static void maybe_screenshot(void)
 {
     const char *path = getenv("LINDBERGH_SHOT");
@@ -627,13 +757,14 @@ static void maybe_screenshot(void)
     int at = env_int("LINDBERGH_SHOT_FRAME", 600);
     char name[512];
     if (every > 0) {
-        if (g_frame == 0 || g_frame % (unsigned)every) return;
+        if (g_frame == 0 || g_frame % (unsigned)every || g_frame < (unsigned)env_int("LINDBERGH_SHOT_FROM", 0)) return;
         snprintf(name, sizeof name, "%s.%05u.ppm", path, g_frame);
     } else {
         if (g_frame != (unsigned)at) return;
         snprintf(name, sizeof name, "%s", path);
     }
-    int w = g_win.w, h = g_win.h;
+    int w, h;
+    picture_size(&w, &h);
     unsigned char *px = (unsigned char *)malloc((size_t)w * h * 3);
     if (!px) return;
     GLint fb = 0;
@@ -653,6 +784,21 @@ static void maybe_screenshot(void)
     free(px);
 }
 
+#if defined(__ANDROID__)
+/* Where a frame's time goes, summed over each [perf] period: the game's own
+ * work (first eye included), the second eye's replay, handing both to the
+ * headset, and waiting for its next frame. */
+static double g_t_game, g_t_eye2, g_t_submit, g_t_wait;
+static Uint64 g_t_mark;
+static double since_mark(void)
+{
+    Uint64 now = SDL_GetPerformanceCounter();
+    double ms = g_t_mark ? (now - g_t_mark) * 1000.0 / SDL_GetPerformanceFrequency() : 0;
+    g_t_mark = now;
+    return ms;
+}
+#endif
+
 void host_swap(void)
 {
     {   /* LINDBERGH_RESIZE_AT=frame,WxH: resize the window then - a test */
@@ -661,10 +807,28 @@ void host_swap(void)
                       if (v) sscanf(v, "%d,%dx%d", &at, &rw, &rh); }
         if (at && g_frame == (unsigned)at && g_win.win) SDL_SetWindowSize(g_win.win, rw, rh);
     }
+#if defined(__ANDROID__)
+    g_t_game += since_mark();
+    stereo_frame_end();                 /* the second eye, then both to the headset */
+    g_t_eye2 += since_mark();
+    xr_frame_end();
+    g_t_submit += since_mark();
+#else
+    if (stereo_enabled()) {             /* draw the second eye, show both */
+        stereo_frame_end();
+        { int pw, ph; picture_size(&pw, &ph); stereo_present_desktop(pw, ph); }
+    }
+#endif
     maybe_screenshot();
     maybe_peek();
     g_frame++;
+#if defined(__ANDROID__)
+    xr_frame_begin();
+    g_t_wait += since_mark();
+    if (0) {
+#else
     if (g_win.win) {
+#endif
         /* Present the window's own framebuffer whatever the game left bound:
          * it ends a frame with one of its offscreen FBOs current, which the
          * Lindbergh's driver ignored at swap and Apple's does not. */
@@ -674,6 +838,7 @@ void host_swap(void)
         SDL_GL_SwapWindow(g_win.win);
         if (fb) glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)fb);
     }
+    stereo_frame_begin();
     {
         static int after = -1;
         if (after < 0) after = env_int("LINDBERGH_EXIT_AFTER", 0);
@@ -686,14 +851,28 @@ void host_swap(void)
         static Uint64 prev; Uint64 now = SDL_GetPerformanceCounter();
         double ms = prev ? (now - prev) * 1000.0 / SDL_GetPerformanceFrequency() : 0; prev = now;
         if (ms > 40 && env_int("LINDBERGH_LATENCY", 0)) fprintf(stderr, "[lat] frame %u took %.0f ms\n", g_frame, ms);
+        /* pacing, for the 5-second report: frames late for 60 Hz, and the worst */
+        if (ms > 17.5) g_late17++;
+        if (ms > 25.0) g_late25++;
+        if (ms > g_worst) g_worst = ms;
     }
     {   /* frame rate, every 5 seconds */
         static Uint32 t0; static unsigned f0;
         Uint32 now = SDL_GetTicks();
         if (!t0) { t0 = now; f0 = g_frame; }
         else if (now - t0 >= 5000) {
+#if defined(__ANDROID__)
+            unsigned n = g_frame - f0 ? g_frame - f0 : 1;
+            fprintf(stderr, "[perf] frame %u, %.1f fps; ms per frame: game %.1f, second eye %.1f, submit %.1f, headset wait %.1f;"
+                            " late %u (over 25 ms %u), worst %.0f ms\n",
+                    g_frame, (g_frame - f0) * 1000.0 / (now - t0),
+                    g_t_game / n, g_t_eye2 / n, g_t_submit / n, g_t_wait / n, g_late17, g_late25, g_worst);
+            g_late17 = g_late25 = 0; g_worst = 0;
+            g_t_game = g_t_eye2 = g_t_submit = g_t_wait = 0;
+#else
             fprintf(stderr, "[perf] frame %u, %.1f fps\n", g_frame,
                     (g_frame - f0) * 1000.0 / (now - t0));
+#endif
             t0 = now; f0 = g_frame;
         }
     }

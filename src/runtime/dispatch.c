@@ -17,6 +17,7 @@
 #include <stdlib.h>
 
 #include "lindbergh_rt.h"
+#include "stereo.h"
 #include "recomp_funcs_list.h"
 #include "recomp_plt.h"
 
@@ -40,15 +41,15 @@ static const Entry g_table[] = { LIFTED_FUNCS(ENT) SOLIB_FUNCS(ENT) };
 
 #define N (sizeof g_table / sizeof g_table[0])
 
-static void (*find(uint32_t va))(CPU *)
+static size_t find_index(uint32_t va)      /* +1, 0: none */
 {
     size_t lo = 0, hi = N;
     while (lo < hi) {
         size_t mid = lo + (hi - lo) / 2;
-        if (g_table[mid].va == va) return g_table[mid].fn;
+        if (g_table[mid].va == va) return mid + 1;
         if (g_table[mid].va < va) lo = mid + 1; else hi = mid;
     }
-    return NULL;
+    return 0;
 }
 
 /* PLT stubs, address -> import. In a non-PIE ELF the address OF an imported
@@ -93,6 +94,27 @@ static __thread unsigned g_depth_max;
 #endif
 
 #define DEPTH_LIMIT 20000
+
+/* How an address resolved, cached: one 64-bit word per slot - the address
+ * above, below an index (+1, 0 empty) into the lifted table, or with the top
+ * bit set into the overrides - so a slot read while another thread writes it
+ * is old or new, never half of each. */
+#define DCACHE_N 8192
+static uint64_t g_dcache[DCACHE_N];
+void dispatch_cache_clear(void) { memset(g_dcache, 0, sizeof g_dcache); }   /* an override added */
+
+/* The lifted body at an address, past any override: for an override that
+ * wraps the game's own function. */
+void (*dispatch_lifted(uint32_t va))(CPU *)
+{
+    size_t lo = 0, hi = N;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (g_table[mid].va == va) return g_table[mid].fn;
+        if (g_table[mid].va < va) lo = mid + 1; else hi = mid;
+    }
+    return NULL;
+}
 
 unsigned guest_depth(void)     { return g_depth; }
 unsigned guest_depth_max(void) { return g_depth_max; }
@@ -149,10 +171,43 @@ static int gl_token_call_entry(CPU *c, uint32_t va)
     return 0;
 }
 
+/* LINDBERGH_TRACE_RANGE=lo,hi (hex): the guest functions in that range each
+ * frame called, printed whenever the set changes - which of the game's
+ * screen filters run, say */
+extern unsigned g_frame;
+static void range_trace(uint32_t va)
+{
+    static int on = -1;
+    static uint32_t lo, hi, cur[32], prev[32];
+    static int ncur, nprev;
+    static unsigned at;
+    if (on < 0) {
+        const char *v = getenv("LINDBERGH_TRACE_RANGE");
+        on = v && *v;
+        if (on) { lo = (uint32_t)strtoul(v, (char **)&v, 16); if (*v == ',') v++; hi = (uint32_t)strtoul(v, NULL, 16); }
+    }
+    if (!on) return;
+    if (g_frame != at) {
+        int same = ncur == nprev;
+        for (int i = 0; same && i < ncur; i++) same = cur[i] == prev[i];
+        if (!same) {
+            fprintf(stderr, "[range] frame %u:", at);
+            for (int i = 0; i < ncur; i++) fprintf(stderr, " %#x", cur[i]);
+            fprintf(stderr, "\n");
+        }
+        memcpy(prev, cur, sizeof cur); nprev = ncur; ncur = 0; at = g_frame;
+    }
+    if (va < lo || va > hi) return;
+    for (int i = 0; i < ncur; i++) if (cur[i] == va) return;
+    if (ncur < 32) { int i = ncur++; while (i > 0 && cur[i - 1] > va) { cur[i] = cur[i - 1]; i--; } cur[i] = va; }
+}
+
 void dispatch(CPU *c, uint32_t va)
 {
     guest_trace_dispatch(va);
+    range_trace(va);
     int watched = watch_check(c, va);
+    if (va >= stereo_state_lo && va <= stereo_state_hi) stereo_guest_state(va);
 
     if (++g_depth > g_depth_max) g_depth_max = g_depth;
     if (g_depth > DEPTH_LIMIT) {
@@ -175,14 +230,32 @@ void dispatch(CPU *c, uint32_t va)
         c->esp = saved;
     }
 
+    /* Most calls are to an address seen before: how it resolved is cached,
+     * by address. The searches below - a scan of the overrides, a binary
+     * search of ~10k lifted functions - were a fifth of the game thread. */
+    uint64_t *sl = &g_dcache[(va >> 2) & (DCACHE_N - 1)];
+    uint64_t e = __atomic_load_n(sl, __ATOMIC_RELAXED);
+    if ((uint32_t)(e >> 32) == va && (uint32_t)e) {
+        uint32_t k = (uint32_t)e;
+        if (k & 0x80000000u) { (void)pop32(c); guest_override_at((int)(k & 0x7fffffffu) - 1)(c); }
+        else g_table[k - 1].fn(c);
+        g_depth--;
+        if (watched) fprintf(stderr, "[watch] %#010x -> %#x\n", va, c->eax);
+        return;
+    }
+
     /* A host body standing in for a guest function. Checked first, so it wins
      * over the lifted version; the range test costs two compares. */
-    HleHandler ov = guest_find_override(va);
+    int oi = guest_find_override_index(va);
+    HleHandler ov = oi >= 0 ? guest_override_at(oi) : NULL;
+    if (ov) __atomic_store_n(sl, (uint64_t)va << 32 | 0x80000000u | (uint32_t)(oi + 1), __ATOMIC_RELAXED);
     if (ov) { (void)pop32(c); ov(c); g_depth--;
               if (watched) fprintf(stderr, "[watch] %#010x -> %#x\n", va, c->eax);
               return; }
 
-    void (*fn)(CPU *) = find(va);
+    size_t fi = find_index(va);
+    void (*fn)(CPU *) = fi ? g_table[fi - 1].fn : NULL;
+    if (fn && !ov) __atomic_store_n(sl, (uint64_t)va << 32 | (uint32_t)fi, __ATOMIC_RELAXED);
     if (fn) { fn(c); g_depth--;
               if (watched) fprintf(stderr, "[watch] %#010x -> %#x\n", va, c->eax);
               return; }

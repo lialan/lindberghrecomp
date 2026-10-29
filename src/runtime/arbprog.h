@@ -15,5 +15,7 @@ void arb_push_attrib(GLbitfield mask);
 void arb_pop_attrib(void);
 void arb_use_glsl(GLuint prog);
 void arb_before_draw(void);
+GLuint arb_bound(GLenum target);     /* the program bound to a target */
+void arb_rect_enable_seen(void);   /* gl4es: the game set a rectangle enable */
 
 #endif

@@ -17,11 +17,15 @@
  */
 
 #include <stdio.h>
+#include <time.h>
 #include <string.h>
 
 #include "lindbergh_rt.h"
 #if !defined(_WIN32)
 #include "host_settings.h"
+#ifndef _WIN32
+#include "stereo.h"
+#endif
 #endif
 
 /* The library's own success code. Every am* function returns 0 for success
@@ -556,10 +560,259 @@ static int region_value(void)
     return g_country ? 1 : 0;
 }
 static void h_region(CPU *c) { RET(region_value()); }
+#if defined(__ANDROID__)
+/* Ghost Squad Evolution paces itself: idle_wait_func spins on the wall clock
+ * until 16.683 ms (59.94 Hz) have passed since the frame began. The headset
+ * shows 120 Hz, two display frames per game frame at exactly 60: at 59.94 the
+ * game slid through the display's phase, and each time it crossed a display
+ * frame one game frame was shown once and the next three times - judder.
+ * The frame target is read only by the waits there, so for the call it is
+ * the display's own (host_frame_period_ms: the headset's period times its
+ * frames per game frame). Pacing by the display alone was tried: the game
+ * then begins a frame only when the headset releases it, too late to finish
+ * in two display frames. The same constant elsewhere (main_loop_func's frame
+ * ratios) is untouched. LINDBERGH_GAME_PACING=1 keeps the game's own. */
+#define FRAME_TARGET_VA 0x081c1d40u
+static void (*g_idle_wait)(CPU *);
+static void h_idle_wait(CPU *c)
+{
+    uint32_t keep = rd32(FRAME_TARGET_VA), now;
+    extern float host_frame_period_ms(void);
+    float t = host_frame_period_ms();
+    if (!(t > 5.0f && t < 40.0f)) memcpy(&t, &keep, 4);
+    memcpy(&now, &t, 4);
+    wr32(FRAME_TARGET_VA, now);
+    push32(c, 0xDEADBEEFu);                 /* the return slot its ret pops */
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    g_idle_wait(c);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    wr32(FRAME_TARGET_VA, keep);
+    {   /* headroom: how long the frame waited, for the 5-second report */
+        static double sum, lo = 1e9; static unsigned n, tight;
+        double ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+        sum += ms; if (ms < lo) lo = ms; if (ms < 1.0) tight++;
+        if (++n == 300) {
+            fprintf(stderr, "[idle] frame wait: mean %.1f ms, least %.1f ms, under 1 ms %u of 300\n", sum / n, lo, tight);
+            sum = 0; lo = 1e9; n = 0; tight = 0;
+        }
+    }
+}
+static int pace_by_display(void)
+{
+    const char *v = getenv("LINDBERGH_GAME_PACING");
+    if (v && *v == '1') return 0;
+    uint32_t va = guest_symbol("_Z14idle_wait_funcv");
+    extern void (*dispatch_lifted(uint32_t va))(CPU *);
+    uint32_t bits = va ? rd32(FRAME_TARGET_VA) : 0;
+    float target;
+    memcpy(&target, &bits, 4);
+    if (!va || target < 16.6f || target > 16.8f || !(g_idle_wait = dispatch_lifted(va))) return 0;
+    return guest_override("_Z14idle_wait_funcv", h_idle_wait);
+}
+#endif
+
+/* The game culls its models against a viewing volume as wide as its camera's
+ * lens (dxMakePerspectiveViewingVolume, from set_camera_transform). In the
+ * headset the view is far wider than the arcade monitor - about 100 degrees,
+ * and the head turns - so a soldier who steps close and to the side was
+ * dropped while still in view. In VR the volume is built wider than the
+ * camera (LINDBERGH_CULL_FOV, degrees, vertical; 0 keeps the game's). Only
+ * the culling is widened: the projection is set elsewhere and unchanged. */
+static void (*g_view_volume)(CPU *);
+static float g_cull_fov;
+static void h_view_volume(CPU *c)
+{
+    uint32_t bits = A32(0);
+    float fov;
+    memcpy(&fov, &bits, 4);
+    static int force = -1;               /* LINDBERGH_CULL_FORCE=1: exactly that angle, narrower too (tests) */
+    if (force < 0) { const char *f = getenv("LINDBERGH_CULL_FORCE"); force = f && *f == '1'; }
+    if (fov > 0 && (fov < g_cull_fov || force)) {
+        memcpy(&bits, &g_cull_fov, 4);
+        wr32(c->esp, bits);             /* the caller's argument, its own to clean */
+    }
+    push32(c, 0xDEADBEEFu);             /* the return slot its ret pops */
+    g_view_volume(c);
+}
+static int widen_culling(void)
+{
+    const char *v = getenv("LINDBERGH_CULL_FOV");
+    g_cull_fov = v ? (float)atof(v) : 0.0f;  /* off unless asked for */
+    if (!(g_cull_fov > 0 && g_cull_fov < 179)) return 0;
+    uint32_t va = guest_symbol("_Z30dxMakePerspectiveViewingVolumeffff");
+    extern void (*dispatch_lifted(uint32_t va))(CPU *);
+    if (!va || !(g_view_volume = dispatch_lifted(va))) return 0;
+    return guest_override("_Z30dxMakePerspectiveViewingVolumeffff", h_view_volume);
+}
+
+/* LINDBERGH_GOD=1: the player takes no damage - for test runs that must
+ * reach the end of a mission. */
+static void h_no_damage(CPU *c) { RET(0); }
+
+/* The player's route. A mission is a chain of routes (a static table of 76,
+ * each a path, the next route and an area); the player's record holds the
+ * current one. LINDBERGH_ROUTE_LOG=1 reports each change; LINDBERGH_ROUTE=N
+ * puts the player on route N a second into the mission - a jump, e.g. to
+ * a mission's last scene. */
+#define PLAYER0_VA   0x086617e0u
+#define ROUTE_TABLE  0x08276ea0u
+static void (*g_game_loop)(CPU *);
+static int g_route_jump = -1, g_route_log;
+static int player_route(void)
+{
+    uint32_t pw = rd32(PLAYER0_VA + 0xf4);
+    if (!pw) return -1;
+    uint32_t r = rd32(pw + 0x100);
+    for (int i = 0; r && i < 76; i++) if (rd32(ROUTE_TABLE + 4u * i) == r) return i;
+    return -1;
+}
+static void h_game_loop(CPU *c)
+{
+    static int last = -2, loops;
+    extern unsigned g_frame;
+    int r = player_route();
+    if (g_route_log && r != last)
+        fprintf(stderr, "[route] frame %u: route %d (path %d, area %d)\n", g_frame, r,
+                r >= 0 ? (int)rd32(rd32(ROUTE_TABLE + 4u * r) + 4) : -1, r >= 0 ? (int)rd32(rd32(ROUTE_TABLE + 4u * r) + 16) : -1);
+    last = r;
+    if (r >= 0) loops++; else loops = 0;
+    {   /* LINDBERGH_HURT=N (test): the player takes a hit every N frames of play */
+        static int hurt = -1;
+        if (hurt < 0) { const char *h = getenv("LINDBERGH_HURT"); hurt = h ? atoi(h) : 0; }
+        if (hurt > 0 && loops > 0 && loops % hurt == 0) {
+            uint32_t fn = guest_symbol("_Z17set_player_damageiiii");
+            uint32_t a[4] = { 0, 1, 0, 0 };
+            if (fn) guest_call(c, fn, a, 4);
+            fprintf(stderr, "[sega] frame %u: test hit\n", g_frame);
+        }
+    }
+    if (g_route_jump >= 0 && loops == 60) {
+        uint32_t fn = guest_symbol("_Z19set_player_route_idii");
+        uint32_t a[2] = { 0, (uint32_t)g_route_jump };
+        uint32_t ok = fn ? guest_call(c, fn, a, 2) : 0;
+        uint32_t path = rd32(rd32(PLAYER0_VA + 0xf4) + 0x108);    /* its path: start and end frame */
+        int p0 = path ? (int)rd32(path) : 0, p1 = path ? (int)rd32(path + 4) : 0;
+        fprintf(stderr, "[route] frame %u: jumped to route %d (%s), its path frames %d..%d\n", g_frame, g_route_jump, ok ? "ok" : "refused", p0, p1);
+        g_route_jump = -1;
+        const char *pf = getenv("LINDBERGH_PATHFRAME");   /* and this far along it (negative: from its end) */
+        uint32_t fs = guest_symbol("_Z20set_player_pathframeif");
+        if (ok && pf && *pf && fs) {
+            float f = (float)atof(pf);
+            f += f < 0 ? p1 : p0;
+            uint32_t b2[2] = { 0, 0 };
+            memcpy(&b2[1], &f, 4);
+            guest_call(c, fs, b2, 2);
+            fprintf(stderr, "[route] frame %u: path frame set to %.0f\n", g_frame, f);
+        }
+    }
+    {   /* LINDBERGH_SHIMMER=<strength>: the plane finale's air shimmer, in any scene - for testing it */
+        static float sh = -1;
+        if (sh < 0) { const char *v = getenv("LINDBERGH_SHIMMER"); sh = v && *v ? (float)atof(v) : 0; }
+        if (sh > 0 && loops >= 60) {
+            uint32_t g = guest_symbol("_Z12efcSetGlobaliifPv"), w = guest_symbol("_Z17efcSetShimmerWarpf");
+            float one = 1.0f; uint32_t a[4] = { 7, 1, 0, 0 }, b1[1];
+            memcpy(&a[2], &one, 4); memcpy(&b1[0], &sh, 4);
+            if (loops == 60 && g) fprintf(stderr, "[sega] shimmer on: %u\n", guest_call(c, g, a, 4));
+            if (w) guest_call(c, w, b1, 1);
+        }
+    }
+    {   /* LINDBERGH_GUNACT_LOG=1: player 1's gun - its input words (held,
+         * pressed) and the 16 gun actions the game derives from them
+         * (is_gun_action; CQC asks for action 14) - on every change */
+        static int on = -1;
+        if (on < 0) { const char *v = getenv("LINDBERGH_GUNACT_LOG"); on = v && *v == '1'; }
+        if (on) {
+            enum { GUN0 = 0x8651e60 };
+            uint32_t in = rd32(GUN0 + 0x40);
+            uint32_t now[4] = { rd32(GUN0 + 0x64), in ? rd32(in + 4) : 0, in ? rd32(in + 8) : 0, rd32(GUN0 + 0x4) };
+            static uint32_t last[4];
+            if (memcmp(now, last, sizeof now)) {
+                fprintf(stderr, "[gunact] frame %u: actions %#x, held %#x, pressed %#x, gun flags %#x\n",
+                        g_frame, now[0], now[1], now[2], now[3]);
+                memcpy(last, now, sizeof now);
+            }
+        }
+    }
+    push32(c, 0xDEADBEEFu);
+    g_game_loop(c);
+}
+/* The sniping and CQC events always report to stereo.c: they change its
+ * scope test and how the gun is aimed. LINDBERGH_QTE_LOG=1: each frame of CQC (qte_ctrl_grapple) and of the
+ * sniping events (qte_ctrl_snipe): the markers CQC checks the gun against,
+ * in screen coordinates, and where the cabinet says the gun points. */
+static void (*g_qte_grapple)(CPU *), (*g_qte_snipe)(CPU *);
+static void qte_log(const char *what, uint32_t q)
+{
+    extern unsigned g_frame;
+    CabinetInput in;
+    host_cabinet_input(&in);
+    char marks[256] = "";
+    int n = (int)rd32(q + 0x38), len = 0;
+    for (int i = 0; i < n && i < 8 && len < 200; i++) {
+        uint32_t e = q + 0x40 + 0x14u * i;
+        len += snprintf(marks + len, sizeof marks - len, " %d@%d,%d", (int16_t)rd32(e) , (int16_t)rd32(e + 4), (int16_t)rd32(e + 6));
+    }
+    fprintf(stderr, "[qte] frame %u: %s, state %d, gun %d,%d buttons %#x, %d marks:%s\n", g_frame, what,
+            (int)rd32(q + 4), in.gun_x, in.gun_y, in.buttons, n, marks);
+}
+static int g_qte_log;
+static void h_qte_grapple(CPU *c)
+{
+#ifndef _WIN32
+    stereo_cqc_running();
+#endif
+    if (g_qte_log) qte_log("CQC", A32(0));
+    push32(c, 0xDEADBEEFu);
+    g_qte_grapple(c);
+}
+static void h_qte_snipe(CPU *c)
+{
+#ifndef _WIN32
+    stereo_snipe_running();
+#endif
+    if (g_qte_log) qte_log("snipe", A32(0));
+    push32(c, 0xDEADBEEFu);
+    g_qte_snipe(c);
+}
+static int watch_qte(void)
+{
+    const char *v = getenv("LINDBERGH_QTE_LOG");
+    g_qte_log = v && *v == '1';
+    extern void (*dispatch_lifted(uint32_t va))(CPU *);
+    uint32_t g = guest_symbol("_Z16qte_ctrl_grappleP3QTE"), s = guest_symbol("_Z14qte_ctrl_snipeP3QTE");
+    int n = 0;
+    if (g && (g_qte_grapple = dispatch_lifted(g))) n += guest_override("_Z16qte_ctrl_grappleP3QTE", h_qte_grapple);
+    if (s && (g_qte_snipe = dispatch_lifted(s))) n += guest_override("_Z14qte_ctrl_snipeP3QTE", h_qte_snipe);
+    return n;
+}
+
+static int watch_route(void)
+{
+    const char *j = getenv("LINDBERGH_ROUTE"), *l = getenv("LINDBERGH_ROUTE_LOG");
+    g_route_log = l && *l == '1';
+    if (j && *j) g_route_jump = atoi(j);
+    if (!g_route_log && g_route_jump < 0 && !getenv("LINDBERGH_SHIMMER") && !getenv("LINDBERGH_HURT") && !getenv("LINDBERGH_GUNACT_LOG")) return 0;
+    uint32_t va = guest_symbol("_Z8GameLoopP8GAMEWORK");
+    extern void (*dispatch_lifted(uint32_t va))(CPU *);
+    if (!va || !(g_game_loop = dispatch_lifted(va))) return 0;
+    return guest_override("_Z8GameLoopP8GAMEWORK", h_game_loop);
+}
 
 void hle_register_sega(void)
 {
     int n = 0;
+    if (watch_route()) fprintf(stderr, "[sega] route log/jump on\n");
+    if (watch_qte()) fprintf(stderr, "[sega] sniping events watched%s\n", g_qte_log ? ", CQC and sniping logged" : "");
+    {
+        const char *g = getenv("LINDBERGH_GOD");
+        if (g && *g == '1' && guest_override("_Z26check_player_damage_enablei", h_no_damage))
+            fprintf(stderr, "[sega] the player takes no damage (LINDBERGH_GOD)\n");
+    }
+    if (widen_culling()) fprintf(stderr, "[sega] model culling widened to %.0f degrees\n", g_cull_fov);
+#if defined(__ANDROID__)
+    if (pace_by_display()) fprintf(stderr, "[sega] idle_wait_func: paced by the headset, not the wall clock\n");
+#endif
 
     /* Ghost Squad Evolution gates its whole boot on this one predicate;
      * a game without these symbols simply does not get the override. */

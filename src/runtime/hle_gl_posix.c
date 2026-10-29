@@ -16,11 +16,54 @@
 
 #include "gl_posix.h"
 #include "arbprog.h"
+#include "stereo.h"
 
 int g_gl_trace;
 int g_gl_errcheck;
 
 static const char *arb_source(GLenum target, GLuint id) { return arb_get_source(target, id); }
+
+#ifdef LINDBERGH_GL4ES
+#include <EGL/egl.h>
+/* What the GLES driver itself says about its current program: gl4es draws
+ * with programs of its own, and its glValidateProgram reports nothing. */
+static void gles_program_report(void)
+{
+    typedef void (*Iv)(GLenum, GLint *);
+    typedef void (*Prog)(GLuint);
+    typedef void (*ProgIv)(GLuint, GLenum, GLint *);
+    typedef void (*Log)(GLuint, GLsizei, GLsizei *, char *);
+    typedef void (*Active)(GLuint, GLuint, GLsizei, GLsizei *, GLint *, GLenum *, char *);
+    typedef GLint (*Loc)(GLuint, const char *);
+    typedef void (*UIv)(GLuint, GLint, GLint *);
+    Iv get = (Iv)eglGetProcAddress("glGetIntegerv");
+    Prog validate = (Prog)eglGetProcAddress("glValidateProgram");
+    ProgIv piv = (ProgIv)eglGetProcAddress("glGetProgramiv");
+    Log plog = (Log)eglGetProcAddress("glGetProgramInfoLog");
+    Active act = (Active)eglGetProcAddress("glGetActiveUniform");
+    Loc loc = (Loc)eglGetProcAddress("glGetUniformLocation");
+    UIv uiv = (UIv)eglGetProcAddress("glGetUniformiv");
+    if (!get || !validate || !piv || !plog || !act || !loc || !uiv) return;
+    GLint prog = 0, linked = 0, n = 0;
+    get(GL_CURRENT_PROGRAM, &prog);
+    if (!prog) { fprintf(stderr, "[gl]   GLES: no current program\n"); return; }
+    char log[2048] = "";
+    validate((GLuint)prog);
+    plog((GLuint)prog, sizeof log, NULL, log);
+    piv((GLuint)prog, GL_LINK_STATUS, &linked);
+    fprintf(stderr, "[gl]   GLES program %d, linked %d, validation: %s\n", prog, linked, *log ? log : "(no log)");
+    piv((GLuint)prog, GL_ACTIVE_UNIFORMS, &n);
+    for (GLint i = 0; i < n; i++) {
+        char nm[128]; GLint sz; GLenum ty;
+        act((GLuint)prog, (GLuint)i, sizeof nm, NULL, &sz, &ty, nm);
+        GLint unit = -1;
+        if (ty == GL_SAMPLER_2D || ty == GL_SAMPLER_CUBE || ty == 0x8B5F /* 3D */ || ty == 0x8B62 /* 2D shadow */)
+            uiv((GLuint)prog, loc((GLuint)prog, nm), &unit);
+        fprintf(stderr, "[gl]     uniform %s type %#x%s", nm, ty, unit >= 0 ? "" : "\n");
+        if (unit >= 0) fprintf(stderr, " unit %d\n", unit);
+    }
+}
+#endif
 
 void gl_check_error(const char *name)
 {
@@ -73,6 +116,9 @@ void gl_check_error(const char *name)
             }
         }
     }
+#ifdef LINDBERGH_GL4ES
+    if (e == GL_INVALID_OPERATION) gles_program_report();
+#endif
 }
 
 /* LINDBERGH_GL_TRACE=1 names every GL call; =N (N > 1) only those of frame N */
@@ -163,6 +209,23 @@ static void h_glMapBufferARB(CPU *c)
     }
     fprintf(stderr, "[gl] glMapBuffer: no shadow slot for target %#x\n", target);
     RET(0);
+}
+
+unsigned gl_bound_buffer(unsigned target)
+{
+    GLuint *slot = binding_slot(target);
+    return slot ? *slot : 0;
+}
+
+int gl_map_shadow(unsigned target, void **shadow, int *size)
+{
+    GLuint *slot = binding_slot(target);
+    for (int i = 0; i < 4; i++)
+        if (g_maps[i].shadow && g_maps[i].target == target && slot && g_maps[i].buffer == *slot &&
+            g_maps[i].access != GL_READ_ONLY) {
+            *shadow = g_maps[i].shadow; *size = g_maps[i].size; return 1;
+        }
+    return 0;
 }
 
 static void h_glUnmapBufferARB(CPU *c)
@@ -430,8 +493,13 @@ static void h_glProgramLocalParameter4fARB(CPU *c)
     arb_local(A32(0), A32(1), v);
     glProgramLocalParameter4fARB(A32(0), A32(1), v[0], v[1], v[2], v[3]);
 }
-static void h_glEnable(CPU *c)  { if (!arb_enable(A32(0), 1)) glEnable(A32(0)); }
-static void h_glDisable(CPU *c) { if (!arb_enable(A32(0), 0)) glDisable(A32(0)); }
+#ifdef LINDBERGH_GL4ES
+#define RECT_SEEN(cap) do { if ((cap) == GL_TEXTURE_RECTANGLE_ARB) arb_rect_enable_seen(); } while (0)
+#else
+#define RECT_SEEN(cap) do { } while (0)
+#endif
+static void h_glEnable(CPU *c)  { RECT_SEEN(A32(0)); if (!arb_enable(A32(0), 1)) glEnable(A32(0)); }
+static void h_glDisable(CPU *c) { RECT_SEEN(A32(0)); if (!arb_enable(A32(0), 0)) glDisable(A32(0)); }
 static void h_glIsEnabled(CPU *c)
 {
     int on;
@@ -439,6 +507,57 @@ static void h_glIsEnabled(CPU *c)
 }
 static void h_glPushAttrib(CPU *c) { arb_push_attrib(A32(0)); glPushAttrib(A32(0)); }
 static void h_glPopAttrib(CPU *c)  { arb_pop_attrib(); glPopAttrib(); }
+
+#ifdef LINDBERGH_GL4ES
+/* GLES has no assembly programs. Every one is translated to GLSL here
+ * (arbprog.c), so the driver never sees them: it is told nothing, and the
+ * game's checks are answered as a desktop driver that took them would. */
+static void es_glProgramStringARB(CPU *c) { arb_set_source(A32(0), (const char *)APTR(3), AI32(2)); }
+static void es_glBindProgramARB(CPU *c)  { arb_bind(A32(0), A32(1)); }
+static void es_glDeleteProgramsARB(CPU *c)
+{
+    GLsizei n = AI32(0);
+    const GLuint *ids = (const GLuint *)APTR(1);
+    for (GLsizei i = 0; ids && i < n; i++) arb_delete(0, ids[i]);
+}
+static void es_glProgramEnvParameter4fvARB(CPU *c)
+{
+    const float *v = (const float *)APTR(2);
+    if (v) arb_env(A32(0), A32(1), v);
+}
+static void es_glProgramLocalParameter4fvARB(CPU *c)
+{
+    const float *v = (const float *)APTR(2);
+    if (v) arb_local(A32(0), A32(1), v);
+}
+static void es_glProgramLocalParameter4fARB(CPU *c)
+{
+    float v[4] = { gl_arg_f(c, 2), gl_arg_f(c, 3), gl_arg_f(c, 4), gl_arg_f(c, 5) };
+    arb_local(A32(0), A32(1), v);
+}
+static void es_glGetProgramivARB(CPU *c)
+{
+    GLint *out = (GLint *)APTR(2);
+    if (!out) return;
+    switch (A32(1)) {
+    case GL_PROGRAM_BINDING_ARB: *out = (GLint)arb_bound(A32(0)); return;
+    case GL_PROGRAM_UNDER_NATIVE_LIMITS_ARB: *out = 1; return;
+    case GL_PROGRAM_LENGTH_ARB: {
+        const char *src = arb_get_source(A32(0), arb_bound(A32(0)));
+        *out = src ? (GLint)strlen(src) : 0;
+        return;
+    }
+    }
+    glGetProgramivARB(A32(0), A32(1), out);
+}
+static void es_glGetIntegerv(CPU *c)
+{
+    GLint *out = (GLint *)APTR(1);
+    if (!out) return;
+    if (A32(0) == GL_PROGRAM_ERROR_POSITION_ARB) { *out = -1; return; }
+    glGetIntegerv(A32(0), out);
+}
+#endif
 
 /* ---- GLU, and the double-precision matrix calls ---- */
 static void h_glOrtho(CPU *c)
@@ -520,6 +639,17 @@ void hle_register_gl(void)
     hle_bind("gluOrtho2D", h_gluOrtho2D); gl_bind_named("gluOrtho2D", h_gluOrtho2D);
     hle_bind("gluPerspective", h_gluPerspective); gl_bind_named("gluPerspective", h_gluPerspective);
     hle_bind("gluErrorString", h_gluErrorString); gl_bind_named("gluErrorString", h_gluErrorString);
+#ifdef LINDBERGH_GL4ES
+    hle_bind("glProgramStringARB", es_glProgramStringARB);
+    hle_bind("glBindProgramARB", es_glBindProgramARB);
+    hle_bind("glDeleteProgramsARB", es_glDeleteProgramsARB);
+    hle_bind("glProgramEnvParameter4fvARB", es_glProgramEnvParameter4fvARB);
+    hle_bind("glProgramLocalParameter4fvARB", es_glProgramLocalParameter4fvARB);
+    hle_bind("glProgramLocalParameter4fARB", es_glProgramLocalParameter4fARB);
+    hle_bind("glGetProgramivARB", es_glGetProgramivARB);
+    hle_bind("glGetIntegerv", es_glGetIntegerv);
+#endif
+    stereo_init();
 }
 
 /* glXGetProcAddressARB tokens: a GLX game's indirect GL calls.
@@ -533,7 +663,8 @@ void hle_register_gl(void)
 #define GL_TOKEN_BASE 0xF0000000u
 #define GL_TOKEN_MAX  2048
 #define GL_NAMED_MAX  4096
-static struct { const char *name; HleHandler fn; } g_named[GL_NAMED_MAX], g_tok[GL_TOKEN_MAX];
+static struct { const char *name; HleHandler fn; } g_named[GL_NAMED_MAX];
+static struct { const char *name; HleHandler fn; HleId id; } g_tok[GL_TOKEN_MAX];
 static int g_named_n, g_tok_n;
 
 void gl_bind_named(const char *name, HleHandler fn)
@@ -557,6 +688,7 @@ uint32_t gl_token_for(const char *name)
     }
     g_tok[g_tok_n].name = strdup(name);
     g_tok[g_tok_n].fn = fn;
+    g_tok[g_tok_n].id = strncmp(name, "glX", 3) ? hle_named_id(name) : (HleId)HLE_ID_MAX;
     if (getenv("LINDBERGH_TOK_LOG")) fprintf(stderr, "[tok] %#x = %s\n", GL_TOKEN_BASE + (uint32_t)g_tok_n, name);
     return GL_TOKEN_BASE + (uint32_t)(g_tok_n++);
 }
@@ -564,7 +696,11 @@ uint32_t gl_token_for(const char *name)
 int gl_token_call(CPU *c, uint32_t va)
 {
     if (va < GL_TOKEN_BASE || va >= GL_TOKEN_BASE + (uint32_t)g_tok_n) return 0;
-    g_tok[va - GL_TOKEN_BASE].fn(c);
+    int t = (int)(va - GL_TOKEN_BASE);
+    /* through the hook, as an import would be: stereo.c must see a draw
+     * made through a fetched glDrawRangeElements like any other */
+    if (g_gl_hook && g_tok[t].id < HLE_ID_MAX) g_gl_hook(c, g_tok[t].id, g_tok[t].fn);
+    else g_tok[t].fn(c);
     return 1;
 }
 

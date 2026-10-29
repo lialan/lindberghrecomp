@@ -88,6 +88,13 @@ extern HleHandler g_hle_handlers[];
 
 void hle_call(CPU *c, HleId id);
 
+/* When set, every import marked in g_gl_ids goes through the hook instead of
+ * straight to its handler (stereo.c: record a frame's GL calls, replay them
+ * for the second eye). */
+typedef void (*GlHook)(CPU *c, HleId id, HleHandler fn);
+extern GlHook g_gl_hook;
+extern unsigned char g_gl_ids[];
+
 /* The PLT stub address for a named import, or 0. What glXGetProcAddressARB
  * hands back, so the guest's indirect call through it routes like any other. */
 uint32_t hle_plt_address(const char *name);
@@ -182,6 +189,7 @@ void guest_install_crash_handler(void);
 void guest_set_current_cpu(CPU *c);
 CPU *guest_current_cpu(void);
 void guest_report_state(const char *why);
+void host_quit(void);              /* end the game at the platform's request */
 void guest_trace_dispatch(uint32_t va);
 void guest_backtrace(CPU *c);
 
@@ -194,6 +202,8 @@ uint32_t   guest_copy_reloc(const char *name);   /* R_386_COPY slot, e.g. "stder
 int        guest_override(const char *name, HleHandler fn);
 int        guest_override_va(const char *name, uint32_t va, HleHandler fn);
 HleHandler guest_find_override(uint32_t va);
+int        guest_find_override_index(uint32_t va);
+HleHandler guest_override_at(int i);
 void       hle_register_vidmode(void);
 void       hle_register_matrix(void);
 void       hle_register_console(void);
