@@ -58,6 +58,12 @@ void stereo_screen(float *half_w, float *half_h, float *dist);
  * below -1000); and whether the game's own sight is drawn. */
 void stereo_set_gun(int x, int y);
 void stereo_show_game_sight(int show);
+/* The game's own gun (its reload animation): hidden, or not; and how many
+ * of its draws the last frame had (nonzero while it animates). */
+void stereo_hide_game_gun(int hide);
+unsigned stereo_game_gun_draws(void);
+/* The player is reloading: the game's gun is on screen, and can be learned. */
+void stereo_game_gun_reloading(int on);
 void stereo_guest_state(uint32_t va);
 
 /* hle_gl_posix.c: a live glMapBuffer's guest shadow, for the recording */

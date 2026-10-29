@@ -778,6 +778,56 @@ static int sight_draw(CPU *c, const char *n)
     return !g_show_sight && g_tex2d_bound == g_sight_tex;
 }
 
+/* The world's lens: the one most of a frame's 3D is drawn with. The game's
+ * own gun - the reload animation, a hand bringing a magazine up - is drawn
+ * into the same scene with a lens of its own, right in front of the camera,
+ * and sometimes last. */
+static struct { float p[16]; unsigned n; } g_lens_tally[4];
+static float    g_world_persp[16] = { 1.732f, 0, 0, 0, 0, 2.309f, 0, 0, 0, 0, -1, -1, 0, 0, -0.02f, 0 };
+
+static void tally_lens(const float *p)
+{
+    int k = -1, least = 0;
+    for (int i = 0; i < 4; i++) {
+        if (g_lens_tally[i].n && fabsf(g_lens_tally[i].p[0] - p[0]) < 1e-3f && fabsf(g_lens_tally[i].p[14] - p[14]) < 1e-6f) { k = i; break; }
+        if (g_lens_tally[i].n < g_lens_tally[least].n) least = i;
+    }
+    if (k < 0) { k = least; memcpy(g_lens_tally[k].p, p, 64); g_lens_tally[k].n = 0; }
+    g_lens_tally[k].n++;
+}
+
+/* The game's gun in VR is in the player's hand: its textures are learned
+ * from draws with the gun's lens (1.73, unlike the world's) within a few
+ * units of the camera while the player reloads (a cutscene's close-ups use
+ * that lens too), and draws with them that close are the gun's - hidden
+ * unless the player wants the game's animation. */
+#define MAX_WEAPON_TEX 32
+static GLuint   g_weapon_tex[MAX_WEAPON_TEX];
+static unsigned g_nweapon_tex, g_weapon_draws, g_weapon_frame_draws;
+static int      g_hide_weapon = 1, g_weapon_learn;
+void stereo_hide_game_gun(int hide) { g_hide_weapon = hide; }
+void stereo_game_gun_reloading(int on) { g_weapon_learn = on; }
+unsigned stereo_game_gun_draws(void) { return g_weapon_frame_draws; }
+
+static int weapon_draw(void)
+{
+    const float *P = g_proj[g_proj_top];
+    if (!g_tex2d_bound) return 0;
+    float mv[16];
+    glGetFloatv(GL_MODELVIEW_MATRIX, mv);
+    if (mv[12] * mv[12] + mv[13] * mv[13] + mv[14] * mv[14] > 9.0f) return 0;
+    int known = 0;
+    for (unsigned i = 0; i < g_nweapon_tex; i++) if (g_weapon_tex[i] == g_tex2d_bound) known = 1;
+    if (!known && !g_replaying && g_weapon_learn && fabsf(P[0] - 1.732f) < 0.01f && fabsf(g_world_persp[0] - P[0]) > 0.05f * P[0] && g_nweapon_tex < MAX_WEAPON_TEX) {
+        g_weapon_tex[g_nweapon_tex++] = g_tex2d_bound;
+        fprintf(stderr, "[stereo] frame %u: texture %u is the game's own gun\n", g_frame, g_tex2d_bound);
+        known = 1;
+    }
+    if (!known) return 0;
+    if (!g_replaying) g_weapon_draws++;
+    return g_hide_weapon;
+}
+
 static int transform_call(CPU *c, HleId id, const char *n)
 {
     int k = cls(id)->kind;
@@ -848,6 +898,10 @@ static int transform_call(CPU *c, HleId id, const char *n)
         /* Screen content or not, decided per draw: 2D that is not a pass over
          * a render target, and 3D drawn into the HUD's target. */
         int persp = is_perspective(g_proj[g_proj_top]);
+        if (persp && !g_flat && (g_game_fb == g_world_fb || g_game_fb == g_world_fb_next)) {
+            if (!g_replaying) tally_lens(g_proj[g_proj_top]);
+            if (is_draw(k) && weapon_draw()) return 1;
+        }
         if (persp && g_game_fb != g_hud_fb && !g_replaying && !offscreen_fb(g_game_fb)) { g_scene_draws++; g_world_fb_next = g_game_fb; }
         if (persp && g_proj[g_proj_top][0] > g_lens_seen) g_lens_seen = g_proj[g_proj_top][0];
         if (persp && !g_replaying && g_game_fb != g_hud_fb) {
@@ -1653,9 +1707,17 @@ void stereo_frame_begin(void)
      * any other width aims every shot off the centre's way (fixed at 1.73,
      * the jungle's 2.41 put shots ~30% wide of the laser). A flat picture -
      * a menu, a scope - keeps the size it had: those cameras zoom. */
-    if (!g_flat && g_scene_draws > 0 && is_perspective(g_last_persp) && g_last_persp[0] > 0.3f && g_last_persp[0] < 8.0f) {
-        g_screen_lens[0] = g_last_persp[0];
-        g_screen_lens[1] = g_last_persp[5];
+    {
+        int best = 0;
+        for (int i = 1; i < 4; i++) if (g_lens_tally[i].n > g_lens_tally[best].n) best = i;
+        if (g_lens_tally[best].n) memcpy(g_world_persp, g_lens_tally[best].p, 64);
+        memset(g_lens_tally, 0, sizeof g_lens_tally);
+        g_weapon_frame_draws = g_weapon_draws;
+        g_weapon_draws = 0;
+    }
+    if (!g_flat && g_scene_draws > 0 && is_perspective(g_world_persp) && g_world_persp[0] > 0.3f && g_world_persp[0] < 8.0f) {
+        g_screen_lens[0] = g_world_persp[0];
+        g_screen_lens[1] = g_world_persp[5];
     }
     g_hud2d = g_pass2d = 0;
     g_zoom_draws = g_hudfb_draws = 0;
@@ -1792,7 +1854,7 @@ int stereo_aim_samples(const float o[3], const float d[3], int max, float (*px)[
         fprintf(stderr, "\n");
     }
     if (!arr) return 0;
-    const float *p = g_last_persp;
+    const float *p = g_world_persp;
     float n = p[14] / (p[10] - 1), f = p[14] / (p[10] + 1), e[16], m[16];
     if (!(n > 0) || !(f > n)) return 0;
     const float *tn = g_tan[0];
