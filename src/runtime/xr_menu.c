@@ -10,7 +10,7 @@
 
 #define MARGIN 28
 #define TITLE_H 64
-#define ROW_H 34
+#define ROW_H 36
 
 static void fill(unsigned char *img, int x0, int y0, int x1, int y1, const unsigned char c[4])
 {

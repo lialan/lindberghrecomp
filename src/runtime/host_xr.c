@@ -110,7 +110,6 @@ static struct {
     float scale, screen, aim;            /* aim: where the laser and the game's shot meet, metres */
     int   resolution, width, refresh, left_handed, laser, auto_coins;
     int   sight, crosshair, show_gun;         /* XO_SIGHT_*; the game's own sight; the gun model */
-    int   game_gun;                           /* the game's own reload animation shown (else: on the player's gun) */
 } cfg = { 1.0f, 3.0f, 15.0f, 2280, 2064, 120, 0, LASER_ON, 1, XO_SIGHT_NONE, 1, 1 };
 
 static void cfg_save(void)
@@ -118,10 +117,10 @@ static void cfg_save(void)
     FILE *f = fopen("vr.cfg", "w");
     if (!f) return;
     fprintf(f, "scale %g\nscreen %g\naim %g\nresolution %d\nwidth %d\nrefresh %d\nhand %s\nlaser %s\ncoins %s\n"
-               "sight %s\ncrosshair %s\ngun %s\nreload %s\n",
+               "sight %s\ncrosshair %s\ngun %s\n",
             cfg.scale, cfg.screen, cfg.aim, cfg.resolution, cfg.width, cfg.refresh, cfg.left_handed ? "left" : "right",
             LASER_NAME[cfg.laser], cfg.auto_coins ? "auto" : "manual",
-            SIGHT_NAME[cfg.sight], cfg.crosshair ? "on" : "off", cfg.show_gun ? "on" : "off", cfg.game_gun ? "game" : "gun");
+            SIGHT_NAME[cfg.sight], cfg.crosshair ? "on" : "off", cfg.show_gun ? "on" : "off");
     fclose(f);
 }
 
@@ -163,7 +162,6 @@ static void cfg_set(const char *key, const char *val)
         else if (!strcmp(key, "sight")) cfg.sight = !strcmp(val, "reddot") ? XO_SIGHT_RED_DOT : !strcmp(val, "holo") ? XO_SIGHT_HOLO : XO_SIGHT_NONE;
         else if (!strcmp(key, "crosshair")) cfg.crosshair = strcmp(val, "off") != 0;
         else if (!strcmp(key, "gun")) cfg.show_gun = strcmp(val, "off") != 0;
-        else if (!strcmp(key, "reload")) cfg.game_gun = !strcmp(val, "game");
     }
 }
 
@@ -361,12 +359,6 @@ static void qrot(XrQuaternionf q, const float v[3], float out[3])
     out[2] = v[2] + w * tz + (x * ty - y * tx);
 }
 
-static XrQuaternionf qmul(XrQuaternionf a, XrQuaternionf b)
-{
-    return (XrQuaternionf){ a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y, a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
-                            a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w, a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z };
-}
-
 /* Cabinet bits, as in lindbergh_rt.h */
 /* LINDBERGH_XR_FAKE_GUN=1: a stand-in for a controller (see below) */
 static int fake_gun(void)
@@ -381,7 +373,7 @@ static int fake_gun(void)
  * towards them, the game's screen still in view (the arcade's own Test menu
  * is worked from here too). Point the gun at a row and pull the trigger;
  * the game gets no input meanwhile. */
-enum { M_SIGHT, M_LASER, M_CROSSHAIR, M_GUN, M_RELOAD, M_HAND, M_SCREEN, M_RATE, M_RES, M_COINS, M_COIN, M_RECENTRE,
+enum { M_SIGHT, M_LASER, M_CROSSHAIR, M_GUN, M_HAND, M_SCREEN, M_RATE, M_RES, M_COINS, M_COIN, M_RECENTRE,
        M_TEST, M_SERVICE, M_CLOSE, M_COUNT };
 static struct {
     int open, hover, dirty;
@@ -402,7 +394,7 @@ static void menu_items(XmItem *it)
     static const char *const sight[] = { "Point shooting", "Red dot", "Holographic" };
     static const char *const laser[] = { "Laser and dot", "Dot only", "Off" };
     static const char *const labels[M_COUNT] = {
-        "Sight", "Laser", "Game crosshair", "Gun model", "Reload animation", "Gun hand", "Screen distance", "Display rate", "Resolution per eye",
+        "Sight", "Laser", "Game crosshair", "Gun model", "Gun hand", "Screen distance", "Display rate", "Resolution per eye",
         "Coins", "Insert a coin", "Recentre view", "Arcade Test button (select)",
         "Arcade Service button (next)", "Close" };
     for (int i = 0; i < M_COUNT; i++) { it[i].label = labels[i]; it[i].value[0] = 0; }
@@ -410,7 +402,6 @@ static void menu_items(XmItem *it)
     snprintf(it[M_LASER].value, 40, "%s", laser[cfg.laser]);
     snprintf(it[M_CROSSHAIR].value, 40, "%s", cfg.crosshair ? "Shown" : "Hidden");
     snprintf(it[M_GUN].value, 40, "%s", cfg.show_gun ? "Shown" : "Hidden");
-    snprintf(it[M_RELOAD].value, 40, "%s", cfg.game_gun ? "Game's" : "On your gun");
     snprintf(it[M_HAND].value, 40, "%s", gun_hand == HAND_L ? "Left" : "Right");
     snprintf(it[M_SCREEN].value, 40, "%.1f m", cfg.screen);
     snprintf(it[M_RATE].value, 40, "%d Hz", cfg.refresh);
@@ -474,7 +465,6 @@ static void menu_choose(int item)
     case M_LASER: cfg.laser = (cfg.laser + 1) % 3; break;
     case M_CROSSHAIR: cfg.crosshair = !cfg.crosshair; stereo_show_game_sight(cfg.crosshair); break;
     case M_GUN: cfg.show_gun = !cfg.show_gun; break;
-    case M_RELOAD: cfg.game_gun = !cfg.game_gun; stereo_hide_game_gun(!cfg.game_gun); break;
     case M_HAND: gun_hand = 1 - gun_hand; cfg.left_handed = gun_hand == HAND_L; break;
     case M_SCREEN: {
         int k = 0;
@@ -595,44 +585,19 @@ static void input_frame(XrTime t)
         if (at > 0 && stereo_ray_to_screen(ah, ax, &x, &y) && x >= 0 && x < 640 && y >= 0 && y < 480) {
             gx = x; gy = y; aimed = 1; aim_reach = at / cfg.scale;
         }
-        /* the overlay: the gun on the aim pose, the laser to the game's screen.
-         * While the game plays its reload (its own gun, hidden), the
-         * player's gun does it instead: rolled over, tipped down, lowered. */
-        static XrTime last_t;
-        static float rw;
-        float dt = last_t ? (float)(t - last_t) / 1e9f : 0;
-        last_t = t;
-        /* the game's gun also flashes and throws casings as it fires: only a
-         * reload the player just made counts */
-        float target = !cfg.game_gun && stereo_game_gun_draws() > 0 && reload_t && t - reload_t < 2000000000 ? 1.0f : 0.0f;
-        static float last_target;
-        if (target != last_target) fprintf(stderr, "[xr] reload animation on the player's gun %s\n", target > 0 ? "starts" : "ends");
-        last_target = target;
-        float k = dt * 9.0f;
-        rw += (target - rw) * (k > 1 ? 1 : k);
-        XrQuaternionf gq = loc.pose.orientation;
-        float gp[3] = { p[0], p[1], p[2] };
-        if (rw > 0.001f) {
-            float e = rw * rw * (3 - 2 * rw);                  /* eased */
-            float rz = -0.95f * e * 0.5f, rx = -0.35f * e * 0.5f;
-            XrQuaternionf roll = { 0, 0, sinf(rz), cosf(rz) }, tip = { sinf(rx), 0, 0, cosf(rx) }, d1 = qmul(roll, tip);
-            gq = qmul(gq, d1);
-            const float drop[3] = { 0, -0.05f * e, 0.03f * e };
-            float w[3];
-            qrot(loc.pose.orientation, drop, w);
-            for (int i = 0; i < 3; i++) gp[i] += w[i];
-        }
+        /* the overlay: the gun on the aim pose, the laser to the game's screen */
         xo.gun_valid = 1;
-        xo.gun_q[0] = gq.x; xo.gun_q[1] = gq.y; xo.gun_q[2] = gq.z; xo.gun_q[3] = gq.w;
-        memcpy(xo.gun_p, gp, sizeof gp);
+        xo.gun_q[0] = loc.pose.orientation.x; xo.gun_q[1] = loc.pose.orientation.y;
+        xo.gun_q[2] = loc.pose.orientation.z; xo.gun_q[3] = loc.pose.orientation.w;
+        memcpy(xo.gun_p, p, sizeof p);
         float m[3];
         qrot(loc.pose.orientation, tip, m);
         for (int i = 0; i < 3; i++) xo.muzzle[i] = p[i] + m[i];
         float reach = 5.0f;
         if (aimed) reach = aim_reach;
         for (int i = 0; i < 3; i++) xo.end[i] = p[i] + d[i] * reach;
-        xo.beam = cfg.laser == LASER_ON && rw < 0.2f;
-        xo.dot = aimed && cfg.laser != LASER_OFF && rw < 0.2f;
+        xo.beam = cfg.laser == LASER_ON;
+        xo.dot = aimed && cfg.laser != LASER_OFF;
         if (menu.open) {        /* the laser points at the panel; the game is not aimed at */
             float u, v, hit[3];
             int on = menu_hit(p, d, &u, &v, hit);
@@ -787,7 +752,6 @@ int xr_init(void)
     if (!gl_load()) { fprintf(stderr, "[xr] cannot load GLES\n"); return 0; }
     cfg_load();
     stereo_show_game_sight(cfg.crosshair);
-    stereo_hide_game_gun(!cfg.game_gun);
 
     JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
     JavaVM *vm = NULL;

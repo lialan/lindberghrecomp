@@ -7,7 +7,7 @@
 
 #define XM_W 768                /* the panel's picture, in pixels */
 #define XM_H 640
-#define XM_ROWS 15
+#define XM_ROWS 14
 
 typedef struct {
     const char *label;

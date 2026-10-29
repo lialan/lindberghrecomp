@@ -799,20 +799,37 @@ static void tally_lens(const float *p)
 /* The game's gun in VR is in the player's hand: its textures are learned
  * from draws with the gun's lens (1.73, unlike the world's) within a few
  * units of the camera while the player reloads (a cutscene's close-ups use
- * that lens too), and draws with them that close are the gun's - hidden
- * unless the player wants the game's animation. */
+ * that lens too), and draws with them that close are the gun's: hidden. */
 #define MAX_WEAPON_TEX 32
 static GLuint   g_weapon_tex[MAX_WEAPON_TEX];
 static unsigned g_nweapon_tex, g_weapon_draws, g_weapon_frame_draws;
-static int      g_hide_weapon = 1, g_weapon_learn;
-void stereo_hide_game_gun(int hide) { g_hide_weapon = hide; }
+static int      g_weapon_learn, g_weapon_loaded;
 void stereo_game_gun_reloading(int on) { g_weapon_learn = on; }
+
+/* The gun's textures are the same every session (loaded at start-up, in the
+ * same order): remembered in game_gun.txt, so the gun is hidden from the
+ * first reload - also in a scene whose world shares the gun's lens. */
+static void weapon_load(void)
+{
+    g_weapon_loaded = 1;
+    FILE *f = fopen("game_gun.txt", "r");
+    unsigned t;
+    while (f && g_nweapon_tex < MAX_WEAPON_TEX && fscanf(f, "%u", &t) == 1) g_weapon_tex[g_nweapon_tex++] = t;
+    if (f) fclose(f);
+}
+static void weapon_save(void)
+{
+    FILE *f = fopen("game_gun.txt", "w");
+    for (unsigned i = 0; f && i < g_nweapon_tex; i++) fprintf(f, "%u\n", g_weapon_tex[i]);
+    if (f) fclose(f);
+}
 unsigned stereo_game_gun_draws(void) { return g_weapon_frame_draws; }
 
 static int weapon_draw(void)
 {
     const float *P = g_proj[g_proj_top];
     if (!g_tex2d_bound) return 0;
+    if (!g_weapon_loaded) weapon_load();
     float mv[16];
     glGetFloatv(GL_MODELVIEW_MATRIX, mv);
     if (mv[12] * mv[12] + mv[13] * mv[13] + mv[14] * mv[14] > 9.0f) return 0;
@@ -824,11 +841,12 @@ static int weapon_draw(void)
     if (!known && !g_replaying && g_weapon_learn && fabsf(P[0] - 1.732f) < 0.01f && fabsf(g_world_persp[0] - P[0]) > 0.05f * P[0] && g_nweapon_tex < MAX_WEAPON_TEX) {
         g_weapon_tex[g_nweapon_tex++] = g_tex2d_bound;
         fprintf(stderr, "[stereo] frame %u: texture %u is the game's own gun\n", g_frame, g_tex2d_bound);
+        weapon_save();
         known = 1;
     }
     if (!known) return 0;
     if (!g_replaying) g_weapon_draws++;
-    return g_hide_weapon;
+    return 1;
 }
 
 static int transform_call(CPU *c, HleId id, const char *n)
