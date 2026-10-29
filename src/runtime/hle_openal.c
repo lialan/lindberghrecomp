@@ -9,6 +9,7 @@
  */
 
 #include <stdio.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -73,7 +74,18 @@ static void h_alcDestroyContext(CPU *c)
     if (x) { alcDestroyContext(x); g_ctx[A32(0) & 0xFF] = NULL; }
 }
 static void h_alcMakeContextCurrent(CPU *c) { RET(alcMakeContextCurrent(ctx_of(A32(0)))); }
-static void h_alcProcessContext(CPU *c)     { ALCcontext *x = ctx_of(A32(0)); if (x) alcProcessContext(x); }
+/* The sound library's server thread (alsvr_server_proc) loops forever with
+ * no wait, calling this once a pass: on the Quest it took a whole core and,
+ * through OpenAL's context lock, kept the game thread waiting on every sound
+ * call. Nothing suspends a context (no alcSuspendContext), so processing one
+ * is a no-op; it becomes the wait the loop lacks - 1 ms, plenty for a loop
+ * that only notices stopped sources. */
+static void h_alcProcessContext(CPU *c)
+{
+    (void)c;
+    struct timespec ts = { 0, 1000000 };
+    nanosleep(&ts, NULL);
+}
 static void h_alcGetError(CPU *c)           { RET(alcGetError(dev_of(A32(0)))); }
 
 /* ---- AL ---- */
