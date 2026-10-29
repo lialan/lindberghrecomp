@@ -576,6 +576,10 @@ int host_gl_context(void)
     }
 #if defined(__APPLE__)
     host_mac_fix_surface(g_win.win, g_win.w, g_win.h);
+    /* the context started with the window's size as its viewport and
+     * scissor box, which the game reads back: make them its own */
+    glViewport(0, 0, g_win.w, g_win.h);
+    glScissor(0, 0, g_win.w, g_win.h);
 #endif
     SDL_GL_SetSwapInterval(env_int("LINDBERGH_VSYNC", 0));   /* the game paces itself; macOS stalls vsync swaps for hidden windows */
     fprintf(stderr, "[window] GL context ready: %s / %s\n",

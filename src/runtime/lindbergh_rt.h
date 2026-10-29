@@ -239,6 +239,7 @@ void       host_mouse_state(int *x, int *y, int *buttons);
 /* The host window and its GL context, shared by the GLX and GLUT seams. */
 void       host_window_hint(int w, int h);
 void       hud_widen_enable(float f, int (*anchored)(void));   /* hud_widen.c */
+void       hud_widen_layout(float lx, float lox, float ly, float loy, int vw);
 int        host_window_open(const char *title);
 int        host_gl_context(void);
 void       host_pump(void);

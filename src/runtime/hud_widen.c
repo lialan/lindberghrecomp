@@ -33,6 +33,11 @@
 extern unsigned g_frame;
 static float g_f;
 static int (*g_anchored)(void);
+/* the layout's own coordinates, when it was positioned for a smaller frame
+ * than it is drawn into: NDC x -> lx x + lox, y -> ly y + loy, applied to quads
+ * drawn into a viewport at least g_layout_vw wide, before the widening */
+static float g_lx = 1, g_lox, g_ly = 1, g_loy;
+static int g_layout_vw;
 
 /* the modelview, as far as it matters here: identity or not */
 static GLenum g_mode = GL_MODELVIEW;
@@ -171,16 +176,40 @@ static void w_glEnd(CPU *c)
     /* covers the screen, or nothing to measure: as it was */
     if (g_overflow || !nv || box[1] - box[0] >= 1.9f) { replay(); return; }
 
+    /* the layout's coordinates into the frame's */
+    float lx = 1, lox = 0, ly = 1, loy = 0;
+    if (g_layout_vw) {
+        GLint vp[4]; glGetIntegerv(GL_VIEWPORT, vp);
+        if (vp[2] >= g_layout_vw) { lx = g_lx; lox = g_lox; ly = g_ly; loy = g_loy; }
+    }
+    box[0] = lx * box[0] + lox; box[1] = lx * box[1] + lox;
+    box[2] = ly * box[2] + loy; box[3] = ly * box[3] + loy;
+    if (box[1] - box[0] >= 1.9f) {          /* now covers the frame: scaled, not squeezed */
+        GLfloat m[16];
+        for (int col = 0; col < 4; col++) {
+            m[col * 4 + 0] = lx * p[col * 4 + 0] + lox * p[col * 4 + 3];
+            m[col * 4 + 1] = ly * p[col * 4 + 1] + loy * p[col * 4 + 3];
+            m[col * 4 + 2] = p[col * 4 + 2];
+            m[col * 4 + 3] = p[col * 4 + 3];
+        }
+        GLint mode; glGetIntegerv(GL_MATRIX_MODE, &mode);
+        glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadMatrixf(m);
+        replay();
+        glMatrixMode(GL_PROJECTION); glPopMatrix(); glMatrixMode((GLenum)mode);
+        return;
+    }
+
     float s = place(box);
     memcpy(g_last_box, box, sizeof box);
     g_last_s = s;
     g_last_frame = g_frame;
 
-    /* T * P, T taking NDC x to f x + s: in clip space x' = f x + s w */
+    /* T * P, T taking NDC x to f (lx x + lox) + s and y to ly y + loy: in
+     * clip space x' = f lx x + (f lox + s) w */
     GLfloat m[16];
     for (int col = 0; col < 4; col++) {
-        m[col * 4 + 0] = g_f * p[col * 4 + 0] + s * p[col * 4 + 3];
-        m[col * 4 + 1] = p[col * 4 + 1];
+        m[col * 4 + 0] = g_f * lx * p[col * 4 + 0] + (g_f * lox + s) * p[col * 4 + 3];
+        m[col * 4 + 1] = ly * p[col * 4 + 1] + loy * p[col * 4 + 3];
         m[col * 4 + 2] = p[col * 4 + 2];
         m[col * 4 + 3] = p[col * 4 + 3];
     }
@@ -208,4 +237,11 @@ void hud_widen_enable(float f, int (*anchored)(void))
 #undef HOOK
     }
     fprintf(stderr, "[hud] 2D drawn at %.3f of the frame's width\n", f);
+}
+
+/* The 2D was positioned for a frame lx, ly times smaller than the viewport it
+ * is drawn into (at least vw wide), anchored at (ox, oy) in NDC. */
+void hud_widen_layout(float lx, float lox, float ly, float loy, int vw)
+{
+    g_lx = lx; g_lox = lox; g_ly = ly; g_loy = loy; g_layout_vw = vw;
 }
