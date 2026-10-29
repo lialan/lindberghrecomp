@@ -51,11 +51,40 @@ static void APIENTRY_GL4ES main_fb_size(int *w, int *h) { *w = 640; *h = 480; }
 
 unsigned g_frame;
 
+/* w, h: the size the game draws at - its monitor, which is what the DIP
+ * switches, the gun and every game-facing query report. The window on the
+ * Mac's screen is a separate thing, any size: the drawable stays w x h and
+ * the system scales it to the window (host_mac_fix_surface). */
 static struct {
     SDL_Window   *win;
     SDL_GLContext gl;
     int           w, h;
 } g_win;
+
+#if defined(__APPLE__)
+void host_mac_fix_surface(SDL_Window *win, int w, int h);   /* host_menu_mac.m */
+#endif
+
+/* A pointer position in the window, in the game's pixels. */
+static void to_game(int *x, int *y)
+{
+    int ww = 0, wh = 0;
+    if (g_win.win) SDL_GetWindowSize(g_win.win, &ww, &wh);
+    if (ww > 0 && wh > 0 && g_win.w > 0) {
+        *x = (int)((long)*x * g_win.w / ww);
+        *y = (int)((long)*y * g_win.h / wh);
+    }
+}
+
+static void to_window(int *x, int *y)
+{
+    int ww = 0, wh = 0;
+    if (g_win.win) SDL_GetWindowSize(g_win.win, &ww, &wh);
+    if (ww > 0 && wh > 0 && g_win.w > 0) {
+        *x = (int)((long)*x * ww / g_win.w);
+        *y = (int)((long)*y * wh / g_win.h);
+    }
+}
 
 static int env_int(const char *name, int dflt)
 {
@@ -428,6 +457,7 @@ static void fake_keys(void)
             if (k == '@') {                  /* a left click where the pointer is */
                 e.type = SDL_MOUSEBUTTONDOWN; e.button.button = SDL_BUTTON_LEFT;
                 e.button.x = g_mouse_x; e.button.y = g_mouse_y;
+                to_window(&e.button.x, &e.button.y);
                 SDL_PushEvent(&e);
                 e.type = SDL_MOUSEBUTTONUP; SDL_PushEvent(&e);
                 fprintf(stderr, "[keys] clicked at frame %u\n", f);
@@ -475,6 +505,7 @@ static void pump(void)
         case SDL_MOUSEMOTION:
             g_mouse_x = e.motion.x;
             g_mouse_y = e.motion.y;
+            to_game(&g_mouse_x, &g_mouse_y);
             in_push(HOST_IN_MOTION, g_mouse_x, g_mouse_y, g_buttons, 0);
             break;
         case SDL_MOUSEBUTTONDOWN:
@@ -482,6 +513,8 @@ static void pump(void)
             int b = button_of(e.button.button), down = e.type == SDL_MOUSEBUTTONDOWN;
             g_mouse_x = e.button.x;
             g_mouse_y = e.button.y;
+            to_game(&g_mouse_x, &g_mouse_y);
+            e.button.x = g_mouse_x; e.button.y = g_mouse_y;
             if (down && g_capture >= 0) { finish_capture(MOUSE_BIND(e.button.button)); break; }
             if (down && g_calib) { calib_click(e.button.x, e.button.y); break; }
             if (down) g_buttons |= 1 << b; else g_buttons &= ~(1 << b);
@@ -558,9 +591,25 @@ int host_window_open(const char *title)
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
     SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
+    /* The window: LINDBERGH_WINDOW=WxH, else 1080 tall at the game's aspect
+     * (1920x1080 for a 16:9 game), shrunk to fit the screen. Resizable; the
+     * picture is scaled to it. */
+    int dw = 0, dh = 0;
+    {
+        const char *v = getenv("LINDBERGH_WINDOW");
+        if (!(v && sscanf(v, "%dx%d", &dw, &dh) == 2 && dw > 0 && dh > 0)) {
+            dh = 1080; dw = (int)((long)dh * g_win.w / g_win.h);
+            SDL_Rect r;
+            if (SDL_GetDisplayUsableBounds(0, &r) == 0 && r.h > 100) {
+                int maxh = r.h - 40, maxw = r.w - 40;
+                if (dh > maxh) { dh = maxh; dw = (int)((long)dh * g_win.w / g_win.h); }
+                if (dw > maxw) { dw = maxw; dh = (int)((long)dw * g_win.h / g_win.w); }
+            }
+        }
+    }
     g_win.win = SDL_CreateWindow(title && *title ? title : "lindberghrecomp",
                                  SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                                 g_win.w, g_win.h, SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN);
+                                 dw, dh, SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
     if (!g_win.win) {
         fprintf(stderr, "[window] SDL_CreateWindow: %s\n", SDL_GetError());
         return 0;
@@ -570,7 +619,7 @@ int host_window_open(const char *title)
     host_menu_install();
 #endif
     SDL_RaiseWindow(g_win.win);
-    fprintf(stderr, "[window] %dx%d\n", g_win.w, g_win.h);
+    fprintf(stderr, "[window] game %dx%d, window %dx%d\n", g_win.w, g_win.h, dw, dh);
     return 1;
 }
 
@@ -593,6 +642,9 @@ int host_gl_context(void)
     }
     xr_frame_begin();
 #else
+#if defined(__APPLE__)
+    host_mac_fix_surface(g_win.win, g_win.w, g_win.h);
+#endif
     SDL_GL_SetSwapInterval(env_int("LINDBERGH_VSYNC", 0));   /* the game paces itself; macOS stalls vsync swaps for hidden windows */
 #endif
     fprintf(stderr, "[window] GL context ready: %s / %s\n",

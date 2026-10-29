@@ -9,7 +9,10 @@
  */
 
 #import <Cocoa/Cocoa.h>
+#include <OpenGL/OpenGL.h>
 #include <stdio.h>
+#include <SDL.h>
+#include <SDL_syswm.h>
 
 #include "host_settings.h"
 
@@ -118,4 +121,23 @@ void host_menu_install(void)
         for (NSMenuItem *i in NSApp.mainMenu.itemArray) [names addObject:i.title.length ? i.title : @"(app)"];
         fprintf(stderr, "[menu] menu bar: %s\n", [[names componentsJoinedByString:@", "] UTF8String]);
     }
+}
+
+/* The game draws at its monitor's size whatever the window is: the current
+ * GL context's drawable is pinned at w x h (a fixed surface backing size) and
+ * the system scales it to the window as it presents. The window keeps the
+ * game's shape when resized, so the picture is never stretched. */
+void host_mac_fix_surface(SDL_Window *win, int w, int h)
+{
+    CGLContextObj ctx = CGLGetCurrentContext();
+    if (ctx) {
+        GLint size[2] = { w, h };
+        CGLError e1 = CGLSetParameter(ctx, kCGLCPSurfaceBackingSize, size);
+        CGLError e2 = CGLEnable(ctx, kCGLCESurfaceBackingSize);
+        fprintf(stderr, "[window] drawable fixed at %dx%d%s\n", w, h, e1 || e2 ? " (refused)" : "");
+    }
+    SDL_SysWMinfo info;
+    SDL_VERSION(&info.version);
+    if (SDL_GetWindowWMInfo(win, &info) && info.subsystem == SDL_SYSWM_COCOA)
+        [info.info.cocoa.window setContentAspectRatio:NSMakeSize(w, h)];
 }
