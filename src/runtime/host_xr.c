@@ -374,11 +374,12 @@ static int fake_gun(void)
  * is worked from here too). Point the gun at a row and pull the trigger;
  * the game gets no input meanwhile. */
 enum { M_SIGHT, M_LASER, M_CROSSHAIR, M_GUN, M_HAND, M_SCREEN, M_RATE, M_RES, M_COINS, M_COIN, M_RECENTRE,
-       M_TEST, M_SERVICE, M_CLOSE, M_COUNT };
+       M_TEST, M_SERVICE, M_RESET, M_CLOSE, M_COUNT };
 static struct {
     int open, hover, dirty;
     float c[3], right[3], up[3], n[3], hw, hh;  /* where it hangs, in LOCAL metres */
     int test_frames, service_frames, coin;
+    int reset_armed;            /* "Reset game" chosen once: a second time resets */
 } menu;
 static float rates[16];
 static int running_resolution, running_width;
@@ -396,7 +397,7 @@ static void menu_items(XmItem *it)
     static const char *const labels[M_COUNT] = {
         "Sight", "Laser", "Game crosshair", "Gun model", "Gun hand", "Screen distance", "Display rate", "Resolution per eye",
         "Coins", "Insert a coin", "Recentre view", "Arcade Test button (select)",
-        "Arcade Service button (next)", "Close" };
+        "Arcade Service button (next)", "Reset game", "Close" };
     for (int i = 0; i < M_COUNT; i++) { it[i].label = labels[i]; it[i].value[0] = 0; }
     snprintf(it[M_SIGHT].value, 40, "%s", sight[cfg.sight]);
     snprintf(it[M_LASER].value, 40, "%s", laser[cfg.laser]);
@@ -411,14 +412,45 @@ static void menu_items(XmItem *it)
     if (cfg.resolution == running_resolution && cfg.width == running_width) snprintf(it[M_RES].value, 40, "%s", res);
     else snprintf(it[M_RES].value, 40, "%s (on restart)", res);
     snprintf(it[M_COINS].value, 40, "%s", cfg.auto_coins ? "Automatic" : "By menu");
+    if (menu.reset_armed) snprintf(it[M_RESET].value, 40, "Pull again to reset");
+}
+
+/* The arcade's reset: the game starts again from its boot, as a new process
+ * (the activity's restartGame, which needs a game whose activity has it) */
+static void reset_game(void)
+{
+    JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
+    jobject activity = (jobject)SDL_AndroidGetActivity();
+    if (!env || !activity) return;
+    jclass cls = (*env)->GetObjectClass(env, activity);
+    jmethodID m = (*env)->GetMethodID(env, cls, "restartGame", "()V");
+    if (m) {
+        fprintf(stderr, "[xr] reset: the game starts again\n");
+        fflush(stderr);
+        (*env)->CallVoidMethod(env, activity, m);
+    } else {
+        (*env)->ExceptionClear(env);
+        fprintf(stderr, "[xr] reset: this app cannot restart itself\n");
+    }
+    (*env)->DeleteLocalRef(env, cls);
+    (*env)->DeleteLocalRef(env, activity);
+}
+
+/* the panel's title: LINDBERGH_XR_TITLE, which the game's own start sets */
+static const char *app_title(void)
+{
+    const char *t = getenv("LINDBERGH_XR_TITLE");
+    return t && *t ? t : "Ghost Squad Evolution VR";
 }
 
 static void menu_paint(void)
 {
     static unsigned char img[XM_W * XM_H * 4];
     XmItem it[M_COUNT];
+    char title[80];
     menu_items(it);
-    xm_paint(img, "Ghost Squad Evolution VR - settings", it, M_COUNT, menu.hover,
+    snprintf(title, sizeof title, "%s - settings", app_title());
+    xm_paint(img, title, it, M_COUNT, menu.hover,
              "Point and pull the trigger. Menu button: close.");
     xo_panel_upload(img, XM_W, XM_H);
     menu.dirty = 0;
@@ -460,6 +492,8 @@ static int menu_hit(const float p[3], const float d[3], float *u, float *v, floa
 static void menu_choose(int item)
 {
     static const float screens[] = { 2.0f, 2.5f, 3.0f, 4.0f, 5.0f };
+    int armed = menu.reset_armed;
+    menu.reset_armed = 0;           /* anything else chosen in between: no reset */
     switch (item) {
     case M_SIGHT: cfg.sight = (cfg.sight + 1) % 3; break;
     case M_LASER: cfg.laser = (cfg.laser + 1) % 3; break;
@@ -495,6 +529,11 @@ static void menu_choose(int item)
     case M_RECENTRE: anchor_pending = 1; break;
     case M_TEST: menu.test_frames = 12; break;
     case M_SERVICE: menu.service_frames = 12; break;
+    case M_RESET:
+        if (!armed) { menu.reset_armed = 1; break; }
+        cfg_save();
+        reset_game();
+        break;
     case M_CLOSE: menu.open = 0; break;
     }
     cfg_save();
@@ -521,7 +560,7 @@ static void input_frame(XrTime t)
     if (fake_menu < 0) { const char *v = getenv("LINDBERGH_XR_FAKE_MENU"); fake_menu = v && *v == '1'; }
     if (fake_menu && !menu.open && views_ok) { menu.open = 1; menu_place(); menu.hover = -1; menu.dirty = 1; }
     if (menu_btn && !prev[HAND_L][6]) {
-        menu.open = !menu.open;
+        menu.open = !menu.open; menu.reset_armed = 0;
         fprintf(stderr, "[xr] settings panel %s\n", menu.open ? "open" : "closed");
         if (menu.open) { menu_place(); menu.hover = -1; menu.dirty = 1; }
     }
@@ -636,7 +675,7 @@ static void input_frame(XrTime t)
     if (btn_b[off] && !prev[off][3]) panel_held = t;
     if (btn_b[off] && panel_held && t - panel_held >= 1000000000) {
         panel_held = 0;
-        menu.open = !menu.open;
+        menu.open = !menu.open; menu.reset_armed = 0;
         if (menu.open) { menu_place(); menu.hover = -1; menu.dirty = 1; }
         rumble(off, 0.3f, 20);
         fprintf(stderr, "[xr] settings panel %s (held button)\n", menu.open ? "open" : "closed");
@@ -790,7 +829,7 @@ int xr_init(void)
     XrInstanceCreateInfo ic = { XR_TYPE_INSTANCE_CREATE_INFO };
     ic.next = &ai;
     ic.enabledExtensionCount = next; ic.enabledExtensionNames = ext;
-    strcpy(ic.applicationInfo.applicationName, "Ghost Squad Evolution VR");
+    snprintf(ic.applicationInfo.applicationName, sizeof ic.applicationInfo.applicationName, "%s", app_title());
     strcpy(ic.applicationInfo.engineName, "lindberghrecomp");
     ic.applicationInfo.applicationVersion = 1;
     ic.applicationInfo.apiVersion = XR_MAKE_VERSION(1, 0, 34);

@@ -6,8 +6,8 @@
 #define XR_MENU_H
 
 #define XM_W 768                /* the panel's picture, in pixels */
-#define XM_H 640
-#define XM_ROWS 14
+#define XM_H 680
+#define XM_ROWS 15
 
 typedef struct {
     const char *label;
