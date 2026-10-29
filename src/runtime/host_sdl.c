@@ -52,10 +52,13 @@ static int env_int(const char *name, int dflt)
     return (v && *v) ? atoi(v) : dflt;
 }
 
+static int g_hint_w, g_hint_h;     /* host_window_hint, before the window exists */
+
 void lindbergh_window_size(int *w, int *h)
 {
-    if (w) *w = g_win.w ? g_win.w : env_int("LINDBERGH_WIDTH", DEFAULT_W);
-    if (h) *h = g_win.h ? g_win.h : env_int("LINDBERGH_HEIGHT", DEFAULT_H);
+    /* before the window opens: what it will open at, hint included */
+    if (w) *w = g_win.w ? g_win.w : env_int("LINDBERGH_WIDTH", g_hint_w ? g_hint_w : DEFAULT_W);
+    if (h) *h = g_win.h ? g_win.h : env_int("LINDBERGH_HEIGHT", g_hint_h ? g_hint_h : DEFAULT_H);
 }
 
 /* ---- input queue ---- */
@@ -453,7 +456,6 @@ static void pump(void)
     }
 }
 
-static int g_hint_w, g_hint_h;
 
 void host_window_hint(int w, int h)
 {

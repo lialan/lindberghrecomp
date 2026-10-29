@@ -517,6 +517,36 @@ static void h_dongle_valid(CPU *c)
     RET(1);
 }
 
+/* amDipswGetData(unsigned char *out): the baseboard's DIP switches. On a
+ * Lindbergh, switches 6-8 (bits 5-7) select the monitor's resolution, and a
+ * game sizes everything it draws from them; with no answer it falls back to
+ * 640x480 whatever the window is. So the bits are the window's size:
+ *   0x00 640x480   0x20 800x480   0x40 1024x768  0x60 1280x768
+ *   0x80 800x600   0xA0 1024x600  0xC0 1280x1024 0xE0 1280x720
+ * LINDBERGH_DIPSW=<hex> sets the whole byte instead. */
+static void h_dipsw_get(CPU *c)
+{
+    static int dips = -1;
+    if (dips < 0) {
+        const char *v = getenv("LINDBERGH_DIPSW");
+        if (v && *v) dips = (int)strtol(v, NULL, 16) & 0xFF;
+        else {
+            static const struct { int w, h, bits; } res[] = {
+                { 640, 480, 0x00 }, { 800, 480, 0x20 }, { 1024, 768, 0x40 }, { 1280, 768, 0x60 },
+                { 800, 600, 0x80 }, { 1024, 600, 0xA0 }, { 1280, 1024, 0xC0 }, { 1280, 720, 0xE0 },
+            };
+            int w, h;
+            lindbergh_window_size(&w, &h);
+            dips = 0x60;
+            for (unsigned i = 0; i < sizeof res / sizeof *res; i++)
+                if (res[i].w == w && res[i].h == h) dips = res[i].bits;
+        }
+        fprintf(stderr, "[sega] DIP switches %#04x\n", dips);
+    }
+    if (A32(0)) *(uint8_t *)APTR(0) = (uint8_t)dips;
+    RET(0);
+}
+
 void hle_register_sega(void)
 {
     int n = 0;
@@ -554,6 +584,7 @@ void hle_register_sega(void)
      * asks for these by name in its console when they are missing. */
     n += guest_override("amDipswInit", h_ok);
     n += guest_override("amDipswExit", h_ok);
+    n += guest_override("amDipswGetData", h_dipsw_get);
 
     /* acpSystem::checkDongle polls amDongleUpdate and raises "Error 15 -
      * Game Program Not Found" the moment it answers anything but zero. */
