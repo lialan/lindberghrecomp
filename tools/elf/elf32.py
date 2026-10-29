@@ -165,13 +165,39 @@ class Elf32:
                 # to addresses where no lifted function exists.
                 untyped_code = ((info & 0xF) == 0 and (info >> 4) in (1, 2)
                                 and in_code(value))
+                # Its destructor cleanup paths too: local labels the code
+                # reaches by pushing one as a return address, so a callee's
+                # `ret` lands there (destr_detour3.209..., destr__44).
+                if (info & 0xF) == 0 and (info >> 4) == 0 and in_code(value):
+                    nm = self._cstr(strtab + name_off)
+                    untyped_code = nm.startswith("destr_")
                 if ((info & 0xF) != STT_FUNC and not untyped_code) or not value or in_plt(value):
                     continue
                 syms.append((value, size, self._cstr(strtab + name_off)))
 
         bounds = sorted({v for v, _s, _n in syms})
+        # A destructor detour runs inside its function and jumps around in it,
+        # so its body is the rest of that function, not the gap to the next
+        # label.
+        sized = sorted((v, v + sz) for v, sz, _n in syms if sz)
+        starts = [v for v, _e in sized]
+
+        def enclosing_end(va):
+            i = bisect.bisect_right(starts, va) - 1
+            while i >= 0 and i >= bisect.bisect_right(starts, va) - 8:
+                lo, hi = sized[i]
+                if lo < va < hi:
+                    return hi
+                i -= 1
+            return 0
+
         out = {}
         for value, size, name in syms:
+            if not size and name.startswith("destr_"):
+                end = enclosing_end(value)
+                if end:
+                    out[value] = (end - value, name)
+                    continue
             if not size:
                 i = bisect.bisect_right(bounds, value)
                 nxt = bounds[i] if i < len(bounds) else 0

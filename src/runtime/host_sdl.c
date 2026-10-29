@@ -213,10 +213,15 @@ static void cabinet_autostart(void)
     static int on = -1, coined;
     if (on < 0) on = env_int("LINDBERGH_AUTOSTART", 0) != 0;
     if (!on) return;
-    if (!coined && g_frame > 240) {
-        coined = 1;
+    /* LINDBERGH_AUTOSTART=N with N > 1 inserts N coins, a second apart:
+     * The House of the Dead 4 takes two to start. */
+    static int want = -1;
+    if (want < 0) want = env_int("LINDBERGH_AUTOSTART", 1);
+    if (!coined && g_frame > 240 && g_frame % 60u == 0) {
         g_cab.coins[0]++;
         fprintf(stderr, "[cab] autostart: coin inserted at frame %u\n", g_frame);
+        static int n;
+        if (++n >= want) coined = 1;
     }
     if (coined) {
         if (g_frame % 120u < 20u) g_auto |= CAB_P1_START;
