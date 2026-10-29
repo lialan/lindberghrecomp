@@ -15,6 +15,8 @@ void stereo_frame_begin(void);          /* before the game draws a frame */
 void stereo_frame_end(void);            /* at the swap: draws the second eye */
 /* glXMakeCurrent: draw into the eyes, as the window does */
 void stereo_bind_window(void);
+/* glXCreatePbuffer: the game draws into pbuffers, which are the eyes too */
+void stereo_pbuffer_made(void);
 
 void stereo_eye_size(int w, int h);
 /* The host's own framebuffer for an eye (an XR swapchain image). */

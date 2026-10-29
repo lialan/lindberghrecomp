@@ -990,10 +990,65 @@ static int screen_copy(GLuint tex)
     return 0;
 }
 
+/* ---- side passes into a pbuffer ----
+ * The pbuffer is the eyes, but the game also draws other views into it to
+ * copy into textures: its glare at 80x60, and in some rooms three 512x512
+ * passes after the scene (reflections) - each cleared first, which wiped the
+ * scene from the eyes and left the clear colour under the HUD. A pass whose
+ * clear comes with less than the whole screen as its viewport goes into a
+ * framebuffer of its own, at the game's resolution and with its projection,
+ * until a clear of the whole screen or the next glXMakeCurrent. */
+#define SIDE_W 1024
+#define SIDE_H 1024
+static int      g_pbuffers;             /* the game draws into pbuffers (the eyes) */
+static int      g_side;                 /* inside a side pass */
+static GLuint   g_side_fbo, g_side_tex[2];
+static GLint    g_game_scissor[4];      /* the game's scissor box, in its pixels */
+
+void stereo_pbuffer_made(void) { g_pbuffers = 1; }
+
+static void side_pass(int on)
+{
+#ifdef LINDBERGH_GL4ES
+    if (on == g_side) return;
+    if (on && !g_side_fbo) {
+        glGenTextures(2, g_side_tex);
+        glBindTexture(GL_TEXTURE_RECTANGLE_ARB, g_side_tex[0]);
+        glTexImage2D(GL_TEXTURE_RECTANGLE_ARB, 0, GL_RGBA, SIDE_W, SIDE_H, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        glBindTexture(GL_TEXTURE_RECTANGLE_ARB, g_side_tex[1]);
+        glTexImage2D(GL_TEXTURE_RECTANGLE_ARB, 0, GL_DEPTH_COMPONENT, SIDE_W, SIDE_H, 0, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, NULL);
+        glBindTexture(GL_TEXTURE_RECTANGLE_ARB, g_unit0_rect);
+        glGenFramebuffers(1, &g_side_fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, g_side_fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_RECTANGLE_ARB, g_side_tex[0], 0);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_RECTANGLE_ARB, g_side_tex[1], 0);
+        GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+        if (g_nfbs < MAX_FBS) { g_fbs[g_nfbs].fb = g_side_fbo; g_fbs[g_nfbs++].offscreen = 1; }
+        fprintf(stderr, "[stereo] frame %u: side passes into the pbuffer drawn apart%s\n", g_frame,
+                st == GL_FRAMEBUFFER_COMPLETE ? "" : " (incomplete framebuffer)");
+    }
+    g_side = on;
+    bind_framebuffer(GL_FRAMEBUFFER, on ? g_side_fbo : 0);
+    /* the viewport and scissor box in the new target's pixels */
+    float sx = on ? 1 : g_sx, sy = on ? 1 : g_sy;
+    GLint X = (GLint)lroundf(g_vp[0] * sx), Y = (GLint)lroundf(g_vp[1] * sy);
+    g_eye_vp[0] = X; g_eye_vp[1] = Y;
+    g_eye_vp[2] = (GLint)lroundf((g_vp[0] + g_vp[2]) * sx) - X; g_eye_vp[3] = (GLint)lroundf((g_vp[1] + g_vp[3]) * sy) - Y;
+    glViewport(g_eye_vp[0], g_eye_vp[1], g_eye_vp[2], g_eye_vp[3]);
+    const GLint *s = g_game_scissor;
+    X = (GLint)lroundf(s[0] * sx); Y = (GLint)lroundf(s[1] * sy);
+    g_scissor[0] = X; g_scissor[1] = Y;
+    g_scissor[2] = (GLint)lroundf((s[0] + s[2]) * sx) - X; g_scissor[3] = (GLint)lroundf((s[1] + s[3]) * sy) - Y;
+    glScissor(g_scissor[0], g_scissor[1], g_scissor[2], g_scissor[3]);
+#else
+    (void)on;
+#endif
+}
+
 static int copy_from_eyes(CPU *c, int k)
 {
 #ifdef LINDBERGH_GL4ES
-    if (!g_mv || g_game_fb != 0 || A32(0) != GL_TEXTURE_2D) return 0;
+    if (!g_mv || (g_game_fb != 0 && !g_side) || A32(0) != GL_TEXTURE_2D) return 0;
     GLint tex = 0;
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
     GLint level = AI32(1), xo = 0, yo = 0, x, y, w, h;
@@ -1007,12 +1062,13 @@ static int copy_from_eyes(CPU *c, int k)
                      ifmt == GL_RGB || ifmt == GL_RGB8 || ifmt == 3 ? GL_RGB : GL_RGBA, GL_UNSIGNED_BYTE, NULL);
     }
     if (!tex || w <= 0 || h <= 0) return 1;
-    int X0 = (int)lroundf(x * g_sx), Y0 = (int)lroundf(y * g_sy);
-    int X1 = (int)lroundf((x + w) * g_sx), Y1 = (int)lroundf((y + h) * g_sy);
+    float sx = g_side ? 1 : g_sx, sy = g_side ? 1 : g_sy;
+    int X0 = (int)lroundf(x * sx), Y0 = (int)lroundf(y * sy);
+    int X1 = (int)lroundf((x + w) * sx), Y1 = (int)lroundf((y + h) * sy);
     static int off = -1;
     if (off < 0) { const char *v = getenv("LINDBERGH_EYE_COPY"); off = v && *v == '0'; }
-    if (!off) gl4es_multiview_copy(g_eye_tex[0], 0, X0, Y0, X1, Y1, (GLuint)tex, level, xo, yo, xo + w, yo + h);
-    if (w >= GAME_W * 9 / 10 && h >= GAME_H * 9 / 10 && !screen_copy((GLuint)tex) && g_nscreen_copy < MAX_SCREEN_COPIES) {
+    if (!off) gl4es_multiview_copy(g_side ? g_side_tex[0] : g_eye_tex[0], 0, X0, Y0, X1, Y1, (GLuint)tex, level, xo, yo, xo + w, yo + h);
+    if (!g_side && w >= GAME_W * 9 / 10 && h >= GAME_H * 9 / 10 && !screen_copy((GLuint)tex) && g_nscreen_copy < MAX_SCREEN_COPIES) {
         g_screen_copy[g_nscreen_copy++] = (GLuint)tex;
         fprintf(stderr, "[stereo] frame %u: texture %d is a copy of the whole screen\n", g_frame, tex);
     }
@@ -1024,7 +1080,11 @@ static int copy_from_eyes(CPU *c, int k)
 }
 
 /* glXMakeCurrent: the window (or a pbuffer standing in for it) is the eyes */
-void stereo_bind_window(void) { bind_framebuffer(GL_FRAMEBUFFER, 0); }
+void stereo_bind_window(void)
+{
+    if (g_side) side_pass(0);
+    else bind_framebuffer(GL_FRAMEBUFFER, 0);
+}
 
 static int transform_call(CPU *c, HleId id, const char *n)
 {
@@ -1035,7 +1095,7 @@ static int transform_call(CPU *c, HleId id, const char *n)
     }
     if (k == K_OTHER) return 0;
     if (g_on && (k == K_COPYTEXSUB || k == K_COPYTEX)) return copy_from_eyes(c, k);
-    if (g_on && g_mv && (is_draw(k) || k == K_BEGIN) && g_tex2d_on && g_nscreen_copy && screen_copy(g_tex2d_bound)) {
+    if (g_on && g_mv && !g_side && (is_draw(k) || k == K_BEGIN) && g_tex2d_on && g_nscreen_copy && screen_copy(g_tex2d_bound)) {
         if (k == K_BEGIN) g_skip_begin = 1;
         return 1;
     }
@@ -1050,6 +1110,9 @@ static int transform_call(CPU *c, HleId id, const char *n)
          * sees, so outside it last frame's pixels stayed and dragged along
          * whenever the camera or the head moved. Clear the colour too. */
         GLbitfield mask = A32(0);
+        if (g_mv && g_pbuffers && (g_game_fb == 0 || g_side))
+            side_pass(!(g_vp[0] <= 0 && g_vp[1] <= 0 && g_vp[0] + g_vp[2] >= GAME_W && g_vp[1] + g_vp[3] >= GAME_H));
+        if (g_side) return 0;
         /* Only the frame's first such clear, and not for a flat picture: the
          * game clears depth again to draw over its finished scene (the
          * scope's reload), and clearing the colour there wiped the scene.
@@ -1082,8 +1145,10 @@ static int transform_call(CPU *c, HleId id, const char *n)
     if (k == K_VIEWPORT || k == K_SCISSOR) {
         GLint x = AI32(0), y = AI32(1), w = AI32(2), h = AI32(3);
         if (n[2] == 'V') { g_vp[0] = x; g_vp[1] = y; g_vp[2] = w; g_vp[3] = h; }
-        GLint X = (GLint)lroundf(x * g_sx), Y = (GLint)lroundf(y * g_sy);
-        GLint W = (GLint)lroundf((x + w) * g_sx) - X, H = (GLint)lroundf((y + h) * g_sy) - Y;
+        else { g_game_scissor[0] = x; g_game_scissor[1] = y; g_game_scissor[2] = w; g_game_scissor[3] = h; }
+        float sx = g_side ? 1 : g_sx, sy = g_side ? 1 : g_sy;
+        GLint X = (GLint)lroundf(x * sx), Y = (GLint)lroundf(y * sy);
+        GLint W = (GLint)lroundf((x + w) * sx) - X, H = (GLint)lroundf((y + h) * sy) - Y;
         if (n[2] == 'V') { glViewport(X, Y, W, H); g_eye_vp[0] = X; g_eye_vp[1] = Y; g_eye_vp[2] = W; g_eye_vp[3] = H; }
         else { glScissor(X, Y, W, H); g_scissor[0] = X; g_scissor[1] = Y; g_scissor[2] = W; g_scissor[3] = H; }
         return 1;
@@ -1193,7 +1258,7 @@ static void fix_query(CPU *c, int k)
     if (k == K_GETINTEGERV && A32(0) == GL_VIEWPORT) {
         GLint *o = (GLint *)APTR(1); if (o) memcpy(o, g_vp, sizeof g_vp);
     } else if (k == K_GETINTEGERV && (A32(0) == GL_FRAMEBUFFER_BINDING)) {
-        GLint *o = (GLint *)APTR(1); if (o) *o = (GLint)g_game_fb;
+        GLint *o = (GLint *)APTR(1); if (o) *o = g_side ? 0 : (GLint)g_game_fb;
     } else if (k == K_GETFLOATV && A32(0) == GL_PROJECTION_MATRIX) {
         float *o = (float *)APTR(1); if (o) memcpy(o, g_proj[g_proj_top], 64);
     } else if (k == K_GETFLOATV && A32(0) == GL_VIEWPORT) {

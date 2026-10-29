@@ -123,6 +123,7 @@ static void h_glXCreatePbuffer(CPU *c)
          * no framebuffer of its own, which gl4es would also keep in two
          * layers and track */
         g_pb[i].fb = ~0u; g_pb[i].w = w; g_pb[i].h = h;
+        stereo_pbuffer_made();
         fprintf(stderr, "[glX] pbuffer %d: %dx%d, drawn as the eyes\n", i, w, h);
         RET(TOK_PBUFFER | (uint32_t)i);
         return;
