@@ -557,9 +557,44 @@ static int pace_by_display(void)
 }
 #endif
 
+/* The game culls its models against a viewing volume as wide as its camera's
+ * lens (dxMakePerspectiveViewingVolume, from set_camera_transform). In the
+ * headset the view is far wider than the arcade monitor - about 100 degrees,
+ * and the head turns - so a soldier who steps close and to the side was
+ * dropped while still in view. In VR the volume is built wider than the
+ * camera (LINDBERGH_CULL_FOV, degrees, vertical; 0 keeps the game's). Only
+ * the culling is widened: the projection is set elsewhere and unchanged. */
+static void (*g_view_volume)(CPU *);
+static float g_cull_fov;
+static void h_view_volume(CPU *c)
+{
+    uint32_t bits = A32(0);
+    float fov;
+    memcpy(&fov, &bits, 4);
+    static int force = -1;               /* LINDBERGH_CULL_FORCE=1: exactly that angle, narrower too (tests) */
+    if (force < 0) { const char *f = getenv("LINDBERGH_CULL_FORCE"); force = f && *f == '1'; }
+    if (fov > 0 && (fov < g_cull_fov || force)) {
+        memcpy(&bits, &g_cull_fov, 4);
+        wr32(c->esp, bits);             /* the caller's argument, its own to clean */
+    }
+    push32(c, 0xDEADBEEFu);             /* the return slot its ret pops */
+    g_view_volume(c);
+}
+static int widen_culling(void)
+{
+    const char *v = getenv("LINDBERGH_CULL_FOV");
+    g_cull_fov = v ? (float)atof(v) : 0.0f;  /* off unless asked for */
+    if (!(g_cull_fov > 0 && g_cull_fov < 179)) return 0;
+    uint32_t va = guest_symbol("_Z30dxMakePerspectiveViewingVolumeffff");
+    extern void (*dispatch_lifted(uint32_t va))(CPU *);
+    if (!va || !(g_view_volume = dispatch_lifted(va))) return 0;
+    return guest_override("_Z30dxMakePerspectiveViewingVolumeffff", h_view_volume);
+}
+
 void hle_register_sega(void)
 {
     int n = 0;
+    if (widen_culling()) fprintf(stderr, "[sega] model culling widened to %.0f degrees\n", g_cull_fov);
 #if defined(__ANDROID__)
     if (pace_by_display()) fprintf(stderr, "[sega] idle_wait_func: paced by the headset, not the wall clock\n");
 #endif

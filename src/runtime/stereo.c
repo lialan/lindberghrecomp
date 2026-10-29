@@ -814,19 +814,19 @@ static int      g_weapon_learn, g_weapon_loaded;
 void stereo_game_gun_reloading(int on) { g_weapon_learn = on; }
 
 /* The gun's textures are the same every session (loaded at start-up, in the
- * same order): remembered in game_gun.txt, so the gun is hidden from the
+ * same order): remembered in game_gun2.txt, so the gun is hidden from the
  * first reload - also in a scene whose world shares the gun's lens. */
 static void weapon_load(void)
 {
     g_weapon_loaded = 1;
-    FILE *f = fopen("game_gun.txt", "r");
+    FILE *f = fopen("game_gun2.txt", "r");
     unsigned t;
     while (f && g_nweapon_tex < MAX_WEAPON_TEX && fscanf(f, "%u", &t) == 1) g_weapon_tex[g_nweapon_tex++] = t;
     if (f) fclose(f);
 }
 static void weapon_save(void)
 {
-    FILE *f = fopen("game_gun.txt", "w");
+    FILE *f = fopen("game_gun2.txt", "w");
     for (unsigned i = 0; f && i < g_nweapon_tex; i++) fprintf(f, "%u\n", g_weapon_tex[i]);
     if (f) fclose(f);
 }
@@ -843,9 +843,14 @@ static int weapon_draw(void)
     if (getenv("LINDBERGH_GUN_LOG") && g_weapon_learn && !g_replaying)
         fprintf(stderr, "[gun] frame %u: lens %.3f (world %.3f), at %.2f %.2f %.2f, tex %u\n", g_frame, P[0], g_world_persp[0],
                 mv[12], mv[13], mv[14], g_tex2d_bound);
+    /* The gun is drawn with a lens of its own (1.732) while the world uses
+     * another: only such a draw can be it. Texture names are reused once a
+     * mission loads, so a name alone hid soldiers who came near. */
+    int gun_lens = fabsf(P[0] - 1.732f) < 0.01f && fabsf(g_world_persp[0] - P[0]) > 0.05f * P[0];
+    if (!gun_lens) return 0;
     int known = 0;
     for (unsigned i = 0; i < g_nweapon_tex; i++) if (g_weapon_tex[i] == g_tex2d_bound) known = 1;
-    if (!known && !g_replaying && g_weapon_learn && fabsf(P[0] - 1.732f) < 0.01f && fabsf(g_world_persp[0] - P[0]) > 0.05f * P[0] && g_nweapon_tex < MAX_WEAPON_TEX) {
+    if (!known && !g_replaying && g_weapon_learn && g_nweapon_tex < MAX_WEAPON_TEX) {
         g_weapon_tex[g_nweapon_tex++] = g_tex2d_bound;
         fprintf(stderr, "[stereo] frame %u: texture %u is the game's own gun\n", g_frame, g_tex2d_bound);
         weapon_save();
