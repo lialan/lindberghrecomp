@@ -112,6 +112,25 @@ static void h_glBindBufferARB(CPU *c)
     glBindBuffer(target, A32(1));
 }
 
+/* glMultiDrawElements: `indices` is an array of pointers - 32-bit guest
+ * values here, 64-bit host pointers (or buffer offsets) to the driver. */
+static void h_glMultiDrawElements(CPU *c)
+{
+    GLenum mode = A32(0), type = A32(2);
+    const GLsizei *count = (const GLsizei *)APTR(1);
+    uint32_t idx = A32(3);
+    GLsizei n = AI32(4);
+    if (n <= 0 || !count || !idx) return;
+    const void *host[256];
+    arb_before_draw();
+    for (GLsizei base = 0; base < n; base += 256) {
+        GLsizei k = n - base < 256 ? n - base : 256;
+        for (GLsizei i = 0; i < k; i++)
+            host[i] = gl_ptr_or_offset(GL_ELEMENT_ARRAY_BUFFER, rd32(idx + 4u * (uint32_t)(base + i)));
+        glMultiDrawElements(mode, count + base, type, host, k);
+    }
+}
+
 /* glMapBuffer returns driver memory, which has no guest address. The guest
  * gets a shadow in its own window instead: filled from the buffer, written
  * back on unmap when it was written. */
@@ -174,6 +193,93 @@ static void h_glCreateProgramObjectARB(CPU *c) { RET(glCreateProgram()); }
 static void h_glCreateShaderObjectARB(CPU *c)  { RET(glCreateShader(A32(0))); }
 static void h_glAttachObjectARB(CPU *c)        { glAttachShader(A32(0), A32(1)); }
 static void h_glUseProgramObjectARB(CPU *c)    { arb_use_glsl(A32(0)); glUseProgram(A32(0)); }
+/* NVIDIA linked a fragment shader that reads a varying its vertex shader
+ * never writes, and left the value undefined; Apple refuses the link. The
+ * House of the Dead 4's shared fragment shaders read texture coordinates some
+ * vertex shaders do not produce. So when that is the only complaint, declare
+ * each missing varying in the vertex shader, zero it at the top of main, and
+ * link again. Returns 1 if it relinked. */
+static int relink_with_missing_varyings(GLuint p, const char *log)
+{
+    GLuint sh[8]; GLsizei n = 0;
+    glGetAttachedShaders(p, 8, &n, sh);
+    GLuint vs = 0, fs = 0;
+    for (GLsizei i = 0; i < n; i++) {
+        GLint type = 0;
+        glGetShaderiv(sh[i], GL_SHADER_TYPE, &type);
+        if (type == GL_VERTEX_SHADER) vs = sh[i]; else if (type == GL_FRAGMENT_SHADER) fs = sh[i];
+    }
+    if (!vs || !fs) return 0;
+    GLint vlen = 0, flen = 0;
+    glGetShaderiv(vs, GL_SHADER_SOURCE_LENGTH, &vlen);
+    glGetShaderiv(fs, GL_SHADER_SOURCE_LENGTH, &flen);
+    char *vsrc = malloc((size_t)vlen + 1), *fsrc = malloc((size_t)flen + 1);
+    glGetShaderSource(vs, vlen + 1, NULL, vsrc);
+    glGetShaderSource(fs, flen + 1, NULL, fsrc);
+
+    char decl[4096] = "", init[4096] = "";
+    const char *at = log;
+    while ((at = strstr(at, "Input of fragment shader '")) != NULL) {
+        at += strlen("Input of fragment shader '");
+        const char *end = strchr(at, '\'');
+        if (!end || end - at > 120) break;
+        char name[128];
+        snprintf(name, sizeof name, "%.*s", (int)(end - at), at);
+        /* the type, from the fragment shader's own declaration */
+        char type[32] = "vec4";
+        const char *f = fsrc;
+        while ((f = strstr(f, name)) != NULL) {
+            const char *v = f;
+            while (v > fsrc && v[-1] != ';' && v[-1] != '\n' && v[-1] != '}') v--;
+            char kw[16], ty[32], nm[128];
+            if (sscanf(v, " %15s %31s %127[A-Za-z0-9_]", kw, ty, nm) == 3 &&
+                strcmp(kw, "varying") == 0 && strcmp(nm, name) == 0) { snprintf(type, sizeof type, "%s", ty); break; }
+            f += strlen(name);
+        }
+        if (strlen(decl) + 200 < sizeof decl) {
+            char line[256];
+            if (!strstr(vsrc, name)) {          /* declared already, just not written */
+                snprintf(line, sizeof line, "varying %s %s;\n", type, name);
+                strcat(decl, line);
+            }
+            snprintf(line, sizeof line, " %s = %s(0.0);", name, type);
+            strcat(init, line);
+        }
+        at = end;
+    }
+    int done = 0;
+    /* Declared just before main, not at the top: the types are the shader's
+     * own (half4), which it #defines further down. */
+    char *mainp = strstr(vsrc, "void main");
+    char *brace = mainp ? strchr(mainp, '{') : NULL;
+    if (*init && brace) {
+        size_t out_n = strlen(vsrc) + strlen(decl) + strlen(init) + 8;
+        char *out = malloc(out_n);
+        size_t a = (size_t)(mainp - vsrc), b = (size_t)(brace + 1 - vsrc);
+        snprintf(out, out_n, "%.*s%s%.*s%s%s", (int)a, vsrc, decl, (int)(b - a), mainp, init, brace + 1);
+        const GLchar *one = out;
+        glShaderSource(vs, 1, &one, NULL);
+        glCompileShader(vs);
+        {
+            GLint cok = 0;
+            glGetShaderiv(vs, GL_COMPILE_STATUS, &cok);
+            static int shown;
+            if (!cok && shown++ < 3) {
+                char l[2048] = "";
+                glGetShaderInfoLog(vs, sizeof l, NULL, l);
+                fprintf(stderr, "[gl] patched vertex shader %u does not compile: %s\n---\n%.1500s\n---\n", vs, l, out);
+            }
+        }
+        glLinkProgram(p);
+        GLint ok = 0;
+        glGetProgramiv(p, GL_LINK_STATUS, &ok);
+        done = ok;
+        free(out);
+    }
+    free(vsrc); free(fsrc);
+    return done;
+}
+
 /* A shader that fails to build draws nothing, silently. Say so. */
 static void h_glLinkProgramARB(CPU *c)
 {
@@ -181,6 +287,12 @@ static void h_glLinkProgramARB(CPU *c)
     glLinkProgram(p);
     GLint ok = 0;
     glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char log[4096] = "";
+        glGetProgramInfoLog(p, sizeof log, NULL, log);
+        if (strstr(log, "not written by vertex shader") && relink_with_missing_varyings(p, log))
+            ok = 1;
+    }
     if (!ok) {
         char log[2048] = "";
         glGetProgramInfoLog(p, sizeof log, NULL, log);
@@ -262,10 +374,32 @@ static void h_glShaderSourceARB(CPU *c)
     uint32_t strs = A32(2);
     const GLint *lens = (const GLint *)APTR(3);
     if (n <= 0 || n > 256 || !strs) return;
-    const GLchar *host[256];
-    for (GLsizei i = 0; i < n; i++)
-        host[i] = (const GLchar *)GP(rd32(strs + 4u * (uint32_t)i));
-    glShaderSource(sh, n, host, lens);
+    /* Two things NVIDIA's 2005 compiler let through and Apple's does not:
+     * bytes past ASCII (Sega's comments are Shift-JIS), and GLSL 1.20's
+     * implicit int-to-float conversions in a shader with no #version. So each
+     * string is copied with those bytes blanked, and one that declares no
+     * version is compiled as 1.20. */
+    const GLchar *host[257];
+    GLint hl[257];
+    char *copy[256];
+    int has_version = 0;
+    for (GLsizei i = 0; i < n; i++) {
+        const char *src = (const char *)GP(rd32(strs + 4u * (uint32_t)i));
+        size_t len = lens && lens[i] >= 0 ? (size_t)lens[i] : (src ? strlen(src) : 0);
+        copy[i] = (char *)malloc(len + 1);
+        for (size_t k = 0; k < len; k++) {
+            unsigned char ch = (unsigned char)src[k];
+            copy[i][k] = ch >= 0x80 ? ' ' : (char)ch;
+        }
+        copy[i][len] = 0;
+        if (strstr(copy[i], "#version")) has_version = 1;
+        host[i + 1] = copy[i];
+        hl[i + 1] = (GLint)len;
+    }
+    host[0] = has_version ? "" : "#version 120\n";
+    hl[0] = (GLint)strlen(host[0]);
+    glShaderSource(sh, n + 1, host, hl);
+    for (GLsizei i = 0; i < n; i++) free(copy[i]);
 }
 
 /* ---- assembly-program state, owned by arbprog.c ---- */
@@ -343,44 +477,95 @@ void hle_register_gl(void)
     g_gl_errcheck = t && *t && *t != '0';
 
     gl_register_generated();
-    hle_bind("glBindBufferARB", h_glBindBufferARB);
-    hle_bind("glMapBufferARB", h_glMapBufferARB);
-    hle_bind("glUnmapBufferARB", h_glUnmapBufferARB);
-    hle_bind("glGetString", h_glGetString);
-    hle_bind("glCreateProgramObjectARB", h_glCreateProgramObjectARB);
-    hle_bind("glCreateShaderObjectARB", h_glCreateShaderObjectARB);
-    hle_bind("glAttachObjectARB", h_glAttachObjectARB);
-    hle_bind("glUseProgramObjectARB", h_glUseProgramObjectARB);
-    hle_bind("glLinkProgramARB", h_glLinkProgramARB);
-    hle_bind("glCompileShaderARB", h_glCompileShaderARB);
-    hle_bind("glDeleteObjectARB", h_glDeleteObjectARB);
-    hle_bind("glGetUniformLocationARB", h_glGetUniformLocationARB);
-    hle_bind("glGetAttribLocationARB", h_glGetAttribLocationARB);
-    hle_bind("glGetObjectParameterivARB", h_glGetObjectParameterivARB);
-    hle_bind("glGetInfoLogARB", h_glGetInfoLogARB);
-    hle_bind("glShaderSourceARB", h_glShaderSourceARB);
-    hle_bind("glProgramStringARB", h_glProgramStringARB);
-    hle_bind("glBindProgramARB", h_glBindProgramARB);
-    hle_bind("glDeleteProgramsARB", h_glDeleteProgramsARB);
-    hle_bind("glProgramEnvParameter4fvARB", h_glProgramEnvParameter4fvARB);
-    hle_bind("glProgramLocalParameter4fvARB", h_glProgramLocalParameter4fvARB);
-    hle_bind("glProgramLocalParameter4fARB", h_glProgramLocalParameter4fARB);
-    hle_bind("glEnable", h_glEnable);
-    hle_bind("glDisable", h_glDisable);
-    hle_bind("glIsEnabled", h_glIsEnabled);
-    hle_bind("glPushAttrib", h_glPushAttrib);
-    hle_bind("glPopAttrib", h_glPopAttrib);
-    hle_bind("glOrtho", h_glOrtho);
-    hle_bind("glFrustum", h_glFrustum);
-    hle_bind("gluOrtho2D", h_gluOrtho2D);
-    hle_bind("gluPerspective", h_gluPerspective);
-    hle_bind("gluErrorString", h_gluErrorString);
+    hle_bind("glBindBufferARB", h_glBindBufferARB); gl_bind_named("glBindBufferARB", h_glBindBufferARB);
+    /* the core names reach the same bookkeeping, or a buffer bound through
+     * glBindBuffer leaves every pointer argument after it misread */
+    gl_bind_named("glBindBuffer", h_glBindBufferARB);
+    gl_bind_named("glMapBuffer", h_glMapBufferARB);
+    gl_bind_named("glUnmapBuffer", h_glUnmapBufferARB);
+    hle_bind("glMultiDrawElements", h_glMultiDrawElements);
+    gl_bind_named("glMultiDrawElements", h_glMultiDrawElements);
+    gl_bind_named("glMultiDrawElementsEXT", h_glMultiDrawElements);
+    hle_bind("glMapBufferARB", h_glMapBufferARB); gl_bind_named("glMapBufferARB", h_glMapBufferARB);
+    hle_bind("glUnmapBufferARB", h_glUnmapBufferARB); gl_bind_named("glUnmapBufferARB", h_glUnmapBufferARB);
+    hle_bind("glGetString", h_glGetString); gl_bind_named("glGetString", h_glGetString);
+    hle_bind("glCreateProgramObjectARB", h_glCreateProgramObjectARB); gl_bind_named("glCreateProgramObjectARB", h_glCreateProgramObjectARB);
+    hle_bind("glCreateShaderObjectARB", h_glCreateShaderObjectARB); gl_bind_named("glCreateShaderObjectARB", h_glCreateShaderObjectARB);
+    hle_bind("glAttachObjectARB", h_glAttachObjectARB); gl_bind_named("glAttachObjectARB", h_glAttachObjectARB);
+    hle_bind("glUseProgramObjectARB", h_glUseProgramObjectARB); gl_bind_named("glUseProgramObjectARB", h_glUseProgramObjectARB);
+    hle_bind("glLinkProgramARB", h_glLinkProgramARB); gl_bind_named("glLinkProgramARB", h_glLinkProgramARB);
+    hle_bind("glCompileShaderARB", h_glCompileShaderARB); gl_bind_named("glCompileShaderARB", h_glCompileShaderARB);
+    hle_bind("glDeleteObjectARB", h_glDeleteObjectARB); gl_bind_named("glDeleteObjectARB", h_glDeleteObjectARB);
+    hle_bind("glGetUniformLocationARB", h_glGetUniformLocationARB); gl_bind_named("glGetUniformLocationARB", h_glGetUniformLocationARB);
+    hle_bind("glGetAttribLocationARB", h_glGetAttribLocationARB); gl_bind_named("glGetAttribLocationARB", h_glGetAttribLocationARB);
+    hle_bind("glGetObjectParameterivARB", h_glGetObjectParameterivARB); gl_bind_named("glGetObjectParameterivARB", h_glGetObjectParameterivARB);
+    hle_bind("glGetInfoLogARB", h_glGetInfoLogARB); gl_bind_named("glGetInfoLogARB", h_glGetInfoLogARB);
+    hle_bind("glShaderSourceARB", h_glShaderSourceARB); gl_bind_named("glShaderSourceARB", h_glShaderSourceARB);
+    hle_bind("glProgramStringARB", h_glProgramStringARB); gl_bind_named("glProgramStringARB", h_glProgramStringARB);
+    hle_bind("glBindProgramARB", h_glBindProgramARB); gl_bind_named("glBindProgramARB", h_glBindProgramARB);
+    hle_bind("glDeleteProgramsARB", h_glDeleteProgramsARB); gl_bind_named("glDeleteProgramsARB", h_glDeleteProgramsARB);
+    hle_bind("glProgramEnvParameter4fvARB", h_glProgramEnvParameter4fvARB); gl_bind_named("glProgramEnvParameter4fvARB", h_glProgramEnvParameter4fvARB);
+    hle_bind("glProgramLocalParameter4fvARB", h_glProgramLocalParameter4fvARB); gl_bind_named("glProgramLocalParameter4fvARB", h_glProgramLocalParameter4fvARB);
+    hle_bind("glProgramLocalParameter4fARB", h_glProgramLocalParameter4fARB); gl_bind_named("glProgramLocalParameter4fARB", h_glProgramLocalParameter4fARB);
+    hle_bind("glEnable", h_glEnable); gl_bind_named("glEnable", h_glEnable);
+    hle_bind("glDisable", h_glDisable); gl_bind_named("glDisable", h_glDisable);
+    hle_bind("glIsEnabled", h_glIsEnabled); gl_bind_named("glIsEnabled", h_glIsEnabled);
+    hle_bind("glPushAttrib", h_glPushAttrib); gl_bind_named("glPushAttrib", h_glPushAttrib);
+    hle_bind("glPopAttrib", h_glPopAttrib); gl_bind_named("glPopAttrib", h_glPopAttrib);
+    hle_bind("glOrtho", h_glOrtho); gl_bind_named("glOrtho", h_glOrtho);
+    hle_bind("glFrustum", h_glFrustum); gl_bind_named("glFrustum", h_glFrustum);
+    hle_bind("gluOrtho2D", h_gluOrtho2D); gl_bind_named("gluOrtho2D", h_gluOrtho2D);
+    hle_bind("gluPerspective", h_gluPerspective); gl_bind_named("gluPerspective", h_gluPerspective);
+    hle_bind("gluErrorString", h_gluErrorString); gl_bind_named("gluErrorString", h_gluErrorString);
 }
 
-/* glXGetProcAddressARB tokens: a GLX game's indirect GL calls. This game is
- * GLUT and never asks; dispatch() still consults the table. */
-uint32_t gl_token_for(const char *name) { (void)name; return 0; }
-int gl_token_call(CPU *c, uint32_t va) { (void)c; (void)va; return 0; }
+/* glXGetProcAddressARB tokens: a GLX game's indirect GL calls.
+ *
+ * A GLX game fetches most of its extension entry points by name rather than
+ * importing them, and calls through the pointer. Each name it asks for gets a
+ * token address in a range nothing else uses; dispatch() hands a call to one
+ * back here, and it runs the typed thunk registered under that name - the
+ * generated ones for every function the host library exports, and the
+ * hand-written ones above, which win. */
+#define GL_TOKEN_BASE 0xF0000000u
+#define GL_TOKEN_MAX  2048
+#define GL_NAMED_MAX  4096
+static struct { const char *name; HleHandler fn; } g_named[GL_NAMED_MAX], g_tok[GL_TOKEN_MAX];
+static int g_named_n, g_tok_n;
+
+void gl_bind_named(const char *name, HleHandler fn)
+{
+    for (int i = 0; i < g_named_n; i++)
+        if (strcmp(g_named[i].name, name) == 0) { g_named[i].fn = fn; return; }
+    if (g_named_n < GL_NAMED_MAX) { g_named[g_named_n].name = name; g_named[g_named_n++].fn = fn; }
+}
+
+uint32_t gl_token_for(const char *name)
+{
+    for (int i = 0; i < g_tok_n; i++)
+        if (strcmp(g_tok[i].name, name) == 0) return GL_TOKEN_BASE + (uint32_t)i;
+    HleHandler fn = NULL;
+    for (int i = 0; i < g_named_n && !fn; i++)
+        if (strcmp(g_named[i].name, name) == 0) fn = g_named[i].fn;
+    if (!fn || g_tok_n >= GL_TOKEN_MAX) {
+        static int shown;
+        if (shown++ < 64) fprintf(stderr, "[tok] %s -> NULL\n", name);
+        return 0;
+    }
+    g_tok[g_tok_n].name = strdup(name);
+    g_tok[g_tok_n].fn = fn;
+    if (getenv("LINDBERGH_TOK_LOG")) fprintf(stderr, "[tok] %#x = %s\n", GL_TOKEN_BASE + (uint32_t)g_tok_n, name);
+    return GL_TOKEN_BASE + (uint32_t)(g_tok_n++);
+}
+
+int gl_token_call(CPU *c, uint32_t va)
+{
+    if (va < GL_TOKEN_BASE || va >= GL_TOKEN_BASE + (uint32_t)g_tok_n) return 0;
+    g_tok[va - GL_TOKEN_BASE].fn(c);
+    return 1;
+}
+
+int gl_token_count(void) { return g_tok_n; }
 
 /* A build with no generated thunks (the toolkit self-check) still links. */
 __attribute__((weak)) void gl_register_generated(void) { }

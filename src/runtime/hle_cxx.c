@@ -28,8 +28,21 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "lindbergh_rt.h"
+
+/* Memory the guest frees through these handlers again. On a 32-bit host the
+ * host heap is guest-addressable; on a 64-bit one it has to be the guest
+ * window, or the pointer truncates on the way in. */
+#ifdef _WIN32
+#define CXX_ALLOC(n) malloc(n)
+#define CXX_FREE(p)  free(p)
+#else
+#define CXX_ALLOC(n) guest_alloc((n), 16)
+#define CXX_FREE(p)  guest_free(p)
+#endif
 
 #define RB_RED   0u
 #define RB_BLACK 1u
@@ -275,9 +288,9 @@ static void h_cxa_atexit(CPU *c) { RET(0); }
 /* A fresh unshared rep holding `n` bytes from `src`, NUL terminated. */
 static uint32_t str_new(const char *src, uint32_t n)
 {
-    unsigned char *block = (unsigned char *)malloc(12 + n + 1);
+    unsigned char *block = (unsigned char *)CXX_ALLOC(12 + n + 1);
     if (!block) return 0;
-    uint32_t p = (uint32_t)(uintptr_t)block + 12;
+    uint32_t p = H2G(block) + 12;
     SET_LEN(p, n);
     SET_CAP(p, n);
     SET_REF(p, 0);
@@ -294,7 +307,7 @@ static void str_set(uint32_t self, uint32_t newdata)
 {
     uint32_t old = rd32(self);
     wr32(self, newdata);
-    if (old && (int32_t)REP_REF(old) <= 0) free((void *)GP((old - 12)));
+    if (old && (int32_t)REP_REF(old) <= 0) CXX_FREE(GP(old - 12));
 }
 
 /* basic_string(const char *s, const allocator &) */
@@ -396,7 +409,7 @@ static void h_str_replace(CPU *c)
 
 /* _Rep::_M_destroy(const allocator &) - `this` is the rep, twelve bytes
  * before the characters, and that is what was allocated. */
-static void h_rep_destroy(CPU *c) { if (A32(0)) free((void *)GP(A32(0))); RET(0); }
+static void h_rep_destroy(CPU *c) { if (A32(0)) CXX_FREE(GP(A32(0))); RET(0); }
 
 /* _Rep::_M_dispose(const allocator &) - the library decrements first and
  * destroys when the old value was already at or below zero. */
@@ -406,8 +419,20 @@ static void h_rep_dispose(CPU *c)
     if (!rep) { RET(0); return; }
     int32_t before = (int32_t)rd32(rep + 8);      /* refcount is the third word */
     wr32(rep + 8, (uint32_t)(before - 1));
-    if (before <= 0) free((void *)GP(rep));
+    if (before <= 0) CXX_FREE(GP(rep));
     RET(0);
+}
+
+/* basic_string() and ~basic_string(), out of line in The House of the Dead 4. */
+static void h_str_ctor_empty(CPU *c) { wr32(A32(0), str_new("", 0)); RET(A32(0)); }
+static void h_str_dtor(CPU *c)       { str_set(A32(0), 0); RET(0); }
+
+/* operator=(const char *) */
+static void h_str_assign_op_cstr(CPU *c)
+{
+    const char *s = A32(1) ? (const char *)GP(A32(1)) : "";
+    str_set(A32(0), str_new(s, (uint32_t)strlen(s)));
+    RET(A32(0));
 }
 
 /* Already unshared, so there is nothing to leak apart. */
@@ -415,8 +440,8 @@ static void h_str_leak(CPU *c) { RET(0); }
 
 /* The SGI pool allocator these builds still use. A pool is an optimisation;
  * malloc is the thing it was optimising. */
-static void h_sgi_allocate(CPU *c)   { RET(malloc(A32(0) ? A32(0) : 1)); }
-static void h_sgi_deallocate(CPU *c) { if (A32(0)) free((void *)GP(A32(0))); RET(0); }
+static void h_sgi_allocate(CPU *c)   { RET(CXX_ALLOC(A32(0) ? A32(0) : 1)); }
+static void h_sgi_deallocate(CPU *c) { if (A32(0)) CXX_FREE(GP(A32(0))); RET(0); }
 
 /* iostreams. Setting up cin, cout and cerr for a game that writes to a
  * console the cabinet does not have. */
@@ -449,6 +474,9 @@ void hle_register_cxx(void)
     n += hle_bind("_ZNSs6assignEPKcj", h_str_assign_cstr);
     n += hle_bind("_ZNSs6assignERKSs", h_str_assign_str);
     n += hle_bind("_ZNSs7replaceEjjPKcj", h_str_replace);
+    n += hle_bind("_ZNSsC1Ev", h_str_ctor_empty);
+    n += hle_bind("_ZNSsD1Ev", h_str_dtor);
+    n += hle_bind("_ZNSsaSEPKc", h_str_assign_op_cstr);
     n += hle_bind("_ZNSs4_Rep10_M_destroyERKSaIcE", h_rep_destroy);
     n += hle_bind("_ZNSs4_Rep10_M_disposeERKSaIcE", h_rep_dispose);
     n += hle_bind("_ZNSs12_M_leak_hardEv", h_str_leak);

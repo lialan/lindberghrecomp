@@ -20,6 +20,9 @@
 #include <string.h>
 #include "lindbergh_rt.h"
 
+/* A thunk under its GL name, for glXGetProcAddressARB (gl_token_for). */
+void gl_bind_named(const char *name, HleHandler fn);
+
 #ifndef GL_PIXEL_PACK_BUFFER
 #define GL_PIXEL_PACK_BUFFER   0x88EB
 #define GL_PIXEL_UNPACK_BUFFER 0x88EC

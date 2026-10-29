@@ -98,22 +98,28 @@ static void h_GetModeLine(CPU *c)
  * pointing at it. Both are static and outlive the process's interest, so the
  * XFree the game eventually calls on the vector does nothing - which is
  * exactly what this runtime's XFree already does. */
-static unsigned char g_mode[36];
-static uint32_t      g_mode_list[1];
+/* The mode line and the one-entry list pointing at it, in guest memory: the
+ * game reads both through the pointers it is handed. */
+static uint32_t g_mode, g_mode_list;
 
 static void h_GetAllModeLines(CPU *c)
 {
     int w, h;
     lindbergh_window_size(&w, &h);
 
-    memset(g_mode, 0, sizeof g_mode);
-    uint32_t m = (uint32_t)(uintptr_t)g_mode;
+    if (!g_mode) {
+        void *p = guest_alloc(48, 16);
+        memset(p, 0, 48);
+        g_mode = H2G(p);
+        g_mode_list = H2G(guest_alloc(4, 16));
+    }
+    uint32_t m = g_mode;
     wr32(m + MI_dotclock, DOTCLOCK);
     fill_modeline(m, w, h, MI_body);
 
-    g_mode_list[0] = m;
+    wr32(g_mode_list, m);
     if (A32(2)) wr32(A32(2), 1);
-    if (A32(3)) wr32(A32(3), (uint32_t)(uintptr_t)g_mode_list);
+    if (A32(3)) wr32(A32(3), g_mode_list);
     fprintf(stderr, "[vidmode] reporting one mode: %dx%d\n", w, h);
     RET(1);
 }

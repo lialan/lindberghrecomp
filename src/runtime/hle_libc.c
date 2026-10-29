@@ -607,6 +607,9 @@ static void h_getenv(CPU *c)
 {
     const char *k = ASTR(0);
     const char *v = getenv(k);
+    /* What the cabinet's start-up environment always has. The House of the
+     * Dead 4 reads __GL_SYNC_TO_VBLANK and compares it without a null check. */
+    if (!v && strcmp(k, "__GL_SYNC_TO_VBLANK") == 0) v = "1";
     fprintf(stderr, "[env] %s = %s\n", k, v ? v : "(unset)");
     fflush(stderr);
     RET(guest_strdup_static(v));
@@ -1618,3 +1621,200 @@ static void h_sscanf(CPU *c)
 }
 
 void hle_register_scan(void) { hle_bind("sscanf", h_sscanf); }
+
+/* ---- what the GLX-family games add (The House of the Dead 4) ----
+ *
+ * The C++ array helpers. A compiler that cannot inline new[] and delete[]
+ * for a class with a constructor or destructor calls these, and they call
+ * back into the game for each element. The cookie in front of an array is
+ * the Itanium ABI's: `padding` bytes, the element count in the last word. */
+static void call_each(CPU *c, uint32_t base, uint32_t count, uint32_t size, uint32_t fn, int reverse)
+{
+    if (!fn) return;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t k = reverse ? count - 1 - i : i;
+        uint32_t arg = base + k * size;
+        guest_call(c, fn, &arg, 1);
+    }
+}
+
+/* __cxa_vec_ctor(array, count, size, ctor, dtor) */
+static void h_cxa_vec_ctor(CPU *c)
+{
+    uint32_t a = A32(0), n = A32(1), sz = A32(2), ctor = A32(3);
+    call_each(c, a, n, sz, ctor, 0);
+    RET(0);
+}
+/* __cxa_vec_cctor(dest, src, count, size, cctor, dtor) */
+static void h_cxa_vec_cctor(CPU *c)
+{
+    uint32_t d = A32(0), s = A32(1), n = A32(2), sz = A32(3), cc = A32(4);
+    for (uint32_t i = 0; cc && i < n; i++) {
+        uint32_t args[2] = { d + i * sz, s + i * sz };
+        guest_call(c, cc, args, 2);
+    }
+    RET(0);
+}
+/* __cxa_vec_dtor(array, count, size, dtor) */
+static void h_cxa_vec_dtor(CPU *c)
+{
+    call_each(c, A32(0), A32(1), A32(2), A32(3), 1);
+    RET(0);
+}
+/* __cxa_vec_new(count, size, padding, ctor, dtor) */
+static void h_cxa_vec_new(CPU *c)
+{
+    uint32_t n = A32(0), sz = A32(1), pad = A32(2), ctor = A32(3);
+    void *p = gmalloc((size_t)n * sz + pad, GUEST_ALIGN);
+    if (!p) { fprintf(stderr, "[libc] __cxa_vec_new(%u x %u) failed\n", n, sz); RET(0); return; }
+    uint32_t base = H2G(p) + pad;
+    if (pad >= 4) wr32(base - 4, n);
+    call_each(c, base, n, sz, ctor, 0);
+    RET(base);
+}
+/* __cxa_vec_delete(array, size, padding, dtor) */
+static void h_cxa_vec_delete(CPU *c)
+{
+    uint32_t a = A32(0), sz = A32(1), pad = A32(2), dtor = A32(3);
+    if (!a) { RET(0); return; }
+    if (pad >= 4) call_each(c, a, rd32(a - 4), sz, dtor, 1);
+    gfree(GP(a - pad));
+    RET(0);
+}
+
+/* Function-local statics. The guard's first byte says "done"; the game only
+ * initialises these on one thread at start-up. */
+static void h_cxa_guard_acquire(CPU *c) { RET(*(uint8_t *)APTR(0) ? 0 : 1); }
+static void h_cxa_guard_release(CPU *c) { *(uint8_t *)APTR(0) = 1; RET(0); }
+
+/* Exceptions. Nothing here throws, so a catch block is only entered if the
+ * lifted code jumps there itself; rethrowing is a fault worth naming. */
+static void h_cxa_begin_catch(CPU *c) { RET(A32(0)); }
+static void h_cxa_end_catch(CPU *c)   { (void)c; }
+static void h_cxa_rethrow(CPU *c)
+{
+    guest_report_state("__cxa_rethrow: the game rethrew an exception");
+    abort();
+}
+
+/* ---- libc, the remainder ---- */
+static void h_atoi(CPU *c)   { RET(atoi(ASTR(0))); }
+static void h_atof(CPU *c)   { RETF(atof(ASTR(0))); }
+static void h_strspn(CPU *c)  { RET(strspn(ASTR(0), ASTR(1))); }
+static void h_strcspn(CPU *c) { RET(strcspn(ASTR(0), ASTR(1))); }
+static void h_strpbrk(CPU *c) { RET(strpbrk(ASTR(0), ASTR(1))); }
+static void h_strtok(CPU *c)  { RET(strtok(A32(0) ? ASTR(0) : NULL, ASTR(1))); }
+static float af(CPU *c, int n) { uint32_t b = A32(n); float f; memcpy(&f, &b, 4); return f; }
+static double ad(CPU *c, int n) { uint64_t b = (uint64_t)A32(n) | (uint64_t)A32(n + 1) << 32; double d; memcpy(&d, &b, 8); return d; }
+static void h_sinhf(CPU *c) { RETF(sinhf(af(c, 0))); }
+static void h_coshf(CPU *c) { RETF(coshf(af(c, 0))); }
+static void h_tanhf(CPU *c) { RETF(tanhf(af(c, 0))); }
+static void h_hypot(CPU *c) { RETF(hypot(ad(c, 0), ad(c, 2))); }
+static void h_IO_putc(CPU *c) { RET(fputc(AI32(0), AFILE(1))); }
+static void h_fsync(CPU *c)  { RET(0); }
+static void h_fcntl(CPU *c)  { RET(0); }
+static void h_sched_yield(CPU *c) { RET(0); }
+static void h_signal(CPU *c) { RET(0); }               /* SIG_DFL: no host signals reach the guest */
+static void h_lseek64(CPU *c)
+{
+    int64_t off = (int64_t)((uint64_t)A32(1) | (uint64_t)A32(2) << 32);
+    int64_t r = (int64_t)lseek(AI32(0), (off_t)off, AI32(3));
+    c->eax = (uint32_t)r;
+    c->edx = (uint32_t)((uint64_t)r >> 32);
+}
+/* select() on no descriptors is how the game sleeps; it never waits on real
+ * ones here, so sleep for the timeout and report nothing ready. */
+static void h_select(CPU *c)
+{
+    uint32_t tv = A32(4);
+    if (tv) {
+        uint32_t us = rd32(tv) * 1000000u + rd32(tv + 4);
+        if (us) usleep(us);
+    }
+    RET(0);
+}
+/* system()/popen(): a cabinet shells out to set the clock or read hardware.
+ * Nothing on this host should be run on the game's behalf. */
+static void h_system(CPU *c)
+{
+    fprintf(stderr, "[libc] system(\"%s\") refused\n", A32(0) ? ASTR(0) : "");
+    RET(-1);
+}
+static void h_popen(CPU *c)
+{
+    fprintf(stderr, "[libc] popen(\"%s\") refused\n", A32(0) ? ASTR(0) : "");
+    RET(0);
+}
+static void h_pclose(CPU *c) { RET(-1); }
+static void h_sysctl(CPU *c) { RET(-1); }
+/* The network: the cabinet's link to its twin. Not present. */
+static void h_inet_addr(CPU *c) { RET(0xFFFFFFFFu); }
+static void h_inet_aton(CPU *c) { RET(0); }
+static void h_inet_ntoa(CPU *c) { RET(guest_strdup_static("0.0.0.0")); }
+
+/* The Intel compiler's CPU dispatch. __get_cpu_indicator(&word) probes the
+ * CPU and stores a class bit, and a binary built for a newer class (0x800,
+ * SSE3, for The House of the Dead 4) refuses the older ones with "This program was not built to run on the
+ * processor in your system". The probe's answer would describe a CPU that is
+ * not there anyway; the machine the game was built for is a Pentium 4, so say
+ * that. The original preserves every register, and so does this. */
+/* The Intel runtime's own memset and memcpy, hand-written assembly that
+ * dispatches through PIC jump tables into unsized local labels. They are the
+ * C library functions they look like; the host's are the same contract. */
+static void h_intel_memset(CPU *c)
+{
+    if (A32(2)) memset(APTR(0), (int)(A32(1) & 0xFF), A32(2));
+    RET(A32(0));
+}
+static void h_intel_memcpy(CPU *c)
+{
+    if (A32(2)) memmove(APTR(0), APTR(1), A32(2));
+    RET(A32(0));
+}
+
+static void h_intel_cpu_indicator(CPU *c)
+{
+    if (A32(0)) wr32(A32(0), 0x800u);        /* Pentium 4 with SSE3 (Prescott), the Lindbergh CPU */
+}
+
+void hle_register_libc4(void)
+{
+    {
+        int n = 0;
+        n += guest_override("__intel_new_memset", h_intel_memset);
+        n += guest_override("__intel_new_memset_P3", h_intel_memset);
+        n += guest_override("__intel_new_memcpy", h_intel_memcpy);
+        n += guest_override("__intel_new_memcpy_P3", h_intel_memcpy);
+        if (n) fprintf(stderr, "[crt] %d Intel string routines answered by the host\n", n);
+    }
+    if (guest_override("__get_cpu_indicator", h_intel_cpu_indicator))
+        fprintf(stderr, "[crt] Intel CPU dispatch: reporting a Pentium 4\n");
+    /* The standard streams the game took by copy relocation. */
+    static const char *std[] = { "stdin", "stdout", "stderr" };
+    for (int i = 0; i < 3; i++) {
+        uint32_t va = guest_copy_reloc(std[i]);
+        if (va) wr32(va, guest_file_wrap(i == 0 ? stdin : i == 1 ? stdout : stderr));
+    }
+    hle_bind("__cxa_vec_ctor", h_cxa_vec_ctor);   hle_bind("__cxa_vec_cctor", h_cxa_vec_cctor);
+    hle_bind("__cxa_vec_dtor", h_cxa_vec_dtor);   hle_bind("__cxa_vec_new", h_cxa_vec_new);
+    hle_bind("__cxa_vec_delete", h_cxa_vec_delete);
+    hle_bind("__cxa_guard_acquire", h_cxa_guard_acquire);
+    hle_bind("__cxa_guard_release", h_cxa_guard_release);
+    hle_bind("__cxa_begin_catch", h_cxa_begin_catch);
+    hle_bind("__cxa_end_catch", h_cxa_end_catch);
+    hle_bind("__cxa_rethrow", h_cxa_rethrow);
+    hle_bind("atoi", h_atoi);         hle_bind("atof", h_atof);
+    hle_bind("strspn", h_strspn);     hle_bind("strcspn", h_strcspn);
+    hle_bind("strpbrk", h_strpbrk);   hle_bind("strtok", h_strtok);
+    hle_bind("sinhf", h_sinhf);       hle_bind("coshf", h_coshf);
+    hle_bind("tanhf", h_tanhf);       hle_bind("hypot", h_hypot);
+    hle_bind("_IO_putc", h_IO_putc);
+    hle_bind("open64", h_open);       hle_bind("fopen64", h_fopen);
+    hle_bind("lseek64", h_lseek64);   hle_bind("fsync", h_fsync);
+    hle_bind("fcntl", h_fcntl);       hle_bind("sched_yield", h_sched_yield);
+    hle_bind("signal", h_signal);     hle_bind("select", h_select);
+    hle_bind("system", h_system);     hle_bind("popen", h_popen);
+    hle_bind("pclose", h_pclose);     hle_bind("sysctl", h_sysctl);
+    hle_bind("inet_addr", h_inet_addr); hle_bind("inet_aton", h_inet_aton);
+    hle_bind("inet_ntoa", h_inet_ntoa);
+}

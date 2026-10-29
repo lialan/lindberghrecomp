@@ -55,6 +55,23 @@ void hle_register_all(void)
     hle_register_cg();
     hle_register_zlib();
     hle_register_openal();
+    hle_register_libc4();
+    hle_register_segaapi();
+#ifndef _WIN32
+    hle_register_glx_posix();
+#endif
+
+    /* LINDBERGH_HLE_UNBOUND=1: name every import that still has no body, then
+     * exit. The static half of the permissive survey: it needs no run, so it
+     * also sees imports the start-up path never reaches. */
+    const char *u = getenv("LINDBERGH_HLE_UNBOUND");
+    if (u && *u == '1') {
+        int n = 0;
+        for (int i = 0; i < HLE_COUNT; i++)
+            if (!g_hle_handlers[i]) { fprintf(stderr, "[unbound] %s\n", hle_name((HleId)i)); n++; }
+        fprintf(stderr, "[unbound] %d of %d imports have no body\n", n, (int)HLE_COUNT);
+        exit(0);
+    }
 }
 
 /* Survey mode. Aborting on the first unimplemented import is the right default

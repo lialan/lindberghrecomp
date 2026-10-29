@@ -59,6 +59,43 @@ static uint32_t rd32le(const unsigned char *p) {
            ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
+/* Data the game takes from libc by copy relocation (R_386_COPY): stdout,
+ * stderr and the like. The dynamic linker would copy libc's value into the
+ * game's own slot; there is no libc here, so the slot stays zero until a
+ * handler fills it. Recorded by name so hle_libc can. */
+#define MAX_COPY 16
+static struct { char name[32]; uint32_t va; } g_copy[MAX_COPY];
+static int g_ncopy;
+
+static void scan_copy_relocs(const unsigned char *img, size_t len)
+{
+    uint32_t shoff = rd32le(img + 32);
+    unsigned shentsize = img[46] | (img[47] << 8), shnum = img[48] | (img[49] << 8);
+    if (!shoff || shoff + (size_t)shnum * shentsize > len) return;
+    for (unsigned i = 0; i < shnum; i++) {
+        const unsigned char *sh = img + shoff + (size_t)i * shentsize;
+        if (rd32le(sh + 4) != 9) continue;                         /* SHT_REL */
+        const unsigned char *symsh = img + shoff + (size_t)rd32le(sh + 24) * shentsize;
+        const unsigned char *strsh = img + shoff + (size_t)rd32le(symsh + 24) * shentsize;
+        uint32_t off = rd32le(sh + 16), size = rd32le(sh + 20);
+        for (uint32_t r = 0; r + 8 <= size && g_ncopy < MAX_COPY; r += 8) {
+            uint32_t where = rd32le(img + off + r), info = rd32le(img + off + r + 4);
+            if ((info & 0xFF) != 5) continue;                       /* R_386_COPY */
+            uint32_t sym = rd32le(symsh + 16) + (info >> 8) * 16;
+            const char *nm = (const char *)img + rd32le(strsh + 16) + rd32le(img + sym);
+            snprintf(g_copy[g_ncopy].name, sizeof g_copy[g_ncopy].name, "%s", nm);
+            g_copy[g_ncopy++].va = where;
+        }
+    }
+}
+
+uint32_t guest_copy_reloc(const char *name)
+{
+    for (int i = 0; i < g_ncopy; i++)
+        if (strcmp(g_copy[i].name, name) == 0) return g_copy[i].va;
+    return 0;
+}
+
 int guest_load(const char *elf_path, int argc, char **argv)
 {
 #ifdef RECOMP_GUEST_BASE
@@ -119,6 +156,7 @@ int guest_load(const char *elf_path, int argc, char **argv)
                rd32le(ph + 16));                      /* p_filesz */
     }
     g_brk = hi;                                       /* the heap starts past the image */
+    scan_copy_relocs(img, (size_t)len);
     free(img);
 
     if (!reserve((STACK_TOP - STACK_SZ) & ~(GRAN - 1), STACK_SZ)) {

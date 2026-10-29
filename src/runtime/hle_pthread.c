@@ -645,9 +645,35 @@ static void h_sem_wait(CPU *c)
 }
 static void h_sem_destroy(CPU *c) { obj_drop(A32(0), dtor_sem); RET(0); }
 
+/* sem_open(name, oflag[, mode, value]): a named semaphore is a sem_t the
+ * library allocates. Nothing else on this host shares the name, so a fresh
+ * one per open is the whole of it. */
+static void h_sem_open(CPU *c)
+{
+    void *p = guest_alloc(16, 16);
+    memset(p, 0, 16);
+    uint32_t va = H2G(p);
+    HostSem *s = (HostSem *)obj_get(va, sizeof(HostSem), ctor_sem);
+    pthread_mutex_lock(&s->m);
+    s->count = (A32(1) & 0x40) ? A32(3) : 0;     /* O_CREAT carries the value */
+    pthread_mutex_unlock(&s->m);
+    RET(va);
+}
+static void h_sem_close(CPU *c) { RET(0); }
+
+/* pthread_cancel: the game cancels its worker threads only on exit. */
+static void h_pthread_cancel(CPU *c)
+{
+    fprintf(stderr, "[pthread] pthread_cancel(%#x) ignored\n", A32(0));
+    RET(0);
+}
+
 void hle_register_pthread(void)
 {
     hle_bind("pthread_mutex_init", h_mutex_init);
+    hle_bind("sem_open", h_sem_open);
+    hle_bind("sem_close", h_sem_close);
+    hle_bind("pthread_cancel", h_pthread_cancel);
     hle_bind("pthread_mutex_lock", h_mutex_lock);
     hle_bind("pthread_mutex_unlock", h_mutex_unlock);
     hle_bind("pthread_mutex_trylock", h_mutex_trylock);

@@ -189,6 +189,7 @@ void guest_backtrace(CPU *c);
  * that was statically linked into the game and so never passes through the
  * PLT - libXxf86vm being the reason this exists. */
 uint32_t   guest_symbol(const char *name);
+uint32_t   guest_copy_reloc(const char *name);   /* R_386_COPY slot, e.g. "stderr" */
 int        guest_override(const char *name, HleHandler fn);
 int        guest_override_va(const char *name, uint32_t va, HleHandler fn);
 HleHandler guest_find_override(uint32_t va);
@@ -242,6 +243,9 @@ void       host_swap(void);
 void       hle_register_gl(void);
 void       hle_register_zlib(void);
 void       hle_register_openal(void);
+void       hle_register_libc4(void);
+void       hle_register_segaapi(void);
+void       hle_register_glx_posix(void);
 int        solib_dlopen(CPU *c, const char *path);
 uint32_t   solib_dlsym(const char *name);
 

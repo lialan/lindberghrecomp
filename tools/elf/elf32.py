@@ -45,6 +45,7 @@ class Section:
     size: int
     link: int
     entsize: int
+    flags: int = 0
 
 
 class Elf32:
@@ -74,7 +75,7 @@ class Elf32:
                for i in range(e_shnum)]
         shstr = raw[e_shstrndx][4] if e_shnum else 0
         self.sections = [
-            Section(self._cstr(shstr + r[0]), r[1], r[3], r[4], r[5], r[6], r[9])
+            Section(self._cstr(shstr + r[0]), r[1], r[3], r[4], r[5], r[6], r[9], r[2])
             for r in raw
         ]
 
@@ -144,6 +145,12 @@ class Elf32:
         def in_plt(va):
             return any(lo <= va < hi for lo, hi in plt_spans)
 
+        code_spans = [(sh.addr, sh.addr + sh.size) for sh in self.sections
+                      if sh.addr and sh.flags & 0x4 and sh.name not in (".plt", ".plt.sec", ".plt.got", ".iplt")]
+
+        def in_code(va):
+            return any(lo <= va < hi for lo, hi in code_spans)
+
         syms = []
         for sh in self.sections:
             if sh.type not in (SHT_SYMTAB, SHT_DYNSYM) or not sh.entsize:
@@ -151,7 +158,14 @@ class Elf32:
             strtab = self.sections[sh.link].offset
             for off in range(sh.offset, sh.offset + sh.size, sh.entsize):
                 name_off, value, size, info = struct.unpack_from("<IIIB", self.data, off)
-                if (info & 0xF) != STT_FUNC or not value or in_plt(value):
+                # A global label in code is a function too. The Intel compiler
+                # writes its runtime (__intel_new_memset and friends) in
+                # assembly with no .type directive, and emits C++ entry points
+                # it calls into as untyped globals; skipping them leaves calls
+                # to addresses where no lifted function exists.
+                untyped_code = ((info & 0xF) == 0 and (info >> 4) in (1, 2)
+                                and in_code(value))
+                if ((info & 0xF) != STT_FUNC and not untyped_code) or not value or in_plt(value):
                     continue
                 syms.append((value, size, self._cstr(strtab + name_off)))
 
