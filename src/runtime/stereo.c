@@ -1740,7 +1740,7 @@ void stereo_frame_begin(void)
      * point on its screen into a shot through its own lens, so a screen of
      * any other width aims every shot off the centre's way (fixed at 1.73,
      * the jungle's 2.41 put shots ~30% wide of the laser). A flat picture -
-     * a menu, a scope - keeps the size it had: those cameras zoom. */
+     * a menu, a scope - has a size of its own, below. */
     {
         int best = 0;
         for (int i = 1; i < 4; i++) if (g_lens_tally[i].n > g_lens_tally[best].n) best = i;
@@ -1771,6 +1771,11 @@ void stereo_frame_begin(void)
          * flat lavender. */
         g_flat = flat_all || (flat_env && (menu_state() || g_zoom_frames >= 6));
     }
+    /* A flat picture is the arcade's whole monitor: the screen at the size
+     * it has in play (lens 1.73). Kept as last followed, a scope coming up -
+     * its lens ramps 2.4, 8.4, 11.4 over a few frames - left the screen a
+     * third of its size, and the magnified picture looked like no zoom. */
+    if (g_flat) { g_screen_lens[0] = 1.732f; g_screen_lens[1] = 2.309f; }
     g_hud_fb = g_hud_fb_next;           /* 3D drawn there this frame is screen content */
     g_world_fb = g_world_fb_next;
     g_hud_fb_next = ~0u;
