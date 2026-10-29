@@ -638,6 +638,16 @@ static void h_game_loop(CPU *c)
                 r >= 0 ? (int)rd32(rd32(ROUTE_TABLE + 4u * r) + 4) : -1, r >= 0 ? (int)rd32(rd32(ROUTE_TABLE + 4u * r) + 16) : -1);
     last = r;
     if (r >= 0) loops++; else loops = 0;
+    {   /* LINDBERGH_HURT=N (test): the player takes a hit every N frames of play */
+        static int hurt = -1;
+        if (hurt < 0) { const char *h = getenv("LINDBERGH_HURT"); hurt = h ? atoi(h) : 0; }
+        if (hurt > 0 && loops > 0 && loops % hurt == 0) {
+            uint32_t fn = guest_symbol("_Z17set_player_damageiiii");
+            uint32_t a[4] = { 0, 1, 0, 0 };
+            if (fn) guest_call(c, fn, a, 4);
+            fprintf(stderr, "[sega] frame %u: test hit\n", g_frame);
+        }
+    }
     if (g_route_jump >= 0 && loops == 60) {
         uint32_t fn = guest_symbol("_Z19set_player_route_idii");
         uint32_t a[2] = { 0, (uint32_t)g_route_jump };
@@ -743,7 +753,7 @@ static int watch_route(void)
     const char *j = getenv("LINDBERGH_ROUTE"), *l = getenv("LINDBERGH_ROUTE_LOG");
     g_route_log = l && *l == '1';
     if (j && *j) g_route_jump = atoi(j);
-    if (!g_route_log && g_route_jump < 0 && !getenv("LINDBERGH_SHIMMER") && !getenv("LINDBERGH_GUNACT_LOG")) return 0;
+    if (!g_route_log && g_route_jump < 0 && !getenv("LINDBERGH_SHIMMER") && !getenv("LINDBERGH_HURT") && !getenv("LINDBERGH_GUNACT_LOG")) return 0;
     uint32_t va = guest_symbol("_Z8GameLoopP8GAMEWORK");
     extern void (*dispatch_lifted(uint32_t va))(CPU *);
     if (!va || !(g_game_loop = dispatch_lifted(va))) return 0;

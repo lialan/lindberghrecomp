@@ -64,6 +64,17 @@ extern unsigned g_frame;
 /* ---- eyes ---- */
 static int      g_on;
 static int      g_mv;                   /* both eyes in one pass (GL_OVR_multiview2): no second eye to replay */
+/* Widescreen (LINDBERGH_WIDE): one "eye", the game camera itself, its image
+ * wider than the game's 4:3. The 3D keeps its vertical view and sees further
+ * to the sides (Hor+); the 2D, laid out for 4:3, keeps its shape in the
+ * middle, where it lines up with the 3D as it did on the arcade. Both are the
+ * game's projection with its x row scaled by g_wide_k (4:3 over the image's
+ * aspect). Nothing is recorded or replayed. */
+static int      g_wide;
+static float    g_wide_s;               /* this 2D draw's shift to its edge (game NDC of the image), 0 centred */
+static int      g_wide_span;            /* this 2D draw spans the arcade screen: it spans the image */
+static int g_flat;                      /* this frame is drawn flat: the arcade's picture, on the screen */
+static float    g_wide_k = 1;
 static float    g_mvR[3][16];           /* the views' matrices last given to GL, and back to the game's clip space */
 static int      g_eye;                  /* the eye being drawn */
 static int      g_ew = 1024, g_eh = 1024;
@@ -193,6 +204,17 @@ static int is_perspective(const float *m) { return fabsf(m[11] + 1) < 1e-4f && f
 static void effective_projection(const float *p, int hud, float *out)
 {
     if (!g_on || hud == 2) { memcpy(out, p, 64); return; }
+    if (g_wide) {
+        memcpy(out, p, 64);
+        if (g_flat) return;                     /* the arcade's picture, shown 4:3 */
+        int persp = is_perspective(p);
+        if (persp && !hud) memcpy(g_last_persp, p, 64);
+        if (persp || (hud && !g_wide_span))     /* the world wider; the 2D in the middle */
+            for (int col = 0; col < 4; col++) out[col * 4] *= g_wide_k;
+        if (hud && !persp && g_wide_s != 0)     /* or out at its edge */
+            for (int col = 0; col < 4; col++) out[col * 4] += g_wide_s * out[col * 4 + 3];
+        return;
+    }
     const float *t = g_tan[g_eye];
     float e[16], ev[16];
     if (is_perspective(p) && !hud) {
@@ -376,7 +398,6 @@ static void scale_target(GLenum textarget, GLuint tex)
     glBindTexture(tg, (GLuint)prev);
 }
 
-static int g_flat;                      /* this frame is drawn flat: the arcade's picture, on the screen */
 static void (*g_aim_hook)(void);
 void stereo_set_aim_hook(void (*fn)(void)) { g_aim_hook = fn; }
 
@@ -535,6 +556,25 @@ static void clip_to_screen(void)
         return;
     }
 #endif
+    if (g_wide && (g_flat || g_wide_span)) return;   /* the whole image is the arcade's / the layer spans it */
+    if (g_wide) {   /* the arcade screen is the middle of the image (moved with a piece at an edge) */
+        float sh = g_wide_s * g_eye_vp[2] / 2;
+        GLint X0 = g_eye_vp[0] + (GLint)floorf(g_eye_vp[2] * (1 - g_wide_k) / 2 + sh);
+        GLint X1 = g_eye_vp[0] + (GLint)ceilf(g_eye_vp[2] * (1 + g_wide_k) / 2 + sh);
+        GLint Y0 = g_eye_vp[1], Y1 = g_eye_vp[1] + g_eye_vp[3];
+        if (g_scissor_on) {
+            if (g_scissor[0] > X0) X0 = g_scissor[0];
+            if (g_scissor[1] > Y0) Y0 = g_scissor[1];
+            if (g_scissor[0] + g_scissor[2] < X1) X1 = g_scissor[0] + g_scissor[2];
+            if (g_scissor[1] + g_scissor[3] < Y1) Y1 = g_scissor[1] + g_scissor[3];
+        }
+        if (X1 < X0) X1 = X0;
+        if (Y1 < Y0) Y1 = Y0;
+        glScissor(X0, Y0, X1 - X0, Y1 - Y0);
+        if (!g_scissor_on) glEnable(GL_SCISSOR_TEST);
+        g_clipped = 1;
+        return;
+    }
     float m[16], e[16], d = g_screen_dist;
     const float *t = g_tan[g_eye];
     mat_frustum(e, -t[0] * 0.01f, t[1] * 0.01f, -t[2] * 0.01f, t[3] * 0.01f, 0.01f, 1000.0f);
@@ -765,6 +805,49 @@ static int is_draw(int kind) { return kind == K_DRAWARRAYS || kind == K_DRAWELEM
 
 /* Returns 1 when it did the call's work itself. */
 /* Is this 2D draw the game's sight? Learns it, and says whether to skip it. */
+/* Widescreen: where a HUD piece goes. The 4:3 layout sits in the middle of
+ * the image; the life gauge, the weapon panel, Press Start - the pieces off
+ * centre in the top and bottom bands - keep to the image's edge instead, as a HUD made for a
+ * wide screen would. A piece continuing the one before it on the same row
+ * (the next letter, the next segment of a gauge) goes where that one went.
+ * Anything near the gun stays: the sight and the markers on soldiers lie on
+ * the world, which the game aims through. */
+static float wide_place(CPU *c, const char *n)
+{
+    static float last[4]; static float last_s; static unsigned last_frame = ~0u;
+    float b[4];
+    if (!ndc_box(c, n, b)) {
+        if (getenv("LINDBERGH_NOBOX")) fprintf(stderr, "[nobox] frame %u %s tex %u\n", g_frame, n, g_tex2d_bound);
+        return 0;
+    }
+    float edge = 1 - g_wide_k, w = b[2] - b[0], h = b[3] - b[1], s = 0;
+    if (getenv("LINDBERGH_NOBOX") && (w > 0.9f || h > 0.9f))
+        fprintf(stderr, "[big2d] frame %u box %.2f..%.2f x %.2f..%.2f tex %u\n", g_frame, b[0], b[2], b[1], b[3], g_tex2d_bound);
+    /* spans the screen's width or height: a banner, a fade, the orange of
+     * being hit (two full-height halves) */
+    if (w >= 1.9f || h >= 1.9f) { g_wide_span = 1; return 0; }
+    float gx = (b[0] + b[2]) * 0.5f - g_gun_ndc[0], gy = (b[1] + b[3]) * 0.5f - g_gun_ndc[1];
+    int near_gun = g_gun_ndc[0] > -2 && gx * gx + gy * gy < 0.04f;
+    int follows = 0;
+    if (last_frame == g_frame) {
+        float lh = last[3] - last[1];
+        int same_row = fabsf(b[1] - last[1]) < 0.5f * (h > lh ? h : lh) + 0.01f;
+        follows = same_row && b[0] > last[0] - 0.01f && b[0] < last[2] + 0.25f * (w + h) + 0.02f;
+    }
+    /* the gauges and panels are in the top and bottom bands: a band's pieces
+     * either side of its centre go to that side. The rows between - the
+     * reload warning, sliding in with big fading copies of itself - stay
+     * centred, or the animation jumped between the middle and an edge. */
+    float cx = (b[0] + b[2]) * 0.5f, cy = (b[1] + b[3]) * 0.5f;
+    float cut = 0.25f;
+    if (fabsf(cy) <= 0.6f) s = 0;
+    else if (follows) s = last_s;
+    else if (!near_gun && cx < -cut) s = -edge;
+    else if (!near_gun && cx >  cut) s = edge;
+    memcpy(last, b, sizeof b); last_s = s; last_frame = g_frame;
+    return s;
+}
+
 static int sight_draw(CPU *c, const char *n)
 {
     if (g_gun_ndc[0] < -2 || !g_tex2d_on || !g_tex2d_bound) return 0;
@@ -969,6 +1052,12 @@ static int transform_call(CPU *c, HleId id, const char *n)
         if (!persp && !g_replaying) { if (hud) { if (!g_hud2d) g_hud_lens = g_last_persp[0]; g_hud2d++; } else g_pass2d++; }
         if (hud == 1 && !persp && !g_replaying && sight_draw(c, n)) return 1;
         if (hud == 1 && !persp && letterbox_bar(c, n)) return 1;
+        if (g_wide) {
+            int span = g_wide_span;
+            g_wide_span = 0;
+            float sh = hud == 1 && !persp ? wide_place(c, n) : 0;
+            if (sh != g_wide_s || span != g_wide_span) { g_wide_s = sh; g_proj_dirty = 1; }
+        }
         if (hud != g_loaded_hud) { g_loaded_hud = hud; g_proj_dirty = 1; }
         if (g_proj_dirty) load_projection();
         if (hud == 1 && persp && !g_menu_vp[2] && (g_vp[2] != GAME_W || g_vp[3] != GAME_H)) memcpy(g_menu_vp, g_vp, sizeof g_vp);
@@ -1534,8 +1623,8 @@ static void stereo_gl_call_inner(CPU *c, HleId id, HleHandler fn)
 #endif
     /* the client arrays' state, for telling what a 2D draw covers (with two
      * passes record() keeps it) */
-    if (g_mv && cls(id)->track) track_arrays(c, n);
-    if (!g_mv) {
+    if ((g_mv || g_wide) && cls(id)->track) track_arrays(c, n);
+    if (!g_mv && !g_wide) {
         if (g_glprof > 0) {
             double t0 = now_ns();
             record(c, id, fn, n);
@@ -1722,7 +1811,7 @@ void stereo_frame_end(void)
     if (!g_on) return;
     g_flat_shown = g_flat;
     dump_targets();
-    if (!g_mv) replay(1);
+    if (!g_mv && !g_wide) replay(1);
     if (g_overflow) { fprintf(stderr, "[stereo] frame %u: recording overflowed %u times\n", g_frame, g_overflow); g_overflow = 0; }
 }
 
@@ -1803,6 +1892,11 @@ void stereo_frame_begin(void)
          * full-screen haze passes ran over the empty room and turned it a
          * flat lavender. */
         g_flat = flat_all || (flat_env && (menu_state() || g_zoom_frames >= 6));
+        /* Widescreen: a sniping event is the arcade's 4:3 from its start - the
+         * scope's mask is drawn for the 4:3 screen, and waiting for its lens
+         * to hold left the first frames wide, the mask's corners at the edges
+         * and the world around them */
+        if (g_wide && flat_env && g_snipe_frame != ~0u && g_frame - g_snipe_frame <= 2) g_flat = 1;
     }
     /* A flat picture is the arcade's whole monitor: the screen at the size
      * it has in play (lens 1.73). Kept as last followed, a scope coming up -
@@ -1982,10 +2076,26 @@ unsigned stereo_eye_array(void) { return g_mv ? gl4es_multiview_array(g_eye_tex[
 #endif
 unsigned stereo_eye_framebuffer(int eye) { return g_eye_fbo[eye]; }
 
-/* Desktop check: both eyes side by side in the window. */
+/* Desktop check: both eyes side by side in the window (widescreen: the one
+ * image, filling it). */
 void stereo_present_desktop(int win_w, int win_h)
 {
     if (!g_on) return;
+    if (g_wide) {
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, g_eye_fbo[0]);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+        glDisable(GL_SCISSOR_TEST);
+        if (g_flat) {       /* a menu, a scope: the arcade's 4:3, black at the sides */
+            glViewport(0, 0, win_w, win_h);
+            glClearColor(0, 0, 0, 1);
+            glClear(GL_COLOR_BUFFER_BIT);
+            int x0 = (int)(win_w * (1 - g_wide_k) / 2 + 0.5f), x1 = win_w - x0;
+            glBlitFramebuffer(0, 0, g_ew, g_eh, x0, 0, x1, win_h, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+        } else
+            glBlitFramebuffer(0, 0, g_ew, g_eh, 0, 0, win_w, win_h, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+        glBindFramebuffer(GL_FRAMEBUFFER, g_eye_fbo[0]);
+        return;
+    }
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
     glViewport(0, 0, win_w, win_h);
     glClearColor(0, 0, 0, 1);
@@ -2017,8 +2127,43 @@ void stereo_init(void)
     v = getenv("LINDBERGH_ZOOM_LENS");
     if (v && *v) g_zoom_lens = (float)atof(v);
     v = getenv("LINDBERGH_STEREO");
-    if (!v || !*v || *v == '0') { stereo_eye_size(GAME_W, GAME_H); return; }
+    if (!v || !*v || *v == '0') {
+        stereo_eye_size(GAME_W, GAME_H);
+        /* LINDBERGH_WIDE=1 (1920x1080) or =WxH: the widescreen image */
+        const char *w = getenv("LINDBERGH_WIDE");
+        int ww = 1920, wh = 1080;
+        if (w && *w && *w != '0') {
+            if (strchr(w, 'x') && sscanf(w, "%dx%d", &ww, &wh) != 2) { ww = 1920; wh = 1080; }
+            stereo_start_wide(ww, wh);
+        }
+        return;
+    }
     stereo_start();
+}
+
+void stereo_start_wide(int w, int h)
+{
+    watch_states();                         /* menus: shown as the arcade's 4:3 */
+    if (g_on || w <= 0 || h <= 0) return;
+    void *a = guest_alloc(ARENA_SIZE, 64);
+    if (!a) { fprintf(stderr, "[stereo] no guest memory - widescreen off\n"); return; }
+    g_arena = H2G(a);
+    stereo_eye_size(w, h);
+    g_wide = 1;
+    g_wide_k = (float)GAME_W / GAME_H * h / w;
+    float m[16]; mat_identity(m);
+    for (int i = 0; i < 2; i++) stereo_set_eye(i, m, 1, 1, 1, 1);
+    g_on = 1;
+    fprintf(stderr, "[stereo] widescreen: %dx%d, the 4:3 picture %.0f%% of its width\n", w, h, g_wide_k * 100);
+}
+
+int stereo_wide(int *w, int *h, float *k)
+{
+    if (!g_wide) return 0;
+    if (w) *w = g_ew;
+    if (h) *h = g_eh;
+    if (k) *k = g_wide_k;
+    return 1;
 }
 
 /* Desktop defaults: a 90-degree square eye, 6.4 cm apart. A VR host
@@ -2055,3 +2200,4 @@ void stereo_show_game_sight(int show)
     g_show_sight = show;
     fprintf(stderr, "[stereo] game sight %s (texture %u)\n", show ? "shown" : "hidden", g_sight_tex);
 }
+

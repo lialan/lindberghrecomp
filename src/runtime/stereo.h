@@ -8,6 +8,8 @@
 
 void stereo_init(void);                 /* hle_register_gl */
 void stereo_start(void);                /* turn it on (LINDBERGH_STEREO does so too) */
+void stereo_start_wide(int w, int h);    /* widescreen: one wider image of the game camera */
+int  stereo_wide(int *w, int *h, float *k); /* its size, and the 4:3 picture's share of its width */
 int  stereo_enabled(void);
 void stereo_frame_begin(void);          /* before the game draws a frame */
 void stereo_frame_end(void);            /* at the swap: draws the second eye */

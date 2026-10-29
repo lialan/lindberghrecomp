@@ -66,10 +66,27 @@ void host_mac_fix_surface(SDL_Window *win, int w, int h);   /* host_menu_mac.m *
 #endif
 
 /* A pointer position in the window, in the game's pixels. */
+/* The picture the window shows: the game's own frame, or the widescreen
+ * image (stereo_wide) whose middle k of the width is the game's screen. */
+static void picture_size(int *w, int *h)
+{
+    if (!stereo_wide(w, h, NULL)) { *w = g_win.w; *h = g_win.h; }
+}
+
 static void to_game(int *x, int *y)
 {
     int ww = 0, wh = 0;
+    float k;
     if (g_win.win) SDL_GetWindowSize(g_win.win, &ww, &wh);
+    if (ww > 0 && wh > 0 && g_win.w > 0 && stereo_wide(NULL, NULL, &k)) {
+        /* the side strips are beyond the game's screen: kept to its edge,
+         * not off it, which is a reload */
+        double u = ((double)*x / ww - 0.5) / k + 0.5;
+        int gx = (int)(u * g_win.w);
+        *x = gx < 0 ? 0 : gx >= g_win.w ? g_win.w - 1 : gx;
+        *y = (int)((long)*y * g_win.h / wh);
+        return;
+    }
     if (ww > 0 && wh > 0 && g_win.w > 0) {
         *x = (int)((long)*x * g_win.w / ww);
         *y = (int)((long)*y * g_win.h / wh);
@@ -79,7 +96,13 @@ static void to_game(int *x, int *y)
 static void to_window(int *x, int *y)
 {
     int ww = 0, wh = 0;
+    float k;
     if (g_win.win) SDL_GetWindowSize(g_win.win, &ww, &wh);
+    if (ww > 0 && wh > 0 && g_win.w > 0 && stereo_wide(NULL, NULL, &k)) {
+        *x = (int)((((double)*x / g_win.w - 0.5) * k + 0.5) * ww);
+        *y = (int)((long)*y * wh / g_win.h);
+        return;
+    }
     if (ww > 0 && wh > 0 && g_win.w > 0) {
         *x = (int)((long)*x * ww / g_win.w);
         *y = (int)((long)*y * wh / g_win.h);
@@ -359,6 +382,9 @@ void host_cabinet_input(CabinetInput *out)
         g_cab.gun_x = (int)((g_mouse_x - st->aim_ox) / st->aim_sx);
         g_cab.gun_y = (int)((g_mouse_y - st->aim_oy) / st->aim_sy);
     }
+#if !defined(__ANDROID__)
+    if (stereo_wide(NULL, NULL, NULL)) stereo_set_gun(g_cab.gun_x, g_cab.gun_y);   /* the HUD keeps clear of it */
+#endif
     g_cab.screen_w = (int)w;
     g_cab.screen_h = (int)h;
     g_cab.buttons = g_auto | (g_scripted ? 0 : g_held);
@@ -496,7 +522,7 @@ static void pump(void)
              * fixed drawable size: pin it again */
             if (e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED && g_win.gl) {
                 fprintf(stderr, "[window] resized to %dx%d\n", e.window.data1, e.window.data2);
-                host_mac_fix_surface(g_win.win, g_win.w, g_win.h);
+                { int pw, ph; picture_size(&pw, &ph); host_mac_fix_surface(g_win.win, pw, ph); }
             }
 #endif
             if (e.window.event == SDL_WINDOWEVENT_FOCUS_GAINED) fprintf(stderr, "[window] focus gained\n");
@@ -606,12 +632,13 @@ int host_window_open(const char *title)
     {
         const char *v = getenv("LINDBERGH_WINDOW");
         if (!(v && sscanf(v, "%dx%d", &dw, &dh) == 2 && dw > 0 && dh > 0)) {
-            dh = 1080; dw = (int)((long)dh * g_win.w / g_win.h);
+            int pw, ph; picture_size(&pw, &ph);
+            dh = 1080; dw = (int)((long)dh * pw / ph);
             SDL_Rect r;
             if (SDL_GetDisplayUsableBounds(0, &r) == 0 && r.h > 100) {
                 int maxh = r.h - 40, maxw = r.w - 40;
-                if (dh > maxh) { dh = maxh; dw = (int)((long)dh * g_win.w / g_win.h); }
-                if (dw > maxw) { dw = maxw; dh = (int)((long)dw * g_win.h / g_win.w); }
+                if (dh > maxh) { dh = maxh; dw = (int)((long)dh * pw / ph); }
+                if (dw > maxw) { dw = maxw; dh = (int)((long)dw * ph / pw); }
             }
         }
     }
@@ -651,7 +678,7 @@ int host_gl_context(void)
     xr_frame_begin();
 #else
 #if defined(__APPLE__)
-    host_mac_fix_surface(g_win.win, g_win.w, g_win.h);
+    { int pw, ph; picture_size(&pw, &ph); host_mac_fix_surface(g_win.win, pw, ph); }
 #endif
     SDL_GL_SetSwapInterval(env_int("LINDBERGH_VSYNC", 0));   /* the game paces itself; macOS stalls vsync swaps for hidden windows */
 #endif
@@ -702,7 +729,8 @@ static void maybe_screenshot(void)
         if (g_frame != (unsigned)at) return;
         snprintf(name, sizeof name, "%s", path);
     }
-    int w = g_win.w, h = g_win.h;
+    int w, h;
+    picture_size(&w, &h);
     unsigned char *px = (unsigned char *)malloc((size_t)w * h * 3);
     if (!px) return;
     GLint fb = 0;
@@ -754,7 +782,7 @@ void host_swap(void)
 #else
     if (stereo_enabled()) {             /* draw the second eye, show both */
         stereo_frame_end();
-        stereo_present_desktop(g_win.w, g_win.h);
+        { int pw, ph; picture_size(&pw, &ph); stereo_present_desktop(pw, ph); }
     }
 #endif
     maybe_screenshot();

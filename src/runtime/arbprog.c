@@ -766,8 +766,8 @@ static int emit_instr(Tr *t, char *stmt)
             else if (proj) snprintf(r, sizeof r, "texture2D(sr_%d, %s.xy / %s.w * u_rect_norm[%d])", unit, X(0), X(0), unit);
             else      snprintf(r, sizeof r, "texture2D(sr_%d, %s.xy * u_rect_norm[%d])", unit, X(0), unit);
 #else
-            if (proj) snprintf(r, sizeof r, "texture2DRectProj(sr_%d, vec4(%s.xy * u_rect_scale, %s.zw))", unit, X(0), X(0));
-            else      snprintf(r, sizeof r, "texture2DRect(sr_%d, %s.xy * u_rect_scale)", unit, X(0));
+            if (proj) snprintf(r, sizeof r, "texture2DRectProj(sr_%d, vec4(%s.xy * u_rect_scale[%d], %s.zw))", unit, X(0), unit, X(0));
+            else      snprintf(r, sizeof r, "texture2DRect(sr_%d, %s.xy * u_rect_scale[%d])", unit, X(0), unit);
 #endif
         } else if (proj && target != 4)
             snprintf(r, sizeof r, "%sProj(%s%d, %s)", fnb[target], sm[target], unit, X(0));
@@ -993,7 +993,7 @@ static char *translate(int stage, const char *src_in, Tr *t)
         if (rect) bput(&g, "uniform vec2 u_rect_norm[16];\n");
 #else
         if (rect) bput(&g, "#extension GL_ARB_texture_rectangle : enable\n"
-                           "uniform vec2 u_rect_scale;\n");    /* render targets drawn larger (stereo.c) */
+                           "uniform vec2 u_rect_scale[16];\n");    /* per unit: render targets drawn larger (stereo.c) */
 #endif
         const char *P = stage ? "f" : "v";
         if (t->env_hi >= 0) bput(&g, "uniform vec4 %s_env[%d];\n", P, t->env_hi + 1);
@@ -1479,7 +1479,25 @@ static void upload(Linked *l)
                     norm[0][0], norm[0][1], norm[3][0], norm[3][1], glGetError());
     }
 #else
-    if (l->u_rect >= 0) { float rx, ry; stereo_rect_scale(&rx, &ry); glUniform2f(l->u_rect, rx, ry); }
+    if (l->u_rect >= 0) {
+        /* only render targets were drawn larger; a texture the game filled
+         * itself (the 256x1 colour table of the final pass) is its own size,
+         * and scaling its lookups washed every colour out */
+        float rx, ry, sc[16][2];
+        stereo_rect_scale(&rx, &ry);
+        GLint active = GL_TEXTURE0;
+        glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+        for (int u = 0; u < 16; u++) {
+            sc[u][0] = sc[u][1] = 1;
+            if (!(l->rect_units & (1u << u)) || (rx == 1 && ry == 1)) continue;
+            GLint bound = 0;
+            glActiveTexture(GL_TEXTURE0 + u);
+            glGetIntegerv(GL_TEXTURE_BINDING_RECTANGLE_ARB, &bound);
+            if (stereo_is_render_target((GLuint)bound)) { sc[u][0] = rx; sc[u][1] = ry; }
+        }
+        glActiveTexture((GLenum)active);
+        glUniform2fv(l->u_rect, 16, &sc[0][0]);
+    }
 #endif
     for (int st = 0; st < 2; st++) {
         GLuint id = st ? l->fid : l->vid;
