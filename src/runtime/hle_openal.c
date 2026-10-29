@@ -90,6 +90,14 @@ static void h_alIsSource(CPU *c)     { RET(alIsSource(A32(0))); }
 void host_audio_toggle_mute(void)
 {
     HostSettings *st = settings();
+    /* LINDBERGH_MUTE=1 is a lock, not a starting point: a run that was asked
+     * to be silent stays silent whatever key or menu is pressed. */
+    const char *lock = getenv("LINDBERGH_MUTE");
+    if (lock && *lock && *lock != '0') {
+        st->muted = 1;
+        fprintf(stderr, "[al] sound stays muted (LINDBERGH_MUTE)\n");
+        return;
+    }
     st->muted = !st->muted;
     settings_save();
     fprintf(stderr, "[al] sound %s\n", st->muted ? "muted" : "on");

@@ -37,6 +37,7 @@ static __thread CPU *g_current;
 #endif
 
 void guest_set_current_cpu(CPU *c) { g_current = c; }
+CPU *guest_current_cpu(void) { return g_current; }
 
 /* Recent dispatches, newest last. Written on the hot path, so it is one store
  * and one masked increment and nothing else - no timestamps, no names. */

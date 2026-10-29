@@ -368,6 +368,10 @@ static int sane(const char *who, uint32_t va, uint32_t len)
     if (va < GUEST_LOW || len > GUEST_HUGE) {
         fprintf(stderr, "[libc] %s(%#010x, %u bytes) refused - bad pointer or size\n",
                 who, va, len);
+        if (getenv("LINDBERGH_REFUSE_TRACE")) {          /* who asked */
+            static int shown;
+            if (shown++ < 3) guest_backtrace(guest_current_cpu());
+        }
         fflush(stderr);
         return 0;
     }

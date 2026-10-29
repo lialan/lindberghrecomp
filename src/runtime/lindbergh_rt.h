@@ -180,6 +180,7 @@ uint32_t guest_call(CPU *c, uint32_t fn, const uint32_t *args, int nargs);
  * sent control to. */
 void guest_install_crash_handler(void);
 void guest_set_current_cpu(CPU *c);
+CPU *guest_current_cpu(void);
 void guest_report_state(const char *why);
 void guest_trace_dispatch(uint32_t va);
 void guest_backtrace(CPU *c);
