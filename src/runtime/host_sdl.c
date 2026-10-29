@@ -258,6 +258,7 @@ static void cabinet_autostart(void)
         if (press && g_frame % 120u >= 60u && g_frame % 120u < 75u) g_auto |= (unsigned)press;
         /* LINDBERGH_AUTOGUN=2: one second in four off the screen, with a
          * press of the gun's screen-out signal - the arcade's reload */
+        if (gun == 2) stereo_game_gun_reloading(g_frame % 240u >= 20u && g_frame % 240u < 110u);
         if (gun == 2 && g_frame % 240u < 60u) {
             g_mouse_x = -100000; g_mouse_y = -100000;
             g_auto &= ~CAB_P1_TRIGGER;
@@ -294,9 +295,15 @@ static void cabinet_script(void)
     if (!n) return;
     int any = 0;
     for (int i = 0; i < n; i++) any |= g_frame >= ln[i].from && g_frame <= ln[i].to;
-    g_scripted = any;           /* between the script's lines, the real gun */
+    static int was;
+    if (!any) {                 /* between the script's lines, the real gun (or LINDBERGH_AUTOGUN's) */
+        if (was) { g_scripted = 0; g_auto = 0; }
+        was = 0;
+        return;
+    }
+    was = 1;
+    g_scripted = 1;
     g_auto = 0;
-    if (!any) return;
     int w = g_win.w ? g_win.w : DEFAULT_W, h = g_win.h ? g_win.h : DEFAULT_H;
     g_mouse_x = -100000; g_mouse_y = -100000;
     for (int i = 0; i < n; i++) {

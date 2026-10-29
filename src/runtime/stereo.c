@@ -816,6 +816,9 @@ static int weapon_draw(void)
     float mv[16];
     glGetFloatv(GL_MODELVIEW_MATRIX, mv);
     if (mv[12] * mv[12] + mv[13] * mv[13] + mv[14] * mv[14] > 9.0f) return 0;
+    if (getenv("LINDBERGH_GUN_LOG") && g_weapon_learn && !g_replaying)
+        fprintf(stderr, "[gun] frame %u: lens %.3f (world %.3f), at %.2f %.2f %.2f, tex %u\n", g_frame, P[0], g_world_persp[0],
+                mv[12], mv[13], mv[14], g_tex2d_bound);
     int known = 0;
     for (unsigned i = 0; i < g_nweapon_tex; i++) if (g_weapon_tex[i] == g_tex2d_bound) known = 1;
     if (!known && !g_replaying && g_weapon_learn && fabsf(P[0] - 1.732f) < 0.01f && fabsf(g_world_persp[0] - P[0]) > 0.05f * P[0] && g_nweapon_tex < MAX_WEAPON_TEX) {
