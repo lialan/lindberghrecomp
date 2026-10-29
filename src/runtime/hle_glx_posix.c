@@ -118,6 +118,15 @@ static void h_glXCreatePbuffer(CPU *c)
     while (i < MAX_PB && g_pb[i].fb) i++;
     if (i == MAX_PB) { fprintf(stderr, "[glX] out of pbuffers\n"); RET(0); return; }
     int w = (int)glx_attrib(A32(2), 0x8041, 256), h = (int)glx_attrib(A32(2), 0x8040, 256);
+    if (stereo_enabled()) {
+        /* in the headset a pbuffer is drawn as the eyes (h_glXMakeCurrent):
+         * no framebuffer of its own, which gl4es would also keep in two
+         * layers and track */
+        g_pb[i].fb = ~0u; g_pb[i].w = w; g_pb[i].h = h;
+        fprintf(stderr, "[glX] pbuffer %d: %dx%d, drawn as the eyes\n", i, w, h);
+        RET(TOK_PBUFFER | (uint32_t)i);
+        return;
+    }
 
     GLint prev_fb = 0, prev_tex = 0, prev_rb = 0;
     glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fb);
@@ -162,6 +171,7 @@ static void h_glXDestroyPbuffer(CPU *c)
 {
     int i = pb_index(A32(1));
     if (i < 0) return;
+    if (g_pb[i].fb == ~0u) { memset(&g_pb[i], 0, sizeof g_pb[i]); return; }
     glDeleteFramebuffers(1, &g_pb[i].fb);
     glDeleteTextures(1, &g_pb[i].color);
     if (g_pb[i].depth_tex) glDeleteTextures(1, &g_pb[i].depth);

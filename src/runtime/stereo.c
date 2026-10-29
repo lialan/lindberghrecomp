@@ -56,6 +56,7 @@ int gl4es_multiview_copy(unsigned src, int layer, int sx0, int sy0, int sx1, int
                          unsigned dst, int level, int dx0, int dy0, int dx1, int dy1);
 extern int gl4es_mv_trace;
 void gl4es_multiview_read_pixel(int x, int y, unsigned char out[4]);
+void gl4es_multiview_read_pixel_layer(int x, int y, int layer, unsigned char out[4]);
 #endif
 
 extern unsigned g_frame;
@@ -302,6 +303,13 @@ static void view_matrices(const float *p, float *eye0)
         for (int i = 0; i < 16; i++) g_mvR[1][i] = (float)r[i];
         mat_mul_d(r, pd, inv);
         for (int i = 0; i < 16; i++) g_mvR[2][i] = (float)r[i];
+    }
+    if ((long)g_frame == g_map_frame) {
+        static int shown;
+        if (shown++ < 3)
+            fprintf(stderr, "[map] views: eye0 %.3f %.3f %.3f %.3f  mvR1 %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | tan1 %.2f %.2f %.2f %.2f\n",
+                    eye0[0], eye0[5], eye0[10], eye0[14], g_mvR[1][0], g_mvR[1][5], g_mvR[1][10], g_mvR[1][15],
+                    g_mvR[1][12], g_mvR[1][13], g_mvR[1][14], g_mvR[1][3], g_tan[1][0], g_tan[1][1], g_tan[1][2], g_tan[1][3]);
     }
     gl4es_multiview_set((const float (*)[16])g_mvR, g_clipped);
 #endif
@@ -1001,7 +1009,9 @@ static int copy_from_eyes(CPU *c, int k)
     if (!tex || w <= 0 || h <= 0) return 1;
     int X0 = (int)lroundf(x * g_sx), Y0 = (int)lroundf(y * g_sy);
     int X1 = (int)lroundf((x + w) * g_sx), Y1 = (int)lroundf((y + h) * g_sy);
-    gl4es_multiview_copy(g_eye_tex[0], 0, X0, Y0, X1, Y1, (GLuint)tex, level, xo, yo, xo + w, yo + h);
+    static int off = -1;
+    if (off < 0) { const char *v = getenv("LINDBERGH_EYE_COPY"); off = v && *v == '0'; }
+    if (!off) gl4es_multiview_copy(g_eye_tex[0], 0, X0, Y0, X1, Y1, (GLuint)tex, level, xo, yo, xo + w, yo + h);
     if (w >= GAME_W * 9 / 10 && h >= GAME_H * 9 / 10 && !screen_copy((GLuint)tex) && g_nscreen_copy < MAX_SCREEN_COPIES) {
         g_screen_copy[g_nscreen_copy++] = (GLuint)tex;
         fprintf(stderr, "[stereo] frame %u: texture %d is a copy of the whole screen\n", g_frame, tex);
@@ -1055,6 +1065,16 @@ static int transform_call(CPU *c, HleId id, const char *n)
             glClearColor(0, 0, 0, 1);
             glClear(mask | GL_COLOR_BUFFER_BIT);
             glClearColor(cc[0], cc[1], cc[2], cc[3]);
+            return 1;
+        }
+        /* Depth and stencil cleared in one call, with both eyes in one pass,
+         * cleared the right eye's depth to nothing on the Quest's driver: every
+         * draw there then failed its depth test, and the right eye showed only
+         * the clear colour (The House of the Dead 4 clears all three at once).
+         * Stencil goes in a call of its own. */
+        if (g_mv && (mask & GL_STENCIL_BUFFER_BIT) && (mask & GL_DEPTH_BUFFER_BIT)) {
+            glClear(mask & ~GL_STENCIL_BUFFER_BIT);
+            glClear(GL_STENCIL_BUFFER_BIT);
             return 1;
         }
         return 0;
@@ -1634,9 +1654,11 @@ static void stereo_gl_call(CPU *c, HleId id, HleHandler fn)
         const char *nm = hle_name(id);
         stereo_gl_call_inner(c, id, fn);
         if (!strncmp(nm, "glDraw", 6) || !strncmp(nm, "glMultiDraw", 11) || !strcmp(nm, "glEnd")) {
-            unsigned char px[4];
+            unsigned char px[4], pr[4];
             gl4es_multiview_read_pixel(g_ew / 2, g_eh / 2, px);
-            fprintf(stderr, "[map]   centre now %u %u %u %u (fb %u)\n", px[0], px[1], px[2], px[3], g_game_fb);
+            gl4es_multiview_read_pixel_layer(g_ew / 2, g_eh / 2, 1, pr);
+            fprintf(stderr, "[map]   centre now %u %u %u %u, right eye %u %u %u (fb %u)\n", px[0], px[1], px[2], px[3],
+                    pr[0], pr[1], pr[2], g_game_fb);
         }
         return;
     }
@@ -1820,11 +1842,12 @@ static void dump_targets(void)
         /* LINDBERGH_EYE_DUMP_EVERY=N: the first eye every N frames, eye_<frame>.ppm */
         unsigned char *px = malloc((size_t)g_ew * g_eh * 4);
 #ifdef LINDBERGH_GL4ES
-        if (px && g_mv && gl4es_multiview_read(g_eye_tex[0], GL_TEXTURE_RECTANGLE_ARB, 0, px)) {
-            char name[64];
-            snprintf(name, sizeof name, "eye_%u.ppm", g_frame);
-            write_ppm(name, g_ew, g_eh, px);
-        }
+        for (int layer = 0; px && g_mv && layer < 2; layer++)
+            if (gl4es_multiview_read(g_eye_tex[0], GL_TEXTURE_RECTANGLE_ARB, layer, px)) {
+                char name[64];
+                snprintf(name, sizeof name, layer ? "eyeR_%u.ppm" : "eye_%u.ppm", g_frame);
+                write_ppm(name, g_ew, g_eh, px);
+            }
 #endif
         free(px);
     }
