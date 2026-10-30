@@ -51,13 +51,15 @@ static struct {
     F(void, FramebufferTexture2D, (GLenum, GLenum, GLenum, GLuint, GLint))
     F(void, ReadPixels, (GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void *))
     F(void *, MapBufferRange, (GLenum, GLintptr, GLsizeiptr, GLbitfield)) F(GLboolean, UnmapBuffer, (GLenum))
-    F(void, Uniform2iv, (GLint, GLsizei, const GLint *))
+    F(void, Uniform2iv, (GLint, GLsizei, const GLint *)) F(void, Uniform1f, (GLint, GLfloat))
     F(GLsync, FenceSync, (GLenum, GLbitfield)) F(GLenum, ClientWaitSync, (GLsync, GLbitfield, GLuint64))
     F(void, DeleteSync, (GLsync))
 #undef F
 } gl;
 
 static GLuint prog_gun, prog_beam, vao_gun, vbo_gun, vao_beam, vbo_beam;
+static GLuint prog_depth, smp_depth;    /* the world's depth, copied for the headset */
+static GLint  u_depth_d, u_depth_layer, u_depth_size;
 static GLuint prog_screen[2], vao_screen, vbo_screen, smp_screen;   /* [0] a 2D texture, [1] a layer of an array */
 static GLint u_screen_mvp[2], u_screen_tex[2];
 static GLuint prog_panel;
@@ -164,7 +166,7 @@ int xo_init(void)
     L(GenSamplers) L(BindSampler) L(SamplerParameteri) L(ClearColor) L(DepthRangef) L(GetFloatv) L(Uniform2f)
     L(TexImage2D) L(GenTextures) L(TexParameteri)
     L(GenFramebuffers) L(BindFramebuffer) L(FramebufferTexture2D) L(ReadPixels) L(MapBufferRange) L(UnmapBuffer)
-    L(Uniform2iv) L(FenceSync) L(ClientWaitSync) L(DeleteSync)
+    L(Uniform2iv) L(Uniform1f) L(FenceSync) L(ClientWaitSync) L(DeleteSync)
 #undef L
     prog_gun = program(
         "#version 300 es\nlayout(location=0) in vec3 p; layout(location=1) in vec3 n; layout(location=2) in vec3 c;\n"
@@ -612,6 +614,49 @@ static int probe_init(void)
     gl.SamplerParameteri(probe_smp, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     gl.SamplerParameteri(probe_smp, GL_TEXTURE_COMPARE_MODE, GL_NONE);
     return 1;
+}
+
+void xo_copy_depth(unsigned depth_array, int layer, int w, int h)
+{
+    if (!prog_depth) {
+        prog_depth = program(
+            "#version 300 es\nlayout(location=0) in vec2 p; void main() { gl_Position = vec4(p, 0.0, 1.0); }\n",
+            "#version 300 es\nprecision highp float; precision highp sampler2DArray;\n"
+            "uniform sampler2DArray d; uniform float layer; uniform vec2 size; out vec4 o;\n"
+            "void main() { gl_FragDepth = texture(d, vec3(gl_FragCoord.xy / size, layer)).r; o = vec4(0.0); }\n",
+            "p", NULL, NULL);
+        u_depth_d = gl.GetUniformLocation(prog_depth, "d");
+        u_depth_layer = gl.GetUniformLocation(prog_depth, "layer");
+        u_depth_size = gl.GetUniformLocation(prog_depth, "size");
+        gl.GenSamplers(1, &smp_depth);
+        gl.SamplerParameteri(smp_depth, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        gl.SamplerParameteri(smp_depth, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        gl.SamplerParameteri(smp_depth, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        gl.SamplerParameteri(smp_depth, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        gl.SamplerParameteri(smp_depth, GL_TEXTURE_COMPARE_MODE, GL_NONE);
+    }
+    Saved s;
+    save(&s);
+    GLint unit = 0, bound = 0;
+    gl.GetIntegerv(GL_ACTIVE_TEXTURE, &unit);
+    gl.ActiveTexture(GL_TEXTURE0);
+    gl.GetIntegerv(GL_TEXTURE_BINDING_2D_ARRAY, &bound);
+    gl.Disable(GL_BLEND); gl.Disable(GL_CULL_FACE);
+    gl.Enable(GL_DEPTH_TEST); gl.DepthFunc(GL_ALWAYS); gl.DepthMask(GL_TRUE);
+    gl.ColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+    gl.Viewport(0, 0, w, h);
+    gl.UseProgram(prog_depth);
+    gl.Uniform1i(u_depth_d, 0);
+    gl.Uniform1f(u_depth_layer, (float)layer);
+    gl.Uniform2f(u_depth_size, (float)w, (float)h);
+    gl.BindTexture(GL_TEXTURE_2D_ARRAY, depth_array);
+    gl.BindSampler(0, smp_depth);
+    gl.BindVertexArray(vao_screen);
+    gl.DrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    gl.BindSampler(0, 0);
+    gl.BindTexture(GL_TEXTURE_2D_ARRAY, (GLuint)bound);
+    gl.ActiveTexture((GLenum)unit);
+    restore(&s);
 }
 
 float xo_probe(unsigned depth_array, const float (*px)[2], const float *z, const float *t, int n, float zn, float zf)

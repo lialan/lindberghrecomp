@@ -2377,6 +2377,30 @@ void stereo_reproject(float out[16])
 
 void stereo_set_screen_distance(float d) { if (d > 0) g_screen_dist = d; }
 
+/* The depth this frame's world left in both eyes (a multiview array, layer
+ * per eye) and the near and far planes it was drawn with, in game units: for
+ * the headset, which uses it to correct a repeated frame for the head's
+ * movement as well as its turn. 0 when the frame has no world in stereo (a
+ * flat frame, no world drawn, or the eyes drawn one at a time). */
+unsigned stereo_world_depth(float *zn, float *zf)
+{
+#ifdef LINDBERGH_GL4ES
+    if (!g_on || !g_mv || g_flat_shown || g_scene_draws == 0) return 0;
+    GLuint dt = 0;
+    for (unsigned i = 0; i < g_nfb_depth; i++) if (g_fb_depth[i].fb == g_world_fb_next) dt = g_fb_depth[i].depth;
+    if (g_world_fb_next == 0) dt = g_eye_tex[1];      /* the window: the eyes' own target */
+    unsigned arr = dt ? gl4es_multiview_array(dt) : 0;
+    const float *p = g_world_persp;
+    float n = p[14] / (p[10] - 1), f = p[14] / (p[10] + 1);
+    if (!arr || !(n > 0) || !(f > n)) return 0;
+    *zn = n; *zf = f;
+    return arr;
+#else
+    (void)zn; (void)zf;
+    return 0;
+#endif
+}
+
 /* Where a ray from the game camera's space crosses the HUD's screen, in the
  * game's pixels. 0 when it points away from the screen. */
 /* Points along the gun's ray (game units, the game camera's space), placed

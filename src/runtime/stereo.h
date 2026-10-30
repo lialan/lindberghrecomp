@@ -61,6 +61,8 @@ int  stereo_flat_frame(void);
  * array to compare them with. 0: no such view this frame. */
 /* Called once a frame, when the world's depth is complete. */
 void stereo_set_aim_hook(void (*fn)(void));
+/* this frame's world depth array for the headset, and its near/far planes (game units); 0: none */
+unsigned stereo_world_depth(float *zn, float *zf);
 int  stereo_aim_samples(const float o[3], const float d[3], int max, float (*px)[2], float *z, float *t, unsigned *depth, float *zn, float *zf);
 void stereo_screen(float *half_w, float *half_h, float *dist);
 /* Where the gun points this frame, in the game's 640x480 (off the screen:

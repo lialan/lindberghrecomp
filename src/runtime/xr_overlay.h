@@ -35,4 +35,8 @@ void xo_draw_panel(const float mvp[16], int w, int h);
  * lay behind a surface two frames ago (zn, zf: the view's near and far) (-1 none, -2 no answer yet). */
 float xo_probe(unsigned depth_array, const float (*px)[2], const float *z, const float *t, int n, float zn, float zf);
 
+/* Layer `layer` of the world's depth array into the bound framebuffer's depth
+ * (w x h), for the headset's depth layer. */
+void xo_copy_depth(unsigned depth_array, int layer, int w, int h);
+
 #endif

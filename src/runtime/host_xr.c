@@ -64,6 +64,12 @@
 /* host_sdl.c: the gun and the cabinet's buttons, from the controllers */
 void host_vr_input(int gun_x, int gun_y, unsigned held, int coin);
 
+#ifndef GL_TEXTURE_INTERNAL_FORMAT
+#define GL_TEXTURE_WIDTH            0x1000
+#define GL_TEXTURE_HEIGHT           0x1001
+#define GL_TEXTURE_INTERNAL_FORMAT  0x1003
+#endif
+
 /* ---- raw GLES, past gl4es ---- */
 static struct {
     void (*BindFramebuffer)(GLenum, GLuint);
@@ -82,6 +88,9 @@ static struct {
     void (*FramebufferRenderbuffer)(GLenum, GLenum, GLenum, GLuint);
     void (*FramebufferTextureLayer)(GLenum, GLenum, GLuint, GLint, GLint);
     void (*ReadPixels)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void *);
+    GLenum (*GetError)(void);
+    void (*BindTexture)(GLenum, GLuint);
+    void (*GetTexLevelParameteriv)(GLenum, GLint, GLenum, GLint *);
 } gl;
 
 static int gl_load(void)
@@ -93,7 +102,7 @@ static int gl_load(void)
     L(BindFramebuffer) L(GenFramebuffers) L(FramebufferTexture2D) L(CheckFramebufferStatus)
     L(BlitFramebuffer) L(GetIntegerv) L(IsEnabled) L(Enable) L(Disable) L(GetString)
     L(GenRenderbuffers) L(BindRenderbuffer) L(RenderbufferStorage) L(FramebufferRenderbuffer)
-    L(FramebufferTextureLayer) L(ReadPixels)
+    L(FramebufferTextureLayer) L(ReadPixels) L(GetError) L(BindTexture) L(GetTexLevelParameteriv)
 #undef L
     return 1;
 }
@@ -186,7 +195,22 @@ static struct Eye {
     XrSwapchainImageOpenGLESKHR img[8];
     GLuint      fb[8], depth;
     uint32_t    acquired;
+    XrSwapchain dchain;                /* the world's depth, for the compositor */
+    uint32_t    dn;
+    XrSwapchainImageOpenGLESKHR dimg[8];
+    GLuint      dfb[8];
 } eye[2];
+/* XR_KHR_composition_layer_depth: with each eye's depth, the compositor
+ * corrects a frame it shows twice (the game draws 60, the display runs 120)
+ * for the head's movement as well as its turn. Half the eye's size: the copy
+ * costs about 0.5 ms of GPU, where the full size cost 1 ms - a few frames a
+ * second on a game already at the GPU's limit. LINDBERGH_XR_DEPTH=0: off,
+ * =1: full size. */
+static int have_depth_layer, depth_on, depth_div = 2;   /* depth at 1/depth_div of the eye's size */
+static int depth_blit;                 /* the world's depth blits straight across (formats match): 1; a shader copies it: 0 */
+static unsigned depth_checked;         /* the depth array depth_blit was decided for */
+static GLuint depth_read_fb;
+static int64_t depth_format;
 static XoFrame xo;                     /* the gun and laser for this frame */
 static int overlay_ok;
 static GLuint read_fb;
@@ -809,22 +833,26 @@ int xr_init(void)
     li.applicationVM = vm; li.applicationContext = activity;
     XRCHECK(init((XrLoaderInitInfoBaseHeaderKHR *)&li));
 
-    const char *ext[5] = { XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME, XR_KHR_OPENGL_ES_ENABLE_EXTENSION_NAME };
+    const char *ext[6] = { XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME, XR_KHR_OPENGL_ES_ENABLE_EXTENSION_NAME };
     uint32_t next = 2, n = 0;
     xrEnumerateInstanceExtensionProperties(NULL, 0, &n, NULL);
     XrExtensionProperties *props = calloc(n ? n : 1, sizeof *props);
     for (uint32_t i = 0; i < n; i++) props[i].type = XR_TYPE_EXTENSION_PROPERTIES;
     xrEnumerateInstanceExtensionProperties(NULL, n, &n, props);
     int have_rate = 0, have_perf = 0, have_thread = 0;
+    have_depth_layer = 0;
     for (uint32_t i = 0; i < n; i++) {
         if (!strcmp(props[i].extensionName, XR_KHR_ANDROID_THREAD_SETTINGS_EXTENSION_NAME)) have_thread = 1;
         if (!strcmp(props[i].extensionName, XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME)) have_rate = 1;
         if (!strcmp(props[i].extensionName, XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME)) have_perf = 1;
+        if (!strcmp(props[i].extensionName, XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME)) have_depth_layer = 1;
     }
+    { const char *v = getenv("LINDBERGH_XR_DEPTH"); if (v && *v == '0') have_depth_layer = 0; if (v && *v == '1') depth_div = 1; }
     free(props);
     if (have_rate) ext[next++] = XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME;
     if (have_perf) ext[next++] = XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME;
     if (have_thread) ext[next++] = XR_KHR_ANDROID_THREAD_SETTINGS_EXTENSION_NAME;
+    if (have_depth_layer) ext[next++] = XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME;
 
     XrInstanceCreateInfoAndroidKHR ai = { XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR };
     ai.applicationVM = vm; ai.applicationActivity = activity;
@@ -902,6 +930,11 @@ int xr_init(void)
     if (!(want && !strcmp(want, "rgba8")))
         for (uint32_t i = 0; i < nf; i++) if (fmts[i] == GL_SRGB8_ALPHA8) color_format = GL_SRGB8_ALPHA8;
     if (!color_format) for (uint32_t i = 0; i < nf; i++) if (fmts[i] == GL_RGBA8) color_format = GL_RGBA8;
+    if (have_depth_layer) {
+        static const int64_t pref[] = { GL_DEPTH24_STENCIL8, GL_DEPTH_COMPONENT24, GL_DEPTH_COMPONENT32F, GL_DEPTH_COMPONENT16 };   /* the first is what gl4es' eye layers hold: a plain blit */
+        for (unsigned k = 0; k < sizeof pref / sizeof *pref && !depth_format; k++)
+            for (uint32_t i = 0; i < nf; i++) if (fmts[i] == pref[k]) depth_format = pref[k];
+    }
     free(fmts);
     if (!color_format) { fprintf(stderr, "[xr] no 8-bit colour swapchain\n"); return 0; }
 
@@ -943,8 +976,31 @@ int xr_init(void)
             if (gl.CheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
                 fprintf(stderr, "[xr] swapchain framebuffer %d/%u incomplete\n", i, j);
         }
+        if (depth_format) {
+            XrSwapchainCreateInfo dc = ci;
+            dc.usageFlags = XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+            dc.format = depth_format;
+            dc.width = w / (uint32_t)depth_div; dc.height = h / (uint32_t)depth_div;
+            if (XR_SUCCEEDED(xrCreateSwapchain(session, &dc, &eye[i].dchain))) {
+                xrEnumerateSwapchainImages(eye[i].dchain, 0, &eye[i].dn, NULL);
+                if (eye[i].dn > 8) eye[i].dn = 8;
+                for (uint32_t j = 0; j < eye[i].dn; j++) eye[i].dimg[j].type = XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR;
+                xrEnumerateSwapchainImages(eye[i].dchain, eye[i].dn, &eye[i].dn, (XrSwapchainImageBaseHeader *)eye[i].dimg);
+                gl.GenFramebuffers((GLsizei)eye[i].dn, eye[i].dfb);
+                for (uint32_t j = 0; j < eye[i].dn; j++) {
+                    gl.BindFramebuffer(GL_FRAMEBUFFER, eye[i].dfb[j]);
+                    gl.FramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, eye[i].dimg[j].image, 0);
+                    if (gl.CheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+                        fprintf(stderr, "[xr] depth framebuffer %d/%u incomplete\n", i, j);
+                        depth_format = 0;
+                    }
+                }
+            } else depth_format = 0;
+        }
         gl.BindFramebuffer(GL_FRAMEBUFFER, (GLuint)was);
     }
+    depth_on = depth_format != 0;
+    fprintf(stderr, "[xr] depth to the compositor: %s\n", depth_on ? "yes" : have_depth_layer ? "no (no usable format)" : "no");
     gl.GenFramebuffers(1, &read_fb);
 
     overlay_ok = xo_init();
@@ -1142,8 +1198,11 @@ void xr_frame_end(void)
     if (!in_frame) return;
     in_frame = 0;
     XrCompositionLayerProjectionView pv[2];
+    XrCompositionLayerDepthInfoKHR di[2];
     int ok = views_ok && frame.shouldRender;
     int flat = stereo_flat_frame();
+    float zn = 0, zf = 0;
+    unsigned world_depth = depth_on && overlay_ok && !flat ? stereo_world_depth(&zn, &zf) : 0;
     if (ok) {
         GLint draw = 0, read = 0;
         gl.GetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
@@ -1237,6 +1296,59 @@ void xr_frame_end(void)
             pv[i].subImage.swapchain = e->chain;
             pv[i].subImage.imageRect.extent.width = (int32_t)e->w;
             pv[i].subImage.imageRect.extent.height = (int32_t)e->h;
+            if (world_depth) {
+                /* the world's depth for this eye, and where its planes lie in metres */
+                uint32_t k = 0;
+                XrSwapchainImageAcquireInfo dai = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+                if (XR_SUCCEEDED(xrAcquireSwapchainImage(e->dchain, &dai, &k))) {
+                    XrSwapchainImageWaitInfo dwi = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+                    dwi.timeout = XR_INFINITE_DURATION;
+                    xrWaitSwapchainImage(e->dchain, &dwi);
+                    gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, e->dfb[k]);
+                    if (world_depth != depth_checked) {
+                        depth_checked = world_depth;
+                        /* a blit is a plain copy, but only between equal formats */
+                        GLint was = 0, ifmt = 0;
+                        gl.GetIntegerv(GL_TEXTURE_BINDING_2D_ARRAY, &was);
+                        gl.BindTexture(GL_TEXTURE_2D_ARRAY, world_depth);
+                        GLint tw = 0, th = 0;
+                        gl.GetTexLevelParameteriv(GL_TEXTURE_2D_ARRAY, 0, GL_TEXTURE_INTERNAL_FORMAT, &ifmt);
+                        gl.GetTexLevelParameteriv(GL_TEXTURE_2D_ARRAY, 0, GL_TEXTURE_WIDTH, &tw);
+                        gl.GetTexLevelParameteriv(GL_TEXTURE_2D_ARRAY, 0, GL_TEXTURE_HEIGHT, &th);
+                        gl.BindTexture(GL_TEXTURE_2D_ARRAY, (GLuint)was);
+                        while (gl.GetError() != GL_NO_ERROR) {}
+                        depth_blit = ifmt == (GLint)depth_format && tw == (GLint)e->w && th == (GLint)e->h;     /* same size, or a whole fraction of it */
+                        fprintf(stderr, "[xr] world depth 0x%x %dx%d, swapchain depth 0x%x: %s\n", ifmt, tw, th, (unsigned)depth_format,
+                                depth_blit ? "blitted" : "copied by a shader");
+                        if (depth_blit && !depth_read_fb) gl.GenFramebuffers(1, &depth_read_fb);
+                    }
+                    if (depth_blit) {
+                        gl.BindFramebuffer(GL_READ_FRAMEBUFFER, depth_read_fb);
+                        gl.FramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, world_depth, 0, i);
+                        gl.BlitFramebuffer(0, 0, (GLint)e->w, (GLint)e->h, 0, 0, (GLint)e->w / depth_div, (GLint)e->h / depth_div,
+                                           GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+                        gl.BindFramebuffer(GL_READ_FRAMEBUFFER, read_fb);
+                    } else
+                        xo_copy_depth(world_depth, i, (int)e->w / depth_div, (int)e->h / depth_div);
+                    XrSwapchainImageReleaseInfo dri = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+                    xrReleaseSwapchainImage(e->dchain, &dri);
+                    di[i] = (XrCompositionLayerDepthInfoKHR){ XR_TYPE_COMPOSITION_LAYER_DEPTH_INFO_KHR };
+                    di[i].subImage.swapchain = e->dchain;
+                    di[i].subImage.imageRect.extent.width = (int32_t)e->w / depth_div;
+                    di[i].subImage.imageRect.extent.height = (int32_t)e->h / depth_div;
+                    di[i].minDepth = 0; di[i].maxDepth = 1;
+                    di[i].nearZ = zn / cfg.scale; di[i].farZ = zf / cfg.scale;
+                    pv[i].next = &di[i];
+                } else world_depth = 0;
+            }
+        }
+        if (!world_depth) pv[0].next = pv[1].next = NULL;      /* both eyes or neither */
+        {   static int told = -1;
+            if (ok && told != (world_depth != 0)) {
+                told = world_depth != 0;
+                fprintf(stderr, "[xr] frame %u: depth layer %s (near %.3f m, far %.1f m)\n", g_frame,
+                        told ? "on" : "off", zn / cfg.scale, zf / cfg.scale);
+            }
         }
         if (fl_on > 0 && ok) fl_frame();
         if (color_format == GL_SRGB8_ALPHA8) gl.Enable(GL_FRAMEBUFFER_SRGB_EXT);
