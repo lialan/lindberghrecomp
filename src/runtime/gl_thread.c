@@ -201,13 +201,18 @@ static void wake_game(void)
     }
 }
 
+static double g_wait_ms;               /* the game thread's time waiting on the worker */
+static _Atomic double g_work_ms;       /* the worker's CPU time, as of its last frame */
+static double now_ms(clockid_t k) { struct timespec t; clock_gettime(k, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
+
 /* Wait on the game thread until cond holds: a short spin, then sleep. */
-#define GAME_WAIT(cond) do { \
+#define GAME_WAIT(cond) do { double _w0 = (cond) ? 0 : now_ms(CLOCK_MONOTONIC); \
     for (int _i = 0; !(cond) && _i < 4000; _i++) __asm__ volatile("" ::: "memory"); \
     if (!(cond)) { pthread_mutex_lock(&g_mu); atomic_store(&g_game_sleeps, 1); \
         atomic_thread_fence(memory_order_seq_cst); \
         while (!(cond)) pthread_cond_wait(&g_cv, &g_mu); \
-        atomic_store(&g_game_sleeps, 0); pthread_mutex_unlock(&g_mu); } } while (0)
+        atomic_store(&g_game_sleeps, 0); pthread_mutex_unlock(&g_mu); } \
+    if (_w0) g_wait_ms += now_ms(CLOCK_MONOTONIC) - _w0; } while (0)
 
 /* Room for n bytes (header included) at the head: a record never wraps. */
 static Rec *ring_take(uint32_t n)
@@ -279,6 +284,7 @@ static void *worker(void *arg)
             break;
         case R_JOB:
             r->u.job(r->arg);
+            atomic_store(&g_work_ms, now_ms(CLOCK_THREAD_CPUTIME_ID));
             atomic_store_explicit(&g_done_seq, r->seq, memory_order_release);
             break;
         }
@@ -392,7 +398,14 @@ void glq_drain(void) { if (g_on) glq_wait(glq_job(nothing, NULL)); }
 void glq_report(unsigned frames)
 {
     if (!g_on || !frames) return;
-    fprintf(stderr, "[glq] per frame: %u queued, %u waited for", g_n_async / frames, g_n_sync / frames);
+    /* which thread holds the frame back: each one's CPU time, and the game
+     * thread's time waiting for the worker */
+    static double game0, work0;
+    double game = now_ms(CLOCK_THREAD_CPUTIME_ID), work = atomic_load(&g_work_ms);
+    fprintf(stderr, "[glq] ms per frame: game thread %.1f (waiting %.1f), GL thread %.1f; ",
+            game0 ? (game - game0) / frames : 0, g_wait_ms / frames, work0 ? (work - work0) / frames : 0);
+    game0 = game; work0 = work; g_wait_ms = 0;
+    fprintf(stderr, "per frame: %u queued, %u waited for", g_n_async / frames, g_n_sync / frames);
     for (int k = 0; k < 5; k++) {
         unsigned best = 0;
         for (unsigned i = 1; i < HLE_ID_MAX; i++) if (g_sync_by_id[i] > g_sync_by_id[best]) best = i;
