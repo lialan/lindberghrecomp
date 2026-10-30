@@ -85,7 +85,7 @@ static uint32_t build_display(void)
 static int ensure_window(void)
 {
     build_display();
-    return host_window_open("The House of the Dead 4") && host_gl_context();
+    return host_window_open(NULL) && host_gl_context();
 }
 
 /* ---- pbuffers ---- */
@@ -244,6 +244,28 @@ static void h_glXSwapBuffers(CPU *c)
     RET(0);
 }
 
+static void h_glXGetCurrentContext(CPU *c)  { RET(TOK_CONTEXT); }
+static void h_glXGetCurrentDisplay(CPU *c)  { RET(build_display()); }
+static void h_glXGetCurrentDrawable(CPU *c)
+{
+    RET(g_drawable_pb > 0 ? TOK_PBUFFER | (uint32_t)g_drawable_pb : TOK_WINDOW);
+}
+
+/* The game checks these strings for extension names before using an entry
+ * point. Reporting none is honest and safe: it takes the ARB path it also
+ * ships, and glXGetProcAddressARB still resolves whatever it asks for. */
+static void h_glXQueryExtensionsString(CPU *c) { RET(guest_strdup_static("")); }
+static void h_glXQueryServerString(CPU *c)     { RET(guest_strdup_static("lindberghrecomp")); }
+static void h_glXGetClientString(CPU *c)       { RET(guest_strdup_static("lindberghrecomp")); }
+
+/* SGIX framebuffer configs and pbuffers (Let's Go Jungle asks about them):
+ * reporting none sends the game down the path that does without. */
+static void h_glXChooseFBConfigSGIX(CPU *c)   { if (A32(3)) wr32(A32(3), 0); RET(0); }
+static void h_glXGetFBConfigAttribSGIX(CPU *c) { RET((uint32_t)-1); }
+
+/* vsync: the host's swap already waits for the display */
+static void h_glXSwapIntervalSGI(CPU *c) { RET(0); }
+
 static void h_glXGetProcAddressARB(CPU *c)
 {
     const char *name = ASTR(0);
@@ -303,6 +325,15 @@ static void h_XMissingExtension(CPU *c)
     RET(0);
 }
 
+/* Atoms are names the X server interns and hands back as ids. Nothing here
+ * resolves them again, so a counter is enough: the game only compares one
+ * it was given against another it was given. */
+static void h_XInternAtom(CPU *c)
+{
+    static uint32_t next = 1000;
+    RET(++next);
+}
+
 /* XKeysymToKeycode: any non-zero keycode; X key events never arrive. */
 static void h_XKeysymToKeycode(CPU *c) { RET((A32(1) & 0xFF) | 8); }
 
@@ -335,6 +366,18 @@ void hle_register_glx_posix(void)
     hle_bind("glXCreatePbuffer", h_glXCreatePbuffer);
     hle_bind("glXDestroyPbuffer", h_glXDestroyPbuffer);
     hle_bind("glXGetProcAddressARB", h_glXGetProcAddressARB);
+    hle_bind("glXGetCurrentContext", h_glXGetCurrentContext);
+    hle_bind("glXGetCurrentDisplay", h_glXGetCurrentDisplay);
+    hle_bind("glXGetCurrentDrawable", h_glXGetCurrentDrawable);
+    hle_bind("glXQueryExtensionsString", h_glXQueryExtensionsString);
+    hle_bind("glXQueryServerString", h_glXQueryServerString);
+    hle_bind("glXGetClientString", h_glXGetClientString);
+    hle_bind("glXChooseFBConfigSGIX", h_glXChooseFBConfigSGIX);
+    hle_bind("glXGetFBConfigAttribSGIX", h_glXGetFBConfigAttribSGIX);
+    hle_bind("glXCreateContextWithConfigSGIX", h_x_zero);
+    hle_bind("glXCreateGLXPbufferSGIX", h_x_zero);
+    hle_bind("glXDestroyGLXPbufferSGIX", h_x_zero);
+    hle_bind("glXSwapIntervalSGI", h_glXSwapIntervalSGI);
 
     hle_bind("XOpenDisplay", h_XOpenDisplay);
     hle_bind("XCreateWindow", h_XCreateWindow);
@@ -350,18 +393,22 @@ void hle_register_glx_posix(void)
     hle_bind("XMissingExtension", h_XMissingExtension);
     hle_bind("XKeysymToKeycode", h_XKeysymToKeycode);
     hle_bind("XInitThreads", h_x_one);
+    hle_bind("XInternAtom", h_XInternAtom);
 
     static const char *zero[] = {
         "XFree", "XFreePixmap", "XMoveWindow", "XWarpPointer", "XGrabPointer",
         "XSetInputFocus", "XDefineCursor", "XAutoRepeatOff", "XAutoRepeatOn",
         "XLookupString", "XStoreName", "XCloseDisplay", "XDestroyWindow",
         "XextAddDisplay", "XextRemoveDisplay", "XextFindDisplay", "XextCreateExtension",
-        "XUngrabPointer", "XSetErrorHandler",
+        "XUngrabPointer", "XSetErrorHandler", "XGrabKeyboard", "XUngrabKeyboard",
+        "XSetWMProperties", "XSetWMProtocols", "XStringListToTextProperty",
+        "XSetCloseDownMode", "XParseColor", "XFreeCursor", "XLockDisplay", "XUnlockDisplay",
     };
     for (unsigned i = 0; i < sizeof zero / sizeof *zero; i++) hle_bind(zero[i], h_x_zero);
     hle_bind("XCreateBitmapFromData", h_x_cursor);
     hle_bind("XCreatePixmapCursor", h_x_cursor);
     hle_bind("XCreateFontCursor", h_x_cursor);
+    hle_bind("XCreatePixmapFromBitmapData", h_x_cursor);
 
     static const char *proto[] = { "_XReply", "_XSend", "_XRead", "_XReadPad", "_XEatData", "_XFlush" };
     for (unsigned i = 0; i < sizeof proto / sizeof *proto; i++) hle_bind(proto[i], h_x_protocol);

@@ -255,6 +255,10 @@ void       host_mouse_state(int *x, int *y, int *buttons);
 
 /* The host window and its GL context, shared by the GLX and GLUT seams. */
 void       host_window_hint(int w, int h);
+void       host_window_title(const char *title);
+void       host_pace_fps(int fps);
+void       host_gun_map(void (*fn)(int *x, int *y));   /* sight position -> the gun reading for it */
+void       segaapi_master_gain(float g);          /* the libsegaapi mix, before its limiter */                 /* hold the game to fps (it relied on vsync) */
 void       host_aim_default(double sx, double ox, double sy, double oy);  /* sight = s*pointer + o, set before the settings load */
 void       hud_widen_enable(float f, int (*anchored)(void));   /* hud_widen.c */
 void       hud_widen_layout(float lx, float lox, float ly, float loy, int vw);

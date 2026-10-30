@@ -1023,6 +1023,9 @@ static void h_xstat(CPU *c)  { xstat_common(c, ASTR(1), A32(2)); }
 static void h_lxstat(CPU *c) { xstat_common(c, ASTR(1), A32(2)); }
 
 static void h_access(CPU *c) { RET(_access(ASTR(0), AI32(1))); }
+/* utime: a file's timestamps, which nothing here reads back - success,
+ * without touching the player's game files */
+static void h_utime(CPU *c) { (void)c; RET(0); }
 
 /* strtol and strtoul are exported under these names with a `group` argument
  * that only affects locale-specific digit grouping, which no game uses. */
@@ -1104,6 +1107,7 @@ void hle_register_libc2(void)
     hle_bind("__xstat", h_xstat);
     hle_bind("__lxstat", h_lxstat);
     hle_bind("access", h_access);
+    hle_bind("utime", h_utime);
     hle_bind("__strtol_internal", h_strtol_internal);
     hle_bind("__strtoul_internal", h_strtoul_internal);
     hle_bind("__strtod_internal", h_strtod_internal);
@@ -1357,6 +1361,17 @@ static void h_localtime(CPU *c)
 static void h_fscanf(CPU *c);   /* defined below, bound here */
 
 /* libgcc: double -> unsigned long long, returned in edx:eax */
+/* float -> unsigned 64-bit, the same as __fixunsdfdi from a float */
+static void h_fixunssfdi(CPU *c)
+{
+    uint32_t bits = A32(0);
+    float f;
+    memcpy(&f, &bits, 4);
+    uint64_t r = f <= 0.0f ? 0 : (uint64_t)f;
+    c->eax = (uint32_t)r;
+    c->edx = (uint32_t)(r >> 32);
+}
+
 static void h_fixunsdfdi(CPU *c)
 {
     uint64_t bits = (uint64_t)A32(0) | ((uint64_t)A32(1) << 32);
@@ -1378,6 +1393,7 @@ static void h_sched_setaffinity(CPU *c) { RET(0); }
 void hle_register_libc3(void)
 {
     hle_bind("__fixunsdfdi", h_fixunsdfdi);
+    hle_bind("__fixunssfdi", h_fixunssfdi);
     hle_bind("sched_getaffinity", h_sched_getaffinity);
     hle_bind("sched_setaffinity", h_sched_setaffinity);
     hle_bind("vsprintf", h_vsprintf);

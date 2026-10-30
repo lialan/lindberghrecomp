@@ -106,6 +106,16 @@ static NSMenu *add_menu(NSString *title)
 /* SDL builds its own menu bar when Cocoa finishes launching, which can come
  * after the window is open and replaces whatever was there. So this is
  * called every so often and puts the menus back if they are gone. */
+/* The app's name in the menus SDL makes (Quit, Hide, About), which it takes
+ * from the process name when there is no bundle: the game's, not the
+ * executable's. Before the window opens. */
+void host_mac_app_name(const char *name)
+{
+    @autoreleasepool {
+        if (name && *name) [[NSProcessInfo processInfo] setProcessName:[NSString stringWithUTF8String:name]];
+    }
+}
+
 void host_menu_install(void)
 {
     @autoreleasepool {

@@ -84,9 +84,13 @@ static void h_mul44(CPU *c)
 /* _sMatrix44::setMul(const _sMatrix34 &, const _sMatrix34 &)
  *
  * A 3x4 has three rows; the fourth is the constant the original loads once
- * into xmm4 and stores straight into dst row 3. Reading it from the image
- * rather than assuming (0,0,0,1) keeps this honest if it is anything else. */
-#define MAT34_ROW3 0x88401D0u
+ * into xmm4 (movups xmm4, [addr] - its first instruction after push ebp) and
+ * stores straight into dst row 3. Its address differs between builds of the
+ * game (Let's Go Jungle's own builds put it at 0x88401d0 and 0x8837f70), so
+ * it is read from that instruction; (0,0,0,1) if the code is not as expected.
+ * A wrong row 3 drops the matrix's translation: the camera sat at the
+ * world's origin. */
+static uint32_t g_mat34_row3;
 
 static void h_mul34(CPU *c)
 {
@@ -94,7 +98,8 @@ static void h_mul34(CPU *c)
     float A[12], B[12], K[4], out[12];
     rd_rows(a, A, 3);
     rd_rows(b, B, 3);
-    rd_rows(MAT34_ROW3, K, 1);
+    if (g_mat34_row3) rd_rows(g_mat34_row3, K, 1);
+    else { K[0] = K[1] = K[2] = 0.0f; K[3] = 1.0f; }
     mul_rows(A, B, out, 3, K);
     if (!out[0] && !out[1] && !out[2]) {
         show("mul34 a", a, A, 3);
@@ -110,6 +115,13 @@ void hle_register_matrix(void)
 {
     int n = 0;
     n += guest_override("_ZN8_sSerial10_sMatrix446setMulERKS0_S2_", h_mul44);
+    {
+        uint32_t f = guest_symbol("_ZN8_sSerial10_sMatrix446setMulERKNS_10_sMatrix34ES3_");
+        const uint8_t *b = f ? (const uint8_t *)GP(f) : NULL;
+        /* 55 = push ebp; 0F 10 25 imm32 = movups xmm4, [imm32] */
+        if (b && b[0] == 0x55 && b[1] == 0x0F && b[2] == 0x10 && b[3] == 0x25)
+            g_mat34_row3 = (uint32_t)b[4] | (uint32_t)b[5] << 8 | (uint32_t)b[6] << 16 | (uint32_t)b[7] << 24;
+    }
     n += guest_override("_ZN8_sSerial10_sMatrix446setMulERKNS_10_sMatrix34ES3_", h_mul34);
     fprintf(stderr, "[matrix] %d of 2 multiplies overridden\n", n);
 }

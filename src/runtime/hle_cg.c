@@ -23,6 +23,13 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#define strdup _strdup
+#else
+#include <dirent.h>
+#include <sys/stat.h>
+#ifndef MAX_PATH
+#define MAX_PATH 1024
+#endif
 #endif
 
 #include "lindbergh_rt.h"
@@ -71,7 +78,7 @@ static char *strip_code(const char *src, size_t len)
 static Shader g_sh[MAX_SHADERS];
 static int    g_sh_n;
 static int    g_indexed;
-static int    g_match_body;      /* matched on shader body AND defines */
+static int    g_match_body;      /* matched on the shader's own body */
 static int    g_match_defines;   /* matched on a defines set unique to one shader */
 
 static char *read_all(const char *path, size_t *len_out)
@@ -89,7 +96,6 @@ static char *read_all(const char *path, size_t *len_out)
     return p;
 }
 
-#ifdef _WIN32
 /* Walk a directory tree for *.cg, and for each one remember the .asm_gl that
  * sits beside it. Depth-limited because the tree is shallow by construction
  * (shader/Cg/{vs,ps,inc}) and a runaway walk during startup is worse than a
@@ -101,20 +107,26 @@ static char *read_all(const char *path, size_t *len_out)
  * the shader - the part before it is shared by all of them, which is why
  * matching on the whole file found the wrong program nearly every time.
  *
- * Returns a pointer into src; strip_code is called on it with len 0 meaning
- * "to the terminator". */
-static const char *own_code(const char *src, size_t len)
+ * Taken from the text already stripped of comments and whitespace: an
+ * #include inside a comment (Let's Go Jungle keeps a commented-out DirectX one
+ * at the end of its shaders) is not one, and cutting there left the rest of
+ * the comment in the body, which then matched nothing. Returns a copy. */
+static char *own_body(const char *src, size_t len)
 {
-    const char *last = src;
-    for (const char *p = src; p && (size_t)(p - src) < len; ) {
-        const char *inc = strstr(p, "#include");
-        if (!inc || (size_t)(inc - src) >= len) break;
-        const char *nl = strchr(inc, '\n');
-        if (!nl) break;
-        last = nl + 1;
-        p = last;
+    char *all = strip_code(src, len);
+    if (!all) return NULL;
+    char *last = NULL;
+    for (char *p = strstr(all, "#include"); p; p = strstr(p + 1, "#include")) last = p;
+    if (!last) return all;
+    char *q = last + 8;
+    if (*q == '"' || *q == '<') {
+        char close = *q == '"' ? '"' : '>';
+        char *r = strchr(q + 1, close);
+        q = r ? r + 1 : q;
     }
-    return last;
+    char *body = strdup(q);
+    free(all);
+    return body;
 }
 
 /* cgc stamps its invocation into the output:
@@ -170,25 +182,44 @@ static void index_dir(const char *dir, int depth)
     char pat[MAX_PATH];
     snprintf(pat, sizeof pat, "%s/*", dir);
 
+#ifdef _WIN32
     WIN32_FIND_DATAA fd;
     HANDLE h = FindFirstFileA(pat, &fd);
     if (h == INVALID_HANDLE_VALUE) {
         if (depth == 0) fprintf(stderr, "[cg] cannot open %s\n", dir);
         return;
     }
-
     do {
-        if (fd.cFileName[0] == '.') continue;
+        const char *name = fd.cFileName;
+        int is_dir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+#else
+    (void)pat;
+    DIR *dp = opendir(dir);
+    if (!dp) {
+        if (depth == 0) fprintf(stderr, "[cg] cannot open %s\n", dir);
+        return;
+    }
+    struct dirent *de;
+    while ((de = readdir(dp))) {
+        const char *name = de->d_name;
+        int is_dir;
+        {
+            char p2[MAX_PATH]; struct stat st;
+            snprintf(p2, sizeof p2, "%s/%s", dir, name);
+            is_dir = stat(p2, &st) == 0 && S_ISDIR(st.st_mode);
+        }
+#endif
+        if (name[0] == '.') continue;
 
         char full[MAX_PATH];
-        snprintf(full, sizeof full, "%s/%s", dir, fd.cFileName);
+        snprintf(full, sizeof full, "%s/%s", dir, name);
 
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+        if (is_dir) {
             index_dir(full, depth + 1);
             continue;
         }
-        size_t n = strlen(fd.cFileName);
-        if (n < 4 || strcmp(fd.cFileName + n - 3, ".cg") != 0) continue;
+        size_t n = strlen(name);
+        if (n < 4 || strcmp(name + n - 3, ".cg") != 0) continue;
 
         char asm_path[MAX_PATH];
         snprintf(asm_path, sizeof asm_path, "%.*s.asm_gl",
@@ -198,8 +229,8 @@ static void index_dir(const char *dir, int depth)
         char *src = read_all(full, &slen);
         char *cmp = read_all(asm_path, &clen);
         if (src && cmp && g_sh_n < MAX_SHADERS) {
-            g_sh[g_sh_n].path     = _strdup(full);
-            g_sh[g_sh_n].body     = strip_code(own_code(src, slen), 0);
+            g_sh[g_sh_n].path     = strdup(full);
+            g_sh[g_sh_n].body     = own_body(src, slen);
             g_sh[g_sh_n].defines  = asm_defines(cmp);
             g_sh[g_sh_n].compiled = cmp;
             g_sh_n++;
@@ -208,9 +239,13 @@ static void index_dir(const char *dir, int depth)
             free(src);
             free(cmp);
         }
+#ifdef _WIN32
     } while (FindNextFileA(h, &fd));
-
     FindClose(h);
+#else
+    }
+    closedir(dp);
+#endif
 }
 
 static void index_shaders(void)
@@ -253,7 +288,6 @@ static void index_shaders(void)
     }
 }
 
-#endif
 
 static void h_cgCreateContext(CPU *c)  { index_shaders(); RET(CG_TOKEN_CTX); }
 static void h_cgIsContext(CPU *c)      { RET(A32(0) == CG_TOKEN_CTX); }
@@ -265,7 +299,7 @@ static void h_cgDestroyContext(CPU *c)
 }
 static void h_cgSetErrorCallback(CPU *c) { (void)c; }
 static void h_cgGetError(CPU *c)       { (void)c; RET(0); }           /* CG_NO_ERROR */
-static void h_cgGetErrorString(CPU *c) { RET(""); }
+static void h_cgGetErrorString(CPU *c) { RET(guest_strdup_static("")); }
 static void h_cgDestroyProgram(CPU *c) { (void)c; }
 
 /* Every profile the game asks about is one cgc already compiled for, and the
@@ -277,7 +311,6 @@ static void h_cgGLIsProfileSupported(CPU *c) { RET(1); }
  * failure value Cg uses. */
 static void h_cgCreateProgram(CPU *c)
 {
-#ifdef _WIN32
     index_shaders();
     const char *src = ASTR(2);
     if (src) {
@@ -289,18 +322,25 @@ static void h_cgCreateProgram(CPU *c)
         char *want_defs = args_defines(c, A32(5));
         char *whole = strip_code(src, strlen(src));
         int hit = -1;
+        size_t hit_len = 0;
         if (want_defs && whole) {
+            /* The longest body that ends the source is the shader: a short
+             * one can be the tail of a longer one. Where two files share a
+             * body, the one compiled with the define set asked for wins. */
+            size_t wl = strlen(whole);
             for (int i = 0; i < g_sh_n; i++) {
-                if (!g_sh[i].body || !g_sh[i].defines) continue;
-                if (strcmp(g_sh[i].defines, want_defs) != 0) continue;
-                size_t wl = strlen(whole), bl = strlen(g_sh[i].body);
-                if (bl && bl <= wl && memcmp(whole + wl - bl, g_sh[i].body, bl) == 0) {
-                    hit = i; g_match_body++;
-                    if (getenv("LINDBERGH_FBSTATS") && g_match_body <= 14)
-                        fprintf(stderr, "[cg] match %2d -> %s\n", g_match_body,
-                                g_sh[i].path ? g_sh[i].path : "?");
-                    break;      /* its own code, at the end */
-                }
+                if (!g_sh[i].body) continue;
+                size_t bl = strlen(g_sh[i].body);
+                if (!bl || bl > wl || memcmp(whole + wl - bl, g_sh[i].body, bl) != 0) continue;
+                int defs = g_sh[i].defines && strcmp(g_sh[i].defines, want_defs) == 0;
+                int hit_defs = hit >= 0 && g_sh[hit].defines && strcmp(g_sh[hit].defines, want_defs) == 0;
+                if (bl > hit_len || (bl == hit_len && defs && !hit_defs)) { hit = i; hit_len = bl; }
+            }
+            if (hit >= 0) {
+                g_match_body++;
+                if (getenv("LINDBERGH_FBSTATS") && g_match_body <= 14)
+                    fprintf(stderr, "[cg] match %2d -> %s\n", g_match_body,
+                            g_sh[hit].path ? g_sh[hit].path : "?");
             }
             /* A define set that matches exactly one shader needs no second
              * opinion - and preprocessing can rewrite a body past recognition. */
@@ -319,7 +359,7 @@ static void h_cgCreateProgram(CPU *c)
             static int reported;
             if (!reported && (g_match_body + g_match_defines) == 50) {
                 reported = 1;
-                fprintf(stderr, "[cg] first 50 matches: %d by body+defines, %d by defines alone\n",
+                fprintf(stderr, "[cg] first 50 matches: %d by body, %d by defines alone\n",
                         g_match_body, g_match_defines);
             }
             RET(hit + 1); return;
@@ -327,7 +367,16 @@ static void h_cgCreateProgram(CPU *c)
     }
     fprintf(stderr, "[cg] no precompiled match for a %zu-byte shader source\n",
             src ? strlen(src) : 0);
-#endif
+    {   /* LINDBERGH_CG_DUMP=dir: write each unmatched source there */
+        static int n;
+        const char *d = getenv("LINDBERGH_CG_DUMP");
+        if (d && *d && src) {
+            char path[MAX_PATH];
+            snprintf(path, sizeof path, "%s/unmatched_%03d.cg", d, n++);
+            FILE *f = fopen(path, "wb");
+            if (f) { fputs(src, f); fclose(f); }
+        }
+    }
     RET(0);
 }
 
@@ -336,8 +385,11 @@ static void h_cgCreateProgram(CPU *c)
 static void h_cgGetProgramString(CPU *c)
 {
     int i = (int)A32(0) - 1;
-    if (i >= 0 && i < g_sh_n) { RET(g_sh[i].compiled); return; }
-    RET("");
+    /* copied into guest memory once per program: the game may ask again */
+    static uint32_t copy[MAX_SHADERS + 1];
+    if (i < 0 || i >= g_sh_n) i = MAX_SHADERS;
+    if (!copy[i]) copy[i] = guest_strdup_static(i < MAX_SHADERS ? g_sh[i].compiled : "");
+    RET(copy[i]);
 }
 
 void hle_register_cg(void)

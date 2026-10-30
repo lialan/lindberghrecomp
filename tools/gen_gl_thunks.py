@@ -38,6 +38,7 @@ MANUAL = {
     "glBindProgramARB", "glDeleteProgramsARB", "glProgramEnvParameter4fvARB",
     "glProgramLocalParameter4fvARB", "glProgramLocalParameter4fARB",
     "glEnable", "glDisable", "glIsEnabled", "glPushAttrib", "glPopAttrib",
+    "glProgramParameters4fvNV",
 }
 
 # Calls that draw: the assembly-program state is turned into a GLSL program

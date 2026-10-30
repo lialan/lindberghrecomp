@@ -257,6 +257,28 @@ static void h_glGetString(CPU *c)
  * One handle space covers programs and shaders in ARB_shader_objects; core
  * splits them, and glIsProgram tells which one a handle is. */
 static void h_glCreateProgramObjectARB(CPU *c) { RET(glCreateProgram()); }
+/* generic attribute arrays: arbprog reads the classic attribute NVIDIA
+ * aliased onto an index while its generic array is off */
+static void h_glEnableVertexAttribArrayARB(CPU *c)  { glEnableVertexAttribArray(A32(0)); arb_attrib_array(A32(0), 1); }
+static void h_glDisableVertexAttribArrayARB(CPU *c) { glDisableVertexAttribArray(A32(0)); arb_attrib_array(A32(0), 0); }
+/* glGetHandleARB(GL_PROGRAM_OBJECT_ARB): the program in use. Let's Go Jungle
+ * looks it up to decide ARB_shader_objects is there at all. */
+static void h_glGetHandleARB(CPU *c)
+{
+    GLint p = 0;
+    if (A32(0) == 0x8B40) glGetIntegerv(GL_CURRENT_PROGRAM, &p);
+    RET((uint32_t)p);
+}
+/* ARB_color_buffer_float: clamping is what the game asks for anyway, and
+ * what a GL without the call does */
+static void h_glClampColorARB(CPU *c)
+{
+#if defined(__APPLE__)
+    glClampColorARB(A32(0), A32(1));
+#else
+    (void)c;
+#endif
+}
 static void h_glCreateShaderObjectARB(CPU *c)  { RET(glCreateShader(A32(0))); }
 static void h_glAttachObjectARB(CPU *c)        { glAttachShader(A32(0), A32(1)); }
 static void h_glUseProgramObjectARB(CPU *c)    { arb_use_glsl(A32(0)); glUseProgram(A32(0)); }
@@ -532,6 +554,71 @@ static void h_glProgramEnvParameter4fvARB(CPU *c)
     const float *v = (const float *)APTR(2);
     if (v) { arb_env(A32(0), A32(1), v); glProgramEnvParameter4fvARB(A32(0), A32(1), v); }
 }
+/* NV_vertex_program's parameter calls set the same registers as ARB's env
+ * parameters (the target is the same number): Let's Go Jungle uploads its
+ * matrices and lights this way, many registers at once. */
+static void nv_params(GLenum target, GLuint index, GLuint n, const float *v)
+{
+    for (GLuint i = 0; v && i < n; i++) {
+        arb_env(target, index + i, v + 4 * i);
+#ifndef LINDBERGH_GL4ES
+        glProgramEnvParameter4fvARB(target, index + i, v + 4 * i);
+#endif
+    }
+}
+/* Every other spelling of the env and local parameter calls (no ARB suffix,
+ * f or d, one or many registers) reaches the same state; a game that fetched
+ * one by name went straight to the driver before, which the translated
+ * programs never see. Let's Go Jungle set its matrices' last column so. */
+static double arg_d(CPU *c, int i)
+{
+    uint64_t b = (uint64_t)A32(i) | (uint64_t)A32(i + 1) << 32; double d; memcpy(&d, &b, 8); return d;
+}
+static void params_set(GLenum target, GLuint index, GLuint n, const float *v, int local)
+{
+    for (GLuint i = 0; v && i < n; i++) {
+        if (local) arb_local(target, index + i, v + 4 * i); else arb_env(target, index + i, v + 4 * i);
+#ifndef LINDBERGH_GL4ES
+        if (local) glProgramLocalParameter4fvARB(target, index + i, v + 4 * i);
+        else glProgramEnvParameter4fvARB(target, index + i, v + 4 * i);
+#endif
+    }
+}
+static void p4f(CPU *c, int local)
+{
+    float v[4] = { gl_arg_f(c, 2), gl_arg_f(c, 3), gl_arg_f(c, 4), gl_arg_f(c, 5) };
+    params_set(A32(0), A32(1), 1, v, local);
+}
+static void p4d(CPU *c, int local)
+{
+    float v[4] = { (float)arg_d(c, 2), (float)arg_d(c, 4), (float)arg_d(c, 6), (float)arg_d(c, 8) };
+    params_set(A32(0), A32(1), 1, v, local);
+}
+static void p4dv(CPU *c, int local)
+{
+    const double *d = (const double *)APTR(2);
+    if (!d) return;
+    float v[4] = { (float)d[0], (float)d[1], (float)d[2], (float)d[3] };
+    params_set(A32(0), A32(1), 1, v, local);
+}
+static void h_env4f(CPU *c)   { p4f(c, 0); }
+static void h_env4fv(CPU *c)  { params_set(A32(0), A32(1), 1, (const float *)APTR(2), 0); }
+static void h_env4d(CPU *c)   { p4d(c, 0); }
+static void h_env4dv(CPU *c)  { p4dv(c, 0); }
+static void h_envs4fv(CPU *c) { params_set(A32(0), A32(1), A32(2), (const float *)APTR(3), 0); }
+static void h_loc4f(CPU *c)   { p4f(c, 1); }
+static void h_loc4fv(CPU *c)  { params_set(A32(0), A32(1), 1, (const float *)APTR(2), 1); }
+static void h_loc4d(CPU *c)   { p4d(c, 1); }
+static void h_loc4dv(CPU *c)  { p4dv(c, 1); }
+static void h_locs4fv(CPU *c) { params_set(A32(0), A32(1), A32(2), (const float *)APTR(3), 1); }
+
+static void h_glProgramParameters4fvNV(CPU *c) { nv_params(A32(0), A32(1), A32(2), (const float *)APTR(3)); }
+static void h_glProgramParameter4fvNV(CPU *c)  { nv_params(A32(0), A32(1), 1, (const float *)APTR(2)); }
+static void h_glProgramParameter4fNV(CPU *c)
+{
+    float v[4] = { gl_arg_f(c, 2), gl_arg_f(c, 3), gl_arg_f(c, 4), gl_arg_f(c, 5) };
+    nv_params(A32(0), A32(1), 1, v);
+}
 static void h_glProgramLocalParameter4fvARB(CPU *c)
 {
     const float *v = (const float *)APTR(2);
@@ -662,6 +749,34 @@ void hle_register_gl(void)
     hle_bind("glUnmapBufferARB", h_glUnmapBufferARB); gl_bind_named("glUnmapBufferARB", h_glUnmapBufferARB);
     hle_bind("glGetString", h_glGetString); gl_bind_named("glGetString", h_glGetString);
     hle_bind("glCreateProgramObjectARB", h_glCreateProgramObjectARB); gl_bind_named("glCreateProgramObjectARB", h_glCreateProgramObjectARB);
+    {
+        static const char *const en[] = { "glEnableVertexAttribArrayARB", "glEnableVertexAttribArray" },
+                                 *const dis[] = { "glDisableVertexAttribArrayARB", "glDisableVertexAttribArray" };
+        for (int i = 0; i < 2; i++) {
+            hle_bind(en[i], h_glEnableVertexAttribArrayARB); gl_bind_named(en[i], h_glEnableVertexAttribArrayARB);
+            hle_bind(dis[i], h_glDisableVertexAttribArrayARB); gl_bind_named(dis[i], h_glDisableVertexAttribArrayARB);
+        }
+    }
+    {
+        static const struct { const char *n; HleHandler f; } pp[] = {
+            { "glProgramEnvParameter4f", h_env4f }, { "glProgramEnvParameter4fARB", h_env4f },
+            { "glProgramEnvParameter4fv", h_env4fv },
+            { "glProgramEnvParameter4d", h_env4d }, { "glProgramEnvParameter4dARB", h_env4d },
+            { "glProgramEnvParameter4dv", h_env4dv }, { "glProgramEnvParameter4dvARB", h_env4dv },
+            { "glProgramEnvParameters4fvEXT", h_envs4fv }, { "glProgramEnvParameters4fvNV", h_envs4fv },
+            { "glProgramLocalParameter4f", h_loc4f },
+            { "glProgramLocalParameter4fv", h_loc4fv },
+            { "glProgramLocalParameter4d", h_loc4d }, { "glProgramLocalParameter4dARB", h_loc4d },
+            { "glProgramLocalParameter4dv", h_loc4dv }, { "glProgramLocalParameter4dvARB", h_loc4dv },
+            { "glProgramLocalParameters4fvEXT", h_locs4fv }, { "glProgramLocalParameters4fvNV", h_locs4fv },
+        };
+        for (unsigned i = 0; i < sizeof pp / sizeof *pp; i++) { hle_bind(pp[i].n, pp[i].f); gl_bind_named(pp[i].n, pp[i].f); }
+    }
+    hle_bind("glProgramParameters4fvNV", h_glProgramParameters4fvNV); gl_bind_named("glProgramParameters4fvNV", h_glProgramParameters4fvNV);
+    hle_bind("glProgramParameter4fvNV", h_glProgramParameter4fvNV); gl_bind_named("glProgramParameter4fvNV", h_glProgramParameter4fvNV);
+    hle_bind("glProgramParameter4fNV", h_glProgramParameter4fNV); gl_bind_named("glProgramParameter4fNV", h_glProgramParameter4fNV);
+    hle_bind("glGetHandleARB", h_glGetHandleARB); gl_bind_named("glGetHandleARB", h_glGetHandleARB);
+    hle_bind("glClampColorARB", h_glClampColorARB); gl_bind_named("glClampColorARB", h_glClampColorARB);
     hle_bind("glCreateShaderObjectARB", h_glCreateShaderObjectARB); gl_bind_named("glCreateShaderObjectARB", h_glCreateShaderObjectARB);
     hle_bind("glAttachObjectARB", h_glAttachObjectARB); gl_bind_named("glAttachObjectARB", h_glAttachObjectARB);
     hle_bind("glUseProgramObjectARB", h_glUseProgramObjectARB); gl_bind_named("glUseProgramObjectARB", h_glUseProgramObjectARB);
@@ -759,9 +874,6 @@ int gl_token_count(void) { return g_tok_n; }
 /* A build with no generated thunks (the toolkit self-check) still links. */
 __attribute__((weak)) void gl_register_generated(void) { }
 
-/* Cg (hle_cg.c) is Windows-only so far; this game does not use it. */
-void hle_register_cg(void) { }
-
 /* ---- LINDBERGH_GL_TRACE=N: the arguments too, for the calls that place
  * things on the screen (matrices, viewport, immediate vertices). Each wraps
  * the handler already bound. */
@@ -782,6 +894,9 @@ WRAP(glScissor, fprintf(stderr, "[gla] glScissor %d %d %d %d\n", (int)A32(0), (i
 WRAP(glOrtho, fprintf(stderr, "[gla] glOrtho %g %g %g %g %g %g\n", targd(c,0), targd(c,2), targd(c,4), targd(c,6), targd(c,8), targd(c,10)))
 WRAP(glVertex3f, fprintf(stderr, "[gla] glVertex3f %g %g %g\n", targf(c,0), targf(c,1), targf(c,2)))
 WRAP(glBegin, fprintf(stderr, "[gla] glBegin %#x\n", A32(0)))
+WRAP(glBindFramebufferEXT, fprintf(stderr, "[gla] glBindFramebufferEXT %#x %u\n", A32(0), A32(1)))
+WRAP(glBindTexture, fprintf(stderr, "[gla] glBindTexture %#x %u\n", A32(0), A32(1)))
+WRAP(glClearColor, fprintf(stderr, "[gla] glClearColor %g %g %g %g\n", targf(c,0), targf(c,1), targf(c,2), targf(c,3)))
 WRAP(glVertex3fv, { const float *v = (const float *)APTR(0); fprintf(stderr, "[gla] glVertex3fv %g %g %g\n", v[0], v[1], v[2]); })
 WRAP(glLoadMatrixf, { const float *m = (const float *)APTR(0);
     fprintf(stderr, "[gla] glLoadMatrixf"); for (int i = 0; i < 16; i++) fprintf(stderr, " %g", m[i]); fprintf(stderr, "\n"); })
@@ -797,6 +912,7 @@ void gl_arg_trace_install(void)
         HOOK(glMatrixMode) HOOK(glLoadIdentity) HOOK(glPushMatrix) HOOK(glPopMatrix) HOOK(glScalef)
         HOOK(glTranslatef) HOOK(glViewport) HOOK(glScissor) HOOK(glOrtho) HOOK(glVertex3f) HOOK(glBegin)
         HOOK(glVertex3fv) HOOK(glLoadMatrixf) HOOK(glMultMatrixf)
+        HOOK(glBindFramebufferEXT) HOOK(glBindTexture) HOOK(glClearColor)
 #undef HOOK
     }
 }

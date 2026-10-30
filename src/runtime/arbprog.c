@@ -52,6 +52,9 @@ extern int gl4es_mv_trace;
 #define MAX_ENV   256
 #define MAX_LOCAL 96
 
+/* which generic attribute arrays the game has enabled (u_gen) */
+static float g_gen_on[16];
+
 /* ------------------------------------------------------------------------ */
 /* program state the driver no longer holds                                  */
 /* ------------------------------------------------------------------------ */
@@ -128,6 +131,7 @@ typedef struct {
     int     env_hi, local_hi;          /* highest index read, -1 none */
     int     tex_target[16];            /* 0 none, else 1=1D 2=2D 3=3D 4=CUBE 5=RECT */
     int     attrib_used[16];
+    int     gen_alias;                 /* reads an attribute NVIDIA aliases (u_gen) */
     int     pos_invariant, fog_mode;   /* fog: 0 none 1 linear 2 exp 3 exp2 */
     int     writes_depth;
     char    err[200];
@@ -254,6 +258,24 @@ static int binding_expr(Tr *t, const char *b, char *out, size_t n)
         if (sscanf(b, "vertex.attrib[%d%c", &i, &c) == 2 && c == ']' && i < 16) {
             if (i == 0) { snprintf(out, n, "gl_Vertex"); return 1; }
             t->attrib_used[i] = 1;
+            /* NVIDIA's driver aliases generic attributes onto the classic
+             * ones (2 normal, 3 colour, 4 secondary colour, 5 fog, 8-15 the
+             * texture coordinates), and Cg's NV profiles read texcoords as
+             * vertex.attrib[8]: Let's Go Jungle sets them with glTexCoord and
+             * glMultiTexCoord. GLSL keeps the two apart, so the program reads
+             * the generic one while the game has its array enabled (u_gen,
+             * arb_attrib_array) and the classic one otherwise. */
+            static const char *const classic[16] = {
+                NULL, NULL, "vec4(gl_Normal, 1.0)", "gl_Color", "gl_SecondaryColor",
+                "vec4(gl_FogCoord, 0.0, 0.0, 1.0)", NULL, NULL,
+                "gl_MultiTexCoord0", "gl_MultiTexCoord1", "gl_MultiTexCoord2", "gl_MultiTexCoord3",
+                "gl_MultiTexCoord4", "gl_MultiTexCoord5", "gl_MultiTexCoord6", "gl_MultiTexCoord7",
+            };
+            if (classic[i]) {
+                t->gen_alias = 1;
+                snprintf(out, n, "(u_gen[%d] > 0.5 ? va_%d : %s)", i, i, classic[i]);
+                return 1;
+            }
             snprintf(out, n, "va_%d", i); return 1;
         }
     } else {
@@ -313,11 +335,29 @@ static int output_expr(Tr *t, const char *b, char *out, size_t n)
     return fail(t, "output %s", b);
 }
 
+/* The next item of a comma list, splitting only at the top level: an item
+ * can be a constant vector, "{ 1.442695, 0.059683103, 1.5 }", whose own
+ * commas are not separators. NULL at the end. */
+static char *next_item(char **cur)
+{
+    char *s = *cur;
+    if (!s || !*s) return NULL;
+    int depth = 0;
+    char *q = s;
+    for (; *q; q++) {
+        if (*q == '{') depth++;
+        else if (*q == '}') depth--;
+        else if (*q == ',' && depth == 0) break;
+    }
+    if (*q) { *q = 0; *cur = q + 1; } else *cur = q;
+    return s;
+}
+
 /* PARAM name[N] = { ... } : alias a contiguous env range or a single matrix,
  * otherwise build a local array. */
 static int declare_param_array(Tr *t, const char *name, const char *init)
 {
-    char tmp[1024];
+    char tmp[8192];
     snprintf(tmp, sizeof tmp, "%s", init);
     char *s = trim(tmp);
     if (*s == '{') s++;
@@ -350,13 +390,18 @@ static int declare_param_array(Tr *t, const char *name, const char *init)
     y->base = 0;
     int k = 0;
     Buf init_code = {0};
-    char *save = NULL;
-    for (char *item = strtok_r(s, ",", &save); item; item = strtok_r(NULL, ",", &save)) {
+    char *cur = s;
+    for (char *item; (item = next_item(&cur)); ) {
         item = trim(item);
         if (sscanf(item, "program.env[%d..%d%c", &lo, &hi, &c) == 3 && c == ']') {
             for (int j = lo; j <= hi; j++) {
                 bput(&init_code, "  pa_%s[%d] = %s_env[%d];\n", name, k++, t->stage ? "f" : "v", j);
                 if (j > t->env_hi) t->env_hi = j;
+            }
+        } else if (sscanf(item, "program.local[%d..%d%c", &lo, &hi, &c) == 3 && c == ']') {
+            for (int j = lo; j <= hi; j++) {
+                bput(&init_code, "  pa_%s[%d] = %s_loc[%d];\n", name, k++, t->stage ? "f" : "v", j);
+                if (j > t->local_hi) t->local_hi = j;
             }
         } else if (!strncmp(item, "state.matrix.", 13)) {
             char arr[32];
@@ -559,7 +604,7 @@ static const char *const k_ops[] = {
     "ABS","ADD","ARL","ARR","ARA","BRA","CAL","CMP","COS","DP3","DP4","DPH","DST","EX2",
     "EXP","FLR","FRC","KIL","LG2","LIT","LOG","LRP","MAD","MAX","MIN","MOV","MUL","POW",
     "RCC","RCP","RET","RSQ","SCS","SEQ","SFL","SGE","SGT","SIN","SLE","SLT","SNE","SSG",
-    "STR","SUB","SWZ","TEX","TXB","TXP","XPD","END", NULL
+    "STR","SUB","SWZ","TEX","TXB","TXP","XPD","NRM","END", NULL
 };
 
 static void block_split(Tr *t)
@@ -599,6 +644,20 @@ static int emit_instr(Tr *t, char *stmt)
         op[strlen(op) - 1] = 0;
         for (int i = 0; k_ops[i]; i++) if (!strcmp(op, k_ops[i])) known = 1;
         if (known) setcc = 1;
+        else op[strlen(op)] = 'C';
+    }
+    /* NV_fragment_program precision: MULR, MOVH, ADDXC - R (fp32), H (fp16)
+     * and X (fixed point) all compute in full precision here */
+    if (!known) {
+        size_t L = strlen(op);
+        int cc = L > 4 && op[L - 1] == 'C';
+        char last = op[L - 1 - cc];
+        if (L - cc > 3 && (last == 'R' || last == 'H' || last == 'X')) {
+            char base[32];
+            snprintf(base, sizeof base, "%.*s", (int)(L - 1 - cc), op);
+            for (int i = 0; k_ops[i]; i++) if (!strcmp(base, k_ops[i])) known = 1;
+            if (known) { snprintf(op, sizeof op, "%s", base); setcc = cc; }
+        }
     }
     if (!known) return fail(t, "opcode %s", opw);
 
@@ -721,6 +780,7 @@ static int emit_instr(Tr *t, char *stmt)
     else if (!strcmp(op, "CMP")) snprintf(r, sizeof r,
         "mix(%s, %s, vec4(lessThan(%s, vec4(0.0))))", X(2), X(1), X(0));
     else if (!strcmp(op, "XPD")) snprintf(r, sizeof r, "vec4(cross(%s.xyz, %s.xyz), 1.0)", X(0), X(1));
+    else if (!strcmp(op, "NRM")) snprintf(r, sizeof r, "vec4(normalize(%s.xyz), 1.0)", X(0));
     else if (!strcmp(op, "ARL") || !strcmp(op, "ARR") || !strcmp(op, "ARA")) {
         if (!d.addr) return fail(t, "%s to a non-address register", op);
         const char *fn = !strcmp(op, "ARR") ? "floor(%s + 0.5)" : "floor(%s)";
@@ -747,15 +807,21 @@ static int emit_instr(Tr *t, char *stmt)
         if (sscanf(tx, " texture[%d]", &unit) != 1) unit = 0;
         const char *tg = a[3] ? a[3] : "2D";
         int target = !strcmp(tg, "1D") ? 1 : !strcmp(tg, "2D") ? 2 : !strcmp(tg, "3D") ? 3 :
-                     !strcmp(tg, "CUBE") ? 4 : !strcmp(tg, "RECT") ? 5 : 0;
+                     !strcmp(tg, "CUBE") ? 4 : !strcmp(tg, "RECT") ? 5 :
+                     !strcmp(tg, "SHADOW2D") ? 6 : 0;   /* ARB_fragment_program_shadow: a depth compare */
         if (!target || unit < 0 || unit >= 16) return fail(t, "texture %s %s", tx, tg);
+        /* SHADOW2D on a unit the program also reads as 2D: the texture has no
+         * depth compare (Let's Go Jungle's exposure reads its luminance
+         * texture both ways), and NVIDIA then returns the texel itself */
+        int shadow_as_2d = target == 6 && t->tex_target[unit] == 2;
+        if (shadow_as_2d) target = 2;
         if (t->tex_target[unit] && t->tex_target[unit] != target)
             return fail(t, "texture unit %d used with two targets", unit);
         t->tex_target[unit] = target;
         int proj = !strcmp(op, "TXP"), bias = !strcmp(op, "TXB");
-        static const char *const fnb[] = { "", "texture1D", "texture2D", "texture3D", "textureCube", "texture2DRect" };
-        static const char *const sw[] = { "", ".x", ".xy", ".xyz", ".xyz", ".xy" };
-        static const char *const sm[] = { "", "s1_", "s2_", "s3_", "sc_", "sr_" };
+        static const char *const fnb[] = { "", "texture1D", "texture2D", "texture3D", "textureCube", "texture2DRect", "shadow2D" };
+        static const char *const sw[] = { "", ".x", ".xy", ".xyz", ".xyz", ".xy", ".xyz" };
+        static const char *const sm[] = { "", "s1_", "s2_", "s3_", "sc_", "sr_", "ss_" };
         if (target == 5) {
             /* Rectangle textures are sampled in texels; the game's render
              * targets are, and stereo.c draws them at the eye's size. */
@@ -773,6 +839,8 @@ static int emit_instr(Tr *t, char *stmt)
             snprintf(r, sizeof r, "%sProj(%s%d, %s)", fnb[target], sm[target], unit, X(0));
         else if (bias)
             snprintf(r, sizeof r, "%s(%s%d, %s%s, %s.w)", fnb[target], sm[target], unit, X(0), sw[target], X(0));
+        else if (shadow_as_2d)
+            snprintf(r, sizeof r, "texture2D(s2_%d, %s.xy).xxxx", unit, X(0));
         else
             snprintf(r, sizeof r, "%s(%s%d, %s%s)", fnb[target], sm[target], unit, X(0), sw[target]);
     } else return fail(t, "opcode %s not translated", op);
@@ -818,6 +886,12 @@ static int split_program(char *src, Stmt *st, int maxst)
             x->labels[x->nl++] = s;
             s = trim(colon + 1);
         }
+        /* NV_fragment_program2's precision on temporaries ("SHORT TEMP H0"):
+         * everything is full precision here */
+        if ((!strncmp(s, "SHORT", 5) || !strncmp(s, "LONG", 4))) {
+            char *q = trim(s + (s[0] == 'S' ? 5 : 4));
+            if (!strncmp(q, "TEMP", 4) && isspace((unsigned char)q[4])) s = q;
+        }
         x->text = s;
         n++;
     }
@@ -841,6 +915,7 @@ static int depth_passthrough(const char *body)
     return writes > 0 && writes == copies;
 }
 
+static GLuint g_tr_id;      /* the program being translated, for LINDBERGH_FP_ONLY */
 static char *translate(int stage, const char *src_in, Tr *t)
 {
     memset(t, 0, sizeof *t);
@@ -1003,14 +1078,16 @@ static char *translate(int stage, const char *src_in, Tr *t)
         /* multiview: one matrix per view, and render targets as two layers */
         if (!stage && !t->nmat && !t->pos_invariant) bput(&g, gl4es_mv_shaders ? "uniform mat4 u_reproj[2];\n" : "uniform mat4 u_reproj;\n");
         const char *sty[] = { "", "sampler1D s1_", "sampler2D s2_", "sampler3D s3_",
-                              "samplerCube sc_", gl4es_mv_shaders ? "sampler2DArray sr_" : "sampler2D sr_" };
+                              "samplerCube sc_", gl4es_mv_shaders ? "sampler2DArray sr_" : "sampler2D sr_",
+                              "sampler2DShadow ss_" };
 #else
         if (!stage && !t->nmat && !t->pos_invariant) bput(&g, "uniform mat4 u_reproj;\n");
         static const char *const sty[] = { "", "sampler1D s1_", "sampler2D s2_", "sampler3D s3_",
-                                           "samplerCube sc_", "sampler2DRect sr_" };
+                                           "samplerCube sc_", "sampler2DRect sr_", "sampler2DShadow ss_" };
 #endif
         for (int u = 0; u < 16; u++) if (t->tex_target[u]) bput(&g, "uniform %s%d;\n", sty[t->tex_target[u]], u);
         for (int a = 1; a < 16; a++) if (t->attrib_used[a]) bput(&g, "attribute vec4 va_%d;\n", a);
+        if (!stage && t->gen_alias) bput(&g, "uniform float u_gen[16];\n");
         bput(&g, "vec4 arb_lit(vec4 s) {\n"
                  "  float d = max(s.x, 0.0), sp = max(s.y, 0.0), e = clamp(s.w, -128.0, 128.0);\n"
                  "  return vec4(1.0, d, s.x > 0.0 ? (sp > 0.0 ? pow(sp, e) : 0.0) : 0.0, 1.0);\n}\n");
@@ -1047,7 +1124,26 @@ static char *translate(int stage, const char *src_in, Tr *t)
                                 "exp(-(gl_Fog.density * gl_FogFragCoord) * (gl_Fog.density * gl_FogFragCoord))";
                 bput(&g, "  o_col.rgb = mix(gl_Fog.color.rgb, o_col.rgb, clamp(%s, 0.0, 1.0));\n", f);
             }
-            bput(&g, "  gl_FragColor = o_col;\n");
+            {   /* LINDBERGH_FP_SOLID=1: every fragment flat green - do the
+                 * draws rasterise at all? */
+                static int mode = -1;
+                if (mode < 0) { const char *v = getenv("LINDBERGH_FP_SOLID"); mode = v && *v ? atoi(v) : 0; }
+                /* LINDBERGH_FP_ONLY=id: only that fragment program */
+                const char *only = getenv("LINDBERGH_FP_ONLY");
+                int solid = only && *only && (GLuint)atoi(only) != g_tr_id ? 0 : mode;
+                if (solid == 1) bput(&g, "  gl_FragColor = vec4(0.0, 1.0, 0.0, 1.0);\n");
+                /* =2: unit 0 fetched raw at texcoord 0 - is the texture black? */
+                else if (solid == 2 && t->tex_target[0] == 2) bput(&g, "  gl_FragColor = vec4(texture2D(s2_0, gl_TexCoord[0].xy).rgb, 1.0);\n");
+                else if (solid == 2 && t->tex_target[0] == 5) bput(&g, "  gl_FragColor = vec4(texture2DRect(sr_0, gl_TexCoord[0].xy).rgb, 1.0);\n");
+                /* =3: texcoord 0 as colour - are the coordinates zero? */
+                else if (solid == 3) bput(&g, "  gl_FragColor = vec4(fract(gl_TexCoord[0].xy), 0.5, 1.0);\n");
+                /* =9: the program's id as a colour (r = id % 8, g = id / 8 % 8, b = id / 64 % 8, in sevenths) */
+                else if (solid == 9) bput(&g, "  gl_FragColor = vec4(%d.0 / 7.0, %d.0 / 7.0, %d.0 / 7.0, 1.0);\n", (int)(g_tr_id % 8), (int)(g_tr_id / 8 % 8), (int)(g_tr_id / 64 % 8));
+                /* =1N: unit 0 at texcoord N; =2N: texcoord N itself as colour */
+                else if (solid >= 10 && solid < 18 && t->tex_target[0] == 2) bput(&g, "  gl_FragColor = vec4(texture2D(s2_0, gl_TexCoord[%d].xy).rgb, 1.0);\n", solid - 10);
+                else if (solid >= 20 && solid < 28) bput(&g, "  gl_FragColor = vec4(gl_TexCoord[%d].xyz, 1.0);\n", solid - 20);
+                else bput(&g, "  gl_FragColor = o_col;\n");
+            }
             /* The game's programs write the depth they were given
              * (MOV result.depth.z, fragment.position.z): that changes nothing
              * but costs the GPU its early depth test, and through mediump on
@@ -1078,7 +1174,7 @@ typedef struct {
     int    ok;
     MatRef mat[2][16]; int nmat[2];
     int    env_hi[2], local_hi[2];
-    GLint  u_env[2], u_loc[2], u_mat[2][16], u_rect, u_reproj;
+    GLint  u_env[2], u_loc[2], u_mat[2][16], u_rect, u_reproj, u_gen;
     GLint  n_rect;                          /* u_rect_norm's length as the driver keeps it */
     unsigned rect_units;                /* texture units sampled as rectangles */
     unsigned up_env[2], up_loc[2];      /* generations last uploaded */
@@ -1229,6 +1325,7 @@ static Linked *link_pair(GLuint vid, GLuint fid)
         if (!pp[st]) continue;
         if (pp[st]->failed || !pp[st]->src) { l->ok = 0; return l; }
         static Tr t;
+        g_tr_id = ids[st];
         char *glsl = translate(st, pp[st]->src, &t);
         if (!glsl) {
             pp[st]->failed = 1;
@@ -1349,15 +1446,16 @@ static Linked *link_pair(GLuint vid, GLuint fid)
     l->u_rect = glGetUniformLocation(l->prog, "u_rect_scale");
 #endif
     l->u_reproj = glGetUniformLocation(l->prog, "u_reproj");
+    l->u_gen = glGetUniformLocation(l->prog, "u_gen");
 #ifdef LINDBERGH_GL4ES
     if (gl4es_mv_shaders && l->u_reproj >= 0) {
         static int shown;
         if (shown++ < 5) fprintf(stderr, "[arbprog] u_reproj at %d, %d matrices as the driver keeps it\n", l->u_reproj, array_len(l->prog, "u_reproj", 2));
     }
 #endif
-    static const char *const pre[] = { "s1_", "s2_", "s3_", "sc_", "sr_" };
+    static const char *const pre[] = { "s1_", "s2_", "s3_", "sc_", "sr_", "ss_" };
     for (int u = 0; u < 16; u++)
-        for (int k = 0; k < 5; k++) {
+        for (int k = 0; k < 6; k++) {
             char nm[16]; snprintf(nm, sizeof nm, "%s%d", pre[k], u);
             GLint loc = glGetUniformLocation(l->prog, nm);
             if (loc >= 0) glUniform1i(loc, u);
@@ -1432,8 +1530,15 @@ static void stack_matrix(int which, int index, float *m)
     }
 }
 
+
+void arb_attrib_array(unsigned index, int on)
+{
+    if (index < 16) g_gen_on[index] = on ? 1.0f : 0.0f;
+}
+
 static void upload(Linked *l)
 {
+    if (l->u_gen >= 0) glUniform1fv(l->u_gen, 16, g_gen_on);
 #ifdef LINDBERGH_GL4ES
     if (l->u_reproj >= 0 && gl4es_mv_shaders) {
         float m[32];
@@ -1695,16 +1800,33 @@ static void before_draw(void)
             glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_INTERNAL_FORMAT, &ifmt);
             glGetIntegerv(GL_BLEND_SRC, &bs); glGetIntegerv(GL_BLEND_DST, &bd); bl = glIsEnabled(GL_BLEND);
             at = glIsEnabled(GL_ALPHA_TEST); glGetTexEnviv(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, &tenv);
+            {
+                GLint mf = 0, maxl = 0, base = 0, nl = 0, lw = 1;
+                glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, &mf);
+                glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, &maxl);
+                glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, &base);
+                for (nl = 0; nl < 16 && lw > 0; nl++) { lw = 0; glGetTexLevelParameteriv(GL_TEXTURE_2D, nl, GL_TEXTURE_WIDTH, &lw); }
+                for (int e = 0; e < 48; e += 4)
+                    fprintf(stderr, "[dumpvp]   env %2d: %g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g %g %g\n", e,
+                            g_env[0][e][0], g_env[0][e][1], g_env[0][e][2], g_env[0][e][3],
+                            g_env[0][e+1][0], g_env[0][e+1][1], g_env[0][e+1][2], g_env[0][e+1][3],
+                            g_env[0][e+2][0], g_env[0][e+2][1], g_env[0][e+2][2], g_env[0][e+2][3],
+                            g_env[0][e+3][0], g_env[0][e+3][1], g_env[0][e+3][2], g_env[0][e+3][3]);
+                fprintf(stderr, "[dumpvp]   tex0 min filter %#x base %d max level %d, levels present %d\n", mf, base, maxl, nl - 1);
+            }
             fprintf(stderr, "[dumpvp] vp %u fp %u (enabled %d/%d) tex0 %d %dx%d ifmt %#x blend %d %#x/%#x alphatest %d texenv %#x 2D %d\n",
                     vid, fid, g_enabled[0], g_enabled[1], tex, w, h, ifmt, bl, bs, bd, at, tenv, glIsEnabled(GL_TEXTURE_2D));
             if (w > 0 && h > 0 && w <= 2048 && h <= 2048) {
                 unsigned char *px = malloc((size_t)w * h * 4);
                 glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
-                char nm[64]; snprintf(nm, sizeof nm, "dumpvp_%d.ppm", shots);
+                /* LINDBERGH_DUMP_DIR: where the images go (not the game's folder) */
+                const char *dir = getenv("LINDBERGH_DUMP_DIR");
+                if (!dir || !*dir) dir = ".";
+                char nm[512]; snprintf(nm, sizeof nm, "%s/dumpvp_%d.ppm", dir, shots);
                 FILE *f = fopen(nm, "wb"); fprintf(f, "P6\n%d %d\n255\n", w, h);
                 for (int i = 0; i < w * h; i++) fwrite(px + 4 * i, 1, 3, f);
                 fclose(f);
-                snprintf(nm, sizeof nm, "dumpvp_%d_a.pgm", shots);
+                snprintf(nm, sizeof nm, "%s/dumpvp_%d_a.pgm", dir, shots);
                 f = fopen(nm, "wb"); fprintf(f, "P5\n%d %d\n255\n", w, h);
                 for (int i = 0; i < w * h; i++) fwrite(px + 4 * i + 3, 1, 1, f);
                 fclose(f); free(px);
@@ -1736,11 +1858,68 @@ static void before_draw(void)
                     }
                 }
             }
+            {
+                char line[256]; int at = 0;
+                for (int a = 0; a < 16; a++) {
+                    GLint e = 0, sz = 0, st = 0, ty = 0; GLvoid *pt = 0;
+                    glGetVertexAttribiv((GLuint)a, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &e);
+                    if (!e && !g_gen_on[a]) continue;
+                    glGetVertexAttribiv((GLuint)a, GL_VERTEX_ATTRIB_ARRAY_SIZE, &sz);
+                    glGetVertexAttribiv((GLuint)a, GL_VERTEX_ATTRIB_ARRAY_TYPE, &ty);
+                    glGetVertexAttribiv((GLuint)a, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &st);
+                    glGetVertexAttribPointerv((GLuint)a, GL_VERTEX_ATTRIB_ARRAY_POINTER, &pt);
+                    at += snprintf(line + at, sizeof line - at, " a%d:%d/%d %dx%#x+%p", a, e, (int)g_gen_on[a], sz, ty, pt);
+                    if (at > 200) break;
+                }
+                fprintf(stderr, "[dumpvp]   generic arrays (gl/ours):%s\n", line);
+                for (int a = 8; a <= 9; a++) {
+                    GLint e = 0, st = 0, ty = 0, buf = 0; GLvoid *pt = 0;
+                    glGetVertexAttribiv((GLuint)a, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &e);
+                    glGetVertexAttribiv((GLuint)a, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &st);
+                    glGetVertexAttribiv((GLuint)a, GL_VERTEX_ATTRIB_ARRAY_TYPE, &ty);
+                    glGetVertexAttribiv((GLuint)a, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &buf);
+                    glGetVertexAttribPointerv((GLuint)a, GL_VERTEX_ATTRIB_ARRAY_POINTER, &pt);
+                    if (!e || !buf || ty != GL_FLOAT) continue;
+                    GLint was = 0; glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &was);
+                    glBindBuffer(GL_ARRAY_BUFFER, (GLuint)buf);
+                    for (int k = 0; k < 4; k++) {
+                        float uv[2] = {0, 0};
+                        glGetBufferSubData(GL_ARRAY_BUFFER, (GLintptr)(uintptr_t)pt + (GLintptr)st * k, 8, uv);
+                        fprintf(stderr, "[dumpvp]   attrib %d (buffer %d) vertex %d: %g %g\n", a, buf, k, uv[0], uv[1]);
+                    }
+                    glBindBuffer(GL_ARRAY_BUFFER, (GLuint)was);
+                }
+            }
             glActiveTexture((GLenum)unit);
             shots++;
         }
     }
     Linked *l = link_pair(vid, fid);
+    {   /* LINDBERGH_GL_TRACE=N (N > 1): each draw of frame N with its programs */
+        extern unsigned g_frame;
+        static long tf = -2;
+        if (tf == -2) { const char *v = getenv("LINDBERGH_GL_TRACE"); tf = v ? atol(v) : 0; }
+        /* LINDBERGH_DRAWLOG=1: every 500th frame's draws, whatever it shows */
+        static int dl = -1;
+        if (dl < 0) { const char *v = getenv("LINDBERGH_DRAWLOG"); dl = v && *v == '1'; }
+        if ((tf > 1 && g_frame == (unsigned)tf) || (dl && g_frame % 500 == 0)) {
+            GLint fb = 0, vp[4] = {0}; glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb); glGetIntegerv(GL_VIEWPORT, vp);
+            fprintf(stderr, "[draw] %u v%u f%u fb %d viewport %dx%d depth %d %s\n", g_frame, vid, fid, fb, vp[2], vp[3],
+                    glIsEnabled(GL_DEPTH_TEST), l && l->ok ? "" : "(not linked)");
+        }
+    }
+    static int probed;
+    const char *dvp = getenv("LINDBERGH_DUMP_VP");
+    if (dvp && (long)vid == strtol(dvp, NULL, 0) && probed < 3 && l && l->ok) {
+        probed++;
+        GLint loc8 = glGetAttribLocation(l->prog, "va_8"), loc3 = glGetAttribLocation(l->prog, "va_3");
+        GLfloat ug[16] = {0};
+        glUseProgram(l->prog); upload(l);
+        GLint l8 = glGetUniformLocation(l->prog, "u_gen[8]"), l3 = glGetUniformLocation(l->prog, "u_gen[3]");
+        if (l8 >= 0) glGetUniformfv(l->prog, l8, &ug[8]);
+        if (l3 >= 0) glGetUniformfv(l->prog, l3, &ug[3]);
+        fprintf(stderr, "[dumpvp]   va_8 at %d, va_3 at %d, u_gen loc %d: [3]=%g [8]=%g\n", loc8, loc3, l->u_gen, ug[3], ug[8]);
+    }
     if (l && l->ok) {
         glDisable(GL_VERTEX_PROGRAM_ARB);
         glDisable(GL_FRAGMENT_PROGRAM_ARB);

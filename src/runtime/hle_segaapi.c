@@ -97,15 +97,27 @@ static void gains(const SegaBuf *b, int ch, float *l, float *r)
         float g = b->level[ch][s];
         if (g <= 0) continue;
         switch (b->route[ch][s]) {
-        case 0: case 4: *l += g; break;
-        case 1: case 5: *r += g; break;
-        case 2: case 3: *l += g * 0.707f; *r += g * 0.707f; break;
+        /* the usual stereo downmix: centre and rears at -3 dB, the
+         * subwoofer's own feed left out (Let's Go Jungle sends a voice to
+         * every speaker at once, which at full level tripled it) */
+        case 0: *l += g; break;
+        case 1: *r += g; break;
+        case 4: *l += g * 0.707f; break;
+        case 5: *r += g * 0.707f; break;
+        case 2: *l += g * 0.707f; *r += g * 0.707f; break;
+        case 3: break;
         default: break;
         }
     }
     *l *= b->vol[ch] * b->atten * g_io[0];
     *r *= b->vol[ch] * b->atten * g_io[1];
 }
+
+/* The game's whole mix, before the limiter: Let's Go Jungle plays a dozen
+ * voices near full scale at once, which the cabinet's amplifier had the
+ * headroom for and a soft limit at 1.0 does not (segaapi_master_gain). */
+static float g_master = 1.0f;
+void segaapi_master_gain(float g) { if (g > 0) g_master = g; }
 
 static void mix(void *ud, Uint8 *stream, int len)
 {
@@ -141,6 +153,7 @@ static void mix(void *ud, Uint8 *stream, int len)
     }
     UNLOCK();
 
+    for (int i = 0; i < frames * 2; i++) out[i] *= g_master;
     static float peak; static unsigned blocks;
     static int meter = -1;
     if (meter < 0) { const char *v = getenv("LINDBERGH_SEGA_METER"); meter = v && *v == '1'; }
@@ -156,7 +169,11 @@ static void mix(void *ud, Uint8 *stream, int len)
         out[i] = v * vol;
     }
     if (meter && ++blocks * (unsigned)frames >= 2 * OUT_RATE) {
-        fprintf(stderr, "[sega-api] mix peak %.3f%s\n", peak, st->muted ? " (muted)" : "");
+        int playing = 0, made = 0;
+        LOCK();
+        for (SegaBuf *b = g_bufs; b; b = b->next) { made++; if (b->playing && !b->paused) playing++; }
+        UNLOCK();
+        fprintf(stderr, "[sega-api] mix peak %.3f%s, %d of %d voices playing\n", peak, st->muted ? " (muted)" : "", playing, made);
         peak = 0; blocks = 0;
     }
 }
@@ -314,11 +331,33 @@ static void h_synth(CPU *c)
     RET(SEGA_OK);
 }
 
+/* SetSynthParamMultiple(h, count, pairs): the same, for an array of
+ * { int param; int value; } (Let's Go Jungle sets several at once) */
+static void h_synth_multi(CPU *c)
+{
+    seg_log("SetSynthParamMultiple", c);
+    SegaBuf *b = buf_of(A32(0));
+    uint32_t n = A32(1), p = A32(2);
+    {
+        static int on = -1, shown;
+        if (on < 0) { const char *v = getenv("LINDBERGH_SEGA_LOG"); on = v && *v == '1'; }
+        for (uint32_t i = 0; on && p && i < n && i < 16 && shown < 400; i++, shown++)
+            fprintf(stderr, "[sega-api]   param %d = %d\n", (int)rd32(p + 8 * i), (int)rd32(p + 8 * i + 4));
+    }
+    for (uint32_t i = 0; b && p && i < n && i < 64; i++) {
+        if (rd32(p + 8 * i) != 0) continue;
+        int cb = (int)rd32(p + 8 * i + 4);
+        b->atten = cb <= 0 ? 1.0f : (float)pow(10.0, -cb / 200.0);
+    }
+    RET(SEGA_OK);
+}
+
 void hle_register_segaapi(void)
 {
     hle_bind("SEGAAPI_Init", h_ok);
     hle_bind("SEGAAPI_Exit", h_ok);
     hle_bind("SEGAAPI_Reset", h_ok);
+    hle_bind("SEGAAPI_SetGlobalEAXProperty", h_ok);     /* the room reverb: not modelled */
     hle_bind("SEGAAPI_UpdateBuffer", h_ok);
     hle_bind("SEGAAPI_CreateBuffer", L_h_create);
     hle_bind("SEGAAPI_DestroyBuffer", L_h_destroy);
@@ -341,5 +380,6 @@ void hle_register_segaapi(void)
     hle_bind("SEGAAPI_SetSendLevel", L_h_send);
     hle_bind("SEGAAPI_SetIOVolume", L_h_iovol);
     hle_bind("SEGAAPI_SetSynthParam", h_synth);
+    hle_bind("SEGAAPI_SetSynthParamMultiple", h_synth_multi);
     hle_bind("kswap_collect", h_kswap_collect);
 }

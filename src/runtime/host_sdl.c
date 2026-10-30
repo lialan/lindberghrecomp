@@ -273,6 +273,12 @@ static void calib_click(int x, int y)
     set_title(NULL);
 }
 
+/* host_gun_map: where the sight should be (game pixels) -> the reading the
+ * game must get for it there, for a gun the game does not read as a plain
+ * screen position. */
+static void (*g_gun_map)(int *x, int *y);
+void host_gun_map(void (*fn)(int *x, int *y)) { g_gun_map = fn; }
+
 /* LINDBERGH_AUTOSTART=1: a coin at frame 240, then start pressed every two
  * seconds - gets past attract mode with nobody at the keyboard. */
 static void cabinet_autostart(void)
@@ -392,6 +398,10 @@ void host_cabinet_input(CabinetInput *out)
         /* undo the game's own calibration, so the sight is under the pointer */
         g_cab.gun_x = (int)((g_mouse_x - st->aim_ox) / st->aim_sx);
         g_cab.gun_y = (int)((g_mouse_y - st->aim_oy) / st->aim_sy);
+        /* a game whose gun is not a plain screen position maps it (on the
+         * screen only: off it is the reload) */
+        if (g_gun_map && g_cab.gun_x >= 0 && g_cab.gun_y >= 0 && g_cab.gun_x < w && g_cab.gun_y < h)
+            g_gun_map(&g_cab.gun_x, &g_cab.gun_y);
     }
 #if !defined(__ANDROID__)
     if (stereo_wide(NULL, NULL, NULL)) stereo_set_gun(g_cab.gun_x, g_cab.gun_y);   /* the HUD keeps clear of it */
@@ -612,6 +622,15 @@ void host_window_hint(int w, int h)
     if (w > 0 && h > 0 && !g_win.win) { g_hint_w = w; g_hint_h = h; }
 }
 
+/* The window's title before the game names it (a GLX game may never). */
+void host_window_title(const char *title)
+{
+    if (title && *title) snprintf(g_title, sizeof g_title, "%s", title);
+#if defined(__APPLE__)
+    { extern void host_mac_app_name(const char *); host_mac_app_name(title); }
+#endif
+}
+
 int host_window_open(const char *title)
 {
     if (title && *title) snprintf(g_title, sizeof g_title, "%s", title);
@@ -659,18 +678,25 @@ int host_window_open(const char *title)
             }
         }
     }
+    /* LINDBERGH_HIDDEN=1: a test run that never shows its window or takes
+     * focus; LINDBERGH_SHOT still captures the frames */
+    const char *hv = getenv("LINDBERGH_HIDDEN");
+    int hidden = hv && *hv && *hv != '0';
     g_win.win = SDL_CreateWindow(title && *title ? title : "lindberghrecomp",
                                  SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                                 dw, dh, SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
+                                 dw, dh, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE |
+                                 (hidden ? SDL_WINDOW_HIDDEN : SDL_WINDOW_SHOWN));
     if (!g_win.win) {
         fprintf(stderr, "[window] SDL_CreateWindow: %s\n", SDL_GetError());
         return 0;
     }
 #if defined(__APPLE__)
-    mac_activate();
-    host_menu_install();
+    if (!hidden) {
+        mac_activate();
+        host_menu_install();
+    }
 #endif
-    SDL_RaiseWindow(g_win.win);
+    if (!hidden) SDL_RaiseWindow(g_win.win);
     /* a crosshair: the shot goes to its centre, where the eye looks, not to
      * the tip of an arrow */
     {
@@ -769,9 +795,11 @@ static void maybe_screenshot(void)
     if (!px) return;
     GLint fb = 0;
     glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb);
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    /* LINDBERGH_SHOT_FB=id: one of the game's own framebuffers instead */
+    GLuint from = (GLuint)env_int("LINDBERGH_SHOT_FB", 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, from);
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    glReadBuffer(GL_BACK);
+    glReadBuffer(from ? GL_COLOR_ATTACHMENT0 : GL_BACK);
     glReadPixels(0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, px);
     glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)fb);
     FILE *f = fopen(name, "wb");
@@ -799,8 +827,33 @@ static double since_mark(void)
 }
 #endif
 
+/* A game that relied on the driver's vsync to keep time (Let's Go Jungle
+ * asks NVIDIA's for it through __GL_SYNC_TO_VBLANK) runs its logic once per
+ * frame: unpaced it plays at whatever rate the machine reaches - ten times
+ * too fast hidden, twice on a 120 Hz display. host_pace_fps(60) holds each
+ * frame to its share of a second here instead; LINDBERGH_UNPACED=1 lifts it,
+ * for fast test runs. */
+static int g_pace_fps;
+void host_pace_fps(int fps) { g_pace_fps = fps; }
+static void pace(void)
+{
+    static int off = -1;
+    if (off < 0) off = env_int("LINDBERGH_UNPACED", 0) != 0;
+    if (off || g_pace_fps <= 0) return;
+    static Uint64 next;
+    Uint64 f = SDL_GetPerformanceFrequency(), now = SDL_GetPerformanceCounter(), period = f / (Uint64)g_pace_fps;
+    if (!next || now > next + period) next = now;      /* first frame, or fell behind: no catching up */
+    while (now < next) {
+        Uint64 left_ms = (next - now) * 1000 / f;
+        if (left_ms > 1) SDL_Delay((Uint32)(left_ms - 1));
+        now = SDL_GetPerformanceCounter();
+    }
+    next += period;
+}
+
 void host_swap(void)
 {
+    pace();
     {   /* LINDBERGH_RESIZE_AT=frame,WxH: resize the window then - a test */
         static int at = -1, rw, rh;
         if (at < 0) { const char *v = getenv("LINDBERGH_RESIZE_AT"); at = 0;
