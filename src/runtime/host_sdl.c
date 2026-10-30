@@ -851,6 +851,19 @@ static void pace(void)
     next += period;
 }
 
+/* gl_thread.c: the GL on a worker thread */
+int glq_active(void);
+int glq_start(void (*release)(void), void (*take)(void));
+uint32_t glq_job(void (*job)(void *), void *arg);
+void glq_wait(uint32_t seq);
+void glq_drain(void);
+void glq_report(unsigned frames);
+static void gl_release(void) { SDL_GL_MakeCurrent(g_win.win, NULL); }
+static void gl_take(void) { SDL_GL_MakeCurrent(g_win.win, g_win.gl); }
+static void frame_gl(void *arg);
+static void host_frame_done(void);
+int g_gl_thread_default;     /* a game's profile may turn the GL thread on */
+
 void host_swap(void)
 {
     pace();
@@ -860,6 +873,28 @@ void host_swap(void)
                       if (v) sscanf(v, "%d,%dx%d", &at, &rw, &rh); }
         if (at && g_frame == (unsigned)at && g_win.win) SDL_SetWindowSize(g_win.win, rw, rh);
     }
+    {   /* LINDBERGH_GL_THREAD=1: the GL on a thread of its own (gl_thread.c),
+         * from this first swap on */
+        static int want = -1;
+        if (want < 0) want = env_int("LINDBERGH_GL_THREAD", g_gl_thread_default);
+        if (want == 1 && g_win.gl) { want = 2; glq_start(gl_release, gl_take); }
+    }
+    if (glq_active()) {
+        /* the end of this frame goes to the worker; the game waits only for
+         * the frame before, so it runs at most one frame ahead */
+        static uint32_t prev;
+        uint32_t job = glq_job(frame_gl, NULL);
+        glq_wait(prev);
+        prev = job;
+    } else frame_gl(NULL);
+    host_frame_done();
+}
+
+/* The end of a frame: the GL and the headset's part. On the GL thread when
+ * there is one. */
+static void frame_gl(void *arg)
+{
+    (void)arg;
 #if defined(__ANDROID__)
     g_t_game += since_mark();
     stereo_frame_end();                 /* the second eye, then both to the headset */
@@ -892,10 +927,16 @@ void host_swap(void)
         if (fb) glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)fb);
     }
     stereo_frame_begin();
+}
+
+/* The game thread's end of a frame. */
+static void host_frame_done(void)
+{
     {
         static int after = -1;
         if (after < 0) after = env_int("LINDBERGH_EXIT_AFTER", 0);
         if (after && g_frame >= (unsigned)after) {
+            glq_drain();
             fprintf(stderr, "[window] LINDBERGH_EXIT_AFTER: %u frames done\n", g_frame);
             exit(0);
         }
@@ -932,6 +973,7 @@ void host_swap(void)
                     (g_frame - f0) * 1000.0 / (now - t0), cpu0 ? (cpu - cpu0) / (g_frame - f0 ? g_frame - f0 : 1) : 0.0);
             cpu0 = cpu;
 #endif
+            glq_report(g_frame - f0);
             t0 = now; f0 = g_frame;
         }
     }
