@@ -35,6 +35,8 @@ void game_profile_apply(const LgGameProfile *p)
     if (p->sound_gain > 0) segaapi_master_gain(p->sound_gain);
     if (p->aim[0] || p->aim[1] || p->aim[2] || p->aim[3]) host_aim_default(p->aim[0], p->aim[1], p->aim[2], p->aim[3]);
     if (p->gun_map) host_gun_map(p->gun_map);
+    if (p->ride_board) rideboard_enable(p->ride_board);
+    if (p->sysdata_region) sega_sysdata_region(1);
 #ifdef __ANDROID__
     if (p->vr.title) env_default("LINDBERGH_XR_TITLE", p->vr.title);
     if (p->vr.scale > 0) {

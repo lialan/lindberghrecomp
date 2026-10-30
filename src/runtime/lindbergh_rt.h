@@ -121,6 +121,18 @@ void hle_register_libc(void);
 void hle_register_libc2(void);
 void hle_register_cg(void);
 void hle_register_io(void);
+
+/* The ride board of a large attraction cabinet, on a serial port
+ * (hle_rideboard.c): rideboard_enable names the device that is the board. */
+void hle_register_rideboard(void);
+void rideboard_enable(const char *dev);
+void sega_sysdata_region(int on);       /* hle_sega.c: the region goes into the EEPROM's system data */
+int  rideboard_open(const char *path);
+int  rideboard_is(int fd);
+int  rideboard_read(unsigned char *p, unsigned n);
+int  rideboard_write(const unsigned char *p, unsigned n);
+void rideboard_flush(void);
+void rideboard_close(void);
 void hle_register_libc3(void);
 void hle_register_pthread(void);
 void hle_register_window(void);

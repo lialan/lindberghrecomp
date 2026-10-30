@@ -1140,7 +1140,8 @@ static int guest_open_flags(uint32_t f)
 
 static void h_open(CPU *c)
 {
-    int fd = _open(ASTR(0), guest_open_flags(A32(1)), 0666);
+    int fd = rideboard_open(ASTR(0));
+    if (fd < 0) fd = _open(ASTR(0), guest_open_flags(A32(1)), 0666);
     /* The cabinet's devices are the ones that matter here: a JVS I/O board
      * hangs off a serial port, and a game that cannot open it stops at an
      * error screen instead of running its attract mode. */
@@ -1148,9 +1149,21 @@ static void h_open(CPU *c)
         fprintf(stderr, "[open] %s -> %d\n", ASTR(0), fd);
     RET(fd);
 }
-static void h_close(CPU *c) { RET(_close(AI32(0))); }
-static void h_read(CPU *c)  { RET(_read(AI32(0), APTR(1), A32(2))); }
-static void h_write(CPU *c) { RET(_write(AI32(0), APTR(1), A32(2))); }
+static void h_close(CPU *c)
+{
+    if (rideboard_is(AI32(0))) { rideboard_close(); RET(0); return; }
+    RET(_close(AI32(0)));
+}
+static void h_read(CPU *c)
+{
+    if (rideboard_is(AI32(0))) { RET(rideboard_read(APTR(1), A32(2))); return; }
+    RET(_read(AI32(0), APTR(1), A32(2)));
+}
+static void h_write(CPU *c)
+{
+    if (rideboard_is(AI32(0))) { RET(rideboard_write(APTR(1), A32(2))); return; }
+    RET(_write(AI32(0), APTR(1), A32(2)));
+}
 static void h_lseek(CPU *c) { RET(_lseek(AI32(0), (long)AI32(1), AI32(2))); }
 static void h_ioctl(CPU *c) { RET(-1); }
 static void h_unlink(CPU *c) { RET(_unlink(ASTR(0))); }
@@ -1204,6 +1217,7 @@ void hle_register_io(void)
     hle_bind("lseek", h_lseek);     hle_bind("ioctl", h_ioctl);
     hle_bind("unlink", h_unlink);   hle_bind("mkdir", h_mkdir);
     hle_bind("iopl", h_iopl);
+    hle_register_rideboard();
 }
 
 /* ---- the v* formatters ----
@@ -1823,6 +1837,10 @@ void hle_register_libc4(void)
         n += guest_override("__intel_new_memset_P3", h_intel_memset);
         n += guest_override("__intel_new_memcpy", h_intel_memcpy);
         n += guest_override("__intel_new_memcpy_P3", h_intel_memcpy);
+        /* the newer runtime's entry points (The House of the Dead 4 Special),
+         * which pick among such routines by the CPU */
+        n += guest_override("_intel_fast_memset", h_intel_memset);
+        n += guest_override("_intel_fast_memcpy", h_intel_memcpy);
         if (n) fprintf(stderr, "[crt] %d Intel string routines answered by the host\n", n);
     }
     if (guest_override("__get_cpu_indicator", h_intel_cpu_indicator))

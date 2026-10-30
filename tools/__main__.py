@@ -4,6 +4,7 @@
   py -3.11 -m tools disc   <disc.iso> [-o outdir]   carve the DVD payload
   py -3.11 -m tools elf    <game.elf>               what the ELF says it needs
   py -3.11 -m tools recomp <game.elf> <outdir>      lift it to C
+  py -3.11 -m tools bounds <game.elf> <out.txt>     function bounds for a stripped ELF
 """
 
 import argparse
@@ -45,9 +46,18 @@ def cmd_elf(a):
 def cmd_recomp(a):
     from .recomp.driver import recompile
     addrs = [int(x, 16) for x in a.addrs] or None
-    done, imports = recompile(a.elf, a.outdir, addrs)
+    bounds = None
+    if a.bounds:
+        from .recomp.bounds import read_bounds
+        bounds = read_bounds(a.bounds)
+    done, imports = recompile(a.elf, a.outdir, addrs, bounds)
     print("lifted %d functions, %d distinct imports -> %s"
           % (len(done), len(imports), a.outdir))
+
+
+def cmd_bounds(a):
+    from .recomp.bounds import main as bounds_main
+    bounds_main(a.elf, a.out, a.ref, a.names)
 
 
 def main(argv=None):
@@ -68,7 +78,15 @@ def main(argv=None):
     r.add_argument("elf")
     r.add_argument("outdir")
     r.add_argument("addrs", nargs="*", help="lift only these (hex); default all")
+    r.add_argument("--bounds", help="function bounds for a stripped ELF (tools bounds)")
     r.set_defaults(fn=cmd_recomp)
+
+    b = sub.add_parser("bounds", help="find a stripped ELF's functions")
+    b.add_argument("elf")
+    b.add_argument("out")
+    b.add_argument("--ref", help="an ELF of the same engine with symbols, to name them")
+    b.add_argument("--names", help="a fixed `0xADDR name` table to name them with")
+    b.set_defaults(fn=cmd_bounds)
 
     a = p.parse_args(argv)
     a.fn(a)

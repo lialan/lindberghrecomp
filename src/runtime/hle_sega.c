@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <time.h>
 #include <string.h>
+#include <zlib.h>
 
 #include "lindbergh_rt.h"
 #if !defined(_WIN32)
@@ -336,10 +337,39 @@ static const char *nvram_path(void)
     return path;
 }
 
+static int g_sysdata_region;    /* the game's region comes from the EEPROM's system data */
+static int region_value(void);
+
+/* The EEPROM's static system data record: 32 bytes at its start, a CRC-32
+ * (no final inversion) of the other 28 first, the region at byte 14 (0 Japan,
+ * 1 USA, 2 export), then the board's serial. A game that takes its region
+ * from here (The House of the Dead 4 Special) gets the Language setting
+ * written into it; a blank store gets a whole record. */
+static void sysdata_apply_region(void)
+{
+    unsigned char *r = g_eeprom;
+    int blank = 1;
+    for (int i = 0; i < 32; i++) if (r[i]) { blank = 0; break; }
+    if (blank) memcpy(r + 15, "AALG-TG-933F3904", 16);
+    r[14] = (unsigned char)region_value();
+    uint32_t crc = (uint32_t)crc32(0L, r + 4, 28) ^ 0xFFFFFFFFu;
+    memcpy(r, &crc, 4);
+    fprintf(stderr, "[sega] system data region %d\n", r[14]);
+}
+
+void sega_sysdata_region(int on) { g_sysdata_region = on; }
+
+static void nvram_read(void);
 static void nvram_load(void)
 {
     if (g_nvram_loaded) return;
     g_nvram_loaded = 1;
+    nvram_read();
+    if (g_sysdata_region) sysdata_apply_region();
+}
+
+static void nvram_read(void)
+{
     FILE *f = fopen(nvram_path(), "rb");
     if (!f) return;
     if (fread(g_sram, 1, sizeof g_sram, f) != sizeof g_sram ||

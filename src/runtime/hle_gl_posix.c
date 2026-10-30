@@ -732,6 +732,12 @@ static void h_gluErrorString(CPU *c)
     RET(guest_strdup_static((e >= 0x500 && e <= 0x505) ? msg[e - 0x500 + 1] : msg[0]));
 }
 
+/* GL_EXT_compiled_vertex_array: a hint that the arrays will not change
+ * between draws. NVIDIA's driver has it and The House of the Dead 4 Special
+ * calls it unchecked; a driver without it (macOS, the Quest) loses nothing by
+ * ignoring it. */
+static void h_glLockArraysEXT(CPU *c) { (void)c; }
+
 void hle_register_gl(void)
 {
     const char *t = getenv("LINDBERGH_GL_TRACE");
@@ -749,6 +755,8 @@ void hle_register_gl(void)
     hle_bind("glMultiDrawElements", h_glMultiDrawElements);
     gl_bind_named("glMultiDrawElements", h_glMultiDrawElements);
     gl_bind_named("glMultiDrawElementsEXT", h_glMultiDrawElements);
+    gl_bind_named("glLockArraysEXT", h_glLockArraysEXT);
+    gl_bind_named("glUnlockArraysEXT", h_glLockArraysEXT);
     hle_bind("glMapBufferARB", h_glMapBufferARB); gl_bind_named("glMapBufferARB", h_glMapBufferARB);
     hle_bind("glUnmapBufferARB", h_glUnmapBufferARB); gl_bind_named("glUnmapBufferARB", h_glUnmapBufferARB);
     hle_bind("glGetString", h_glGetString); gl_bind_named("glGetString", h_glGetString);

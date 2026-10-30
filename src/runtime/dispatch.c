@@ -66,7 +66,7 @@ static const PltEntry g_plt[] = { HLE_PLT(PLT_ENT) SOLIB_PLT(PLT_ENT) };
 
 #define NPLT (sizeof g_plt / sizeof g_plt[0])
 
-static int find_plt(uint32_t va, HleId *out)
+static int find_plt_exact(uint32_t va, HleId *out)
 {
     size_t lo = 0, hi = NPLT;
     while (lo < hi) {
@@ -75,6 +75,15 @@ static int find_plt(uint32_t va, HleId *out)
         if (g_plt[mid].va < va) lo = mid + 1; else hi = mid;
     }
     return 0;
+}
+
+/* A stub, or its second half: stub+6 is the `push index; jmp PLT0` that a
+ * GOT slot holds until the dynamic linker binds it, so a function pointer the
+ * game read out of its GOT (The House of the Dead 4 Special does) lands
+ * there. Through the resolver it reaches the same import. */
+static int find_plt(uint32_t va, HleId *out)
+{
+    return find_plt_exact(va, out) || find_plt_exact(va - 6, out);
 }
 
 /* Guest call depth, per thread.
@@ -283,8 +292,8 @@ void dispatch(CPU *c, uint32_t va)
 
     /* Neither lifted nor an import: a function the bounds missed, or a jump
      * into the middle of one that did lift. Both are worth the address. */
-    fprintf(stderr, "[dispatch] no lifted function at %#010x (called from esp=%#010x)\n",
-            va, c->esp);
+    fprintf(stderr, "[dispatch] no lifted function at %#010x (called from esp=%#010x,"
+            " return address %#010x)\n", va, c->esp, c->esp ? rd32(c->esp) : 0);
     abort();
 }
 
