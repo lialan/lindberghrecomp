@@ -2140,14 +2140,38 @@ const char *arb_get_source(GLenum target, GLuint id)
  * from the matrix: a symmetric or off-centre perspective times a rigid
  * model-view (uniformly scaled). Returns 1 with P (column-major), identity for
  * 2D; 0 when there is no vertex program to read. */
+/* The program hands its position on as it came - "MOV result.position,
+ * vertex.position;" - so it is already in clip space. Only a whole MOV: the
+ * last step of a transform, "MAD result.position, vertex.attrib[0].w, c[3],
+ * R0;", reads the same up to its swizzle, and taking that for a pass-through
+ * left Let's Go Jungle's terrain locked to the head. */
+static int passes_position(const char *src)
+{
+    for (const char *q = src; (q = strstr(q, "result.position")) != NULL; q++) {
+        const char *ln = q;
+        while (ln > src && ln[-1] != '\n') ln--;
+        while (*ln == ' ' || *ln == '\t') ln++;
+        if (strncmp(ln, "MOV", 3) != 0) continue;
+        const char *a = q + strlen("result.position");
+        while (*a == ' ' || *a == '\t' || *a == ',') a++;
+        const char *ins[2] = { "vertex.position", "vertex.attrib[0]" };
+        for (int i = 0; i < 2; i++) {
+            size_t n = strlen(ins[i]);
+            if (strncmp(a, ins[i], n) != 0) continue;
+            const char *e = a + n;
+            while (*e == ' ' || *e == '\t') e++;
+            if (*e == ';') return 1;
+        }
+    }
+    return 0;
+}
+
 int arb_env_projection(float P[16])
 {
     if (!g_enabled[0] || !g_bound[0]) return 0;
     ArbProg *p = prog_get(0, g_bound[0], 0);
     if (!p || !p->src) return 0;
-    if (!p->pos_kind)
-        p->pos_kind = strstr(p->src, "result.position, vertex.position") ||
-                      strstr(p->src, "result.position, vertex.attrib[0]") ? 2 : 1;
+    if (!p->pos_kind) p->pos_kind = passes_position(p->src) ? 2 : 1;
     for (int i = 0; i < 16; i++) P[i] = i % 5 ? 0.0f : 1.0f;
     if (p->pos_kind == 2) return 1;
     const float (*c)[4] = (const float (*)[4])g_env[0];      /* the matrix's columns */
@@ -2155,7 +2179,12 @@ int arb_env_projection(float P[16])
           r2[3] = { c[0][2], c[1][2], c[2][2] }, r3[3] = { c[0][3], c[1][3], c[2][3] };
 #define DOT3(a, b) ((a)[0] * (b)[0] + (a)[1] * (b)[1] + (a)[2] * (b)[2])
     float ss = DOT3(r3, r3);
-    if (ss < 1e-12f) return 1;                                 /* no w from depth: 2D */
+    /* No w from depth: 2D. Measured against the matrix's own size - Let's Go
+     * Jungle's terrain has its vertices in units so small that its whole
+     * matrix is, and a fixed 1e-12 took it for 2D: drawn with the game's own
+     * lens, locked to the head. */
+    float mag = DOT3(r0, r0) + DOT3(r1, r1) + DOT3(r2, r2);
+    if (!(ss > 1e-10f * mag) || ss < 1e-36f) return 1;
     float s = sqrtf(ss);
     float cx = -DOT3(r0, r3) / ss, cy = -DOT3(r1, r3) / ss, A = -DOT3(r2, r3) / ss;
     float ax[3], ay[3];

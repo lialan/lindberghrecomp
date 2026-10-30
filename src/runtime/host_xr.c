@@ -1165,6 +1165,27 @@ void xr_frame_begin(void)
     uint32_t n = 0;
     views_ok = XR_SUCCEEDED(xrLocateViews(session, &vl, &vs, 2, &n, views)) &&
                (vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT);
+    {   /* LINDBERGH_XR_FAKE_YAW=degrees (tests): the head turned left by that much, for
+         * telling what follows the head from what stays in the world with
+         * the headset on a desk */
+        static float yaw = -1000; static unsigned from;    /* =degrees[,from frame] */
+        if (yaw == -1000) { const char *v = getenv("LINDBERGH_XR_FAKE_YAW"); yaw = v ? (float)atof(v) * 0.0174533f : 0;
+                            from = v && strchr(v, ',') ? (unsigned)atol(strchr(v, ',') + 1) : 0; }
+        if (views_ok && yaw != 0 && g_frame >= from) {
+            XrQuaternionf r = { 0, sinf(yaw / 2), 0, cosf(yaw / 2) };
+            for (int i = 0; i < 2; i++) {
+                XrQuaternionf q = views[i].pose.orientation;
+                views[i].pose.orientation = (XrQuaternionf){
+                    r.w * q.x + r.x * q.w + r.y * q.z - r.z * q.y,
+                    r.w * q.y - r.x * q.z + r.y * q.w + r.z * q.x,
+                    r.w * q.z + r.x * q.y - r.y * q.x + r.z * q.w,
+                    r.w * q.w - r.x * q.x - r.y * q.y - r.z * q.z };
+                XrVector3f p = views[i].pose.position;
+                float c = cosf(yaw), sn = sinf(yaw);
+                views[i].pose.position = (XrVector3f){ c * p.x + sn * p.z, p.y, -sn * p.x + c * p.z };
+            }
+        }
+    }
     if (views_ok && getenv("LINDBERGH_POSE_LOG")) {
         XrQuaternionf q = views[0].pose.orientation;
         fprintf(stderr, "[pose] frame %u: q %.5f %.5f %.5f %.5f pos %.4f %.4f %.4f t %lld\n", g_frame, q.x, q.y, q.z, q.w,
