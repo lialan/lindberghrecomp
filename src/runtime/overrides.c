@@ -30,7 +30,7 @@ typedef struct { uint32_t va; HleHandler fn; const char *name; } Override;
 
 static Override g_ov[MAX_OVERRIDES];
 static int      g_ov_n;
-static uint32_t g_ov_lo = 0xFFFFFFFFu, g_ov_hi;
+uint32_t g_ov_lo = 0xFFFFFFFFu, g_ov_hi;   /* read by DISPATCH_TO in lifted code */
 
 uint32_t guest_symbol(const char *name)
 {

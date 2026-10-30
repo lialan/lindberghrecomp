@@ -31,6 +31,13 @@ void lindbergh_todo(uint32_t va, const char *text);
 #include "cpu.h"
 #include "posix_compat.h"
 
+/* The arithmetic of flags_add/flags_sub/flags_logicz without the flags, for
+ * an instruction whose flags nothing reads before they are overwritten
+ * (tools/recomp/flags.py rewrites those). */
+static inline uint32_t nf_add(uint32_t a, uint32_t b, int sz) { return (a + b) & mask_sz(sz); }
+static inline uint32_t nf_sub(uint32_t a, uint32_t b, int sz) { return (a - b) & mask_sz(sz); }
+static inline uint32_t nf_logicz(uint32_t r, int sz) { return r & mask_sz(sz); }
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -195,6 +202,19 @@ const char *hle_name(HleId id);
 /* Address -> lifted function. Generated: recomp_funcs_list.h is the X-macro
  * of every VA that lifted, and recomp_dispatch.c turns it into a table. */
 void dispatch(CPU *c, uint32_t va);
+
+/* A branch or call to a lifted function the lifter knew about goes straight
+ * to it, unless the runtime may want to step in at that address: an override
+ * (g_ov_lo..g_ov_hi), the stereo layer's state hooks, or a debug watch or
+ * trace (g_dispatch_always). dispatch() costs a lookup and bookkeeping per
+ * branch, which across a hand-written decoder's inner loops was a third of a
+ * frame on the Quest. */
+extern uint32_t g_ov_lo, g_ov_hi, stereo_state_lo, stereo_state_hi;
+extern int g_dispatch_always;
+#define DISPATCH_TO(c, va, fn) do { uint32_t _dv = (va); \
+    if (!g_dispatch_always && (_dv < g_ov_lo || _dv > g_ov_hi) && \
+        (_dv < stereo_state_lo || _dv > stereo_state_hi)) fn(c); else dispatch((c), _dv); } while (0)
+
 void dispatch_jmp(CPU *c, uint32_t va);
 
 /* Run a guest function from host code and return its eax. Arguments are

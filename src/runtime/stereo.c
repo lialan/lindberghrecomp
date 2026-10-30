@@ -811,6 +811,9 @@ typedef struct {
     uint8_t pkind;                          /* 0: pbytes; 1: glBufferData's size; 2: glBufferSubData's */
     uint32_t pbytes;
 } Cls;
+/* Cls.track: the client-array calls, in cls()'s order */
+enum { T_ENABLECS = 1, T_DISABLECS, T_CLIENTTEX, T_CLIENTTEXARB, T_ENABLEVA, T_DISABLEVA,
+       T_VERTEXPTR, T_NORMALPTR, T_COLORPTR, T_TEXCOORDPTR, T_ATTRIBPTR };
 static Cls g_cls[HLE_ID_MAX];
 
 /* ---- the game's menu screens ----
@@ -928,11 +931,16 @@ static const Cls *cls(HleId id)
     if (k->kind == K_OTHER && (!strncmp(n, "glDraw", 6) || !strncmp(n, "glMultiDraw", 11))) k->kind = K_DRAWOTHER;
     if (k->kind == K_OTHER && !strncmp(n, "glGet", 5)) k->kind = K_GETOTHER;
     k->live = (uint8_t)live_only(n);
-    k->track = !strcmp(n, "glEnableClientState") || !strcmp(n, "glDisableClientState") ||
-               !strcmp(n, "glClientActiveTexture") || !strcmp(n, "glClientActiveTextureARB") ||
-               !strcmp(n, "glEnableVertexAttribArrayARB") || !strcmp(n, "glDisableVertexAttribArrayARB") ||
-               !strcmp(n, "glVertexPointer") || !strcmp(n, "glNormalPointer") || !strcmp(n, "glColorPointer") ||
-               !strcmp(n, "glTexCoordPointer") || !strcmp(n, "glVertexAttribPointerARB");
+    {   /* which client-array call, for track_arrays: its 1-based place here */
+        static const char *const TR[] = {
+            "glEnableClientState", "glDisableClientState", "glClientActiveTexture", "glClientActiveTextureARB",
+            "glEnableVertexAttribArrayARB", "glDisableVertexAttribArrayARB", "glVertexPointer", "glNormalPointer",
+            "glColorPointer", "glTexCoordPointer", "glVertexAttribPointerARB",
+        };
+        k->track = 0;
+        for (unsigned i = 0; i < sizeof TR / sizeof TR[0]; i++)
+            if (!strcmp(n, TR[i])) { k->track = (uint8_t)(i + 1); break; }
+    }
     int idx; uint32_t bytes; uint8_t pk;
     pointer_arg(n, &idx, &bytes, &pk);
     k->pidx = (int8_t)idx; k->pbytes = bytes; k->pkind = pk;
@@ -1506,20 +1514,21 @@ static int client_array(GLenum cap)
 }
 
 /* Keeps g_arr in step with the game's calls (recording only). */
-static void track_arrays(CPU *c, const char *n)
+static void track_arrays(CPU *c, int t)
 {
+    /* t: the call, as cls() numbered it - names compared once, not per call */
     Arr *a = NULL;
-    if (!strcmp(n, "glEnableClientState") || !strcmp(n, "glDisableClientState")) {
-        int i = client_array(A32(0)); if (i >= 0) g_arr[i].on = n[2] == 'E';
-    } else if (!strcmp(n, "glClientActiveTexture") || !strcmp(n, "glClientActiveTextureARB")) {
+    if (t == T_ENABLECS || t == T_DISABLECS) {
+        int i = client_array(A32(0)); if (i >= 0) g_arr[i].on = t == T_ENABLECS;
+    } else if (t == T_CLIENTTEX || t == T_CLIENTTEXARB) {
         g_client_unit = (int)(A32(0) - GL_TEXTURE0);
-    } else if (!strcmp(n, "glEnableVertexAttribArrayARB") || !strcmp(n, "glDisableVertexAttribArrayARB")) {
-        if (A32(0) < 16) g_arr[ARR_ATTR0 + A32(0)].on = n[2] == 'E';
-    } else if (!strcmp(n, "glVertexPointer")) { a = &g_arr[ARR_VERTEX]; a->size = A32(0); a->type = A32(1); a->stride = AI32(2); a->ptr = A32(3); }
-    else if (!strcmp(n, "glNormalPointer")) { a = &g_arr[ARR_NORMAL]; a->size = 3; a->type = A32(0); a->stride = AI32(1); a->ptr = A32(2); }
-    else if (!strcmp(n, "glColorPointer")) { a = &g_arr[ARR_COLOR]; a->size = A32(0); a->type = A32(1); a->stride = AI32(2); a->ptr = A32(3); }
-    else if (!strcmp(n, "glTexCoordPointer")) { a = &g_arr[ARR_TEX0 + (g_client_unit & 7)]; a->size = A32(0); a->type = A32(1); a->stride = AI32(2); a->ptr = A32(3); }
-    else if (!strcmp(n, "glVertexAttribPointerARB")) {
+    } else if (t == T_ENABLEVA || t == T_DISABLEVA) {
+        if (A32(0) < 16) g_arr[ARR_ATTR0 + A32(0)].on = t == T_ENABLEVA;
+    } else if (t == T_VERTEXPTR) { a = &g_arr[ARR_VERTEX]; a->size = A32(0); a->type = A32(1); a->stride = AI32(2); a->ptr = A32(3); }
+    else if (t == T_NORMALPTR) { a = &g_arr[ARR_NORMAL]; a->size = 3; a->type = A32(0); a->stride = AI32(1); a->ptr = A32(2); }
+    else if (t == T_COLORPTR) { a = &g_arr[ARR_COLOR]; a->size = A32(0); a->type = A32(1); a->stride = AI32(2); a->ptr = A32(3); }
+    else if (t == T_TEXCOORDPTR) { a = &g_arr[ARR_TEX0 + (g_client_unit & 7)]; a->size = A32(0); a->type = A32(1); a->stride = AI32(2); a->ptr = A32(3); }
+    else if (t == T_ATTRIBPTR) {
         if (A32(0) >= 16) return;
         a = &g_arr[ARR_ATTR0 + A32(0)]; a->size = A32(1); a->type = A32(2); a->norm = A32(3); a->stride = AI32(4); a->ptr = A32(5);
         {   /* LINDBERGH_ATTRIB_LOG=1: each kind of generic array the game gives */
@@ -1642,7 +1651,7 @@ static void record(CPU *c, HleId id, HleHandler fn, const char *n)
         return;
     }
     if (k->live) return;
-    if (k->track) track_arrays(c, n);
+    if (k->track) track_arrays(c, k->track);
     uint32_t va = arena_take(ARGS * 4);
     if (!va) { g_overflow++; return; }
     memcpy(G2H(va), G2H(c->esp), ARGS * 4);
@@ -1984,7 +1993,7 @@ static void stereo_gl_call_inner(CPU *c, HleId id, HleHandler fn)
 #endif
     /* the client arrays' state, for telling what a 2D draw covers (with two
      * passes record() keeps it) */
-    if ((g_mv || g_wide) && cls(id)->track) track_arrays(c, n);
+    if ((g_mv || g_wide) && cls(id)->track) track_arrays(c, cls(id)->track);
     if (!g_mv && !g_wide) {
         if (g_glprof > 0) {
             double t0 = now_ns();

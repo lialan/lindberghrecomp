@@ -97,15 +97,21 @@ static int find_plt(uint32_t va, HleId *out)
 #ifdef _MSC_VER
 static __declspec(thread) unsigned g_depth;
 static __declspec(thread) unsigned g_depth_max;
+#elif defined(__ANDROID__)
+/* Bionic will not dlopen a library (libmain.so) with initial-exec TLS, so the
+ * Quest keeps the default model and its resolver call per access. */
+static __thread unsigned g_depth;
+static __thread unsigned g_depth_max;
 #else
-/* initial-exec: a plain thread-pointer load. The default model for a shared
- * library (libmain.so on the Quest) goes through the dynamic linker's TLS
- * resolver on every access, which was 6% of the game thread there. */
+/* initial-exec: a plain thread-pointer load, not the default model's call
+ * into the dynamic linker's TLS resolver on every access. */
 static __thread unsigned g_depth __attribute__((tls_model("initial-exec")));
 static __thread unsigned g_depth_max __attribute__((tls_model("initial-exec")));
 #endif
 
 #define DEPTH_LIMIT 20000
+
+int g_dispatch_always;      /* a watch or trace is on: lifted code dispatches every branch */
 
 /* How an address resolved, cached: one 64-bit word per slot - the address
  * above, below an index (+1, 0 empty) into the lifted table, or with the top
@@ -145,6 +151,7 @@ static int watch_check(CPU *c, uint32_t va)
     if (n < 0) {
         n = 0;
         const char *v = getenv("LINDBERGH_WATCH");
+        if (v && *v) g_dispatch_always = 1;
         while (v && *v && n < 16) {
             list[n++] = (uint32_t)strtoul(v, (char **)&v, 16);
             while (*v == ',' || *v == ' ') v++;
@@ -196,7 +203,7 @@ static void range_trace(uint32_t va)
     if (on < 0) {
         const char *v = getenv("LINDBERGH_TRACE_RANGE");
         on = v && *v;
-        if (on) { lo = (uint32_t)strtoul(v, (char **)&v, 16); if (*v == ',') v++; hi = (uint32_t)strtoul(v, NULL, 16); }
+        if (on) { g_dispatch_always = 1; lo = (uint32_t)strtoul(v, (char **)&v, 16); if (*v == ',') v++; hi = (uint32_t)strtoul(v, NULL, 16); }
     }
     if (!on) return;
     if (g_frame != at) {
@@ -214,8 +221,39 @@ static void range_trace(uint32_t va)
     if (ncur < 32) { int i = ncur++; while (i > 0 && cur[i - 1] > va) { cur[i] = cur[i - 1]; i--; } cur[i] = va; }
 }
 
+static void dispatch_slow(CPU *c, uint32_t va);
+static int g_dispatch_fast;     /* the debug options are read and none is on */
+
 void dispatch(CPU *c, uint32_t va)
 {
+    /* An indirect call (a virtual function, a callback) to a lifted function
+     * resolved before: straight to it. The trace ring, the call depth and the
+     * debug checks below cost more than the lookup - TLS on the Quest is a
+     * resolver call - and the C++ in these games makes a virtual call every
+     * few hundred instructions. DISPATCH_TO skips them for direct calls the
+     * same way. */
+    if (__builtin_expect(g_dispatch_fast, 1) && (va < stereo_state_lo || va > stereo_state_hi)) {
+        uint64_t e = __atomic_load_n(&g_dcache[(va >> 2) & (DCACHE_N - 1)], __ATOMIC_RELAXED);
+        if ((uint32_t)(e >> 32) == va && (uint32_t)e && !((uint32_t)e & 0x80000000u)) {
+            g_table[(uint32_t)e - 1].fn(c);
+            return;
+        }
+    }
+    dispatch_slow(c, va);
+}
+
+static void dispatch_slow(CPU *c, uint32_t va)
+{
+    if (!g_dispatch_fast) {
+        static int once;
+        if (!once) {
+            once = 1;
+            watch_check(c, 0); range_trace(0);   /* read their settings */
+            const char *t = getenv("LINDBERGH_TRACE_FILE");
+            if (t && *t) g_dispatch_always = 1;
+            g_dispatch_fast = !g_dispatch_always;
+        }
+    }
     guest_trace_dispatch(va);
     range_trace(va);
     int watched = watch_check(c, va);
