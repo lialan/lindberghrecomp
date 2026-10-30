@@ -1907,6 +1907,17 @@ int stereo_glprof_on(void)
 static void stereo_gl_call_inner(CPU *c, HleId id, HleHandler fn);
 static void stereo_gl_call(CPU *c, HleId id, HleHandler fn)
 {
+    /* Most calls in a busy frame - texture and fog parameters, uniforms, the
+     * lighting state - are nothing to this file in the headset: no view, no
+     * target, no array, nothing to record. Straight to them. */
+    if (g_mv && g_on && !g_skip_begin && g_glprof <= 0 && (long)g_frame != g_map_frame) {
+        const Cls *k = cls(id);
+        if (k->kind == K_OTHER && !k->track
+#ifdef LINDBERGH_GL4ES
+            && !gl4es_mv_trace
+#endif
+           ) { fn(c); return; }
+    }
     stereo_glprof_on();
 #ifdef LINDBERGH_GL4ES
     if ((long)g_frame == g_map_frame && g_mv) {
