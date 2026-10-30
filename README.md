@@ -10,6 +10,15 @@
  Static Recompilation Toolkit for Sega Lindbergh Arcade Games
 ```
 
+## Thank you, sp00nznet
+
+This is a fork of
+[**sp00nznet/lindberghrecomp**](https://github.com/sp00nznet/lindberghrecomp).
+The toolkit and its runtime are [sp00nznet](https://github.com/sp00nznet)'s
+work; this fork adds the macOS and Meta Quest support used by
+[lialan/lindbergh-recomp-ports](https://github.com/lialan/lindbergh-recomp-ports).
+Thank you, sp00nznet, for building it and sharing it.
+
 > A Lindbergh is a 2005 PC in an arcade case. The game is a 32-bit x86 ELF that
 > calls libc and OpenGL. So don't emulate the board — recompile the ELF and
 > hand it the libraries.
