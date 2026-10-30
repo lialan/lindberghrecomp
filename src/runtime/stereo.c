@@ -519,16 +519,24 @@ static void apply_rect(int vp)
     else { glScissor(X, Y, W, H); g_scissor[0] = X; g_scissor[1] = Y; g_scissor[2] = W; g_scissor[3] = H; }
 }
 
+/* The times the world's target is left in a frame, and how many world draws
+ * were done by each; the one to read its depth at (last frame's first after
+ * which no more world was drawn), -1 none: the frame's end. */
+static unsigned g_leaves, g_leave_draws[16];
+static int      g_read_at_leave;
+
 static void bind_framebuffer(GLenum target, GLuint fb)
 {
-    /* Leaving the world's target with the scene drawn: its depth is the
-     * world's now - later full-screen passes into it write a flat 0.5 over
-     * it - so the aim reads it here. */
-    static unsigned probed = ~0u;
-    if (g_aim_hook && g_mv && !g_flat && g_scene_draws > 0 && g_game_fb == g_world_fb_next && fb != g_game_fb &&
-        probed != g_frame) {
-        probed = g_frame;
-        g_aim_hook();
+    /* Leaving the world's target with the whole scene drawn: its depth is
+     * the world's now - later full-screen passes into it write a flat 0.5
+     * over it (Ghost Squad) - so the aim reads it here. Some games leave it
+     * before they are done (Let's Go Jungle, for its shadow and reflection
+     * targets): the leaving that counts is the one after the last world
+     * draw, as the previous frame had it. */
+    if (g_aim_hook && g_mv && !g_flat && g_scene_draws > 0 && g_game_fb == g_world_fb_next && fb != g_game_fb) {
+        if (g_leaves < 16) g_leave_draws[g_leaves] = g_scene_draws;
+        if ((int)g_leaves == g_read_at_leave) g_aim_hook();
+        g_leaves++;
     }
     g_game_fb = fb;
     glBindFramebuffer(target, fb ? fb : g_eye_fbo[g_eye]);
@@ -2184,6 +2192,10 @@ static void dump_targets(void)
 void stereo_frame_end(void)
 {
     if (!g_on) return;
+    g_read_at_leave = -1;
+    for (unsigned i = 0; i < g_leaves && i < 16; i++)
+        if (g_leave_draws[i] == g_scene_draws) { g_read_at_leave = (int)i; break; }
+    g_leaves = 0;
     g_flat_shown = g_flat;
     dump_targets();
     if (!g_mv && !g_wide) replay(1);
@@ -2211,7 +2223,9 @@ void stereo_frame_begin(void)
         if (++g_menu_frames >= 120) g_menu = 1;
     }
     if (getenv("LINDBERGH_SCENE_STATS") && g_frame % 30 == 0)
-        fprintf(stderr, "[stereo] frame %u: %u world draws%s, lens %.2f, near %.4f\n", g_frame, g_scene_draws, g_menu ? " (menu)" : "", g_lens_seen, g_near_seen);
+        fprintf(stderr, "[stereo] frame %u: %u world draws%s, lens %.2f, near %.4f; world %.3f %.3f (%.3f %.3f), screen lens %.3f %.3f\n",
+                g_frame, g_scene_draws, g_menu ? " (menu)" : "", g_lens_seen, g_near_seen, g_world_persp[0], g_world_persp[5],
+                g_world_persp[8], g_world_persp[9], g_screen_lens[0], g_screen_lens[1]);
     static int mode_log = -1, last_sig = -1;
     if (mode_log < 0) { const char *v = getenv("LINDBERGH_MODE_LOG"); mode_log = v && *v && *v != '0'; }
     if (mode_log) {
@@ -2385,7 +2399,7 @@ void stereo_set_screen_distance(float d) { if (d > 0) g_screen_dist = d; }
 unsigned stereo_world_depth(float *zn, float *zf)
 {
 #ifdef LINDBERGH_GL4ES
-    if (!g_on || !g_mv || g_flat_shown || g_scene_draws == 0) return 0;
+    if (!g_on || !g_mv || g_flat || g_scene_draws == 0) return 0;
     GLuint dt = 0;
     for (unsigned i = 0; i < g_nfb_depth; i++) if (g_fb_depth[i].fb == g_world_fb_next) dt = g_fb_depth[i].depth;
     if (g_world_fb_next == 0) dt = g_eye_tex[1];      /* the window: the eyes' own target */
