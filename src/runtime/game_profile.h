@@ -56,6 +56,7 @@ typedef struct {
                                  * player's head (needs camera_in_constants; LINDBERGH_XR_FACE_SWINGS=0 turns it off) */
         int   level_horizon;    /* the world kept level: the game camera's pitch and roll go into where its view
                                  * sits, not into the world (needs camera_in_constants; LINDBERGH_XR_LEVEL=0 off) */
+        int   gl_thread;        /* the GL on a thread of its own (gl_thread.c; LINDBERGH_GL_THREAD=0 off) */
     } vr;
 } LgGameProfile;
 

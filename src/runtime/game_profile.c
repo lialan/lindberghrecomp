@@ -40,6 +40,7 @@ void game_profile_apply(const LgGameProfile *p)
     if (p->reload_switch[1]) jvs_reload_switch(p->reload_switch[0], p->reload_switch[1]);
 #ifdef __ANDROID__
     if (p->vr.title) env_default("LINDBERGH_XR_TITLE", p->vr.title);
+    if (p->vr.gl_thread) env_default("LINDBERGH_GL_THREAD", "1");
     if (p->vr.scale > 0) {
         char s[32];
         snprintf(s, sizeof s, "%g", p->vr.scale);

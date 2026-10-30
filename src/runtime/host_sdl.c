@@ -862,7 +862,6 @@ static void gl_release(void) { SDL_GL_MakeCurrent(g_win.win, NULL); }
 static void gl_take(void) { SDL_GL_MakeCurrent(g_win.win, g_win.gl); }
 static void frame_gl(void *arg);
 static void host_frame_done(void);
-int g_gl_thread_default;     /* a game's profile may turn the GL thread on */
 
 void host_swap(void)
 {
@@ -876,7 +875,7 @@ void host_swap(void)
     {   /* LINDBERGH_GL_THREAD=1: the GL on a thread of its own (gl_thread.c),
          * from this first swap on */
         static int want = -1;
-        if (want < 0) want = env_int("LINDBERGH_GL_THREAD", g_gl_thread_default);
+        if (want < 0) want = env_int("LINDBERGH_GL_THREAD", 0);   /* or the game's profile: vr.gl_thread */
         if (want == 1 && g_win.gl) { want = 2; glq_start(gl_release, gl_take); }
     }
     if (glq_active()) {
