@@ -57,6 +57,7 @@ typedef struct {
         int   level_horizon;    /* the world kept level: the game camera's pitch and roll go into where its view
                                  * sits, not into the world (needs camera_in_constants; LINDBERGH_XR_LEVEL=0 off) */
         int   gl_thread;        /* the GL on a thread of its own (gl_thread.c; LINDBERGH_GL_THREAD=0 off) */
+        int   hud_head_locked;  /* the 2D HUD stays in front of the face, not in the world (LINDBERGH_XR_HUD_LOCK=0 off) */
     } vr;
 } LgGameProfile;
 

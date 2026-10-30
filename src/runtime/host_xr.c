@@ -413,6 +413,7 @@ static float rates[16];
 static int running_resolution, running_width;
 /* the gun's ray this frame (game units), what it reached two frames ago */
 static float probe_o[3], probe_d[3], aim_hit_t = -1, aim_reach;
+static int aim_on_box;              /* this frame's aim went to a box on the screen */
 static int probe_on;
 static XrTime reload_t;            /* when the player last reloaded */
 static void aim_probe(void);   /* the eye size this run was set up with */
@@ -655,6 +656,14 @@ static void input_frame(XrTime t)
         if (at > 0 && stereo_ray_to_screen(ah, ax, &x, &y) && x >= 0 && x < gw && y >= 0 && y < gh) {
             gx = x; gy = y; aimed = 1; aim_reach = at / cfg.scale;
         }
+        /* A box the game hangs in front of its camera - the path choice's
+         * views - is aimed at where the laser crosses it, not where it meets
+         * the world behind: from the hand those are degrees apart */
+        aim_on_box = 0;
+        {
+            float xs, ys, ts;
+            if (!flat && stereo_aim_box(o, d, &xs, &ys, &ts)) { gx = xs; gy = ys; aimed = 1; aim_reach = ts / cfg.scale; aim_on_box = 1; }
+        }
         /* the overlay: the gun on the aim pose, the laser to the game's screen */
         xo.gun_valid = 1;
         xo.gun_q[0] = loc.pose.orientation.x; xo.gun_q[1] = loc.pose.orientation.y;
@@ -739,8 +748,9 @@ static void input_frame(XrTime t)
     }
 
     if (trig[g] && !prev[g][0] && !menu.open)       /* each pull: where the game is told it went */
-        fprintf(stderr, "[aim] frame %u: pull at %d,%d%s (reach %.2f m, depth %s, flat %d)\n", g_frame, (int)gx, (int)gy,
-                aimed ? "" : " - off the screen", aim_reach, aim_hit_t > 0 ? "read" : "assumed", stereo_flat_frame());
+        fprintf(stderr, "[aim] frame %u: pull at %d,%d%s (reach %.2f m, depth %s, flat %d%s)\n", g_frame, (int)gx, (int)gy,
+                aimed ? "" : " - off the screen", aim_reach, aim_hit_t > 0 ? "read" : "assumed", stereo_flat_frame(),
+                aim_on_box ? ", on a box" : "");
 
     unsigned held = 0;
     if (firing) held |= CAB_P1_TRIGGER;
@@ -1224,6 +1234,16 @@ void xr_frame_begin(void)
             float m[16];
             view_matrix(views[i].pose, m);
             stereo_set_eye(i, m, tx, tx, ty, ty);
+            /* the same eye seen from the head (between the eyes, facing as
+             * they do): a HUD that follows the head is placed through it */
+            XrQuaternionf q = views[0].pose.orientation, iq = { -q.x, -q.y, -q.z, q.w };
+            float off[3] = { views[i].pose.position.x - 0.5f * (views[0].pose.position.x + views[1].pose.position.x),
+                             views[i].pose.position.y - 0.5f * (views[0].pose.position.y + views[1].pose.position.y),
+                             views[i].pose.position.z - 0.5f * (views[0].pose.position.z + views[1].pose.position.z) }, rel[3];
+            qrot(iq, off, rel);
+            XrPosef hp = { { 0, 0, 0, 1 }, { rel[0], rel[1], rel[2] } };
+            view_matrix(hp, m);
+            stereo_set_eye_head(i, m);
         }
     }
     if (state == XR_SESSION_STATE_FOCUSED) input_frame(frame.predictedDisplayTime);

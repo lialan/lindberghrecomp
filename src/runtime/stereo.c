@@ -96,6 +96,8 @@ static float    g_sx, g_sy;             /* eye pixels per game pixel */
 static GLuint   g_eye_fbo[2], g_eye_tex[2], g_eye_depth[2];
 static int      g_external[2];          /* the host supplies the eye images */
 static float    g_view[2][16];          /* game camera -> eye */
+static float    g_hud_view[2][16];      /* head -> eye: the HUD kept in front of the face */
+static int      g_hud_lock = -1;        /* the HUD follows the head (LINDBERGH_XR_HUD_LOCK, vr.hud_head_locked) */
 static float    g_tan[2][4];            /* left, right, down, up */
 
 /* ---- what the game believes ---- */
@@ -217,9 +219,23 @@ static int is_perspective(const float *m) { return fabsf(m[11] + 1) < 1e-4f && f
  * lies on the ray the game fires along. 3D drawn where the HUD goes - menu
  * models, spent cases - is screen content too: flattened onto that screen
  * exactly where the arcade monitor showed it. */
+/* The view the HUD's screen is seen through: the game camera's, so it stays
+ * put in the world, or the head's, so it stays in front of the face */
+static const float *hud_view(int eye)
+{
+    if (g_hud_lock < 0) { const char *v = getenv("LINDBERGH_XR_HUD_LOCK"); g_hud_lock = v && *v == '1'; }
+    return g_hud_lock ? g_hud_view[eye] : g_view[eye];
+}
+void stereo_hud_head_locked(int on) { if (!getenv("LINDBERGH_XR_HUD_LOCK")) g_hud_lock = on; }
+
 static void effective_projection(const float *p, int hud, float *out)
 {
     if (!g_on || hud == 2) { memcpy(out, p, 64); return; }
+    if (hud == 3) {     /* a 2D layer over the whole screen - a fade, a wipe: over the whole eye, in front */
+        memcpy(out, p, 64);
+        for (int col = 0; col < 4; col++) out[col * 4 + 2] = -0.999f * out[col * 4 + 3];
+        return;
+    }
     if (g_wide) {
         memcpy(out, p, 64);
         if (g_flat) return;                     /* the arcade's picture, shown 4:3 */
@@ -251,7 +267,7 @@ static void effective_projection(const float *p, int hud, float *out)
      * steps there - a scoped view's whole scene fought over them */
     float zn = 0.25f * d, zf = 4.0f * d;
     mat_frustum(e, -t[0] * zn, t[1] * zn, -t[2] * zn, t[3] * zn, zn, zf);
-    mat_mul(ev, e, g_view[g_eye]);
+    mat_mul(ev, e, hud_view(g_eye));
     mat_mul(ev, ev, sc);
     mat_mul(out, ev, p);
 }
@@ -714,7 +730,7 @@ static void clip_to_screen(void)
     float m[16], e[16], d = g_screen_dist;
     const float *t = g_tan[g_eye];
     mat_frustum(e, -t[0] * 0.01f, t[1] * 0.01f, -t[2] * 0.01f, t[3] * 0.01f, 0.01f, 1000.0f);
-    mat_mul(m, e, g_view[g_eye]);
+    mat_mul(m, e, hud_view(g_eye));
     float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
     for (int k = 0; k < 4; k++) {
         float p[3] = { (k & 1 ? 1 : -1) * d / g_screen_lens[0], (k & 2 ? 1 : -1) * d / g_screen_lens[1], -d };
@@ -800,7 +816,7 @@ static void fixed_function_rect_done(void)
  * on every call cost more than the calls. */
 enum {
     K_OTHER, K_BINDFB, K_VIEWPORT, K_SCISSOR, K_FBTEX2D, K_ACTIVETEX, K_BINDTEX, K_ENABLE, K_DISABLE,
-    K_DRAWARRAYS, K_DRAWELEMENTS, K_DRAWOTHER, K_BEGIN, K_END, K_MATRIXMODE,
+    K_DRAWARRAYS, K_DRAWELEMENTS, K_DRAWOTHER, K_BEGIN, K_END, K_MATRIXMODE, K_VERTEX,
     K_LOADID, K_LOADMATRIX, K_MULTMATRIX, K_ORTHO, K_ORTHO2D, K_FRUSTUM, K_PERSPECTIVE,
     K_PUSHMATRIX, K_POPMATRIX, K_TRANSLATE, K_SCALE, K_GETINTEGERV, K_GETFLOATV, K_GETOTHER, K_UNMAP, K_CLEAR, K_COPYTEXSUB, K_COPYTEX,
     K_TEXIMAGE, K_FBSTATUS,
@@ -916,6 +932,7 @@ static const Cls *cls(HleId id)
         { "glEnable", K_ENABLE }, { "glDisable", K_DISABLE },
         { "glDrawArrays", K_DRAWARRAYS }, { "glDrawElements", K_DRAWELEMENTS },
         { "glBegin", K_BEGIN }, { "glEnd", K_END }, { "glMatrixMode", K_MATRIXMODE },
+        { "glVertex2f", K_VERTEX }, { "glVertex3f", K_VERTEX }, { "glVertex2i", K_VERTEX },
         { "glLoadIdentity", K_LOADID }, { "glLoadMatrixf", K_LOADMATRIX }, { "glMultMatrixf", K_MULTMATRIX },
         { "glOrtho", K_ORTHO }, { "gluOrtho2D", K_ORTHO2D }, { "glFrustum", K_FRUSTUM }, { "gluPerspective", K_PERSPECTIVE },
         { "glPushMatrix", K_PUSHMATRIX }, { "glPopMatrix", K_POPMATRIX },
@@ -1119,6 +1136,7 @@ static int weapon_draw(void)
 static GLuint   g_screen_copy[MAX_SCREEN_COPIES];
 static unsigned g_nscreen_copy;
 static int      g_skip_begin;           /* inside a glBegin/glEnd that is left out */
+static HleId    g_cur_id;               /* the call transform_call is looking at */
 
 static int screen_copy(GLuint tex)
 {
@@ -1220,9 +1238,160 @@ void stereo_bind_window(void)
     else bind_framebuffer(GL_FRAMEBUFFER, 0);
 }
 
+/* ---- what can be aimed at on the screen ----
+ * Some of the game's 2D is a target: the path choice's two boxes, each a
+ * view of a way on (shoot one to go there). On the screen in front of the
+ * player those boxes hang on the screen's plane, but the gun is told where
+ * its laser meets the world behind them - from the hand, not the eye, a
+ * point some degrees off the box aimed at. So the quads the game draws in 2D
+ * (glBegin, an identity modelview, not a perspective projection) are noted
+ * each frame as rectangles in the game's pixels; host_xr.c aims at the
+ * screen's plane where the laser crosses one (stereo_aim_box). */
+#define MAX_AIM_BOXES 16
+static float g_aim_box[2][MAX_AIM_BOXES][4];    /* [0]: the last whole frame's, [1]: this one's */
+static float g_aim_dist[2][MAX_AIM_BOXES];      /* how far in front of the game camera each hangs */
+static float g_imm_z;
+static int   g_n_aim_box[2];
+static int   g_mv_ident = 1, g_mv_ident_stack[32], g_mv_ident_top;
+static int   g_imm, g_imm_n;                    /* inside a glBegin we measure; its vertices */
+static float g_imm_box[4];
+static GLuint g_view_tex[16];                   /* textures the game copies its rendering into */
+static int   g_n_view_tex;
+
+static void aim_box_track(CPU *c, int k)
+{
+    if (g_replaying) return;
+    if (g_mode == GL_MODELVIEW) {
+        if (k == K_LOADID) g_mv_ident = 1;
+        else if (k == K_PUSHMATRIX) { if (g_mv_ident_top < 31) g_mv_ident_stack[g_mv_ident_top++] = g_mv_ident; }
+        else if (k == K_POPMATRIX) { if (g_mv_ident_top > 0) g_mv_ident = g_mv_ident_stack[--g_mv_ident_top]; }
+        else if (k == K_LOADMATRIX || k == K_MULTMATRIX || k == K_TRANSLATE || k == K_SCALE ||
+                 k == K_ORTHO || k == K_ORTHO2D || k == K_FRUSTUM || k == K_PERSPECTIVE) g_mv_ident = 0;
+    }
+    if (k == K_COPYTEXSUB || k == K_COPYTEX) {         /* a texture the game renders into: a view */
+        GLint t = 0;
+        glGetIntegerv(GL_TEXTURE_BINDING_2D, &t);
+        int known = 0;
+        for (int i = 0; i < g_n_view_tex; i++) known |= g_view_tex[i] == (GLuint)t;
+        if (t && !known && g_n_view_tex < 16) g_view_tex[g_n_view_tex++] = (GLuint)t;
+        return;
+    }
+    if (k == K_BEGIN) {
+        int view = 0;
+        for (int i = 0; i < g_n_view_tex; i++) view |= g_view_tex[i] == g_tex2d_bound;
+        g_imm = view && !g_skip_begin && g_mv_ident && g_tex2d_on;
+        { static int dbg = -1; if (dbg < 0) dbg = getenv("LINDBERGH_AIM_BOX_DEBUG") != NULL;
+          if (dbg && g_n_view_tex) fprintf(stderr, "[aimbox?] frame %u begin %#x: tex %u view %d ident %d tex2d %d skip %d persp %d (%d view textures)\n",
+                                   g_frame, A32(0), g_tex2d_bound, view, g_mv_ident, g_tex2d_on, g_skip_begin,
+                                   is_perspective(g_proj[g_proj_top]), g_n_view_tex); }
+        g_imm_n = 0; g_imm_z = 0;
+        g_imm_box[0] = g_imm_box[1] = 1e9f; g_imm_box[2] = g_imm_box[3] = -1e9f;
+    } else if (k == K_VERTEX && g_imm) {
+        const char *n = hle_name(g_cur_id);
+        float x = n[9] == 'i' ? (float)AI32(0) : argf(c, 0), y = n[9] == 'i' ? (float)AI32(1) : argf(c, 1);
+        float z = n[8] == '3' ? argf(c, 2) : 0;
+        const float *m = g_proj[g_proj_top];
+        float w = m[3] * x + m[7] * y + m[11] * z + m[15];
+        if (w <= 1e-6f) { g_imm = 0; return; }
+        float nx = (m[0] * x + m[4] * y + m[8] * z + m[12]) / w, ny = (m[1] * x + m[5] * y + m[9] * z + m[13]) / w;
+        float gx = GAME_W * 0.5f * (1 + nx), gy = GAME_H * 0.5f * (1 - ny);
+        g_imm_z += z;
+        if (gx < g_imm_box[0]) g_imm_box[0] = gx; if (gy < g_imm_box[1]) g_imm_box[1] = gy;
+        if (gx > g_imm_box[2]) g_imm_box[2] = gx; if (gy > g_imm_box[3]) g_imm_box[3] = gy;
+        g_imm_n++;
+    } else if (k == K_END && g_imm) {
+        g_imm = 0;
+        float w = g_imm_box[2] - g_imm_box[0], h = g_imm_box[3] - g_imm_box[1], a = w * h, all = (float)GAME_W * GAME_H;
+        if (g_imm_n >= 3 && a >= all * 0.005f && a <= all * 0.6f && g_n_aim_box[1] < MAX_AIM_BOXES) {
+            int i = g_n_aim_box[1]++;
+            memcpy(g_aim_box[1][i], g_imm_box, sizeof g_imm_box);
+            /* where it hangs: on the screen for a flat projection, else at its
+             * own depth in front of the game camera (the modelview is identity) */
+            g_aim_dist[1][i] = is_perspective(g_proj[g_proj_top]) ? -g_imm_z / (float)g_imm_n : g_screen_dist;
+        }
+    }
+}
+
+static void aim_box_frame(void)
+{
+    static int log = -1;
+    if (log < 0) { const char *v = getenv("LINDBERGH_AIM_BOX_LOG"); log = v && *v == '1'; }
+    if (log && g_n_aim_box[1] != g_n_aim_box[0] && g_n_aim_box[1]) {
+        fprintf(stderr, "[aimbox] frame %u:", g_frame);
+        for (int i = 0; i < g_n_aim_box[1]; i++)
+            fprintf(stderr, " %.0f,%.0f-%.0f,%.0f at %.2f", g_aim_box[1][i][0], g_aim_box[1][i][1], g_aim_box[1][i][2],
+                    g_aim_box[1][i][3], g_aim_dist[1][i]);
+        fputc('\n', stderr);
+    }
+    memcpy(g_aim_box[0], g_aim_box[1], sizeof g_aim_box[0]);
+    memcpy(g_aim_dist[0], g_aim_dist[1], sizeof g_aim_dist[0]);
+    g_n_aim_box[0] = g_n_aim_box[1];
+    g_n_aim_box[1] = 0;
+}
+
+static void from_level(const float in[3], float out[3]);
+int stereo_aim_box(const float o_[3], const float d_[3], float *x, float *y, float *reach)
+{
+    float o[3], d[3];
+    from_level(o_, o); from_level(d_, d);
+    if (d[2] > -1e-4f) return 0;
+    for (int i = 0; i < g_n_aim_box[0]; i++) {
+        float dist = g_aim_dist[0][i], t = (-dist - o[2]) / d[2];
+        if (t <= 0 || dist <= 0) continue;
+        /* where the laser crosses the box's plane, as the game camera sees it */
+        float u = (o[0] + t * d[0]) * g_screen_lens[0] / dist, v = (o[1] + t * d[1]) * g_screen_lens[1] / dist;
+        float sx = GAME_W * 0.5f * (1 + u), sy = GAME_H * 0.5f * (1 - v);
+        const float *b = g_aim_box[0][i];
+        if (sx >= b[0] && sx <= b[2] && sy >= b[1] && sy <= b[3]) { *x = sx; *y = sy; *reach = t; return 1; }
+    }
+    return 0;
+}
+
+/* ---- 2D over the whole screen ----
+ * A fade or a wipe covers the game's whole screen; put on the screen in front
+ * of the player it is a rectangle in the scene instead of the change of
+ * scene it is. A 2D draw that covers the screen goes over the whole eye
+ * (effective_projection's hud 3). An array draw is measured as it is made; a
+ * glBegin only at its glEnd, when gl4es draws it. */
+static int   g_fill_track;
+static float g_fill_box[4];
+
+static int fills_screen(CPU *c, const char *n)
+{
+    float b[4];
+    return ndc_box(c, n, b) && b[0] <= -0.98f && b[2] >= 0.98f && b[1] <= -0.98f && b[3] >= 0.98f;
+}
+
+static void fill_track(CPU *c, int k)
+{
+    if (!g_fill_track) return;
+    if (k == K_VERTEX) {
+        const char *n = hle_name(g_cur_id);
+        float x = n[9] == 'i' ? (float)AI32(0) : argf(c, 0), y = n[9] == 'i' ? (float)AI32(1) : argf(c, 1);
+        float z = n[8] == '3' ? argf(c, 2) : 0;
+        const float *m = g_proj[g_proj_top];
+        float w = m[3] * x + m[7] * y + m[11] * z + m[15];
+        if (w <= 1e-6f) { g_fill_track = 0; return; }
+        float nx = (m[0] * x + m[4] * y + m[8] * z + m[12]) / w, ny = (m[1] * x + m[5] * y + m[9] * z + m[13]) / w;
+        if (nx < g_fill_box[0]) g_fill_box[0] = nx; if (ny < g_fill_box[1]) g_fill_box[1] = ny;
+        if (nx > g_fill_box[2]) g_fill_box[2] = nx; if (ny > g_fill_box[3]) g_fill_box[3] = ny;
+    } else if (k == K_END) {
+        g_fill_track = 0;
+        if (g_fill_box[0] <= -0.98f && g_fill_box[2] >= 0.98f && g_fill_box[1] <= -0.98f && g_fill_box[3] >= 0.98f) {
+            clip_done();
+            g_loaded_hud = 3;
+            load_projection();
+            g_proj_dirty = 1;           /* the next draw decides afresh */
+        }
+    }
+}
+
 static int transform_call(CPU *c, HleId id, const char *n)
 {
     int k = cls(id)->kind;
+    g_cur_id = id;
+    aim_box_track(c, k);
+    fill_track(c, k);
     if (g_skip_begin) {
         if (k == K_END) g_skip_begin = 0;
         return 1;
@@ -1371,6 +1540,9 @@ static int transform_call(CPU *c, HleId id, const char *n)
         int hud = persp ? g_game_fb == g_hud_fb || menu_state() || g_menu || zoom
                         : !(g_unit0_rect || picture_2d(g_tex2d_bound) || picture_fb(g_game_fb)) || !covers_viewport(c, n);
         if (offscreen_fb(g_game_fb) || g_flat) hud = 2;  /* the game's own projection, untouched */
+        if (hud == 1 && !persp && g_mv && fills_screen(c, n)) hud = 3;
+        g_fill_track = hud == 1 && !persp && g_mv && k == K_BEGIN;    /* glBegin: measured until glEnd */
+        if (g_fill_track) { g_fill_box[0] = g_fill_box[1] = 1e9f; g_fill_box[2] = g_fill_box[3] = -1e9f; }
         if (hud == 1 && !is_perspective(g_proj[g_proj_top]) && !g_replaying) g_hud_fb_next = g_game_fb;
         if (!persp && !g_replaying) { if (hud) { if (!g_hud2d) g_hud_lens = g_last_persp[0]; g_hud2d++; } else g_pass2d++; }
         if (hud == 1 && !persp && !g_replaying && sight_draw(c, n)) return 1;
@@ -1385,6 +1557,7 @@ static int transform_call(CPU *c, HleId id, const char *n)
         if (g_proj_dirty) load_projection();
         if (hud == 1 && persp && !g_menu_vp[2] && (g_vp[2] != GAME_W || g_vp[3] != GAME_H)) memcpy(g_menu_vp, g_vp, sizeof g_vp);
         if (hud == 1) clip_to_screen();
+        else if (hud == 3) clip_done();
         /* The game's 2D all sits at one depth and is drawn with LEQUAL, so on
          * the arcade the last draw wins. Put on the screen, coplanar quads
          * round to slightly different depths and fight pixel by pixel - the
@@ -2314,6 +2487,7 @@ void stereo_frame_end(void)
 
 void stereo_frame_begin(void)
 {
+    aim_box_frame();
     glprof_report();
     if (!g_on) return;
     g_nops = 0;
@@ -2434,6 +2608,9 @@ void stereo_set_eye_target(int eye, unsigned fbo)
     g_external[eye] = 1;
     g_eye_fbo[eye] = fbo;
 }
+
+/* head -> eye, for a HUD that follows the head */
+void stereo_set_eye_head(int eye, const float view[16]) { memcpy(g_hud_view[eye], view, 64); }
 
 void stereo_set_eye(int eye, const float view[16], float tl, float tr, float td, float tu)
 {

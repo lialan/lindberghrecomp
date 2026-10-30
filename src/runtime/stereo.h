@@ -24,11 +24,18 @@ void stereo_set_eye_target(int eye, unsigned fbo);
 /* view: game camera space -> eye space, column-major, in game units.
  * The tangents of the eye's field of view: left, right, down, up. */
 void stereo_set_eye(int eye, const float view[16], float tan_l, float tan_r, float tan_d, float tan_u);
+/* head -> eye, for a HUD that follows the head; whether it does */
+void stereo_set_eye_head(int eye, const float view[16]);
+void stereo_hud_head_locked(int on);
 /* The HUD is drawn on a screen this far in front of the game camera. */
 void stereo_set_screen_distance(float d);
 /* A ray in game camera space -> the point it aims at on that screen, in the
  * game's 640x480 pixels. Returns 0 if it points away. */
 int  stereo_ray_to_screen(const float o[3], const float d[3], float *x, float *y);
+/* The laser (origin o, direction d, game units) on a box the game drew last
+ * frame from its own rendering - the path choice's views: where it crosses
+ * the box, in the game's pixels, and how far along the laser */
+int  stereo_aim_box(const float o[3], const float d[3], float *x, float *y, float *reach);
 void stereo_game_size(int *w, int *h);
 void stereo_picture_size(int w, int h);   /* the world drawn into a target of this size */
 void stereo_env_projection(int on);       /* the projection is in program.env[0..3] */     /* the game's picture, in its pixels */

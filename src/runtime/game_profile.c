@@ -41,6 +41,7 @@ void game_profile_apply(const LgGameProfile *p)
 #ifdef __ANDROID__
     if (p->vr.title) env_default("LINDBERGH_XR_TITLE", p->vr.title);
     if (p->vr.gl_thread) env_default("LINDBERGH_GL_THREAD", "1");
+    if (p->vr.hud_head_locked) stereo_hud_head_locked(1);
     if (p->vr.scale > 0) {
         char s[32];
         snprintf(s, sizeof s, "%g", p->vr.scale);
