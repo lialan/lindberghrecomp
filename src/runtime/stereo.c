@@ -1269,8 +1269,11 @@ static void aim_box_track(CPU *c, int k)
                  k == K_ORTHO || k == K_ORTHO2D || k == K_FRUSTUM || k == K_PERSPECTIVE) g_mv_ident = 0;
     }
     if (k == K_COPYTEXSUB || k == K_COPYTEX) {         /* a texture the game renders into: a view */
+        /* the game's own name for it, as the draws bind it: in the headset GL
+         * may have a larger stand-in of a render target bound instead */
         GLint t = 0;
-        glGetIntegerv(GL_TEXTURE_BINDING_2D, &t);
+        if (g_active_unit == GL_TEXTURE0) t = (GLint)g_tex2d_bound;
+        else glGetIntegerv(GL_TEXTURE_BINDING_2D, &t);
         int known = 0;
         for (int i = 0; i < g_n_view_tex; i++) known |= g_view_tex[i] == (GLuint)t;
         if (t && !known && g_n_view_tex < 16) g_view_tex[g_n_view_tex++] = (GLuint)t;
@@ -1299,6 +1302,8 @@ static void aim_box_track(CPU *c, int k)
         if (gx < g_imm_box[0]) g_imm_box[0] = gx; if (gy < g_imm_box[1]) g_imm_box[1] = gy;
         if (gx > g_imm_box[2]) g_imm_box[2] = gx; if (gy > g_imm_box[3]) g_imm_box[3] = gy;
         g_imm_n++;
+        if (getenv("LINDBERGH_AIM_BOX_DEBUG") && g_frame % 10 == 0)
+            fprintf(stderr, "[aimbox?] frame %u vertex %.3f,%.3f,%.3f -> %.1f,%.1f (proj %.3f %.3f %.3f %.3f)\n", g_frame, x, y, z, gx, gy, m[0], m[5], m[8], m[9]);
     } else if (k == K_END && g_imm) {
         g_imm = 0;
         float w = g_imm_box[2] - g_imm_box[0], h = g_imm_box[3] - g_imm_box[1], a = w * h, all = (float)GAME_W * GAME_H;
@@ -1315,8 +1320,9 @@ static void aim_box_track(CPU *c, int k)
 static void aim_box_frame(void)
 {
     static int log = -1;
-    if (log < 0) { const char *v = getenv("LINDBERGH_AIM_BOX_LOG"); log = v && *v == '1'; }
-    if (log && g_n_aim_box[1] != g_n_aim_box[0] && g_n_aim_box[1]) {
+    if (log < 0) { const char *v = getenv("LINDBERGH_AIM_BOX_LOG"); log = v ? atoi(v) : 0; }
+    /* =2: every tenth frame a box is up, not only when their number changes */
+    if (log && g_n_aim_box[1] && (g_n_aim_box[1] != g_n_aim_box[0] || (log == 2 && g_frame % 10 == 0))) {
         fprintf(stderr, "[aimbox] frame %u:", g_frame);
         for (int i = 0; i < g_n_aim_box[1]; i++)
             fprintf(stderr, " %.0f,%.0f-%.0f,%.0f at %.2f", g_aim_box[1][i][0], g_aim_box[1][i][1], g_aim_box[1][i][2],
@@ -1330,6 +1336,14 @@ static void aim_box_frame(void)
 }
 
 static void from_level(const float in[3], float out[3]);
+/* the last whole frame's route box i, on the game's screen; 0 when there's none */
+int stereo_aim_box_rect(int i, float r[4])
+{
+    if (i < 0 || i >= g_n_aim_box[0]) return 0;
+    memcpy(r, g_aim_box[0][i], sizeof(float) * 4);
+    return 1;
+}
+
 int stereo_aim_box(const float o_[3], const float d_[3], float *x, float *y, float *reach)
 {
     float o[3], d[3];

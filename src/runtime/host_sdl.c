@@ -312,7 +312,14 @@ static void cabinet_autostart(void)
         int w = g_win.w ? g_win.w : DEFAULT_W, h = g_win.h ? g_win.h : DEFAULT_H;
         int ax, ay;     /* LINDBERGH_AIM=x,y holds the gun still instead */
         const char *aim = getenv("LINDBERGH_AIM");
-        if (aim && sscanf(aim, "%d,%d", &ax, &ay) == 2) { g_mouse_x = ax; g_mouse_y = ay; }
+        /* LINDBERGH_AIM_BOX=<n>: at the centre of route box n while one is up;
+         * =<x>,<y>: at that point while any is */
+        const char *box = getenv("LINDBERGH_AIM_BOX");
+        float r[4];
+        int bx, by;
+        if (box && strchr(box, ',') && sscanf(box, "%d,%d", &bx, &by) == 2 && stereo_aim_box_rect(0, r)) { g_mouse_x = bx; g_mouse_y = by; }
+        else if (box && !strchr(box, ',') && stereo_aim_box_rect(atoi(box), r)) { g_mouse_x = (int)((r[0] + r[2]) / 2); g_mouse_y = (int)((r[1] + r[3]) / 2); }
+        else if (aim && sscanf(aim, "%d,%d", &ax, &ay) == 2) { g_mouse_x = ax; g_mouse_y = ay; }
         else {
             g_mouse_x = (int)(w / 2 + w / 3 * cos(t));
             g_mouse_y = (int)(h / 2 + h / 3 * sin(t));

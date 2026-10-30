@@ -36,6 +36,7 @@ int  stereo_ray_to_screen(const float o[3], const float d[3], float *x, float *y
  * frame from its own rendering - the path choice's views: where it crosses
  * the box, in the game's pixels, and how far along the laser */
 int  stereo_aim_box(const float o[3], const float d[3], float *x, float *y, float *reach);
+int  stereo_aim_box_rect(int i, float r[4]);
 void stereo_game_size(int *w, int *h);
 void stereo_picture_size(int w, int h);   /* the world drawn into a target of this size */
 void stereo_env_projection(int on);       /* the projection is in program.env[0..3] */     /* the game's picture, in its pixels */
