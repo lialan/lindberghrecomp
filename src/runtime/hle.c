@@ -117,16 +117,25 @@ static unsigned char *g_seen;
 static int tracing(void)
 {
     static int cached = -1;
-    static long only = -2;              /* LINDBERGH_HLE_TRACE_FRAME=n: that frame's calls alone */
+    /* LINDBERGH_HLE_TRACE_FRAME=n: that frame's calls alone; =a,b,step:
+     * every step-th frame from a to b */
+    static long only = -2, last, step = 1;
     if (cached < 0) {
         const char *v = getenv("LINDBERGH_HLE_TRACE");
         cached = (v && *v && *v != '0') ? 1 : 0;
         const char *f = getenv("LINDBERGH_HLE_TRACE_FRAME");
         only = f && *f ? atol(f) : -1;
+        last = only;
+        if (f && strchr(f, ',')) {
+            last = atol(strchr(f, ',') + 1);
+            const char *s2 = strchr(strchr(f, ',') + 1, ',');
+            if (s2 && atol(s2 + 1) > 0) step = atol(s2 + 1);
+        }
         if (only >= 0) cached = 1;
     }
     extern unsigned g_frame;
-    return cached && (only < 0 || (long)g_frame == only);
+    long fr = (long)g_frame;
+    return cached && (only < 0 || (fr >= only && fr <= last && (fr - only) % step == 0));
 }
 
 /* Stop deliberately at the Nth import call and report, because the failure
@@ -161,7 +170,8 @@ void hle_call(CPU *c, HleId id)
         static int next_tid;
         static __thread int tid;
         if (!tid) tid = __sync_add_and_fetch(&next_tid, 1);
-        fprintf(stderr, "[call] t%d %s\n", tid, hle_name(id));
+        fprintf(stderr, "[call] t%d %s %#x %#x %#x %#x %#x %#x\n", tid, hle_name(id), rd32(c->esp), rd32(c->esp + 4),
+                rd32(c->esp + 8), rd32(c->esp + 12), rd32(c->esp + 16), rd32(c->esp + 20));
         fflush(stderr);
     }
     if ((unsigned)id < HLE_COUNT && g_hle_handlers[id]) {
