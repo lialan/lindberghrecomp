@@ -1868,7 +1868,9 @@ static void glprof_report(void)
     {   /* the call count is what the per-call overhead multiplies */
         static unsigned shown[HLE_ID_MAX];
         memset(shown, 0, sizeof shown);
-        for (int k = 0; k < 16; k++) {
+        static int most = -1;
+        if (most < 0) { const char *v = getenv("LINDBERGH_GLPROF_CALLS"); most = v && *v ? atoi(v) : 16; }
+        for (int k = 0; k < most; k++) {
             unsigned best = 0;
             for (unsigned i = 1; i < HLE_ID_MAX; i++) if (!shown[i] && g_glprof_n[i] > g_glprof_n[best]) best = i;
             if (!best || !g_glprof_n[best]) break;

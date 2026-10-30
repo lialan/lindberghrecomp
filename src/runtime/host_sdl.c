@@ -923,8 +923,14 @@ void host_swap(void)
             g_late17 = g_late25 = 0; g_worst = 0;
             g_t_game = g_t_eye2 = g_t_submit = g_t_wait = 0;
 #else
-            fprintf(stderr, "[perf] frame %u, %.1f fps\n", g_frame,
-                    (g_frame - f0) * 1000.0 / (now - t0));
+            /* the game thread's own CPU time: what a slower CPU (the Quest's)
+             * scales, where the frame rate here is held at the display's */
+            static double cpu0;
+            struct timespec ts; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+            double cpu = ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+            fprintf(stderr, "[perf] frame %u, %.1f fps; game thread CPU %.2f ms per frame\n", g_frame,
+                    (g_frame - f0) * 1000.0 / (now - t0), cpu0 ? (cpu - cpu0) / (g_frame - f0 ? g_frame - f0 : 1) : 0.0);
+            cpu0 = cpu;
 #endif
             t0 = now; f0 = g_frame;
         }
