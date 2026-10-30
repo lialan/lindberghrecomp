@@ -65,6 +65,7 @@ void stereo_set_aim_hook(void (*fn)(void));
 unsigned stereo_world_depth(float *zn, float *zf);
 /* when the world's depth is read: LG_DEPTH_* (game_profile.h) */
 void stereo_depth_read(int mode);
+int  stereo_camera_swung(void);           /* the game turned its camera hard since last asked (once) */
 int  stereo_aim_samples(const float o[3], const float d[3], int max, float (*px)[2], float *z, float *t, unsigned *depth, float *zn, float *zf);
 void stereo_screen(float *half_w, float *half_h, float *dist);
 /* Where the gun points this frame, in the game's 640x480 (off the screen:

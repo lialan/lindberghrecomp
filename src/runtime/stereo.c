@@ -70,6 +70,7 @@ static int g_game_w = 640, g_game_h = 480;
  * 800x600, tone mapped onto its 1360x768 screen), and whether its projection
  * lives in its vertex programs' constants (arb_env_projection) */
 static int g_pic_w, g_pic_h, g_env_proj;
+static unsigned g_swing_at;       /* the frame the game last swung its camera hard (track_camera_swing) */
 void stereo_picture_size(int w, int h) { g_pic_w = w; g_pic_h = h; }
 void stereo_env_projection(int on) { g_env_proj = on; }
 static int picture_size(int w, int h) { return (w == GAME_W && h == GAME_H) || (w && w == g_pic_w && h == g_pic_h); }
@@ -2191,9 +2192,41 @@ static void dump_targets(void)
     glDeleteFramebuffers(1, &fb);
 }
 
+/* The game turning its camera hard - Let's Go Jungle swings round to a
+ * spider on the jeep's tailgate - measured over a third of a second, the
+ * camera's direction taken from the draws' matrices (arb_camera_direction).
+ * The headset puts the game's view back in front of the player then
+ * (stereo_camera_swung). */
+#define SWING_SPAN 20
+static float    g_cam_hist[SWING_SPAN][3];
+static unsigned g_cam_n, g_swung;
+static void track_camera_swing(void)
+{
+    float d[3];
+    if (!arb_camera_direction(d)) { g_cam_n = 0; return; }
+    static int log = -1;
+    if (log < 0) { const char *v = getenv("LINDBERGH_CAM_LOG"); log = v && *v && *v != '0'; }
+    if (g_cam_n >= SWING_SPAN) {
+        const float *o = g_cam_hist[g_cam_n % SWING_SPAN];
+        float c = o[0] * d[0] + o[1] * d[1] + o[2] * d[2];
+        if (log && g_frame % 30 == 0)
+            fprintf(stderr, "[cam] frame %u: looking %.2f %.2f %.2f, %.0f deg in %d frames\n",
+                    g_frame, d[0], d[1], d[2], acosf(c > 1 ? 1 : c < -1 ? -1 : c) * 57.2958f, SWING_SPAN);
+        if (c < 0.82f && g_frame - g_swing_at > 90) {      /* more than ~35 degrees */
+            g_swung = 1; g_swing_at = g_frame;
+            fprintf(stderr, "[cam] frame %u: the game swung its camera %.0f deg\n", g_frame, acosf(c < -1 ? -1 : c) * 57.2958f);
+        }
+    }
+    memcpy(g_cam_hist[g_cam_n % SWING_SPAN], d, sizeof d);
+    g_cam_n++;
+}
+
+int stereo_camera_swung(void) { int s = g_swung; g_swung = 0; return s; }
+
 void stereo_frame_end(void)
 {
     if (!g_on) return;
+    if (g_env_proj) track_camera_swing();
     g_read_at_leave = -1;
     if (g_depth_read == 1) g_read_at_leave = 0;             /* LG_DEPTH_FIRST_LEAVE */
     else if (g_depth_read == 0)                             /* LG_DEPTH_AUTO */

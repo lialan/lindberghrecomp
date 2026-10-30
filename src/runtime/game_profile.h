@@ -49,6 +49,8 @@ typedef struct {
         int   camera_in_constants;  /* the camera is in the vertex programs' constants, not GL's matrices */
         int   depth_read;       /* LG_DEPTH_* */
         int   compositor_depth; /* LG_COMPOSITOR_DEPTH_* */
+        int   face_swings;      /* when the game swings its camera hard, its view is put back in front of the
+                                 * player's head (needs camera_in_constants; LINDBERGH_XR_FACE_SWINGS=0 turns it off) */
     } vr;
 } LgGameProfile;
 

@@ -23,5 +23,6 @@ unsigned arb_bound_vp(void);       /* the programs a draw now would use (0: none
 unsigned arb_bound_fp(void);
 
 int arb_env_projection(float P[16]);   /* the projection in program.env[0..3], for stereo.c */
+int arb_camera_direction(float out[3]); /* where the game camera looked this frame (stereo.c) */
 
 #endif

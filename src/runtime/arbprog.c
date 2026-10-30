@@ -2166,6 +2166,10 @@ static int passes_position(const char *src)
     return 0;
 }
 
+#define MAX_CAM_DIR 192
+static float g_cam_dir[MAX_CAM_DIR][3];
+static int g_ncam_dir;
+
 int arb_env_projection(float P[16])
 {
     if (!g_enabled[0] || !g_bound[0]) return 0;
@@ -2211,6 +2215,33 @@ int arb_env_projection(float P[16])
     P[8] = cx; P[9] = cy; P[10] = A; P[11] = -1.0f;
     P[14] = c[3][2] + A * c[3][3]; P[15] = 0.0f;
     memcpy(good, P, sizeof good); have_good = 1;
+    if (g_ncam_dir < MAX_CAM_DIR) {         /* where the camera looks, in the draw's own space */
+        float *d = g_cam_dir[g_ncam_dir++];
+        for (int i = 0; i < 3; i++) d[i] = r3[i] / s;
+    }
+    return 1;
+}
+
+/* The direction the game camera looks this frame, from the draws'
+ * matrices: each holds the camera times its model's own placement, so the
+ * direction most of them agree on - the terrain and the props, set in the
+ * world as they are - is the camera's. Returns 0 when too few drew to say;
+ * starts the next frame's count either way. */
+int arb_camera_direction(float out[3])
+{
+    int n = g_ncam_dir, best = -1, best_k = 0;
+    g_ncam_dir = 0;
+    if (n < 4) return 0;
+    for (int i = 0; i < n; i++) {
+        int k = 0;
+        for (int j = 0; j < n; j++) {
+            const float *a = g_cam_dir[i], *b = g_cam_dir[j];
+            if (a[0] * b[0] + a[1] * b[1] + a[2] * b[2] > 0.9995f) k++;
+        }
+        if (k > best_k) { best_k = k; best = i; }
+    }
+    if (best_k < 3) return 0;
+    memcpy(out, g_cam_dir[best], 3 * sizeof(float));
     return 1;
 }
 

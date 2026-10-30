@@ -1186,6 +1186,23 @@ void xr_frame_begin(void)
             }
         }
     }
+    {   /* The game swung its camera round (a spider on the tailgate): its new
+         * view goes where the player is looking, not where the game was
+         * anchored - looking off to one side, they would face the jeep's
+         * seats instead. Only when the head is turned enough to miss it. */
+        static int on = -1;
+        if (on < 0) { const char *v = getenv("LINDBERGH_XR_FACE_SWINGS"); on = v && *v && *v != '0'; }
+        if (on && stereo_camera_swung() && views_ok) {
+            const float back[3] = { 0, 0, -1 };
+            float f[3];
+            qrot(views[0].pose.orientation, back, f);
+            float yaw = atan2f(-f[0], -f[2]) * 57.2958f;
+            if (fabsf(yaw) > 15.0f) {
+                anchor_pending = 1;
+                fprintf(stderr, "[xr] the game swung its camera with the head %.0f deg off it: re-anchoring\n", yaw);
+            }
+        }
+    }
     if (views_ok && getenv("LINDBERGH_POSE_LOG")) {
         XrQuaternionf q = views[0].pose.orientation;
         fprintf(stderr, "[pose] frame %u: q %.5f %.5f %.5f %.5f pos %.4f %.4f %.4f t %lld\n", g_frame, q.x, q.y, q.z, q.w,
