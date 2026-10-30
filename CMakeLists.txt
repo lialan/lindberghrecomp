@@ -52,6 +52,7 @@ function(lindbergh_runtime target generated_dir)
             "${LINDBERGH_RUNTIME_DIR}/guest_mem.c"
             "${LINDBERGH_RUNTIME_DIR}/host_sdl.c"
             "${LINDBERGH_RUNTIME_DIR}/host_settings.c"
+            "${LINDBERGH_RUNTIME_DIR}/game_profile.c"
             "${LINDBERGH_RUNTIME_DIR}/hle_gl_posix.c"
             "${LINDBERGH_RUNTIME_DIR}/arbprog.c"
             "${LINDBERGH_RUNTIME_DIR}/glsl_pp.c"

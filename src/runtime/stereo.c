@@ -524,6 +524,8 @@ static void apply_rect(int vp)
  * which no more world was drawn), -1 none: the frame's end. */
 static unsigned g_leaves, g_leave_draws[16];
 static int      g_read_at_leave;
+static int      g_depth_read;           /* LG_DEPTH_* (game_profile.h): which leaving that is */
+void stereo_depth_read(int mode) { g_depth_read = mode; }
 
 static void bind_framebuffer(GLenum target, GLuint fb)
 {
@@ -2193,8 +2195,10 @@ void stereo_frame_end(void)
 {
     if (!g_on) return;
     g_read_at_leave = -1;
-    for (unsigned i = 0; i < g_leaves && i < 16; i++)
-        if (g_leave_draws[i] == g_scene_draws) { g_read_at_leave = (int)i; break; }
+    if (g_depth_read == 1) g_read_at_leave = 0;             /* LG_DEPTH_FIRST_LEAVE */
+    else if (g_depth_read == 0)                             /* LG_DEPTH_AUTO */
+        for (unsigned i = 0; i < g_leaves && i < 16; i++)
+            if (g_leave_draws[i] == g_scene_draws) { g_read_at_leave = (int)i; break; }
     g_leaves = 0;
     g_flat_shown = g_flat;
     dump_targets();

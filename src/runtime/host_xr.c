@@ -57,6 +57,7 @@
 #include <openxr/openxr_platform.h>
 
 #include "lindbergh_rt.h"
+#include "game_profile.h"
 #include "stereo.h"
 #include "xr_overlay.h"
 #include "xr_menu.h"
@@ -463,11 +464,11 @@ static void reset_game(void)
     (*env)->DeleteLocalRef(env, activity);
 }
 
-/* the panel's title: LINDBERGH_XR_TITLE, which the game's own start sets */
+/* the panel's title: LINDBERGH_XR_TITLE, which the game's profile sets (game_profile.h) */
 static const char *app_title(void)
 {
     const char *t = getenv("LINDBERGH_XR_TITLE");
-    return t && *t ? t : "Ghost Squad Evolution VR";
+    return t && *t ? t : "Lindbergh VR";
 }
 
 static void menu_paint(void)
@@ -850,7 +851,15 @@ int xr_init(void)
         if (!strcmp(props[i].extensionName, XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME)) have_perf = 1;
         if (!strcmp(props[i].extensionName, XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME)) have_depth_layer = 1;
     }
-    { const char *v = getenv("LINDBERGH_XR_DEPTH"); if (v && *v == '0') have_depth_layer = 0; if (v && *v == '1') depth_div = 1; }
+    {   /* the game's choice (game_profile.h), unless LINDBERGH_XR_DEPTH=0 (off), 1 (full size) or 2 (half) */
+        const char *v = getenv("LINDBERGH_XR_DEPTH");
+        int mode = game_profile()->vr.compositor_depth;
+        if (v && *v == '0') mode = LG_COMPOSITOR_DEPTH_OFF;
+        if (v && *v == '1') mode = LG_COMPOSITOR_DEPTH_FULL;
+        if (v && *v == '2') mode = LG_COMPOSITOR_DEPTH_HALF;
+        if (mode == LG_COMPOSITOR_DEPTH_OFF) have_depth_layer = 0;
+        depth_div = mode == LG_COMPOSITOR_DEPTH_FULL ? 1 : 2;
+    }
     free(props);
     if (have_rate) ext[next++] = XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME;
     if (have_perf) ext[next++] = XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME;
