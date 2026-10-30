@@ -2161,10 +2161,27 @@ int arb_env_projection(float P[16])
     float ax[3], ay[3];
     for (int i = 0; i < 3; i++) { ax[i] = r0[i] + cx * r3[i]; ay[i] = r1[i] + cy * r3[i]; }
 #undef DOT3
-    P[0] = sqrtf(ax[0] * ax[0] + ax[1] * ax[1] + ax[2] * ax[2]) / s;
-    P[5] = sqrtf(ay[0] * ay[0] + ay[1] * ay[1] + ay[2] * ay[2]) / s;
+    float lx = sqrtf(ax[0] * ax[0] + ax[1] * ax[1] + ax[2] * ax[2]), ly = sqrtf(ay[0] * ay[0] + ay[1] * ay[1] + ay[2] * ay[2]);
+    float skew = lx > 0 && ly > 0 ? fabsf(ax[0] * ay[0] + ax[1] * ay[1] + ax[2] * ay[2]) / (lx * ly) : 1;
+    /* The matrix is the projection times a rigid view (times a uniform
+     * scale) only for most draws. A skinned model's program multiplies by it
+     * after blending its bones, and the game folds whatever it likes into it
+     * then (Let's Go Jungle's jeep and riders: a horizontal lens of 0) - the
+     * projection is still the camera's, so it is the one the frame's other
+     * world draws gave. Taken apart, it would have left them drawn with the
+     * game's own lens, locked to the head. */
+    static float good[16];
+    static int have_good;
+    if (lx / s < 0.05f || ly / s < 0.05f || skew > 0.02f) {
+        if (!have_good) return 0;
+        memcpy(P, good, sizeof good);
+        return 1;
+    }
+    P[0] = lx / s;
+    P[5] = ly / s;
     P[8] = cx; P[9] = cy; P[10] = A; P[11] = -1.0f;
     P[14] = c[3][2] + A * c[3][3]; P[15] = 0.0f;
+    memcpy(good, P, sizeof good); have_good = 1;
     return 1;
 }
 
