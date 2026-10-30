@@ -134,6 +134,7 @@ def recompile(elf_path, outdir, addrs=None, bounds=None, split=400):
     # direct call unless the runtime has a hook at that address (see
     # lindbergh_rt.h); each unit declares what it calls that way.
     from .flags import strip_dead_flags
+    from .regcache import cache_registers, PRELUDE as REGCACHE_PRELUDE
     flags_dropped = 0
     lifted = set(done)
     lit = re.compile(r"\bdispatch\(c, 0x([0-9A-F]{8})u\);")
@@ -148,9 +149,10 @@ def recompile(elf_path, outdir, addrs=None, bounds=None, split=400):
         body = lit.sub(direct, "\n".join(chunk[len(header):]))
         body, n = strip_dead_flags(body)
         flags_dropped += n
+        body, _ = cache_registers(body)      # registers in locals (regcache.py)
         protos = sorted(set(re.findall(r"DISPATCH_TO\(c, 0x[0-9A-F]{8}u, (L_[0-9A-F]{8})\)", body)))
         with open(os.path.join(outdir, "recomp_funcs_%04d.c" % i), "w") as f:
-            f.write("\n".join(header) + "\n")
+            f.write("\n".join(header) + "\n" + REGCACHE_PRELUDE)
             f.write("".join("void %s(CPU *c);\n" % p for p in protos) + "\n")
             f.write(body)
 
