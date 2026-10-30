@@ -1348,7 +1348,7 @@ static int transform_call(CPU *c, HleId id, const char *n)
             if (!g_replaying) tally_lens(g_proj[g_proj_top]);
             if (is_draw(k) && weapon_draw()) return 1;
         }
-        if (persp && g_game_fb != g_hud_fb && !g_replaying && !offscreen_fb(g_game_fb)) { g_scene_draws++; g_world_fb_next = g_game_fb; }
+        if (persp && g_game_fb != g_hud_fb && !g_replaying && !offscreen_fb(g_game_fb)) { g_scene_draws++; g_world_fb_next = g_game_fb; if (g_env_proj) arb_camera_count(); }
         if (persp && g_proj[g_proj_top][0] > g_lens_seen) g_lens_seen = g_proj[g_proj_top][0];
         if (persp && !g_replaying && g_game_fb != g_hud_fb) {
             const float *P = g_proj[g_proj_top];
@@ -2194,24 +2194,63 @@ static void dump_targets(void)
 
 /* The game turning its camera hard - Let's Go Jungle swings round to a
  * spider on the jeep's tailgate - measured over a third of a second, the
- * camera's direction taken from the draws' matrices (arb_camera_direction).
- * The headset puts the game's view back in front of the player then
- * (stereo_camera_swung). */
+ * camera's direction taken from the draws' matrices (arb_camera_basis). The
+ * headset puts the game's view back in front of the player then
+ * (stereo_camera_swung).
+ *
+ * The horizon kept level (stereo_level_horizon): the game tips its camera
+ * too - 70 degrees down into the jeep for its bees, for many seconds - and
+ * in the headset that tips the whole world. Its turning left and right is
+ * kept; its pitch and roll go into where its view sits instead: the eyes see
+ * the world from a level camera, the HUD and the sight lie where the game
+ * looks, and the player looks down at the bees. g_level takes the game
+ * camera's space to the level one. */
 #define SWING_SPAN 20
 static float    g_cam_hist[SWING_SPAN][3];
 static unsigned g_cam_n, g_swung;
+static int      g_level_on;
+static float    g_level[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+static float    g_head_view[2][16];     /* level space -> eye, as the headset gave it */
+
+void stereo_level_horizon(int on) { g_level_on = on; }
+
+static void update_level(const float r[3], const float u[3], const float f[3])
+{
+    static float hf[3] = { 0, 0, -1 };      /* the level heading, kept while the camera looks straight down */
+    float h = sqrtf(f[0] * f[0] + f[2] * f[2]);
+    if (h > 0.2f) { hf[0] = f[0] / h; hf[1] = 0; hf[2] = f[2] / h; }
+    else if (h < 1e-3f) return;
+    /* the level frame: right = heading x up, up, back */
+    const float L[3][3] = { { -hf[2], 0, hf[0] }, { 0, 1, 0 }, { -hf[0], 0, -hf[2] } };
+    const float *C[3] = { r, u, NULL };
+    float cb[3] = { -f[0], -f[1], -f[2] };
+    C[2] = cb;
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++)
+            g_level[j * 4 + i] = L[i][0] * C[j][0] + L[i][1] * C[j][1] + L[i][2] * C[j][2];
+    for (int e = 0; e < 2; e++) mat_mul(g_view[e], g_head_view[e], g_level);
+    g_proj_dirty = 1;
+}
+
+/* a direction or point in level space -> the game camera's (g_level's transpose) */
+static void from_level(const float in[3], float out[3])
+{
+    for (int j = 0; j < 3; j++) out[j] = g_level[j * 4] * in[0] + g_level[j * 4 + 1] * in[1] + g_level[j * 4 + 2] * in[2];
+}
+
 static void track_camera_swing(void)
 {
-    float d[3];
-    if (!arb_camera_direction(d)) { g_cam_n = 0; return; }
+    float r[3], u[3], d[3];
+    if (!arb_camera_basis(r, u, d)) { g_cam_n = 0; return; }
+    if (g_level_on) update_level(r, u, d);
     static int log = -1;
     if (log < 0) { const char *v = getenv("LINDBERGH_CAM_LOG"); log = v && *v && *v != '0'; }
     if (g_cam_n >= SWING_SPAN) {
         const float *o = g_cam_hist[g_cam_n % SWING_SPAN];
         float c = o[0] * d[0] + o[1] * d[1] + o[2] * d[2];
         if (log && g_frame % 30 == 0)
-            fprintf(stderr, "[cam] frame %u: looking %.2f %.2f %.2f, %.0f deg in %d frames\n",
-                    g_frame, d[0], d[1], d[2], acosf(c > 1 ? 1 : c < -1 ? -1 : c) * 57.2958f, SWING_SPAN);
+            fprintf(stderr, "[cam] frame %u: looking %.2f %.2f %.2f, up %.2f %.2f %.2f, %.0f deg in %d frames\n",
+                    g_frame, d[0], d[1], d[2], u[0], u[1], u[2], acosf(c > 1 ? 1 : c < -1 ? -1 : c) * 57.2958f, SWING_SPAN);
         if (c < 0.82f && g_frame - g_swing_at > 90) {      /* more than ~35 degrees */
             g_swung = 1; g_swing_at = g_frame;
             fprintf(stderr, "[cam] frame %u: the game swung its camera %.0f deg\n", g_frame, acosf(c < -1 ? -1 : c) * 57.2958f);
@@ -2364,7 +2403,8 @@ void stereo_set_eye_target(int eye, unsigned fbo)
 
 void stereo_set_eye(int eye, const float view[16], float tl, float tr, float td, float tu)
 {
-    memcpy(g_view[eye], view, 64);
+    memcpy(g_head_view[eye], view, 64);
+    mat_mul(g_view[eye], view, g_level);
     g_tan[eye][0] = tl; g_tan[eye][1] = tr; g_tan[eye][2] = td; g_tan[eye][3] = tu;
 }
 
@@ -2459,9 +2499,11 @@ unsigned stereo_world_depth(float *zn, float *zf)
  * depth, to be compared with the depth the world left - where the ray first
  * goes behind a surface is what it points at. 0 if there is no such view (a
  * flat frame, or the eyes drawn one at a time). */
-int stereo_aim_samples(const float o[3], const float d[3], int max, float (*px)[2], float *z, float *t, unsigned *depth, float *zn, float *zf)
+int stereo_aim_samples(const float o_[3], const float d_[3], int max, float (*px)[2], float *z, float *t, unsigned *depth, float *zn, float *zf)
 {
 #ifdef LINDBERGH_GL4ES
+    float o[3], d[3];
+    from_level(o_, o); from_level(d_, d);
     if (!g_on || !g_mv || g_flat) return 0;
     GLuint dt = 0;
     for (unsigned i = 0; i < g_nfb_depth; i++) if (g_fb_depth[i].fb == g_world_fb_next) dt = g_fb_depth[i].depth;
@@ -2499,13 +2541,15 @@ int stereo_aim_samples(const float o[3], const float d[3], int max, float (*px)[
     *depth = arr; *zn = n; *zf = f;
     return k;
 #else
-    (void)o; (void)d; (void)max; (void)px; (void)z; (void)t; (void)depth; (void)zn; (void)zf;
+    (void)o_; (void)d_; (void)max; (void)px; (void)z; (void)t; (void)depth; (void)zn; (void)zf;
     return 0;
 #endif
 }
 
-int stereo_ray_to_screen(const float o[3], const float d[3], float *x, float *y)
+int stereo_ray_to_screen(const float o_[3], const float d_[3], float *x, float *y)
 {
+    float o[3], d[3];
+    from_level(o_, o); from_level(d_, d);
     if (d[2] > -1e-4f) return 0;
     float t = (-g_screen_dist - o[2]) / d[2];
     if (t <= 0) return 0;

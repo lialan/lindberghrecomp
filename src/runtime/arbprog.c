@@ -2166,12 +2166,23 @@ static int passes_position(const char *src)
     return 0;
 }
 
-#define MAX_CAM_DIR 192
-static float g_cam_dir[MAX_CAM_DIR][3];
-static int g_ncam_dir;
+#define MAX_CAM 192
+static float g_cam[MAX_CAM][9];     /* right, up, looking: each draw's camera axes this frame */
+static int g_ncam;
+static float g_cam_last[9];  /* the last draw's, until arb_camera_count takes it */
+static int g_cam_last_ok;
+
+/* The last draw went into the world's own picture: its camera counts (not a
+ * shadow's, a mirror's, a reflection's). */
+void arb_camera_count(void)
+{
+    if (g_cam_last_ok && g_ncam < MAX_CAM) memcpy(g_cam[g_ncam++], g_cam_last, sizeof g_cam_last);
+    g_cam_last_ok = 0;
+}
 
 int arb_env_projection(float P[16])
 {
+    g_cam_last_ok = 0;
     if (!g_enabled[0] || !g_bound[0]) return 0;
     ArbProg *p = prog_get(0, g_bound[0], 0);
     if (!p || !p->src) return 0;
@@ -2215,33 +2226,50 @@ int arb_env_projection(float P[16])
     P[8] = cx; P[9] = cy; P[10] = A; P[11] = -1.0f;
     P[14] = c[3][2] + A * c[3][3]; P[15] = 0.0f;
     memcpy(good, P, sizeof good); have_good = 1;
-    if (g_ncam_dir < MAX_CAM_DIR) {         /* where the camera looks, in the draw's own space */
-        float *d = g_cam_dir[g_ncam_dir++];
-        for (int i = 0; i < 3; i++) d[i] = r3[i] / s;
+    {                                       /* the camera's axes, in the draw's own space */
+        float *b = g_cam_last;
+        for (int i = 0; i < 3; i++) { b[i] = ax[i] / lx; b[3 + i] = ay[i] / ly; b[6 + i] = r3[i] / s; }
+        /* a mirrored prop (a negative scale) turns all three round: a
+         * left-handed set, which is no camera */
+        float cz[3] = { b[1] * b[5] - b[2] * b[4], b[2] * b[3] - b[0] * b[5], b[0] * b[4] - b[1] * b[3] };
+        g_cam_last_ok = cz[0] * b[6] + cz[1] * b[7] + cz[2] * b[8] < 0;
     }
     return 1;
 }
 
-/* The direction the game camera looks this frame, from the draws'
- * matrices: each holds the camera times its model's own placement, so the
- * direction most of them agree on - the terrain and the props, set in the
- * world as they are - is the camera's. Returns 0 when too few drew to say;
- * starts the next frame's count either way. */
-int arb_camera_direction(float out[3])
+/* The game camera this frame, from the draws' matrices: each holds the
+ * camera times its model's own placement, so the orientation most of them
+ * agree on - the terrain and the props, set in the world as they are - is
+ * the camera's. Its right, up and looking directions, in the world; 0 when
+ * too few drew to say. Starts the next frame's count either way. */
+int arb_camera_basis(float right[3], float up[3], float fwd[3])
 {
-    int n = g_ncam_dir, best = -1, best_k = 0;
-    g_ncam_dir = 0;
+    static float prev[3];
+    static int have_prev;
+    int n = g_ncam, best = -1, best_k = 0, near = -1, near_k = 0;
+    g_ncam = 0;
     if (n < 4) return 0;
     for (int i = 0; i < n; i++) {
+        const float *a = g_cam[i] + 6;
         int k = 0;
         for (int j = 0; j < n; j++) {
-            const float *a = g_cam_dir[i], *b = g_cam_dir[j];
+            const float *b = g_cam[j] + 6;
             if (a[0] * b[0] + a[1] * b[1] + a[2] * b[2] > 0.9995f) k++;
         }
         if (k > best_k) { best_k = k; best = i; }
+        /* within ~25 degrees of last frame's: the same camera, moved */
+        if (have_prev && a[0] * prev[0] + a[1] * prev[1] + a[2] * prev[2] > 0.9f && k > near_k) { near_k = k; near = i; }
     }
     if (best_k < 3) return 0;
-    memcpy(out, g_cam_dir[best], 3 * sizeof(float));
+    /* Another camera's draws land in the same picture now and then - the
+     * jeep's mirrors look backwards - and can outnumber the world's for a
+     * frame: the one that carries on from last frame wins while it has a
+     * fair share of the draws. A cut leaves no such one. */
+    if (near >= 0 && near_k >= 3 && near_k * 4 >= best_k) best = near;
+    memcpy(right, g_cam[best], 3 * sizeof(float));
+    memcpy(up, g_cam[best] + 3, 3 * sizeof(float));
+    memcpy(fwd, g_cam[best] + 6, 3 * sizeof(float));
+    memcpy(prev, fwd, sizeof prev); have_prev = 1;
     return 1;
 }
 

@@ -51,6 +51,8 @@ typedef struct {
         int   compositor_depth; /* LG_COMPOSITOR_DEPTH_* */
         int   face_swings;      /* when the game swings its camera hard, its view is put back in front of the
                                  * player's head (needs camera_in_constants; LINDBERGH_XR_FACE_SWINGS=0 turns it off) */
+        int   level_horizon;    /* the world kept level: the game camera's pitch and roll go into where its view
+                                 * sits, not into the world (needs camera_in_constants; LINDBERGH_XR_LEVEL=0 off) */
     } vr;
 } LgGameProfile;
 

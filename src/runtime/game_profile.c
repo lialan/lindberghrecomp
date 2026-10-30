@@ -46,6 +46,10 @@ void game_profile_apply(const LgGameProfile *p)
     if (p->vr.camera_in_constants) stereo_env_projection(1);
     stereo_depth_read(p->vr.depth_read);
     if (p->vr.face_swings) env_default("LINDBERGH_XR_FACE_SWINGS", "1");
+    if (p->vr.level_horizon) {
+        env_default("LINDBERGH_XR_LEVEL", "1");
+        if (*getenv("LINDBERGH_XR_LEVEL") != '0') stereo_level_horizon(1);
+    }
 #else
     if (p->desktop_wide) {
         env_default("LINDBERGH_WIDE", "1");
