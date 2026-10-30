@@ -1864,6 +1864,18 @@ static void glprof_report(void)
         fprintf(stderr, " %s %.2f ms/%.0f", hle_name((HleId)best), g_glprof_ns[best] / frames / 1e6, g_glprof_n[best] / frames);
         g_glprof_ns[best] = -g_glprof_ns[best];
     }
+    fprintf(stderr, "; most called:");
+    {   /* the call count is what the per-call overhead multiplies */
+        static unsigned shown[HLE_ID_MAX];
+        memset(shown, 0, sizeof shown);
+        for (int k = 0; k < 16; k++) {
+            unsigned best = 0;
+            for (unsigned i = 1; i < HLE_ID_MAX; i++) if (!shown[i] && g_glprof_n[i] > g_glprof_n[best]) best = i;
+            if (!best || !g_glprof_n[best]) break;
+            shown[best] = 1;
+            fprintf(stderr, " %s %.0f", hle_name((HleId)best), g_glprof_n[best] / frames);
+        }
+    }
     fputc('\n', stderr);
 #ifdef LINDBERGH_GL4ES
     {   /* inside gl4es' draws */
