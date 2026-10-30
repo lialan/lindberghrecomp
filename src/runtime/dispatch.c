@@ -98,8 +98,11 @@ static int find_plt(uint32_t va, HleId *out)
 static __declspec(thread) unsigned g_depth;
 static __declspec(thread) unsigned g_depth_max;
 #else
-static __thread unsigned g_depth;
-static __thread unsigned g_depth_max;
+/* initial-exec: a plain thread-pointer load. The default model for a shared
+ * library (libmain.so on the Quest) goes through the dynamic linker's TLS
+ * resolver on every access, which was 6% of the game thread there. */
+static __thread unsigned g_depth __attribute__((tls_model("initial-exec")));
+static __thread unsigned g_depth_max __attribute__((tls_model("initial-exec")));
 #endif
 
 #define DEPTH_LIMIT 20000

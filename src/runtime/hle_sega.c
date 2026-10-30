@@ -98,6 +98,12 @@ static const unsigned char JVS_FEATURES[] = {
     0x00                   /* end of list */
 };
 
+/* Where the cabinet's reload input lands in a player's switch bytes: byte 0,
+ * bit 0 by default; The House of the Dead 4 Special's guns report a shake as
+ * the second byte's bit 6. */
+static unsigned g_reload_byte, g_reload_mask = 0x01;
+void jvs_reload_switch(unsigned byte, unsigned mask) { g_reload_byte = byte; g_reload_mask = mask; }
+
 /* One reply at a time: the game sends, then receives, on the same thread. */
 static unsigned char g_ack[0x200];
 static unsigned      g_ack_len;
@@ -175,7 +181,7 @@ static void jvs_command(const unsigned char *p)
                 if (in.buttons & CAB_P1_START)   b0 |= 0x80;
                 if (in.buttons & CAB_SERVICE)    b0 |= 0x40;
                 if (in.buttons & CAB_P1_TRIGGER) b0 |= 0x02;
-                if (in.buttons & CAB_P1_RELOAD)  b0 |= 0x01;
+                if ((in.buttons & CAB_P1_RELOAD) && g_reload_byte == 0) b0 |= (unsigned char)g_reload_mask;
             } else if (pl == 1) {
                 if (in.buttons & CAB_P2_START)   b0 |= 0x80;
             }
@@ -187,6 +193,7 @@ static void jvs_command(const unsigned char *p)
                 if (pl == 0) {        /* the gun's other two buttons */
                     if (in.buttons & CAB_P1_ACTION)   b1 |= 0x80;
                     if (in.buttons & CAB_P1_FIREMODE) b1 |= 0x40;  /* single/burst/auto/grenade */
+                    if ((in.buttons & CAB_P1_RELOAD) && g_reload_byte == 1) b1 |= (unsigned char)g_reload_mask;
                 }
                 ack_byte(b1);
                 ack_zeros(bytes - 2);

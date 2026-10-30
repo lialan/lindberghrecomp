@@ -38,6 +38,7 @@ typedef struct {
     double aim[4];              /* sight = aim[0] * pointer + aim[1] across, aim[2] * pointer + aim[3] down; all 0: 1, 0, 1, 0 */
     void (*gun_map)(int *x, int *y);    /* the sight's position -> the gun reading that puts it there */
     int   desktop_wide;         /* the desktop build draws 16:9 with the HUD at the edges (Ghost Squad) */
+    unsigned char reload_switch[2]; /* the player's switch byte and bit the reload input sets (0: byte 0, bit 0) */
     int   sysdata_region;       /* the game reads its region (and language) from the EEPROM's system data */
     const char *ride_board;     /* the serial device a large attraction cabinet's ride board is on (hle_rideboard.c) */
     float cull_fov;             /* the angle, degrees, the game culls its models to, when wide (0: the game's) */

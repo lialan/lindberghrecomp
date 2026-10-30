@@ -126,7 +126,8 @@ void hle_register_io(void);
  * (hle_rideboard.c): rideboard_enable names the device that is the board. */
 void hle_register_rideboard(void);
 void rideboard_enable(const char *dev);
-void sega_sysdata_region(int on);       /* hle_sega.c: the region goes into the EEPROM's system data */
+void sega_sysdata_region(int on);
+void jvs_reload_switch(unsigned byte, unsigned mask);  /* hle_sega.c: where the reload input lands */       /* hle_sega.c: the region goes into the EEPROM's system data */
 int  rideboard_open(const char *path);
 int  rideboard_is(int fd);
 int  rideboard_read(unsigned char *p, unsigned n);
