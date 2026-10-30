@@ -622,7 +622,9 @@ static void input_frame(XrTime t)
         else at = d[2] < -1e-4f ? (-cfg.aim * cfg.scale - o[2]) / d[2] : -1;
         for (int i = 0; i < 3; i++) ax[i] = o[i] + d[i] * at;
         memcpy(probe_o, o, sizeof probe_o); memcpy(probe_d, d, sizeof probe_d); probe_on = 1;
-        if (at > 0 && stereo_ray_to_screen(ah, ax, &x, &y) && x >= 0 && x < 640 && y >= 0 && y < 480) {
+        int gw, gh;
+        stereo_game_size(&gw, &gh);
+        if (at > 0 && stereo_ray_to_screen(ah, ax, &x, &y) && x >= 0 && x < gw && y >= 0 && y < gh) {
             gx = x; gy = y; aimed = 1; aim_reach = at / cfg.scale;
         }
         /* the overlay: the gun on the aim pose, the laser to the game's screen */

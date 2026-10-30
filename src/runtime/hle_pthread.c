@@ -198,7 +198,9 @@ static void h_sched_get_priority_max(CPU *c) { RET(0); }
 static void h_sched_get_priority_min(CPU *c) { RET(0); }
 
 static void h_mutexattr_init(CPU *c)    { if (A32(0)) wr32(A32(0), 0); RET(0); }
-static void h_mutexattr_settype(CPU *c) { RET(0); }   /* always recursive here */
+/* glibc keeps the kind in the attribute's int: pthread_mutex_init reads it
+ * there (POSIX; the Windows side is always recursive) */
+static void h_mutexattr_settype(CPU *c) { if (A32(0)) wr32(A32(0), A32(1)); RET(0); }
 
 /* ---- threads ----
  *
@@ -415,21 +417,34 @@ static void obj_drop(uint32_t va, void (*dtor)(void *))
     }
 }
 
-/* Recursive, as on the Windows side: a CRITICAL_SECTION is, and the game was
- * debugged against that. */
+/* The kind the game asked for, as glibc keeps it (0 normal, 1 recursive,
+ * 2 error-checking, 3 adaptive): a normal mutex may be unlocked by a thread
+ * that did not lock it, and the game's sound library does that now and then -
+ * as recursive, every mutex refused it (EPERM), and start-up failed in
+ * "CRICRS_Leave : pthread_mutex_unlock failed". Read before the GuestObj,
+ * 16 bytes here, covers glibc's __kind at offset 12. */
+static __thread int t_mutex_kind;
 static void ctor_mutex(void *p)
 {
     pthread_mutexattr_t a;
     pthread_mutexattr_init(&a);
-    pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+    int k = t_mutex_kind & 3;
+    pthread_mutexattr_settype(&a, k == 1 ? PTHREAD_MUTEX_RECURSIVE : k == 2 ? PTHREAD_MUTEX_ERRORCHECK : PTHREAD_MUTEX_NORMAL);
     pthread_mutex_init((pthread_mutex_t *)p, &a);
     pthread_mutexattr_destroy(&a);
+}
+static pthread_mutex_t *mutex_get(uint32_t va)
+{
+    GuestObj *g = (GuestObj *)GP(va);
+    if (g && g->magic == GUEST_MAGIC && g->host) return (pthread_mutex_t *)g->host;
+    t_mutex_kind = g ? (int)rd32(va + 12) : 0;      /* a static initialiser's kind */
+    return (pthread_mutex_t *)obj_get(va, sizeof(pthread_mutex_t), ctor_mutex);
 }
 static void ctor_cond(void *p) { pthread_cond_init((pthread_cond_t *)p, NULL); }
 static void dtor_mutex(void *p) { pthread_mutex_destroy((pthread_mutex_t *)p); }
 static void dtor_cond(void *p)  { pthread_cond_destroy((pthread_cond_t *)p); }
 
-#define MUTEX(n) ((pthread_mutex_t *)obj_get(A32(n), sizeof(pthread_mutex_t), ctor_mutex))
+#define MUTEX(n) mutex_get(A32(n))
 #define COND(n)  ((pthread_cond_t *)obj_get(A32(n), sizeof(pthread_cond_t), ctor_cond))
 
 /* Who holds each guest mutex, and what each thread waits for: the hang
@@ -448,7 +463,14 @@ static int mown_slot(uint32_t va)
     }
     return -1;
 }
-static void h_mutex_init(CPU *c)    { (void)MUTEX(0); RET(0); }
+/* pthread_mutex_init(m, attr): attr is glibc's int __mutexkind */
+static void h_mutex_init(CPU *c)
+{
+    obj_drop(A32(0), dtor_mutex);
+    t_mutex_kind = A32(1) ? (int)rd32(A32(1)) : 0;
+    (void)obj_get(A32(0), sizeof(pthread_mutex_t), ctor_mutex);
+    RET(0);
+}
 static void h_mutex_lock(CPU *c)
 {
     uint32_t va = A32(0);
@@ -559,7 +581,9 @@ static void h_attr_setschedparam(CPU *c)
 static void h_sched_get_priority_max(CPU *c) { RET(0); }
 static void h_sched_get_priority_min(CPU *c) { RET(0); }
 static void h_mutexattr_init(CPU *c)    { if (A32(0)) wr32(A32(0), 0); RET(0); }
-static void h_mutexattr_settype(CPU *c) { RET(0); }   /* always recursive here */
+/* glibc keeps the kind in the attribute's int: pthread_mutex_init reads it
+ * there (POSIX; the Windows side is always recursive) */
+static void h_mutexattr_settype(CPU *c) { if (A32(0)) wr32(A32(0), A32(1)); RET(0); }
 
 /* The GuestThread lives in guest memory, because its address IS the guest's
  * pthread_t; its stack does too, because guest code addresses it. */

@@ -19,4 +19,9 @@ void arb_attrib_array(unsigned index, int on);   /* glEnable/DisableVertexAttrib
 GLuint arb_bound(GLenum target);     /* the program bound to a target */
 void arb_rect_enable_seen(void);   /* gl4es: the game set a rectangle enable */
 
+unsigned arb_bound_vp(void);       /* the programs a draw now would use (0: none) */
+unsigned arb_bound_fp(void);
+
+int arb_env_projection(float P[16]);   /* the projection in program.env[0..3], for stereo.c */
+
 #endif

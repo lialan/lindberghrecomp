@@ -29,6 +29,9 @@ void stereo_set_screen_distance(float d);
 /* A ray in game camera space -> the point it aims at on that screen, in the
  * game's 640x480 pixels. Returns 0 if it points away. */
 int  stereo_ray_to_screen(const float o[3], const float d[3], float *x, float *y);
+void stereo_game_size(int *w, int *h);
+void stereo_picture_size(int w, int h);   /* the world drawn into a target of this size */
+void stereo_env_projection(int on);       /* the projection is in program.env[0..3] */     /* the game's picture, in its pixels */
 /* The game's own camera, as tangents of half its field of view. */
 void stereo_game_camera(float *tan_x, float *tan_y);
 unsigned stereo_eye_texture(int eye);

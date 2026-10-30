@@ -61,8 +61,18 @@ void gl4es_multiview_read_pixel_layer(int x, int y, int layer, unsigned char out
 
 extern unsigned g_frame;
 
-#define GAME_W 640
-#define GAME_H 480
+/* The game's picture: 640x480 unless its mode says otherwise (Let's Go
+ * Jungle draws 1360x768), taken at stereo_init */
+static int g_game_w = 640, g_game_h = 480;
+#define GAME_W g_game_w
+#define GAME_H g_game_h
+/* A game drawing its world into a target of another size (Let's Go Jungle:
+ * 800x600, tone mapped onto its 1360x768 screen), and whether its projection
+ * lives in its vertex programs' constants (arb_env_projection) */
+static int g_pic_w, g_pic_h, g_env_proj;
+void stereo_picture_size(int w, int h) { g_pic_w = w; g_pic_h = h; }
+void stereo_env_projection(int on) { g_env_proj = on; }
+static int picture_size(int w, int h) { return (w == GAME_W && h == GAME_H) || (w && w == g_pic_w && h == g_pic_h); }
 
 /* ---- eyes ---- */
 static int      g_on;
@@ -89,7 +99,7 @@ static float    g_tan[2][4];            /* left, right, down, up */
 
 /* ---- what the game believes ---- */
 static GLuint   g_game_fb;              /* framebuffer the game has bound */
-static GLint    g_vp[4] = { 0, 0, GAME_W, GAME_H };
+static GLint    g_vp[4] = { 0, 0, 640, 480 };       /* set to the game's size at stereo_init */
 static GLenum   g_mode = GL_MODELVIEW;
 static float    g_proj[32][16];         /* the game's projection stack */
 static int      g_proj_top;
@@ -112,6 +122,8 @@ static int      g_scissor_on;           /* the game's scissor test */
 static GLint    g_scissor[4];           /* the game's scissor box, in eye pixels */
 static int      g_clipped;              /* a screen draw is clipped to the screen: undo after it */
 static GLint    g_eye_vp[4];            /* the viewport GL has, in eye pixels */
+static int      g_side;                 /* inside a side pass */
+static GLint    g_game_scissor[4];      /* the game's scissor box, in its pixels */
 static unsigned g_scene_draws;          /* 3D draws in the world this frame */
 static float    g_lens_seen;            /* the longest lens (projection x scale) drawn with this frame */
 static float    g_zoom_lens = 8.0f;     /* a longer one is a zoomed view: the sniper scope is 11.4, the
@@ -337,6 +349,31 @@ static void load_projection(void)
 static GLuint g_scaled[MAX_SCALED];
 static unsigned g_nscaled;
 static short  g_scaled_w[MAX_SCALED], g_scaled_h[MAX_SCALED];   /* their size as the game made them */
+static float  g_scaled_k[MAX_SCALED][2];                        /* and how much bigger they are now */
+
+/* The floating-point formats the game gave its textures, which gl4es reports
+ * as RGBA (Let's Go Jungle draws its scene in half floats and tone maps it):
+ * a render target made again at the eyes' size keeps it. Depth goes by where
+ * the texture is attached (scale_target). */
+#define MAX_TEXFMT 256
+static struct { GLuint tex; GLenum ifmt, fmt, type; } g_texfmt[MAX_TEXFMT];
+static unsigned g_ntexfmt;
+
+static int texfmt_find(GLuint tex)
+{
+    for (unsigned i = 0; i < g_ntexfmt; i++) if (g_texfmt[i].tex == tex) return (int)i;
+    return -1;
+}
+
+/* The framebuffer the game draws into, and its pixels per game pixel: the
+ * eyes' scale for the window and the game's picture, a target's own for the
+ * rest. The viewport and scissor box follow it. */
+#define MAX_FB_K 64
+static struct { GLuint fb; float k[2]; } g_fb_k[MAX_FB_K];
+static unsigned g_nfb_k;
+static float g_cur_k[2];
+static struct { GLuint fb, tex; } g_fb_color[MAX_FB_K];  /* each framebuffer's colour texture */
+static unsigned g_nfb_color;
 
 /* Framebuffers drawn into a texture that is not the game's 640x480 picture -
  * the menu's soldier and rifle, drawn with their own camera into 256x256
@@ -366,11 +403,12 @@ static void note_fb_target(GLuint fb, GLuint tex)
     int w = 0, h = 0;
     for (unsigned i = 0; i < g_nscaled; i++) if (g_scaled[i] == tex) { w = g_scaled_w[i]; h = g_scaled_h[i]; }
     if (!w || !fb) return;
-    int off = !(w == GAME_W && h == GAME_H);
+    int off = !picture_size(w, h);
     unsigned i = 0;
     while (i < g_nfbs && g_fbs[i].fb != fb) i++;
-    if (i == g_nfbs) { if (g_nfbs >= MAX_FBS) return; g_nfbs++; g_fbs[i].fb = fb; }
-    if (g_fbs[i].offscreen != off || i == g_nfbs - 1)
+    int added = i == g_nfbs;
+    if (added) { if (g_nfbs >= MAX_FBS) return; g_nfbs++; g_fbs[i].fb = fb; }
+    if (g_fbs[i].offscreen != off || added)
         fprintf(stderr, "[stereo] framebuffer %u draws into texture %u, %dx%d%s\n", fb, tex, w, h, off ? ": offscreen, the game's own projection" : "");
     g_fbs[i].offscreen = off;
 }
@@ -381,9 +419,47 @@ static int scaled(GLuint t)
     return 0;
 }
 
+/* a 2D texture the game draws its world into (stereo_picture_size) */
+static int picture_2d(GLuint tex)
+{
+    for (unsigned i = 0; tex && g_pic_w && i < g_nscaled; i++)
+        if (g_scaled[i] == tex) return g_scaled_w[i] == g_pic_w && g_scaled_h[i] == g_pic_h;
+    return 0;
+}
+
+int stereo_is_picture_texture(unsigned tex) { return g_on && picture_2d(tex); }
+
+/* a framebuffer drawing into such a texture: a full-screen pass there
+ * (a background, a haze) is part of the world's picture, not the HUD */
+static int picture_fb(GLuint fb)
+{
+    for (unsigned i = 0; fb && i < g_nfb_color; i++)
+        if (g_fb_color[i].fb == fb) return picture_2d(g_fb_color[i].tex);
+    return 0;
+}
+
+/* framebuffer fb draws into tex: it takes tex's scale */
+static void note_fb_scale(GLuint fb, GLuint tex)
+{
+    unsigned i = 0;
+    while (i < g_nscaled && g_scaled[i] != tex) i++;
+    if (!fb || i == g_nscaled) return;
+    unsigned j = 0;
+    while (j < g_nfb_k && g_fb_k[j].fb != fb) j++;
+    if (j == g_nfb_k) { if (g_nfb_k >= MAX_FB_K) return; g_nfb_k++; g_fb_k[j].fb = fb; }
+    g_fb_k[j].k[0] = g_scaled_k[i][0]; g_fb_k[j].k[1] = g_scaled_k[i][1];
+}
+
+static void fb_scale(GLuint fb, float k[2])
+{
+    k[0] = g_sx; k[1] = g_sy;
+    for (unsigned j = 0; fb && j < g_nfb_k; j++)
+        if (g_fb_k[j].fb == fb) { k[0] = g_fb_k[j].k[0]; k[1] = g_fb_k[j].k[1]; }
+}
+
 /* A texture the game renders into is reallocated at the eye's resolution.
  * Sampling uses normalised coordinates, so nothing that reads it changes. */
-static void scale_target(GLenum textarget, GLuint tex)
+static void scale_target(GLenum textarget, GLuint tex, GLenum attachment)
 {
     if (!tex || scaled(tex) || g_nscaled >= MAX_SCALED ||
         (textarget != GL_TEXTURE_2D && textarget != GL_TEXTURE_RECTANGLE_ARB)) return;
@@ -396,12 +472,33 @@ static void scale_target(GLenum textarget, GLuint tex)
     glGetTexLevelParameteriv(tg, 0, GL_TEXTURE_HEIGHT, &h);
     glGetTexLevelParameteriv(tg, 0, GL_TEXTURE_INTERNAL_FORMAT, &ifmt);
     GLenum fmt = GL_RGBA, type = GL_UNSIGNED_BYTE;
-    if (ifmt == GL_DEPTH_COMPONENT || ifmt == GL_DEPTH_COMPONENT16 || ifmt == GL_DEPTH_COMPONENT24 ||
+    int known = texfmt_find(tex);
+    if (known >= 0) { ifmt = (GLint)g_texfmt[known].ifmt; fmt = g_texfmt[known].fmt; type = g_texfmt[known].type; }
+    else if (ifmt == GL_DEPTH_COMPONENT || ifmt == GL_DEPTH_COMPONENT16 || ifmt == GL_DEPTH_COMPONENT24 ||
         ifmt == GL_DEPTH_COMPONENT32) { fmt = GL_DEPTH_COMPONENT; type = GL_UNSIGNED_INT; }
     else if (ifmt == GL_DEPTH24_STENCIL8 || ifmt == GL_DEPTH_STENCIL) { fmt = GL_DEPTH_STENCIL; type = GL_UNSIGNED_INT_24_8; }
+    /* gl4es reports a depth texture's format as RGBA; where it is attached
+     * says what it is (Let's Go Jungle's depth textures) */
+    else if (attachment == GL_DEPTH_ATTACHMENT) { ifmt = GL_DEPTH_COMPONENT; fmt = GL_DEPTH_COMPONENT; type = GL_UNSIGNED_INT; }
+    else if (attachment == GL_DEPTH_STENCIL_ATTACHMENT || attachment == GL_STENCIL_ATTACHMENT) {
+        ifmt = GL_DEPTH_STENCIL; fmt = GL_DEPTH_STENCIL; type = GL_UNSIGNED_INT_24_8;
+    }
     else if (ifmt == GL_RGB || ifmt == GL_RGB8) fmt = GL_RGB;
-    int nw = (int)lroundf(w * g_sx), nh = (int)lroundf(h * g_sy);
+    /* The game's picture is drawn at the eyes' resolution. Its other
+     * targets - shadow maps, glow, the menu's sprites - at most twice their
+     * size and 1024 pixels across: at the eyes' scale Let's Go Jungle's
+     * 1024x1024 shadow map was 1550x3040, and the frame took 200 ms. A
+     * rectangle texture is sampled in pixels, so it keeps the eyes' scale. */
+    float kx = g_sx, ky = g_sy;
+    if (w > 0 && h > 0 && w == g_pic_w && h == g_pic_h) { kx = (float)g_ew / w; ky = (float)g_eh / h; }   /* the eyes' size */
+    else if (tg == GL_TEXTURE_2D && !(w == GAME_W && h == GAME_H) && w > 0 && h > 0) {
+        float k = fminf(fminf(g_sx, g_sy), 2.0f);
+        k = fminf(k, 1024.0f / (float)(w > h ? w : h));
+        kx = ky = k < 1.0f ? 1.0f : k;
+    }
+    int nw = (int)lroundf(w * kx), nh = (int)lroundf(h * ky);
     g_scaled_w[g_nscaled - 1] = (short)w; g_scaled_h[g_nscaled - 1] = (short)h;
+    g_scaled_k[g_nscaled - 1][0] = kx; g_scaled_k[g_nscaled - 1][1] = ky;
     glTexImage2D(tg, 0, ifmt, nw, nh, 0, fmt, type, NULL);
     fprintf(stderr, "[stereo] render target %u%s: %dx%d -> %dx%d (format %#x)\n", tex,
             tg == GL_TEXTURE_2D ? "" : " (rect)", w, h, nw, nh, ifmt);
@@ -410,6 +507,17 @@ static void scale_target(GLenum textarget, GLuint tex)
 
 static void (*g_aim_hook)(void);
 void stereo_set_aim_hook(void (*fn)(void)) { g_aim_hook = fn; }
+
+/* the game's viewport (vp) or scissor box, in the bound target's pixels */
+static void apply_rect(int vp)
+{
+    const GLint *r = vp ? g_vp : g_game_scissor;
+    float sx = g_side ? 1 : g_cur_k[0], sy = g_side ? 1 : g_cur_k[1];
+    GLint X = (GLint)lroundf(r[0] * sx), Y = (GLint)lroundf(r[1] * sy);
+    GLint W = (GLint)lroundf((r[0] + r[2]) * sx) - X, H = (GLint)lroundf((r[1] + r[3]) * sy) - Y;
+    if (vp) { glViewport(X, Y, W, H); g_eye_vp[0] = X; g_eye_vp[1] = Y; g_eye_vp[2] = W; g_eye_vp[3] = H; }
+    else { glScissor(X, Y, W, H); g_scissor[0] = X; g_scissor[1] = Y; g_scissor[2] = W; g_scissor[3] = H; }
+}
 
 static void bind_framebuffer(GLenum target, GLuint fb)
 {
@@ -424,6 +532,13 @@ static void bind_framebuffer(GLenum target, GLuint fb)
     }
     g_game_fb = fb;
     glBindFramebuffer(target, fb ? fb : g_eye_fbo[g_eye]);
+    float k[2];
+    fb_scale(fb, k);
+    if (!g_side && (k[0] != g_cur_k[0] || k[1] != g_cur_k[1])) {
+        g_cur_k[0] = k[0]; g_cur_k[1] = k[1];
+        if (g_vp[2] > 0) apply_rect(1);
+        if (g_game_scissor[2] > 0) apply_rect(0);
+    }
 }
 
 /* Multiview, wanted unless LINDBERGH_MULTIVIEW=0: one framebuffer for both
@@ -677,6 +792,7 @@ enum {
     K_DRAWARRAYS, K_DRAWELEMENTS, K_DRAWOTHER, K_BEGIN, K_END, K_MATRIXMODE,
     K_LOADID, K_LOADMATRIX, K_MULTMATRIX, K_ORTHO, K_ORTHO2D, K_FRUSTUM, K_PERSPECTIVE,
     K_PUSHMATRIX, K_POPMATRIX, K_TRANSLATE, K_SCALE, K_GETINTEGERV, K_GETFLOATV, K_GETOTHER, K_UNMAP, K_CLEAR, K_COPYTEXSUB, K_COPYTEX,
+    K_TEXIMAGE, K_FBSTATUS,
 };
 typedef struct {
     uint8_t ok, kind, live, track;          /* live: run, never recorded; track: client array state */
@@ -792,7 +908,8 @@ static const Cls *cls(HleId id)
         { "glTranslatef", K_TRANSLATE }, { "glScalef", K_SCALE },
         { "glGetIntegerv", K_GETINTEGERV }, { "glGetFloatv", K_GETFLOATV },
         { "glUnmapBufferARB", K_UNMAP }, { "glUnmapBuffer", K_UNMAP }, { "glClear", K_CLEAR },
-        { "glCopyTexSubImage2D", K_COPYTEXSUB }, { "glCopyTexImage2D", K_COPYTEX },
+        { "glCopyTexSubImage2D", K_COPYTEXSUB }, { "glCopyTexImage2D", K_COPYTEX }, { "glTexImage2D", K_TEXIMAGE },
+        { "glCheckFramebufferStatusEXT", K_FBSTATUS }, { "glCheckFramebufferStatus", K_FBSTATUS },
     };
     k->kind = K_OTHER;
     for (unsigned i = 0; i < sizeof T / sizeof T[0]; i++)
@@ -1001,9 +1118,7 @@ static int screen_copy(GLuint tex)
 #define SIDE_W 1024
 #define SIDE_H 1024
 static int      g_pbuffers;             /* the game draws into pbuffers (the eyes) */
-static int      g_side;                 /* inside a side pass */
 static GLuint   g_side_fbo, g_side_tex[2];
-static GLint    g_game_scissor[4];      /* the game's scissor box, in its pixels */
 
 void stereo_pbuffer_made(void) { g_pbuffers = 1; }
 
@@ -1146,16 +1261,44 @@ static int transform_call(CPU *c, HleId id, const char *n)
         GLint x = AI32(0), y = AI32(1), w = AI32(2), h = AI32(3);
         if (n[2] == 'V') { g_vp[0] = x; g_vp[1] = y; g_vp[2] = w; g_vp[3] = h; }
         else { g_game_scissor[0] = x; g_game_scissor[1] = y; g_game_scissor[2] = w; g_game_scissor[3] = h; }
-        float sx = g_side ? 1 : g_sx, sy = g_side ? 1 : g_sy;
-        GLint X = (GLint)lroundf(x * sx), Y = (GLint)lroundf(y * sy);
-        GLint W = (GLint)lroundf((x + w) * sx) - X, H = (GLint)lroundf((y + h) * sy) - Y;
-        if (n[2] == 'V') { glViewport(X, Y, W, H); g_eye_vp[0] = X; g_eye_vp[1] = Y; g_eye_vp[2] = W; g_eye_vp[3] = H; }
-        else { glScissor(X, Y, W, H); g_scissor[0] = X; g_scissor[1] = Y; g_scissor[2] = W; g_scissor[3] = H; }
+        apply_rect(n[2] == 'V');
         return 1;
     }
+    if (k == K_FBSTATUS) {
+        /* an incomplete target sends a game down another path: say so */
+        GLenum st = glCheckFramebufferStatus(A32(0));
+        if (st != GL_FRAMEBUFFER_COMPLETE)
+            fprintf(stderr, "[stereo] framebuffer %u incomplete (%#x)\n", g_game_fb, st);
+        c->eax = st;
+        return 1;
+    }
+    if (k == K_TEXIMAGE) {
+        GLenum ifmt = A32(2);
+        int is_float = ifmt == 0x881A || ifmt == 0x881B || ifmt == 0x8814 || ifmt == 0x8815;   /* RGBA/RGB 16F, 32F */
+        static int rt8 = -1;           /* LINDBERGH_RT_8BIT=1: not kept (a debugging aid) */
+        if (rt8 < 0) { const char *v = getenv("LINDBERGH_RT_8BIT"); rt8 = v && *v == '1'; }
+        if (A32(0) == GL_TEXTURE_2D && A32(1) == 0 && is_float && !rt8) {
+            GLint tex = 0;
+            glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
+            int i = texfmt_find((GLuint)tex);
+            if (i < 0 && g_ntexfmt < MAX_TEXFMT) i = (int)g_ntexfmt++;
+            if (i >= 0) {
+                g_texfmt[i].tex = (GLuint)tex; g_texfmt[i].ifmt = ifmt;
+                g_texfmt[i].fmt = A32(6); g_texfmt[i].type = A32(7);
+            }
+        }
+        return 0;
+    }
     if (k == K_FBTEX2D) {
-        scale_target(A32(2), A32(3));
-        if (A32(1) == GL_COLOR_ATTACHMENT0) note_fb_target(g_game_fb, A32(3));
+        scale_target(A32(2), A32(3), A32(1));
+        note_fb_scale(g_game_fb, A32(3));
+        if (!g_side) fb_scale(g_game_fb, g_cur_k);
+        if (A32(1) == GL_COLOR_ATTACHMENT0) {
+            note_fb_target(g_game_fb, A32(3));
+            unsigned i = 0;
+            while (i < g_nfb_color && g_fb_color[i].fb != g_game_fb) i++;
+            if (i < MAX_FB_K) { if (i == g_nfb_color) g_nfb_color++; g_fb_color[i].fb = g_game_fb; g_fb_color[i].tex = A32(3); }
+        }
         if (A32(1) == GL_DEPTH_ATTACHMENT || A32(1) == GL_DEPTH_STENCIL_ATTACHMENT) note_fb_depth(g_game_fb, A32(3));
         return 0;
     }
@@ -1182,6 +1325,13 @@ static int transform_call(CPU *c, HleId id, const char *n)
     if (g_on && (is_draw(k) || k == K_BEGIN)) {
         /* Screen content or not, decided per draw: 2D that is not a pass over
          * a render target, and 3D drawn into the HUD's target. */
+        if (g_env_proj) {       /* the projection is in the program's constants */
+            float P[16];
+            if (arb_env_projection(P) && memcmp(P, g_proj[g_proj_top], sizeof P)) {
+                memcpy(g_proj[g_proj_top], P, sizeof P);
+                g_proj_dirty = 1;
+            }
+        }
         int persp = is_perspective(g_proj[g_proj_top]);
         if (persp && !g_flat && (g_game_fb == g_world_fb || g_game_fb == g_world_fb_next)) {
             if (!g_replaying) tally_lens(g_proj[g_proj_top]);
@@ -1200,7 +1350,7 @@ static int transform_call(CPU *c, HleId id, const char *n)
         int zoom = persp && g_proj[g_proj_top][0] > zoom_limit() && g_zoom_frames >= 6;
         if (persp && !g_replaying) { if (zoom) g_zoom_draws++; if (g_game_fb == g_hud_fb) g_hudfb_draws++; }
         int hud = persp ? g_game_fb == g_hud_fb || menu_state() || g_menu || zoom
-                        : !g_unit0_rect || !covers_viewport(c, n);
+                        : !(g_unit0_rect || picture_2d(g_tex2d_bound) || picture_fb(g_game_fb)) || !covers_viewport(c, n);
         if (offscreen_fb(g_game_fb) || g_flat) hud = 2;  /* the game's own projection, untouched */
         if (hud == 1 && !is_perspective(g_proj[g_proj_top]) && !g_replaying) g_hud_fb_next = g_game_fb;
         if (!persp && !g_replaying) { if (hud) { if (!g_hud2d) g_hud_lens = g_last_persp[0]; g_hud2d++; } else g_pass2d++; }
@@ -1361,6 +1511,17 @@ static void track_arrays(CPU *c, const char *n)
     else if (!strcmp(n, "glVertexAttribPointerARB")) {
         if (A32(0) >= 16) return;
         a = &g_arr[ARR_ATTR0 + A32(0)]; a->size = A32(1); a->type = A32(2); a->norm = A32(3); a->stride = AI32(4); a->ptr = A32(5);
+        {   /* LINDBERGH_ATTRIB_LOG=1: each kind of generic array the game gives */
+            static int on = -1, n; static uint32_t seen[64];
+            if (on < 0) { const char *v = getenv("LINDBERGH_ATTRIB_LOG"); on = v && *v == '1'; }
+            uint32_t key = A32(0) << 24 | A32(1) << 20 | (A32(2) & 0xFFFF) << 4 | (A32(3) & 1);
+            int k = 0;
+            while (k < n && seen[k] != key) k++;
+            if (on && k == n && n < 64) {
+                seen[n++] = key;
+                fprintf(stderr, "[attrib] index %u: %u x %#x, normalised %u, stride %d\n", A32(0), A32(1), A32(2), A32(3), AI32(4));
+            }
+        }
     }
     if (a) a->vbo = gl_bound_buffer(GL_ARRAY_BUFFER);
 }
@@ -1717,13 +1878,33 @@ static void stereo_gl_call(CPU *c, HleId id, HleHandler fn)
     if ((long)g_frame == g_map_frame && g_mv) {
         /* the frame map: the eye's centre pixel after each draw */
         const char *nm = hle_name(id);
+        static double t_last;
+        int draw = !strncmp(nm, "glDraw", 6) || !strncmp(nm, "glMultiDraw", 11) || !strcmp(nm, "glEnd");
+        if (draw && !t_last) { glFinish(); t_last = now_ns(); }
         stereo_gl_call_inner(c, id, fn);
-        if (!strncmp(nm, "glDraw", 6) || !strncmp(nm, "glMultiDraw", 11) || !strcmp(nm, "glEnd")) {
+        if (draw) {
+            glFinish();             /* offscreen targets too: a tiler runs them only when needed */
             unsigned char px[4], pr[4];
             gl4es_multiview_read_pixel(g_ew / 2, g_eh / 2, px);
             gl4es_multiview_read_pixel_layer(g_ew / 2, g_eh / 2, 1, pr);
-            fprintf(stderr, "[map]   centre now %u %u %u %u, right eye %u %u %u (fb %u)\n", px[0], px[1], px[2], px[3],
-                    pr[0], pr[1], pr[2], g_game_fb);
+            /* the read waits for the GPU: the time since the last is this draw's */
+            double t = now_ns();
+            GLint vp[4]; glGetIntegerv(GL_VIEWPORT, vp);
+            GLuint ct = 0;
+            for (unsigned i = 0; i < g_nfb_color; i++) if (g_fb_color[i].fb == g_game_fb) ct = g_fb_color[i].tex;
+            if (g_game_fb && ct) {  /* an offscreen target (8-bit, LINDBERGH_RT_8BIT): its centre and lower middle */
+                static unsigned char *buf;
+                if (!buf) buf = malloc(4096u * 4096u * 4u);
+                int tw = vp[0] + vp[2], th = vp[1] + vp[3];
+                if (buf && tw * th <= 4096 * 4096 && gl4es_multiview_read(ct, GL_TEXTURE_2D, 0, buf)) {
+                    const unsigned char *a0 = buf + ((size_t)(th / 2) * tw + tw / 2) * 4, *a1 = buf + ((size_t)(th / 4) * tw + tw / 2) * 4;
+                    fprintf(stderr, "[map]     target %u centre %u %u %u %u, lower %u %u %u %u\n", ct,
+                            a0[0], a0[1], a0[2], a0[3], a1[0], a1[1], a1[2], a1[3]);
+                }
+            }
+            fprintf(stderr, "[map]   %s %.2f ms, centre now %u %u %u %u, right eye %u %u %u (fb %u, viewport %dx%d, v%u f%u)\n", nm,
+                    (t - t_last) / 1e6, px[0], px[1], px[2], px[3], pr[0], pr[1], pr[2], g_game_fb, vp[2], vp[3], arb_bound_vp(), arb_bound_fp());
+            t_last = now_ns();
         }
         return;
     }
@@ -1890,8 +2071,17 @@ static void dump_targets(void)
             glGetTexLevelParameteriv(GL_TEXTURE_RECTANGLE_ARB, 0, GL_TEXTURE_WIDTH, &tw);
             glGetTexLevelParameteriv(GL_TEXTURE_RECTANGLE_ARB, 0, GL_TEXTURE_HEIGHT, &th);
             glBindTexture(GL_TEXTURE_RECTANGLE_ARB, (GLuint)was);
+            GLenum tt = GL_TEXTURE_RECTANGLE_ARB;
+            if (tw <= 0 || th <= 0) {       /* a 2D render target */
+                tt = GL_TEXTURE_2D;
+                glGetIntegerv(GL_TEXTURE_BINDING_2D, &was);
+                glBindTexture(GL_TEXTURE_2D, tex);
+                glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &tw);
+                glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &th);
+                glBindTexture(GL_TEXTURE_2D, (GLuint)was);
+            }
             unsigned char *tp = tw > 0 && th > 0 ? malloc((size_t)tw * th * 4) : NULL;
-            if (tp && gl4es_multiview_read(tex, GL_TEXTURE_RECTANGLE_ARB, 0, tp)) {
+            if (tp && gl4es_multiview_read(tex, tt, 0, tp)) {
                 char name[64]; snprintf(name, sizeof name, "t%u_%u.ppm", tex, g_frame); write_ppm(name, tw, th, tp);
             }
             free(tp);
@@ -2087,7 +2277,7 @@ void stereo_frame_begin(void)
      * it has in play (lens 1.73). Kept as last followed, a scope coming up -
      * its lens ramps 2.4, 8.4, 11.4 over a few frames - left the screen a
      * third of its size, and the magnified picture looked like no zoom. */
-    if (g_flat) { g_screen_lens[0] = 1.732f; g_screen_lens[1] = 2.309f; }
+    if (g_flat) { g_screen_lens[0] = 1.732f; g_screen_lens[1] = 1.732f * GAME_W / GAME_H; }
     g_hud_fb = g_hud_fb_next;           /* 3D drawn there this frame is screen content */
     g_world_fb = g_world_fb_next;
     g_hud_fb_next = ~0u;
@@ -2112,6 +2302,7 @@ void stereo_eye_size(int w, int h)
 {
     g_ew = w; g_eh = h;
     g_sx = (float)w / GAME_W; g_sy = (float)h / GAME_H;
+    g_cur_k[0] = g_sx; g_cur_k[1] = g_sy;
 }
 
 void stereo_set_eye_target(int eye, unsigned fbo)
@@ -2176,6 +2367,8 @@ void stereo_reproject(float out[16])
     mat_identity(out);
     if (!g_on) return;
     const float *p = g_proj[g_proj_top];
+    /* a pass over the world's own picture, in the eyes' pixels already: as is */
+    if (g_env_proj && !is_perspective(p) && !g_loaded_hud) return;
     if (!is_perspective(p)) p = g_last_persp;
     float eff[16], inv[16];
     effective_projection(p, g_loaded_hud, eff);
@@ -2185,7 +2378,7 @@ void stereo_reproject(float out[16])
 void stereo_set_screen_distance(float d) { if (d > 0) g_screen_dist = d; }
 
 /* Where a ray from the game camera's space crosses the HUD's screen, in the
- * game's 640x480 pixels. 0 when it points away from the screen. */
+ * game's pixels. 0 when it points away from the screen. */
 /* Points along the gun's ray (game units, the game camera's space), placed
  * in the first eye's view of this frame's world: their pixel there and their
  * depth, to be compared with the depth the world left - where the ray first
@@ -2248,6 +2441,8 @@ int stereo_ray_to_screen(const float o[3], const float d[3], float *x, float *y)
     return 1;
 }
 
+void stereo_game_size(int *w, int *h) { *w = GAME_W; *h = GAME_H; }
+
 int stereo_is_render_target(unsigned tex) { return g_on && scaled(tex); }
 
 void stereo_rect_scale(float *x, float *y)
@@ -2299,6 +2494,13 @@ void stereo_present_desktop(int win_w, int win_h)
 /* Called once the GL handlers are bound. */
 void stereo_init(void)
 {
+    {
+        int w = 0, h = 0;
+        lindbergh_window_size(&w, &h);
+        if (w > 0 && h > 0) { g_game_w = w; g_game_h = h; }
+        g_vp[2] = g_game_w; g_vp[3] = g_game_h;
+    }
+    if (g_game_w * 3 != g_game_h * 4) g_screen_lens[1] = g_screen_lens[0] * g_game_w / g_game_h;
     const char *v = getenv("LINDBERGH_FRAMEMAP");
     if (v && *v) g_map_frame = atol(v);
     for (unsigned i = 0; i < HLE_COUNT; i++) {
@@ -2370,7 +2572,7 @@ void stereo_start(void)
         stereo_set_eye(i, m, 1, 1, 1, 1);
     }
     g_on = 1;
-    fprintf(stderr, "[stereo] on: %dx%d per eye (x%.2f, x%.2f of the game's 640x480)\n", g_ew, g_eh, g_sx, g_sy);
+    fprintf(stderr, "[stereo] on: %dx%d per eye (x%.2f, x%.2f of the game's %dx%d)\n", g_ew, g_eh, g_sx, g_sy, GAME_W, GAME_H);
 }
 
 void stereo_set_gun(int x, int y)

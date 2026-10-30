@@ -250,6 +250,10 @@ static void h_glUnmapBufferARB(CPU *c)
 static void h_glGetString(CPU *c)
 {
     const char *s = (const char *)glGetString(A32(0));
+    {   /* what the game decides its features from, once */
+        static int said;
+        if (A32(0) == GL_EXTENSIONS && !said++) fprintf(stderr, "[gl] extensions: %s\n", s ? s : "(none)");
+    }
     RET(guest_strdup_static(s ? s : ""));
 }
 

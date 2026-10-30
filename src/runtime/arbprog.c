@@ -65,10 +65,14 @@ typedef struct {
     float    local[MAX_LOCAL][4];
     unsigned local_gen;
     int      failed;             /* translation failed: use the driver */
+    int      pos_kind;           /* arb_env_projection: 0 not looked, 1 env[0..3], 2 passed through */
 } ArbProg;
 
 static ArbProg *g_prog[2][MAX_IDS];       /* [0] vertex, [1] fragment */
 static GLuint   g_bound[2];
+static unsigned g_tr_layered;      /* fragment units to read per view (target 7) */
+void gl4es_multiview_layered(unsigned texture);
+int stereo_is_picture_texture(unsigned tex);
 static int      g_enabled[2];
 static float    g_env[2][MAX_ENV][4];
 static unsigned g_env_gen[2];
@@ -141,6 +145,11 @@ typedef struct {
     int     nlabel;
     int     has_flow;
     int     block;                     /* current block number when has_flow */
+    /* literals inside a constant array that otherwise is program.env as it
+     * is: written into the program's copy of env when it is uploaded */
+    int     nlit;
+    int     lit_idx[16];
+    float   lit[16][4];
 } Tr;
 
 static int fail(Tr *t, const char *fmt, ...)
@@ -272,6 +281,16 @@ static int binding_expr(Tr *t, const char *b, char *out, size_t n)
                 "gl_MultiTexCoord4", "gl_MultiTexCoord5", "gl_MultiTexCoord6", "gl_MultiTexCoord7",
             };
             if (classic[i]) {
+#ifdef LINDBERGH_GL4ES
+                /* gl4es keeps the classic arrays at NVIDIA's indices, so the
+                 * game's generic array and its classic one are the same input,
+                 * and a second name for it would not link. The classic one:
+                 * gl4es gives it the current value when no array is on (the
+                 * HUD's glColor before glBegin), a generic name it does not. */
+                t->attrib_used[i] = 0;
+                snprintf(out, n, "%s", classic[i]);
+                return 1;
+#endif
                 t->gen_alias = 1;
                 snprintf(out, n, "(u_gen[%d] > 0.5 ? va_%d : %s)", i, i, classic[i]);
                 return 1;
@@ -382,6 +401,55 @@ static int declare_param_array(Tr *t, const char *name, const char *init)
         snprintf(y->expr, sizeof y->expr, "%s", arr);
         y->base = lo; y->len = hi - lo + 1;
         return 1;
+    }
+    /* program.env from 0 on, a few of its entries literals instead (Cg's
+     * skinning arrays: 224 entries, one of them a constant): program.env
+     * itself, the literals written into this program's copy of it. A local
+     * copy of the array was made for every vertex. */
+    {
+        char tmp2[8192];
+        snprintf(tmp2, sizeof tmp2, "%s", s);
+        char *cur2 = tmp2;
+        int k2 = 0, ok2 = 1, nl = 0, li[16];
+        float lv[16][4];
+        for (char *item; ok2 && (item = next_item(&cur2)); ) {
+            item = trim(item);
+            if (sscanf(item, "program.env[%d..%d%c", &lo, &hi, &c) == 3 && c == ']') {
+                if (lo != k2) ok2 = 0;
+                k2 = hi + 1;
+            } else if (sscanf(item, "program.env[%d%c", &lo, &c) == 2 && c == ']') {
+                if (lo != k2) ok2 = 0;
+                k2++;
+            } else if (nl < 16 && (*item == '{' || *item == '-' || *item == '.' || isdigit((unsigned char)*item))) {
+                float v[4] = { 0, 0, 0, 1 };
+                char *q = item + (*item == '{'), *end;
+                int nv = 0;
+                while (nv < 4) {
+                    v[nv] = strtof(q, &end);
+                    if (end == q) break;
+                    nv++;
+                    q = end;
+                    while (*q == ' ' || *q == ',') q++;
+                }
+                if (!nv) { ok2 = 0; break; }
+                if (*item != '{') v[1] = v[2] = v[3] = v[0];
+                li[nl] = k2; memcpy(lv[nl], v, sizeof v); nl++;
+                k2++;
+            } else ok2 = 0;
+        }
+        if (ok2 && nl && k2 > 16 && t->nlit + nl <= 16) {
+            Sym *y = sym_add(t, name, SYM_ARRAY);
+            if (!y) return 0;
+            snprintf(y->expr, sizeof y->expr, "%s_env", t->stage ? "f" : "v");
+            y->base = 0; y->len = k2;
+            if (k2 - 1 > t->env_hi) t->env_hi = k2 - 1;
+            for (int i = 0; i < nl; i++) {
+                t->lit_idx[t->nlit] = li[i];
+                memcpy(t->lit[t->nlit], lv[i], sizeof lv[i]);
+                t->nlit++;
+            }
+            return 1;
+        }
     }
     /* general list: a local array */
     Sym *y = sym_add(t, name, SYM_ARRAY);
@@ -699,6 +767,7 @@ static int emit_instr(Tr *t, char *stmt)
         char test[200];
         cond_test(cond, csw, test, sizeof test);
         int next = t->block + 1;
+        if (!t->has_flow) return 1;     /* the final RET of a program without branches */
         if (!strcmp(op, "RET")) {
             bput(&t->body, "      if (any(%s)) { if (sp > 0) { sp--; pc = stk[sp]; } else pc = -1; } else pc = %d;\n",
                  test, next);
@@ -815,14 +884,21 @@ static int emit_instr(Tr *t, char *stmt)
          * texture both ways), and NVIDIA then returns the texel itself */
         int shadow_as_2d = target == 6 && t->tex_target[unit] == 2;
         if (shadow_as_2d) target = 2;
+#ifdef LINDBERGH_GL4ES
+        /* the world's picture, drawn in both views: this view's layer */
+        if (target == 2 && t->stage == 1 && gl4es_mv_shaders && (g_tr_layered >> unit & 1)) target = 7;
+#endif
         if (t->tex_target[unit] && t->tex_target[unit] != target)
             return fail(t, "texture unit %d used with two targets", unit);
         t->tex_target[unit] = target;
         int proj = !strcmp(op, "TXP"), bias = !strcmp(op, "TXB");
-        static const char *const fnb[] = { "", "texture1D", "texture2D", "texture3D", "textureCube", "texture2DRect", "shadow2D" };
-        static const char *const sw[] = { "", ".x", ".xy", ".xyz", ".xyz", ".xy", ".xyz" };
-        static const char *const sm[] = { "", "s1_", "s2_", "s3_", "sc_", "sr_", "ss_" };
-        if (target == 5) {
+        static const char *const fnb[] = { "", "texture1D", "texture2D", "texture3D", "textureCube", "texture2DRect", "shadow2D", "texture2D" };
+        static const char *const sw[] = { "", ".x", ".xy", ".xyz", ".xyz", ".xy", ".xyz", ".xy" };
+        static const char *const sm[] = { "", "s1_", "s2_", "s3_", "sc_", "sr_", "ss_", "sl_" };
+        if (target == 7) {
+            if (proj) snprintf(r, sizeof r, "texture2D(sl_%d, vec3(%s.xy / %s.w, gl4es_layer))", unit, X(0), X(0));
+            else      snprintf(r, sizeof r, "texture2D(sl_%d, vec3(%s.xy, gl4es_layer))", unit, X(0));
+        } else if (target == 5) {
             /* Rectangle textures are sampled in texels; the game's render
              * targets are, and stereo.c draws them at the eye's size. */
 #ifdef LINDBERGH_GL4ES
@@ -835,7 +911,15 @@ static int emit_instr(Tr *t, char *stmt)
             if (proj) snprintf(r, sizeof r, "texture2DRectProj(sr_%d, vec4(%s.xy * u_rect_scale[%d], %s.zw))", unit, X(0), unit, X(0));
             else      snprintf(r, sizeof r, "texture2DRect(sr_%d, %s.xy * u_rect_scale[%d])", unit, X(0), unit);
 #endif
-        } else if (proj && target != 4)
+        }
+#ifdef LINDBERGH_GL4ES
+        /* the depth compare (LEQUAL) done here, on a plain sampler: see shadow_compare */
+        else if (target == 6 && proj)
+            snprintf(r, sizeof r, "vec4(step(%s.z / %s.w, texture2DProj(ss_%d, %s).x))", X(0), X(0), unit, X(0));
+        else if (target == 6)
+            snprintf(r, sizeof r, "vec4(step(%s.z, texture2D(ss_%d, %s.xy).x))", X(0), unit, X(0));
+#endif
+        else if (proj && target != 4)
             snprintf(r, sizeof r, "%sProj(%s%d, %s)", fnb[target], sm[target], unit, X(0));
         else if (bias)
             snprintf(r, sizeof r, "%s(%s%d, %s%s, %s.w)", fnb[target], sm[target], unit, X(0), sw[target], X(0));
@@ -946,11 +1030,17 @@ static char *translate(int stage, const char *src_in, Tr *t)
         for (int l = 0; l < st[i].nl; l++) {
             if (t->nlabel >= 64) { fail(t, "too many labels"); goto out; }
             snprintf(t->label[t->nlabel], 64, "%s", st[i].labels[l]);
-            t->has_flow = 1;
             t->nlabel++;
         }
-        if (!strncmp(s, "BRA", 3) || !strncmp(s, "CAL", 3) || !strncmp(s, "RET", 3)) t->has_flow = 1;
+        if (!strncmp(s, "BRA", 3) || !strncmp(s, "CAL", 3)) t->has_flow = 1;
+        /* a RET with only END after it ends the program anyway */
+        if (!strncmp(s, "RET", 3))
+            for (int j = i + 1; j < n; j++) if (*st[j].text && strncmp(st[j].text, "END", 3)) { t->has_flow = 1; break; }
     }
+    /* Without branches the program runs straight through: no block loop.
+     * Cg labels every program's start, and that alone had put each one in a
+     * loop of up to 4096 rounds, which Adreno's compiler made slow enough to
+     * cost Let's Go Jungle most of its frame. */
     /* label -> block number: a block starts at each labelled statement and
      * after each branch, call or return */
     if (t->has_flow) {
@@ -1079,11 +1169,12 @@ static char *translate(int stage, const char *src_in, Tr *t)
         if (!stage && !t->nmat && !t->pos_invariant) bput(&g, gl4es_mv_shaders ? "uniform mat4 u_reproj[2];\n" : "uniform mat4 u_reproj;\n");
         const char *sty[] = { "", "sampler1D s1_", "sampler2D s2_", "sampler3D s3_",
                               "samplerCube sc_", gl4es_mv_shaders ? "sampler2DArray sr_" : "sampler2D sr_",
-                              "sampler2DShadow ss_" };
+                              "sampler2D ss_",      /* the compare done in the shader (shadow_compare) */
+                              "sampler2DArray sl_" };
 #else
         if (!stage && !t->nmat && !t->pos_invariant) bput(&g, "uniform mat4 u_reproj;\n");
         static const char *const sty[] = { "", "sampler1D s1_", "sampler2D s2_", "sampler3D s3_",
-                                           "samplerCube sc_", "sampler2DRect sr_", "sampler2DShadow ss_" };
+                                           "samplerCube sc_", "sampler2DRect sr_", "sampler2DShadow ss_", "sampler2D sl_" };
 #endif
         for (int u = 0; u < 16; u++) if (t->tex_target[u]) bput(&g, "uniform %s%d;\n", sty[t->tex_target[u]], u);
         for (int a = 1; a < 16; a++) if (t->attrib_used[a]) bput(&g, "attribute vec4 va_%d;\n", a);
@@ -1099,8 +1190,12 @@ static char *translate(int stage, const char *src_in, Tr *t)
         if (t->has_flow) bput(&g, "  int pc = 0, sp = 0;\n  int stk[16];\n");
         if (stage == 0) {
             bput(&g, "  vec4 o_fog = vec4(0.0), o_psize = vec4(1.0);\n");
-            bput(&g, "  gl_FrontColor = vec4(0.0); gl_FrontSecondaryColor = vec4(0.0);\n"
-                     "  gl_BackColor = vec4(0.0); gl_BackSecondaryColor = vec4(0.0);\n");
+            bput(&g, "  gl_FrontColor = vec4(0.0); gl_FrontSecondaryColor = vec4(0.0);\n");
+            /* Back colours only if the program writes them: on GLES, gl4es
+             * picks them for back faces whenever the vertex shader has them,
+             * and Let's Go Jungle's HUD, drawn facing away, came out black. */
+            if (strstr(t->body.p ? t->body.p : "", "gl_Back"))
+                bput(&g, "  gl_BackColor = vec4(0.0); gl_BackSecondaryColor = vec4(0.0);\n");
             if (t->pos_invariant) bput(&g, "  gl_Position = ftransform();\n");
         } else {
             bput(&g, "  vec4 o_col = vec4(0.0), o_dep = vec4(gl_FragCoord.z);\n");
@@ -1131,17 +1226,31 @@ static char *translate(int stage, const char *src_in, Tr *t)
                 /* LINDBERGH_FP_ONLY=id: only that fragment program */
                 const char *only = getenv("LINDBERGH_FP_ONLY");
                 int solid = only && *only && (GLuint)atoi(only) != g_tr_id ? 0 : mode;
+                /* LINDBERGH_FP_RAW=id: that program fetches unit 0 raw (=2) whatever the mode -
+                 * a final composite showing the scene the others coloured */
+                const char *raw = getenv("LINDBERGH_FP_RAW");
+                if (raw && *raw && (GLuint)atoi(raw) == g_tr_id) solid = 2;
                 if (solid == 1) bput(&g, "  gl_FragColor = vec4(0.0, 1.0, 0.0, 1.0);\n");
                 /* =2: unit 0 fetched raw at texcoord 0 - is the texture black? */
                 else if (solid == 2 && t->tex_target[0] == 2) bput(&g, "  gl_FragColor = vec4(texture2D(s2_0, gl_TexCoord[0].xy).rgb, 1.0);\n");
                 else if (solid == 2 && t->tex_target[0] == 5) bput(&g, "  gl_FragColor = vec4(texture2DRect(sr_0, gl_TexCoord[0].xy).rgb, 1.0);\n");
                 /* =3: texcoord 0 as colour - are the coordinates zero? */
                 else if (solid == 3) bput(&g, "  gl_FragColor = vec4(fract(gl_TexCoord[0].xy), 0.5, 1.0);\n");
+                /* =4: the primary colour - do the vertex colours arrive? */
+                else if (solid == 4) bput(&g, "  gl_FragColor = vec4(gl_Color.rgb, 1.0);\n");
                 /* =9: the program's id as a colour (r = id % 8, g = id / 8 % 8, b = id / 64 % 8, in sevenths) */
                 else if (solid == 9) bput(&g, "  gl_FragColor = vec4(%d.0 / 7.0, %d.0 / 7.0, %d.0 / 7.0, 1.0);\n", (int)(g_tr_id % 8), (int)(g_tr_id / 8 % 8), (int)(g_tr_id / 64 % 8));
                 /* =1N: unit 0 at texcoord N; =2N: texcoord N itself as colour */
                 else if (solid >= 10 && solid < 18 && t->tex_target[0] == 2) bput(&g, "  gl_FragColor = vec4(texture2D(s2_0, gl_TexCoord[%d].xy).rgb, 1.0);\n", solid - 10);
                 else if (solid >= 20 && solid < 28) bput(&g, "  gl_FragColor = vec4(gl_TexCoord[%d].xyz, 1.0);\n", solid - 20);
+                /* =3N: texcoord N an eighth as bright - how far past 1 is it? */
+                else if (solid >= 30 && solid < 38) bput(&g, "  gl_FragColor = vec4(gl_TexCoord[%d].xyz / 8.0, 1.0);\n", solid - 30);
+                /* =40: the program's own colour an eighth as bright */
+                else if (solid == 40) bput(&g, "  gl_FragColor = vec4(o_col.rgb / 8.0, 1.0);\n");
+                /* =41: the program's alpha as grey (what an alpha test sees) */
+                else if (solid == 41) bput(&g, "  gl_FragColor = vec4(vec3(o_col.a), 1.0);\n");
+                /* =42: the program's colour, alpha 1 (is an alpha test dropping it?) */
+                else if (solid == 42) bput(&g, "  gl_FragColor = vec4(o_col.rgb, 1.0);\n");
                 else bput(&g, "  gl_FragColor = o_col;\n");
             }
             /* The game's programs write the depth they were given
@@ -1175,8 +1284,11 @@ typedef struct {
     MatRef mat[2][16]; int nmat[2];
     int    env_hi[2], local_hi[2];
     GLint  u_env[2], u_loc[2], u_mat[2][16], u_rect, u_reproj, u_gen;
+    int    nlit[2], lit_idx[2][16];         /* literals in the program's env (Tr) */
+    float  lit[2][16][4];
     GLint  n_rect;                          /* u_rect_norm's length as the driver keeps it */
     unsigned rect_units;                /* texture units sampled as rectangles */
+    unsigned shadow_units;              /* and as shadow maps (a depth compare) */
     unsigned up_env[2], up_loc[2];      /* generations last uploaded */
 } Linked;
 
@@ -1326,6 +1438,24 @@ static Linked *link_pair(GLuint vid, GLuint fid)
         if (pp[st]->failed || !pp[st]->src) { l->ok = 0; return l; }
         static Tr t;
         g_tr_id = ids[st];
+#ifdef LINDBERGH_GL4ES
+        /* units holding the world's picture now are read per view (stereo.c) */
+        g_tr_layered = 0;
+        if (st == 1 && gl4es_mv_shaders) {
+            GLint active = GL_TEXTURE0;
+            glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+            for (int u = 0; u < 16; u++) {
+                GLint tex = 0;
+                glActiveTexture(GL_TEXTURE0 + u);
+                glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
+                if (tex && stereo_is_picture_texture((unsigned)tex)) {
+                    g_tr_layered |= 1u << u;
+                    gl4es_multiview_layered((GLuint)tex);
+                }
+            }
+            glActiveTexture((GLenum)active);
+        }
+#endif
         char *glsl = translate(st, pp[st]->src, &t);
         if (!glsl) {
             pp[st]->failed = 1;
@@ -1339,8 +1469,12 @@ static Linked *link_pair(GLuint vid, GLuint fid)
         glsl_s[st] = glsl;
         memcpy(l->mat[st], t.mat, sizeof t.mat);
         for (int u = 0; u < 16; u++) if (t.tex_target[u] == 5) l->rect_units |= 1u << u;
+        for (int u = 0; u < 16; u++) if (t.tex_target[u] == 6) l->shadow_units |= 1u << u;
         l->nmat[st] = t.nmat;
         l->env_hi[st] = t.env_hi;
+        l->nlit[st] = t.nlit;
+        memcpy(l->lit_idx[st], t.lit_idx, sizeof t.lit_idx);
+        memcpy(l->lit[st], t.lit, sizeof t.lit);
         l->local_hi[st] = t.local_hi;
         if (st == 0) {
             /* generic attributes at the indices the program named */
@@ -1351,6 +1485,25 @@ static Linked *link_pair(GLuint vid, GLuint fid)
             }
         }
     }
+#ifdef LINDBERGH_GL4ES
+    /* A fragment program over fixed-function vertices (Let's Go Jungle's 2D):
+     * gl4es' own vertex shader for it lost the current colour, and every
+     * sprite came out black. Ours passes through what the fragment side reads. */
+    if (!vp && glsl_s[1]) {
+        Buf v = {0};
+        bput(&v, "#version 120\nvoid main() {\n  gl_Position = ftransform();\n");
+        if (strstr(glsl_s[1], "gl_Color")) bput(&v, "  gl_FrontColor = gl_Color;\n");
+        if (strstr(glsl_s[1], "gl_SecondaryColor")) bput(&v, "  gl_FrontSecondaryColor = gl_SecondaryColor;\n");
+        for (int u = 0; u < 8; u++) {
+            char nm[24]; snprintf(nm, sizeof nm, "gl_TexCoord[%d]", u);
+            if (strstr(glsl_s[1], nm)) bput(&v, "  gl_TexCoord[%d] = gl_TextureMatrix[%d] * gl_MultiTexCoord%d;\n", u, u, u);
+        }
+        if (strstr(glsl_s[1], "gl_FogFragCoord")) bput(&v, "  gl_FogFragCoord = abs((gl_ModelViewMatrix * gl_Vertex).z);\n");
+        bput(&v, "}\n");
+        glsl_s[0] = v.p;
+        if (g_dump) fprintf(stderr, "[arb] fixed-function vertices for fragment program %u ->\n%s\n", fid, glsl_s[0]);
+    }
+#endif
     if (!l->prog) l->prog = glCreateProgram();
     GLint ok = 0;
     struct timespec t_link, t_tr;
@@ -1389,7 +1542,8 @@ static Linked *link_pair(GLuint vid, GLuint fid)
                 }
             } else sh[st] = compile(st ? GL_FRAGMENT_SHADER : GL_VERTEX_SHADER, glsl_s[st], st, ids[st]);
             if (!sh[st]) {
-                pp[st]->failed = 1; l->ok = 0;
+                if (pp[st]) pp[st]->failed = 1;
+                l->ok = 0;
                 for (int k = 0; k < 2; k++) { if (sh[k]) glDeleteShader(sh[k]); free(glsl_s[k]); }
                 return l;
             }
@@ -1453,9 +1607,9 @@ static Linked *link_pair(GLuint vid, GLuint fid)
         if (shown++ < 5) fprintf(stderr, "[arbprog] u_reproj at %d, %d matrices as the driver keeps it\n", l->u_reproj, array_len(l->prog, "u_reproj", 2));
     }
 #endif
-    static const char *const pre[] = { "s1_", "s2_", "s3_", "sc_", "sr_", "ss_" };
+    static const char *const pre[] = { "s1_", "s2_", "s3_", "sc_", "sr_", "ss_", "sl_" };
     for (int u = 0; u < 16; u++)
-        for (int k = 0; k < 6; k++) {
+        for (int k = 0; k < 7; k++) {
             char nm[16]; snprintf(nm, sizeof nm, "%s%d", pre[k], u);
             GLint loc = glGetUniformLocation(l->prog, nm);
             if (loc >= 0) glUniform1i(loc, u);
@@ -1608,7 +1762,14 @@ static void upload(Linked *l)
         GLuint id = st ? l->fid : l->vid;
         if (!id) continue;
         if (l->u_env[st] >= 0 && l->up_env[st] != g_env_gen[st]) {
-            glUniform4fv(l->u_env[st], l->env_hi[st] + 1, &g_env[st][0][0]);
+            if (l->nlit[st]) {
+                static float env[MAX_ENV][4];
+                memcpy(env, g_env[st], (size_t)(l->env_hi[st] + 1) * sizeof env[0]);
+                for (int i = 0; i < l->nlit[st]; i++)
+                    if (l->lit_idx[st][i] <= l->env_hi[st]) memcpy(env[l->lit_idx[st][i]], l->lit[st][i], sizeof env[0]);
+                glUniform4fv(l->u_env[st], l->env_hi[st] + 1, &env[0][0]);
+            } else
+                glUniform4fv(l->u_env[st], l->env_hi[st] + 1, &g_env[st][0][0]);
             l->up_env[st] = g_env_gen[st];
         }
         ArbProg *p = prog_get(st, id, 0);
@@ -1776,6 +1937,27 @@ void arb_before_draw(void)
     g_arb_draw_ns += (b.tv_sec - a.tv_sec) * 1e9 + (b.tv_nsec - a.tv_nsec);
 }
 
+#ifdef LINDBERGH_GL4ES
+/* A shadow map. The Quest's driver silently dropped every draw that read
+ * one through a shadow sampler - Let's Go Jungle's ground, trees and leaves,
+ * all shadowed, were gone - so the program reads it as a plain texture and
+ * compares in the shader. That needs the texture's own compare off, and
+ * nearest filtering: GLES 3 filters depth only when it compares. */
+static void shadow_compare(unsigned units)
+{
+    GLint active = GL_TEXTURE0;
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+    for (int u = 0; u < 16; u++) {
+        if (!(units & (1u << u))) continue;
+        glActiveTexture(GL_TEXTURE0 + u);
+        glTexParameteri(GL_TEXTURE_2D, 0x884C /* COMPARE_MODE */, GL_NONE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    }
+    glActiveTexture((GLenum)active);
+}
+#endif
+
 static void before_draw(void)
 {
 #ifdef LINDBERGH_GL4ES
@@ -1927,6 +2109,7 @@ static void before_draw(void)
         upload(l);
 #ifdef LINDBERGH_GL4ES
         rect_enables(l->rect_units);
+        if (l->shadow_units) shadow_compare(l->shadow_units);
 #endif
         return;
     }
@@ -1948,3 +2131,43 @@ const char *arb_get_source(GLenum target, GLuint id)
     ArbProg *p = st >= 0 ? prog_get(st, id, 0) : NULL;
     return p ? p->src : NULL;
 }
+
+/* The projection inside the bound vertex program's model-view-projection.
+ * Let's Go Jungle never uses GL's matrices: each program gets its matrix as
+ * program.env[0..3] (the columns), and the 2D passes their positions as they
+ * are. For the stereo layer, which tells the world from the screen and makes
+ * each eye's view from the game's projection, that projection is taken apart
+ * from the matrix: a symmetric or off-centre perspective times a rigid
+ * model-view (uniformly scaled). Returns 1 with P (column-major), identity for
+ * 2D; 0 when there is no vertex program to read. */
+int arb_env_projection(float P[16])
+{
+    if (!g_enabled[0] || !g_bound[0]) return 0;
+    ArbProg *p = prog_get(0, g_bound[0], 0);
+    if (!p || !p->src) return 0;
+    if (!p->pos_kind)
+        p->pos_kind = strstr(p->src, "result.position, vertex.position") ||
+                      strstr(p->src, "result.position, vertex.attrib[0]") ? 2 : 1;
+    for (int i = 0; i < 16; i++) P[i] = i % 5 ? 0.0f : 1.0f;
+    if (p->pos_kind == 2) return 1;
+    const float (*c)[4] = (const float (*)[4])g_env[0];      /* the matrix's columns */
+    float r0[3] = { c[0][0], c[1][0], c[2][0] }, r1[3] = { c[0][1], c[1][1], c[2][1] },
+          r2[3] = { c[0][2], c[1][2], c[2][2] }, r3[3] = { c[0][3], c[1][3], c[2][3] };
+#define DOT3(a, b) ((a)[0] * (b)[0] + (a)[1] * (b)[1] + (a)[2] * (b)[2])
+    float ss = DOT3(r3, r3);
+    if (ss < 1e-12f) return 1;                                 /* no w from depth: 2D */
+    float s = sqrtf(ss);
+    float cx = -DOT3(r0, r3) / ss, cy = -DOT3(r1, r3) / ss, A = -DOT3(r2, r3) / ss;
+    float ax[3], ay[3];
+    for (int i = 0; i < 3; i++) { ax[i] = r0[i] + cx * r3[i]; ay[i] = r1[i] + cy * r3[i]; }
+#undef DOT3
+    P[0] = sqrtf(ax[0] * ax[0] + ax[1] * ax[1] + ax[2] * ax[2]) / s;
+    P[5] = sqrtf(ay[0] * ay[0] + ay[1] * ay[1] + ay[2] * ay[2]) / s;
+    P[8] = cx; P[9] = cy; P[10] = A; P[11] = -1.0f;
+    P[14] = c[3][2] + A * c[3][3]; P[15] = 0.0f;
+    return 1;
+}
+
+/* the programs a draw now would use (0: none), for the frame map */
+unsigned arb_bound_vp(void) { return g_enabled[0] ? g_bound[0] : 0; }
+unsigned arb_bound_fp(void) { return g_enabled[1] ? g_bound[1] : 0; }

@@ -605,6 +605,7 @@ static void h_exit(CPU *c)
     /* Worth announcing. A game that decides to leave looks exactly like a
      * game that crashed, unless it says so. */
     fprintf(stderr, "[guest] exit(%d)\n", AI32(0));
+    if (AI32(0)) guest_backtrace(c);    /* who gave up, and from where */
     fflush(stderr);
     exit(AI32(0));
 }
