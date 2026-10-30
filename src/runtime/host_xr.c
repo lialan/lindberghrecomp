@@ -738,6 +738,10 @@ static void input_frame(XrTime t)
         }
     }
 
+    if (trig[g] && !prev[g][0] && !menu.open)       /* each pull: where the game is told it went */
+        fprintf(stderr, "[aim] frame %u: pull at %d,%d%s (reach %.2f m, depth %s, flat %d)\n", g_frame, (int)gx, (int)gy,
+                aimed ? "" : " - off the screen", aim_reach, aim_hit_t > 0 ? "read" : "assumed", stereo_flat_frame());
+
     unsigned held = 0;
     if (firing) held |= CAB_P1_TRIGGER;
     if (trig[g] && !aimed && !menu.open) held |= CAB_P1_RELOAD;  /* the arcade's reload: fire off the screen */

@@ -843,7 +843,8 @@ void hle_register_sega(void)
     if (watch_qte()) fprintf(stderr, "[sega] sniping events watched%s\n", g_qte_log ? ", CQC and sniping logged" : "");
     {
         const char *g = getenv("LINDBERGH_GOD");
-        if (g && *g == '1' && guest_override("_Z26check_player_damage_enablei", h_no_damage))
+        if (g && *g == '1' && (guest_override("_Z26check_player_damage_enablei", h_no_damage) |
+                               guest_override("_Z21PlMgr_CanDamagePlayeri", h_no_damage)))  /* The House of the Dead 4 */
             fprintf(stderr, "[sega] the player takes no damage (LINDBERGH_GOD)\n");
     }
     if (widen_culling()) fprintf(stderr, "[sega] model culling widened to %.0f degrees\n", g_cull_fov);
