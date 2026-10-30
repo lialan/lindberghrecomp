@@ -117,11 +117,16 @@ static unsigned char *g_seen;
 static int tracing(void)
 {
     static int cached = -1;
+    static long only = -2;              /* LINDBERGH_HLE_TRACE_FRAME=n: that frame's calls alone */
     if (cached < 0) {
         const char *v = getenv("LINDBERGH_HLE_TRACE");
         cached = (v && *v && *v != '0') ? 1 : 0;
+        const char *f = getenv("LINDBERGH_HLE_TRACE_FRAME");
+        only = f && *f ? atol(f) : -1;
+        if (only >= 0) cached = 1;
     }
-    return cached;
+    extern unsigned g_frame;
+    return cached && (only < 0 || (long)g_frame == only);
 }
 
 /* Stop deliberately at the Nth import call and report, because the failure
