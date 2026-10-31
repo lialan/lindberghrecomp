@@ -489,16 +489,17 @@ static void h_glGetInfoLogARB(CPU *c)
 }
 
 #ifdef LINDBERGH_GL4ES
-/* Greyscale (GL_LUMINANCE) uploads, which gl4es loses on the headset: The
+/* Greyscale (GL_LUMINANCE, GL_LUMINANCE_ALPHA) uploads, which gl4es loses on the headset: The
  * House of the Dead 4 Special's movies come as three such planes a frame,
  * combined by a shader, and showed black. Given to GL as RGBA (L, L, L, 1),
  * which a shader's .r reads the same. */
-static unsigned char *lum_to_rgba(const unsigned char *src, GLsizei w, GLsizei h)
+static unsigned char *lum_to_rgba(const unsigned char *src, GLsizei w, GLsizei h, int la)
 {
     GLint align = 4;
     glGetIntegerv(GL_UNPACK_ALIGNMENT, &align);
     if (align < 1) align = 1;
-    size_t stride = ((size_t)w + (size_t)align - 1) / (size_t)align * (size_t)align;
+    size_t row = (size_t)w * (la ? 2 : 1);
+    size_t stride = (row + (size_t)align - 1) / (size_t)align * (size_t)align;
     unsigned char *out = malloc((size_t)w * h * 4);
     if (!out) return NULL;
     static int told;
@@ -506,12 +507,34 @@ static unsigned char *lum_to_rgba(const unsigned char *src, GLsizei w, GLsizei h
     for (GLsizei y = 0; y < h; y++) {
         const unsigned char *r = src + stride * (size_t)y;
         unsigned char *o = out + (size_t)w * 4 * (size_t)y;
-        for (GLsizei x = 0; x < w; x++) { o[0] = o[1] = o[2] = r[x]; o[3] = 255; o += 4; }
+        if (la) for (GLsizei x = 0; x < w; x++) { o[0] = o[1] = o[2] = r[2 * x]; o[3] = r[2 * x + 1]; o += 4; }
+        else    for (GLsizei x = 0; x < w; x++) { o[0] = o[1] = o[2] = r[x]; o[3] = 255; o += 4; }
     }
     return out;
 }
-static int is_lum(GLenum f) { return f == GL_LUMINANCE; }
-static int is_lum_ifmt(GLint f) { return f == 1 || f == GL_LUMINANCE || f == 0x8040 /* GL_LUMINANCE8 */; }
+static int is_lum(GLenum f) { return f == GL_LUMINANCE || f == GL_LUMINANCE_ALPHA; }
+static int is_lum_ifmt(GLint f) { return f == 1 || f == 2 || f == GL_LUMINANCE || f == GL_LUMINANCE_ALPHA || f == 0x8040 || f == 0x8045; /* ..8, ..8_ALPHA8 */ }
+
+/* glGetError: on the headset the runtime's own GL - the eyes' targets and
+ * copies, gl4es's multiview - leaves errors the game never caused, and a
+ * game that checks for one after linking a shader takes it for the shader's
+ * failure (The House of the Dead 4 Special then played its movies through a
+ * fallback that showed black). The game is told there is none; each kind is
+ * logged once. LINDBERGH_GL_ERRORS=1 passes them through. */
+static void h_glGetError(CPU *c)
+{
+    extern unsigned g_frame;
+    static int pass = -1;
+    if (pass < 0) { const char *v = getenv("LINDBERGH_GL_ERRORS"); pass = v && *v == '1'; }
+    GLenum e = glGetError();
+    if (pass) { RET(e); return; }
+    static unsigned seen;
+    for (int n = 0; e != GL_NO_ERROR && n < 16; e = glGetError(), n++) {
+        unsigned bit = 1u << (e & 15);
+        if (!(seen & bit)) { seen |= bit; fprintf(stderr, "[gl] error %#x kept from the game (first seen at frame %u)\n", e, g_frame); }
+    }
+    RET(GL_NO_ERROR);
+}
 
 static void h_glTexImage2D(CPU *c)
 {
@@ -520,7 +543,7 @@ static void h_glTexImage2D(CPU *c)
     GLsizei w = AI32(3), h = AI32(4);
     const void *px = APTR(8);
     if (is_lum(fmt) && type == GL_UNSIGNED_BYTE && is_lum_ifmt(ifmt)) {
-        unsigned char *rgba = px ? lum_to_rgba(px, w, h) : NULL;
+        unsigned char *rgba = px ? lum_to_rgba(px, w, h, fmt == GL_LUMINANCE_ALPHA) : NULL;
         GLint was = 4; glGetIntegerv(GL_UNPACK_ALIGNMENT, &was); glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
         glTexImage2D(A32(0), AI32(1), GL_RGBA, w, h, AI32(5), GL_RGBA, GL_UNSIGNED_BYTE, rgba);
         glPixelStorei(GL_UNPACK_ALIGNMENT, was);
@@ -536,7 +559,17 @@ static void h_glTexSubImage2D(CPU *c)
     GLsizei w = AI32(4), h = AI32(5);
     const void *px = APTR(8);
     if (is_lum(fmt) && type == GL_UNSIGNED_BYTE && px) {
-        unsigned char *rgba = lum_to_rgba(px, w, h);
+        if (fmt == GL_LUMINANCE_ALPHA && getenv("LINDBERGH_TEXSUB_LOG")) {
+            static unsigned last; extern unsigned g_frame;
+            if (g_frame - last >= 60) { last = g_frame; long l = 0, a = 0; size_t n = (size_t)w * h;
+                for (size_t i = 0; i < n; i += 97) { l += ((const unsigned char *)px)[2 * i]; a += ((const unsigned char *)px)[2 * i + 1]; }
+                fprintf(stderr, "[texsub] greyscale+alpha %dx%d: grey %.1f, alpha %.1f\n", w, h, l / (n / 97.0), a / (n / 97.0)); }
+        }
+        if (fmt == GL_LUMINANCE_ALPHA && getenv("LINDBERGH_CAPTURE_ON_LA")) {    /* =<frame>: a capture at such an overlay's first upload after it */
+            static int done; extern unsigned g_frame;
+            if (!done && g_frame >= (unsigned)atol(getenv("LINDBERGH_CAPTURE_ON_LA"))) { done = 1; stereo_capture(); }
+        }
+        unsigned char *rgba = lum_to_rgba(px, w, h, fmt == GL_LUMINANCE_ALPHA);
         if (rgba) {
             GLint was = 4; glGetIntegerv(GL_UNPACK_ALIGNMENT, &was); glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
             glTexSubImage2D(A32(0), AI32(1), AI32(2), AI32(3), w, h, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
@@ -594,6 +627,17 @@ static void h_glShaderSourceARB(CPU *c)
             char *done = glsl_resolve_conditionals(all);
             free(all);
             all = done;
+        }
+        {   /* LINDBERGH_YUV_TEST=red|y: the movie shader's output replaced, for finding why it shows black */
+            const char *t = getenv("LINDBERGH_YUV_TEST");
+            char *at = t ? strstr(all, "gl_FragColor.rgb = YCbCr2RGBMatrix * YCbCrA.rgb;") : NULL;
+            if (at) {
+                const char *rep = !strcmp(t, "red") ? "gl_FragColor.rgb = vec3(1.0, 0.0, 0.0);         "
+                                                    : "gl_FragColor.rgb = vec3(YCbCrA.r + 0.0625);      ";
+                size_t n = strlen("gl_FragColor.rgb = YCbCr2RGBMatrix * YCbCrA.rgb;");
+                memset(at, ' ', n); memcpy(at, rep, strlen(rep) < n ? strlen(rep) : n);
+                fprintf(stderr, "[gl] movie shader output replaced (%s)\n", t);
+            }
         }
         const GLchar *one = all;
         glShaderSource(sh, 1, &one, NULL);
@@ -861,6 +905,7 @@ void hle_register_gl(void)
     hle_bind("glGetObjectParameterivARB", h_glGetObjectParameterivARB); gl_bind_named("glGetObjectParameterivARB", h_glGetObjectParameterivARB);
 #ifdef LINDBERGH_GL4ES
     hle_bind("glTexImage2D", h_glTexImage2D); gl_bind_named("glTexImage2D", h_glTexImage2D);
+    hle_bind("glGetError", h_glGetError); gl_bind_named("glGetError", h_glGetError);
     hle_bind("glTexSubImage2D", h_glTexSubImage2D); gl_bind_named("glTexSubImage2D", h_glTexSubImage2D);
 #endif
     hle_bind("glGetInfoLogARB", h_glGetInfoLogARB); gl_bind_named("glGetInfoLogARB", h_glGetInfoLogARB);

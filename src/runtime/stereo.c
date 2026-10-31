@@ -1587,6 +1587,11 @@ static int transform_call(CPU *c, HleId id, const char *n)
         if (A32(0) == GL_TEXTURE_2D && g_active_unit == GL_TEXTURE0) g_tex2d_on = n[2] == 'E';
         return 0;
     }
+    {   /* LINDBERGH_SKIP_TEX=<name>: draws with that texture on unit 0 left out (finding what covers what) */
+        static long skip = -2;
+        if (skip == -2) { const char *v = getenv("LINDBERGH_SKIP_TEX"); skip = v ? atol(v) : -1; }
+        if (skip > 0 && (is_draw(k) || k == K_BEGIN) && g_tex2d_bound == (GLuint)skip) { if (k == K_BEGIN) g_skip_begin = 1; return 1; }
+    }
     if (g_on && (is_draw(k) || k == K_BEGIN)) {
         /* Screen content or not, decided per draw: 2D that is not a pass over
          * a render target, and 3D drawn into the HUD's target. */
@@ -1637,6 +1642,24 @@ static int transform_call(CPU *c, HleId id, const char *n)
                   GLint prog = 0; glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
                   GLboolean bl = glIsEnabled(GL_BLEND); GLint bs = 0, bd = 0; glGetIntegerv(GL_BLEND_SRC, &bs); glGetIntegerv(GL_BLEND_DST, &bd);
                   fprintf(stderr, "[units]%s fp %d vp %d glsl %d blend %d %#x/%#x\n", u, fpon, vpon, prog, bl, bs, bd);
+                  static GLint told[8]; int seen = 0;
+                  for (int i = 0; i < 8; i++) if (told[i] == prog) seen = 1;
+                  if (prog && !seen) {
+                      for (int i = 0; i < 8; i++) if (!told[i]) { told[i] = prog; break; }
+                      GLint lk = 0, vl = 0; char pl[1024] = "";
+                      glGetProgramiv((GLuint)prog, GL_LINK_STATUS, &lk);
+                      glValidateProgram((GLuint)prog); glGetProgramiv((GLuint)prog, GL_VALIDATE_STATUS, &vl);
+                      glGetProgramInfoLog((GLuint)prog, sizeof pl, NULL, pl);
+                      fprintf(stderr, "[units] program %d: linked %d, valid %d, log: %s\n", prog, lk, vl, pl);
+                      GLint nu = 0; glGetProgramiv((GLuint)prog, GL_ACTIVE_UNIFORMS, &nu);
+                      for (GLint k = 0; k < nu && k < 16; k++) {
+                          char nm[64]; GLint sz = 0; GLenum ty = 0;
+                          glGetActiveUniform((GLuint)prog, (GLuint)k, sizeof nm, NULL, &sz, &ty, nm);
+                          GLint loc = glGetUniformLocation((GLuint)prog, nm), iv = -1;
+                          if (ty == GL_SAMPLER_2D && loc >= 0) glGetUniformiv((GLuint)prog, loc, &iv);
+                          fprintf(stderr, "[units]   uniform %s type %#x = %d\n", nm, ty, iv);
+                      }
+                  }
               }
               fprintf(stderr, "[draw] f%u %s fb %u tex %u persp %d ident %d hud %d lens %.3f,%.3f vp %d,%d %dx%d mv-t %.3f,%.3f,%.3f gun %.3f,%.3f\n", g_frame, hle_name(g_cur_id), (unsigned)g_game_fb,
                       g_tex2d_bound, persp, g_mv_ident, hud, g_proj[g_proj_top][0], g_proj[g_proj_top][5], g_vp[0], g_vp[1], g_vp[2], g_vp[3],
@@ -2391,9 +2414,10 @@ static void cap_save_tex(GLuint t)
             for (int y = h - 1; y >= 0; y--) for (int x = 0; x < w; x++) fwrite(px + ((size_t)y * w + x) * 4, 1, 3, f);
             fclose(f);
         }
-        long sum = 0;
-        for (size_t k = 0; k < (size_t)w * h * 4; k += 4) sum += px[k] + px[k + 1] + px[k + 2];
-        fprintf(stderr, "[capture] texture %u: %dx%d saved as %s, mean level %.1f\n", t, w, h, name, sum / (3.0 * w * h));
+        long sum = 0, asum = 0;
+        for (size_t k = 0; k < (size_t)w * h * 4; k += 4) { sum += px[k] + px[k + 1] + px[k + 2]; asum += px[k + 3]; }
+        fprintf(stderr, "[capture] texture %u: %dx%d saved as %s, mean level %.1f, alpha %.1f\n", t, w, h, name,
+                sum / (3.0 * w * h), asum / (double)w / h);
     } else fprintf(stderr, "[capture] texture %u: cannot be read through a framebuffer\n", t);
     free(px);
     glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)was_fb);
