@@ -79,6 +79,7 @@ enum {
     C_DRAW_EL,      /* indices at arg a */
     C_MULTI_EL,     /* glMultiDrawElements */
     C_LOCK,         /* glLockArraysEXT: reads the arrays now */
+    C_UNLOCK,       /* glUnlockArraysEXT */
     C_DIRECT,       /* glXSwapBuffers: here, on the game thread (host_swap queues its GL) */
     C_RAW,          /* the rest of GLX: on the worker, waited for, past stereo.c's hook */
 };
@@ -90,6 +91,11 @@ static uint8_t g_cls_ok[HLE_ID_MAX];
 enum { S_VERTEX, S_NORMAL, S_COLOR, S_SECONDARY, S_FOG, S_TEX0, S_ATTR0 = S_TEX0 + 8, S_N = S_ATTR0 + 16 };
 static uint8_t g_slot_on[S_N], g_slot_client[S_N];
 static uint32_t g_array_buf, g_element_buf;
+/* Each client array's pointer call as the game made it (and the client
+ * texture unit it was for): a locked range of it is copied (lock_copy) and
+ * the call made again for the copy, then for the game's own memory at unlock */
+static struct { uint8_t set, unit, copied; HleId id; HleHandler fn; uint32_t args[16]; uint8_t a; } g_ptr[S_N];
+static HleId g_cat_id; static HleHandler g_cat_fn;   /* glClientActiveTexture, for a texture unit's pointer */
 static unsigned g_client_unit;
 
 static const struct { const char *name; uint8_t kind, a, b, c; } T[] = {
@@ -120,7 +126,7 @@ static const struct { const char *name; uint8_t kind, a, b, c; } T[] = {
     { "glProgramEnvParameter4fARB", C_VAL }, { "glProgramLocalParameter4fARB", C_VAL },
     { "glCopyTexSubImage2D", C_VAL }, { "glPixelStorei", C_VAL }, { "glTexGeni", C_VAL },
     { "glBindFramebufferEXT", C_VAL }, { "glBindFramebuffer", C_VAL }, { "glBindRenderbufferEXT", C_VAL },
-    { "glFlush", C_VAL }, { "glUnlockArraysEXT", C_VAL },
+    { "glFlush", C_VAL }, { "glUnlockArraysEXT", C_UNLOCK },
     /* one array, its size fixed by the call */
     { "glMaterialfv", C_BLOB, 2, 16 }, { "glLightfv", C_BLOB, 2, 16 }, { "glFogfv", C_BLOB, 1, 16 },
     { "glLightModelfv", C_BLOB, 1, 16 }, { "glColor4fv", C_BLOB, 0, 16 }, { "glColor3fv", C_BLOB, 0, 12 },
@@ -314,6 +320,13 @@ static int g_vp_known, g_sc_known;
 extern unsigned g_frame;
 static void call_sync(CPU *c, HleId id, HleHandler fn)
 {
+    {   /* LINDBERGH_GLQ_SYNCLOG=<frame>: every call waited for in that frame, with its arguments */
+        static long f = -2;
+        if (f == -2) { const char *v = getenv("LINDBERGH_GLQ_SYNCLOG"); f = v ? atol(v) : -1; }
+        if (f >= 0 && (long)g_frame == f)
+            fprintf(stderr, "[glq] sync %s(%#x, %#x, %#x, %#x, %#x, %#x) array buffer %u, element buffer %u\n", hle_name(id),
+                    A32(0), A32(1), A32(2), A32(3), A32(4), A32(5), g_array_buf, g_element_buf);
+    }
     {   /* LINDBERGH_GLQ_GETS=1: each state read the game waits for, by what it asks (once) */
         static int on = -1; static uint32_t seen[64]; static int nseen;
         if (on < 0) { const char *v = getenv("LINDBERGH_GLQ_GETS"); on = v && *v == '1'; }
@@ -368,6 +381,107 @@ static int shadow_state(CPU *c, HleId id)
     return 0;
 }
 
+/* ---- client arrays copied at a lock ----
+ * A batch of vertices in the game's own memory, locked (glLockArraysEXT) and
+ * drawn: its locked range of every array in use, and its index lists, go to
+ * the worker as copies instead of making the game wait (twice a frame in The
+ * House of the Dead 4: an offscreen pass of 423 vertices). The copies live in
+ * three buffers used a frame each - the game is never more than a frame
+ * ahead. LINDBERGH_GLQ_NOCOPY=1: such a batch waits, as before. */
+#define ARENA_SIZE (2u << 20)
+static uint8_t *g_arena[3];
+static uint32_t g_arena_used, g_arena_frame = ~0u;
+static int copy_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *v = getenv("LINDBERGH_GLQ_NOCOPY"); on = !(v && *v == '1'); }
+    return on;
+}
+static uint8_t *arena_take(uint32_t n)
+{
+    if (g_arena_frame != g_frame) { g_arena_frame = g_frame; g_arena_used = 0; }
+    uint8_t **a = &g_arena[g_frame % 3];
+    if (!*a) *a = guest_alloc(ARENA_SIZE, 64);
+    n = (n + 15u) & ~15u;
+    if (!*a || g_arena_used + n > ARENA_SIZE) return NULL;
+    uint8_t *p = *a + g_arena_used;
+    g_arena_used += n;
+    return p;
+}
+static uint32_t type_size(uint32_t t)
+{
+    switch (t) {
+    case 0x1400: case 0x1401: return 1;
+    case 0x1402: case 0x1403: case 0x140B: return 2;
+    case 0x1404: case 0x1405: case 0x1406: return 4;
+    case 0x140A: return 8;
+    }
+    return 0;
+}
+/* bytes of one element of slot s's array, and its stride */
+static int ptr_layout(int s, uint32_t *elem, uint32_t *stride)
+{
+    const uint32_t *a = g_ptr[s].args;
+    uint32_t size, type, st;
+    if (g_ptr[s].a == 2) { size = s == S_NORMAL ? 3 : 1; type = a[0]; st = a[1]; }
+    else if (g_ptr[s].a == 3) { size = a[0] == 0x80E1 ? 4 : a[0]; type = a[1]; st = a[2]; }
+    else if (g_ptr[s].a == 5) { size = a[1] == 0x80E1 ? 4 : a[1]; type = a[2]; st = a[4]; }
+    else return 0;
+    uint32_t ts = type_size(type);
+    if (!ts || size < 1 || size > 4) return 0;
+    *elem = size * ts; *stride = st ? st : size * ts;
+    return 1;
+}
+static void put_call(HleId id, HleHandler fn, const uint32_t *args)
+{
+    Rec *r = ring_take(HDR + ARGS * 4);
+    r->kind = R_ASYNC; r->id = (uint32_t)id; r->fn = fn;
+    memcpy((uint8_t *)r + HDR, args, ARGS * 4);
+    ring_put();
+    g_n_async++;
+}
+/* slot s's pointer call again, its array at va (texture coordinates: for their unit) */
+static void put_pointer(int s, uint32_t va)
+{
+    uint32_t args[ARGS];
+    memcpy(args, g_ptr[s].args, sizeof args);
+    args[g_ptr[s].a] = va;
+    int tex = s >= S_TEX0 && s < S_ATTR0;
+    uint32_t unit[ARGS] = { 0 };
+    if (tex && g_cat_fn) { unit[0] = 0x84C0 + g_ptr[s].unit; put_call(g_cat_id, g_cat_fn, unit); }
+    put_call(g_ptr[s].id, g_ptr[s].fn, args);
+    if (tex && g_cat_fn) { unit[0] = 0x84C0 + g_client_unit; put_call(g_cat_id, g_cat_fn, unit); }
+}
+/* the locked range [first, first+count) of every client array in use, copied
+ * and pointed at; 0: not possible (nothing changed) */
+static int lock_copy(uint32_t first, uint32_t count)
+{
+    if (!count || count > (1u << 20)) return 0;
+    uint8_t *copy[S_N] = { 0 };
+    uint32_t stride[S_N] = { 0 };
+    for (int s = 0; s < S_N; s++) {
+        if (!(g_slot_on[s] && g_slot_client[s])) continue;
+        uint32_t elem;
+        if (!g_ptr[s].set || !ptr_layout(s, &elem, &stride[s])) return 0;
+        uint32_t src = g_ptr[s].args[g_ptr[s].a] + first * stride[s];
+        uint32_t n = (count - 1) * stride[s] + elem;
+        if (!(copy[s] = arena_take(n))) return 0;
+        memcpy(copy[s], GP(src), n);
+    }
+    for (int s = 0; s < S_N; s++) {
+        if (!copy[s]) continue;
+        put_pointer(s, H2G(copy[s]) - first * stride[s]);   /* element i at copy + (i - first) * stride */
+        g_slot_client[s] = 0; g_ptr[s].copied = 1;
+    }
+    return 1;
+}
+/* at unlock: the copied arrays back on the game's memory (an unlocked draw then waits) */
+static void unlock_restore(void)
+{
+    for (int s = 0; s < S_N; s++)
+        if (g_ptr[s].copied) { g_ptr[s].copied = 0; g_slot_client[s] = 1; put_pointer(s, g_ptr[s].args[g_ptr[s].a]); }
+}
+
 static void glq_hook(CPU *c, HleId id, HleHandler fn)
 {
     const Cls *k = cls(id);
@@ -391,21 +505,40 @@ static void glq_hook(CPU *c, HleId id, HleHandler fn)
     case C_ENABLE_CS: case C_DISABLE_CS: {
         int s = slot_of(a0); if (s >= 0) g_slot_on[s] = k->kind == C_ENABLE_CS;
         break; }
-    case C_CLIENT_TEX: g_client_unit = a0 - 0x84C0; break;
+    case C_CLIENT_TEX: g_client_unit = a0 - 0x84C0; g_cat_id = id; g_cat_fn = fn; break;
     case C_ENABLE_VA: case C_DISABLE_VA:
         if (a0 < 16) g_slot_on[S_ATTR0 + a0] = k->kind == C_ENABLE_VA;
         break;
     case C_PTR: {
         int s = k->b == S_TEX0 ? S_TEX0 + (int)(g_client_unit & 7) : k->b == S_ATTR0 ? (a0 < 16 ? S_ATTR0 + (int)a0 : -1) : k->b;
-        if (s >= 0) g_slot_client[s] = g_array_buf == 0;
-        if (g_array_buf == 0) async = 0;   /* the pointer is the game's memory: keep in step */
+        uint32_t ptr = A32(k->a);
+        if (s >= 0) {
+            g_slot_client[s] = g_array_buf == 0 && ptr != 0;
+            g_ptr[s].set = g_array_buf == 0; g_ptr[s].copied = 0; g_ptr[s].unit = (uint8_t)(g_client_unit & 7);
+            g_ptr[s].id = id; g_ptr[s].fn = fn; g_ptr[s].a = k->a;
+            for (int i = 0; i < 16; i++) g_ptr[s].args[i] = A32(i);
+        }
+        /* the pointer is the game's memory: keep in step - unless the copies
+         * at a lock take care of it (a draw from it otherwise still waits),
+         * or it points at nothing */
+        if (g_array_buf == 0 && ptr != 0 && !(copy_on() && s >= 0)) async = 0;
         break; }
-    case C_DRAW: case C_LOCK: if (client_arrays_live()) async = 0; break;
+    case C_DRAW: if (client_arrays_live()) async = 0; break;
+    case C_LOCK:
+        if (client_arrays_live() && !(copy_on() && lock_copy(A32(0), A32(1)))) async = 0;
+        break;
+    case C_UNLOCK: unlock_restore(); break;
     case C_DRAW_EL: if (client_arrays_live() || !g_element_buf) async = 0; break;
     case C_MULTI_EL: {
         int32_t n = (int32_t)A32(4);
-        if (client_arrays_live() || !g_element_buf || n <= 0 || n > 4096 || !A32(1) || !A32(3)) async = 0;
-        else extra = 8u * (uint32_t)n;
+        if (client_arrays_live() || n <= 0 || n > 4096 || !A32(1) || !A32(3)) async = 0;
+        else if (g_element_buf) extra = 8u * (uint32_t)n;
+        else if (!copy_on() || !type_size(A32(2))) async = 0;
+        else {      /* index lists in the game's memory: they go along too */
+            extra = 8u * (uint32_t)n;
+            for (int32_t i = 0; i < n; i++) extra += ((uint32_t)rd32(A32(1) + 4u * (uint32_t)i) * type_size(A32(2)) + 15u) & ~15u;
+            if (extra > (4u << 20)) async = 0;
+        }
         break; }
     }
     if (!async) { call_sync(c, id, fn); return; }
@@ -426,6 +559,16 @@ static void glq_hook(CPU *c, HleId id, HleHandler fn)
         memcpy(blob, GP(A32(1)), 4u * n);           /* counts */
         memcpy(blob + 4u * n, GP(A32(3)), 4u * n);  /* offsets into the element buffer */
         args[1] = va_of(blob); args[3] = va_of(blob + 4u * n);
+        if (!g_element_buf) {                       /* or the lists themselves, copied after */
+            uint32_t *ptrs = (uint32_t *)(blob + 4u * n), *cnt = (uint32_t *)blob, ts = type_size(A32(2));
+            uint8_t *at = blob + 8u * n;
+            for (uint32_t i = 0; i < n; i++) {
+                uint32_t bytes = cnt[i] * ts;
+                memcpy(at, GP(ptrs[i]), bytes);
+                ptrs[i] = va_of(at);
+                at += (bytes + 15u) & ~15u;
+            }
+        }
     }
     ring_put();
     g_n_async++;
