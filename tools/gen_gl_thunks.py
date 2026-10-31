@@ -134,6 +134,9 @@ def core_name(name, sig):
     return name
 
 
+WORDS = {}      # name -> dwords of arguments on the guest stack
+
+
 def emit(name, target, ret, types):
     lines, call, slot = [], [], 0
     off = OFFSET_ARGS.get(target)
@@ -160,6 +163,7 @@ def emit(name, target, ret, types):
         else:
             call.append(f"({base})A32({slot})")
             slot += 1
+    WORDS[name] = slot
     expr = f"{target}({', '.join(call)})"
     r = ret.replace("const", "").strip()
     chk = f"    gl_check(\"{name}\");\n"
@@ -229,9 +233,9 @@ def main():
         extra.append(n)
     out.append("void gl_register_generated(void)\n{")
     for n in bound:
-        out.append(f'    hle_bind("{n}", th_{n}); gl_bind_named("{n}", th_{n});')
+        out.append(f'    hle_bind("{n}", th_{n}); gl_bind_named("{n}", th_{n}); gl_arg_words("{n}", {WORDS[n]});')
     for n in extra:
-        out.append(f'    gl_bind_named("{n}", th_{n});')
+        out.append(f'    gl_bind_named("{n}", th_{n}); gl_arg_words("{n}", {WORDS[n]});')
     out.append("}")
     if missing:
         out.append("\n/* not generated (no prototype or returns a pointer): " + ", ".join(missing) + " */")

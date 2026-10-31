@@ -27,6 +27,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <string.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <time.h>
@@ -49,6 +50,9 @@ typedef struct {
     void *arg;
 } Rec;
 #define HDR ((uint32_t)((sizeof(Rec) + 15u) & ~15u))
+/* an R_ASYNC record's arguments start after the fields it uses (size to fn):
+ * u and arg are a sync record's or a job's */
+#define HDR_A ((uint32_t)((offsetof(Rec, u) + 15u) & ~15u))
 
 static uint8_t *g_ring;                /* host address */
 static uint32_t g_ring_va;             /* guest address */
@@ -90,7 +94,7 @@ enum {
 };
 /* ok: classified; sh: a call the game thread keeps a shadow of (viewport,
  * scissor) or may answer from it (glGetIntegerv), so the rest skip that check */
-typedef struct { uint8_t kind, a, b, c, ok, sh; } Cls;
+typedef struct { uint8_t kind, a, b, c, ok, sh, words; } Cls;
 static Cls g_cls[HLE_ID_MAX];
 
 /* the client arrays as the game set them: on, and whether in client memory */
@@ -148,6 +152,11 @@ static const struct { const char *name; uint8_t kind, a, b, c; } T[] = {
     { "glUniform1ivARB", C_VEC, 2, 1, 4 }, { "glUniform4fv", C_VEC, 2, 1, 16 },
     { "glUniformMatrix3fvARB", C_VEC, 3, 1, 36 }, { "glUniformMatrix4fvARB", C_VEC, 3, 1, 64 },
     { "glUniformMatrix4fv", C_VEC, 3, 1, 64 },
+    /* names to delete: queued too - the order is kept, and a glGen* that could
+     * hand a name out again waits for the queue (16 waits a frame in a stretch
+     * of The House of the Dead 4) */
+    { "glDeleteBuffers", C_VEC, 1, 0, 4 }, { "glDeleteBuffersARB", C_VEC, 1, 0, 4 },
+    { "glDeleteTextures", C_VEC, 1, 0, 4 },
     /* the client arrays */
     { "glBindBuffer", C_BIND }, { "glBindBufferARB", C_BIND },
     { "glEnableClientState", C_ENABLE_CS }, { "glDisableClientState", C_DISABLE_CS },
@@ -164,11 +173,34 @@ static const struct { const char *name; uint8_t kind, a, b, c; } T[] = {
     { "glLockArraysEXT", C_LOCK },
 };
 
+/* the generated thunks say how many argument dwords each GL function takes;
+ * a call copies that many (at least 4, in steps of 4 to keep the arrays
+ * after them aligned) instead of 16 - most take one to four, and at 40,000
+ * calls a frame the copy is the queue's memory traffic */
+static struct { const char *name; uint8_t words; } g_words[4096];
+static int g_nwords;
+void gl_arg_words(const char *name, int words)
+{
+    if (g_nwords < (int)(sizeof g_words / sizeof g_words[0]) && words >= 0 && words <= (int)ARGS) {
+        g_words[g_nwords].name = name; g_words[g_nwords].words = (uint8_t)words; g_nwords++;
+    }
+}
+static uint8_t words_of(const char *n)
+{
+    for (int i = 0; i < g_nwords; i++)
+        if (!strcmp(g_words[i].name, n)) {
+            unsigned w = (g_words[i].words + 3u) & ~3u;
+            return (uint8_t)(w ? w : 4u);
+        }
+    return ARGS;                       /* hand-written thunks, and older generated ones */
+}
+
 static const Cls *cls(HleId id)
 {
     if (g_cls[id].ok) return &g_cls[id];
     const char *n = hle_name(id);
-    Cls k = { C_SYNC, 0, 0, 0, 1, 0 };
+    Cls k = { C_SYNC, 0, 0, 0, 1, 0, 0 };
+    k.words = words_of(n);
     for (unsigned i = 0; i < sizeof T / sizeof T[0]; i++)
         if (!strcmp(n, T[i].name)) { k.kind = T[i].kind; k.a = T[i].a; k.b = T[i].b; k.c = T[i].c; break; }
     if (!strncmp(n, "glX", 3)) k.kind = strcmp(n, "glXSwapBuffers") ? C_RAW : C_DIRECT;
@@ -320,7 +352,7 @@ static void *worker(void *arg)
              * the rest of the CPU is cleared once, not for every call (352
              * bytes, 40,000 times a frame) */
             cpu.eax = cpu.edx = 0; cpu.fpu_top = 0;
-            cpu.esp = va_of((uint8_t *)r + HDR);
+            cpu.esp = va_of((uint8_t *)r + HDR_A);
             if (g_prev && cls((HleId)r->id)->kind != C_RAW) g_prev(&cpu, (HleId)r->id, r->fn); else r->fn(&cpu);
             break;
         case R_SYNC:
@@ -473,9 +505,10 @@ static int ptr_layout(int s, uint32_t *elem, uint32_t *stride)
 }
 static void put_call(HleId id, HleHandler fn, const uint32_t *args)
 {
-    Rec *r = ring_take(HDR + ARGS * 4);
+    uint32_t w = cls(id)->words;
+    Rec *r = ring_take(HDR_A + w * 4);
     r->kind = R_ASYNC; r->id = (uint32_t)id; r->fn = fn;
-    memcpy((uint8_t *)r + HDR, args, ARGS * 4);
+    memcpy((uint8_t *)r + HDR_A, args, w * 4);
     ring_put();
     g_n_async++;
 }
@@ -543,6 +576,12 @@ static void glq_hook(CPU *c, HleId id, HleHandler fn)
     case C_VEC: {
         int32_t n = (int32_t)A32(k->b);
         if (n < 0 || n > 4096 || !A32(k->a)) async = 0; else extra = (uint32_t)n * k->c;
+        if (async && k->b == 0 && k->a == 1 && !strncmp(hle_name(id), "glDeleteBuffers", 15))   /* a deleted buffer is unbound */
+            for (int32_t i = 0; i < n; i++) {
+                uint32_t name = rd32(A32(1) + 4u * (uint32_t)i);
+                if (name && name == g_array_buf) g_array_buf = 0;
+                if (name && name == g_element_buf) g_element_buf = 0;
+            }
         break; }
     case C_BIND:
         if (a0 == 0x8892) g_array_buf = A32(1);
@@ -589,11 +628,12 @@ static void glq_hook(CPU *c, HleId id, HleHandler fn)
     }
     if (!async) { call_sync(c, id, fn); return; }
 
-    Rec *r = ring_take(HDR + ARGS * 4 + ((extra + 15u) & ~15u));
+    uint32_t w = k->words;
+    Rec *r = ring_take(HDR_A + w * 4 + ((extra + 15u) & ~15u));
     r->kind = R_ASYNC; r->id = (uint32_t)id; r->fn = fn;
-    uint32_t *args = (uint32_t *)((uint8_t *)r + HDR);
-    memcpy(args, GP(c->esp), ARGS * 4);
-    uint8_t *blob = (uint8_t *)args + ARGS * 4;
+    uint32_t *args = (uint32_t *)((uint8_t *)r + HDR_A);
+    memcpy(args, GP(c->esp), w * 4);
+    uint8_t *blob = (uint8_t *)args + w * 4;
     if (k->kind == C_BLOB) {
         memcpy(blob, GP(A32(k->a)), extra);
         args[k->a] = va_of(blob);

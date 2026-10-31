@@ -22,6 +22,9 @@
 
 /* A thunk under its GL name, for glXGetProcAddressARB (gl_token_for). */
 void gl_bind_named(const char *name, HleHandler fn);
+/* dwords of arguments the GL function takes on the guest stack (the GL queue
+ * copies that many, not a fixed 16) */
+void gl_arg_words(const char *name, int words);
 
 #ifndef GL_PIXEL_PACK_BUFFER
 #define GL_PIXEL_PACK_BUFFER   0x88EB
