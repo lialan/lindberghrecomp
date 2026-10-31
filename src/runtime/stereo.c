@@ -1588,9 +1588,12 @@ static int transform_call(CPU *c, HleId id, const char *n)
         if (offscreen_fb(g_game_fb) || g_flat) hud = 2;  /* the game's own projection, untouched */
         if (hud == 1 && !persp && g_mv && fills_screen(c, n)) hud = 3;
         { static long dl = -2; if (dl == -2) { const char *v = getenv("LINDBERGH_DRAW_LOG"); dl = v ? atol(v) : -1; }
-          if (dl >= 0 && g_frame == (unsigned)dl && !g_replaying)     /* LINDBERGH_DRAW_LOG=<frame>: each draw's class */
-              fprintf(stderr, "[draw] %s fb %u tex %u persp %d ident %d hud %d lens %.3f,%.3f vp %d,%d %dx%d\n", hle_name(g_cur_id), (unsigned)g_game_fb,
-                      g_tex2d_bound, persp, g_mv_ident, hud, g_proj[g_proj_top][0], g_proj[g_proj_top][5], g_vp[0], g_vp[1], g_vp[2], g_vp[3]); }
+          if (dl >= 0 && g_frame == (unsigned)dl && !g_replaying) {   /* LINDBERGH_DRAW_LOG=<frame>: each draw's class */
+              float mv[16]; glGetFloatv(GL_MODELVIEW_MATRIX, mv);
+              fprintf(stderr, "[draw] %s fb %u tex %u persp %d ident %d hud %d lens %.3f,%.3f vp %d,%d %dx%d mv-t %.3f,%.3f,%.3f gun %.3f,%.3f\n", hle_name(g_cur_id), (unsigned)g_game_fb,
+                      g_tex2d_bound, persp, g_mv_ident, hud, g_proj[g_proj_top][0], g_proj[g_proj_top][5], g_vp[0], g_vp[1], g_vp[2], g_vp[3],
+                      mv[12], mv[13], mv[14], g_gun_ndc[0], g_gun_ndc[1]);
+          } }
         g_fill_track = hud == 1 && !persp && g_mv && k == K_BEGIN;    /* glBegin: measured until glEnd */
         if (g_fill_track) { g_fill_box[0] = g_fill_box[1] = 1e9f; g_fill_box[2] = g_fill_box[3] = -1e9f; }
         if (hud == 1 && !is_perspective(g_proj[g_proj_top]) && !g_replaying) g_hud_fb_next = g_game_fb;
@@ -2768,6 +2771,7 @@ int stereo_aim_samples(const float o_[3], const float d_[3], int max, float (*px
     if (!g_on || !g_mv || g_flat) return 0;
     GLuint dt = 0;
     for (unsigned i = 0; i < g_nfb_depth; i++) if (g_fb_depth[i].fb == g_world_fb_next) dt = g_fb_depth[i].depth;
+    if (g_world_fb_next == 0) dt = g_eye_tex[1];      /* the window: the eyes' own target (The House of the Dead 4 Special) */
     unsigned arr = dt ? gl4es_multiview_array(dt) : 0;
     static unsigned dbg;
     if (getenv("LINDBERGH_AIM_LOG") && ++dbg % 120 == 1) {
