@@ -90,6 +90,8 @@ enum {
     C_MULTI_EL,     /* glMultiDrawElements */
     C_LOCK,         /* glLockArraysEXT: reads the arrays now */
     C_UNLOCK,       /* glUnlockArraysEXT */
+    C_TEXIMG,       /* glTex(Sub)Image2D: the pixels at arg a, width at arg b, height after it */
+    C_PSTORE,       /* glPixelStorei: watched for unpacking that moves the pixels */
     C_DIRECT,       /* glXSwapBuffers: here, on the game thread (host_swap queues its GL) */
     C_RAW,          /* the rest of GLX: on the worker, waited for, past stereo.c's hook */
 };
@@ -193,7 +195,7 @@ static const struct { const char *name; uint8_t kind, a, b, c; } T[] = {
     { "glUniform1iARB", C_VAL }, { "glUniform1fARB", C_VAL }, { "glUniform2fARB", C_VAL },
     { "glUniform3fARB", C_VAL }, { "glUniform4fARB", C_VAL }, { "glUniform1i", C_VAL }, { "glUniform1f", C_VAL },
     { "glProgramEnvParameter4fARB", C_VAL }, { "glProgramLocalParameter4fARB", C_VAL },
-    { "glCopyTexSubImage2D", C_VAL }, { "glPixelStorei", C_VAL }, { "glTexGeni", C_VAL },
+    { "glCopyTexSubImage2D", C_VAL }, { "glPixelStorei", C_PSTORE }, { "glTexGeni", C_VAL },
     { "glBindFramebufferEXT", C_VAL }, { "glBindFramebuffer", C_VAL }, { "glBindRenderbufferEXT", C_VAL },
     { "glFlush", C_VAL }, { "glUnlockArraysEXT", C_UNLOCK },
     /* one array, its size fixed by the call */
@@ -237,7 +239,39 @@ static const struct { const char *name; uint8_t kind, a, b, c; } T[] = {
     { "glDrawArrays", C_DRAW }, { "glDrawElements", C_DRAW_EL, 3 }, { "glDrawRangeElements", C_DRAW_EL, 5 },
     { "glMultiDrawElements", C_MULTI_EL }, { "glMultiDrawElementsEXT", C_MULTI_EL },
     { "glLockArraysEXT", C_LOCK },
+    /* texture uploads: the pixels go along (movie frames, 3 waits a frame in
+     * The House of the Dead 4 Special, 2-3 ms of the game thread) */
+    { "glTexSubImage2D", C_TEXIMG, 8, 4 }, { "glTexImage2D", C_TEXIMG, 8, 3 },
 };
+
+/* bytes of the pixels a glTex(Sub)Image2D reads, 0 if not sure. Unpack row
+ * length and skips are taken as 0 unless the game ever set them otherwise,
+ * the alignment as the largest (8): copying a few bytes too many is harmless,
+ * since the copy keeps the layout. A bound unpack buffer makes the pointer an
+ * offset - then not copied at all. */
+static int g_unpack_odd;
+static uint32_t pixel_bytes(uint32_t w, uint32_t h, uint32_t fmt, uint32_t type)
+{
+    uint32_t comps, size;
+    switch (fmt) {
+    case 0x1906: case 0x1909: case 0x1903: case 0x1901: case 0x1902: comps = 1; break;   /* alpha, luminance, red, stencil, depth */
+    case 0x190A: comps = 2; break;
+    case 0x1907: case 0x80E0: comps = 3; break;
+    case 0x1908: case 0x80E1: comps = 4; break;
+    default: return 0;
+    }
+    switch (type) {
+    case 0x1400: case 0x1401: size = comps; break;
+    case 0x1402: case 0x1403: case 0x140B: size = 2 * comps; break;
+    case 0x1404: case 0x1405: case 0x1406: size = 4 * comps; break;
+    case 0x8033: case 0x8034: case 0x8363: case 0x8364: case 0x8365: case 0x8366: size = 2; break;
+    case 0x8035: case 0x8036: case 0x8367: case 0x8368: size = 4; break;
+    default: return 0;
+    }
+    if (!w || !h || w > 8192 || h > 8192) return 0;
+    uint64_t row = (uint64_t)w * size, n = ((row + 7u) & ~7ull) * (h - 1) + row;
+    return n > (8u << 20) ? 0 : (uint32_t)n;
+}
 
 /* the generated thunks say how many argument dwords each GL function takes;
  * a call copies that many (at least 4, in steps of 4 to keep the arrays
@@ -784,6 +818,7 @@ static void glq_hook(CPU *c, HleId id, HleHandler fn)
             }
         break; }
     case C_BIND:
+        if ((a0 == 0x88EC || a0 == 0x88EB) && A32(1)) g_unpack_odd = 1;    /* pixel buffers: the pointers are offsets */
         if (a0 == 0x8892 || a0 == 0x8893) {
             int e = a0 == 0x8893;
             uint32_t *b = e ? &g_element_buf : &g_array_buf;
@@ -831,6 +866,13 @@ static void glq_hook(CPU *c, HleId id, HleHandler fn)
         if (client_arrays_live() && !(copy_on() && lock_copy(A32(0), A32(1)))) async = 0;
         break;
     case C_UNLOCK: unlock_restore(); break;
+    case C_PSTORE:
+        if ((a0 == 0x0CF2 || a0 == 0x0CF3 || a0 == 0x0CF4 || a0 == 0x806D || a0 == 0x806E) && A32(1)) g_unpack_odd = 1;
+        break;
+    case C_TEXIMG:
+        if (!A32(k->a)) break;                      /* no pixels: storage only */
+        if (g_unpack_odd || !copy_on() || !(extra = pixel_bytes(A32(k->b), A32(k->b + 1u), A32(6), A32(7)))) async = 0;
+        break;
     case C_DRAW_EL: if (client_arrays_live() || !g_element_buf) async = 0; break;
     case C_MULTI_EL: {
         int32_t n = (int32_t)A32(4);
@@ -855,7 +897,7 @@ static void glq_hook(CPU *c, HleId id, HleHandler fn)
     if (k->kind == C_BLOB) {
         memcpy(blob, GP(A32(k->a)), extra);
         args[k->a] = va_of(blob);
-    } else if (k->kind == C_VEC && extra) {
+    } else if ((k->kind == C_VEC || k->kind == C_TEXIMG) && extra) {
         memcpy(blob, GP(A32(k->a)), extra);
         args[k->a] = va_of(blob);
     } else if (k->kind == C_MULTI_EL) {
