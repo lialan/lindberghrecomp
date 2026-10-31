@@ -285,6 +285,7 @@ static void pose_matrix(const float q[4], const float p[3], float *m)
 typedef struct {
     GLint prog, vao, vbo, vp[4], blend_src[2], blend_dst[2], depth_func, front, cull_face;
     GLboolean blend, depth, cull, depth_mask, color_mask[4];
+    GLboolean scissor, stencil, poly_offset;     /* off while the overlay draws: a game's left on would clip it */
 } Saved;
 
 static void save(Saved *s)
@@ -301,10 +302,16 @@ static void save(Saved *s)
     s->blend = gl.IsEnabled(GL_BLEND); s->depth = gl.IsEnabled(GL_DEPTH_TEST); s->cull = gl.IsEnabled(GL_CULL_FACE);
     gl.GetBooleanv(GL_DEPTH_WRITEMASK, &s->depth_mask);
     gl.GetBooleanv(GL_COLOR_WRITEMASK, s->color_mask);
+    s->scissor = gl.IsEnabled(GL_SCISSOR_TEST); s->stencil = gl.IsEnabled(GL_STENCIL_TEST);
+    s->poly_offset = gl.IsEnabled(GL_POLYGON_OFFSET_FILL);
+    gl.Disable(GL_SCISSOR_TEST); gl.Disable(GL_STENCIL_TEST); gl.Disable(GL_POLYGON_OFFSET_FILL);
 }
 
 static void restore(const Saved *s)
 {
+    if (s->scissor) gl.Enable(GL_SCISSOR_TEST);
+    if (s->stencil) gl.Enable(GL_STENCIL_TEST);
+    if (s->poly_offset) gl.Enable(GL_POLYGON_OFFSET_FILL);
     gl.UseProgram((GLuint)s->prog);
     gl.BindVertexArray((GLuint)s->vao);
     gl.BindBuffer(GL_ARRAY_BUFFER, (GLuint)s->vbo);

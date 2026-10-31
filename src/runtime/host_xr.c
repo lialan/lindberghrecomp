@@ -1408,12 +1408,12 @@ void xr_frame_begin(void)
         head_ok = 1;
     }
     if (state == XR_SESSION_STATE_FOCUSED) input_frame(frame.predictedDisplayTime);
-    if (cfg.show_fps) fps_update(frame.predictedDisplayTime);
     else {
         host_vr_input(-100000, -100000, 0, 0); host_vr_input2(0, -100000, -100000);
         xo.gun_valid = xo.beam = xo.dot = xo.flash = 0; xo2.gun_valid = xo2.beam = xo2.dot = xo2.flash = 0;
         stereo_set_gun_ray(0, NULL, NULL, 0); stereo_set_gun_ray(1, NULL, NULL, 0);
     }
+    if (cfg.show_fps) fps_update(frame.predictedDisplayTime);
 }
 
 /* This frame's world depth, copied into each eye's depth swapchain image -
