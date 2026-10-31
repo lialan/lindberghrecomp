@@ -39,7 +39,9 @@ uint32_t g_image_delta = 0;       /* cpu.h's GVA(): we map where it asked */
 
 static void *reserve(uint32_t addr, uint32_t size)
 {
-#ifdef RECOMP_GUEST_BASE
+#if defined(RECOMP_GUEST_BASE) && defined(_WIN32)
+    return VirtualAlloc(G2H(addr), size, MEM_COMMIT, PAGE_READWRITE);
+#elif defined(RECOMP_GUEST_BASE)
     /* The whole window is already mapped read/write (guest_mem.c); a
      * "reservation" is just a range inside it. */
     (void)size;

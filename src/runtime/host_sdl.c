@@ -33,17 +33,24 @@ static void mac_activate(void)
 }
 #endif
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include "gl_posix.h"
 #include "host_settings.h"
 
-#if defined(__ANDROID__)
-/* Meta Quest: GL through gl4es, frames to the headset (host_xr.c) */
+#if defined(LINDBERGH_OPENXR)
+/* Shared VR frame loop; Android uses gl4es, Windows uses desktop GL. */
+#ifdef LINDBERGH_GL4ES
 #include <gl4esinit.h>
+#endif
 int  xr_init(void);
 void xr_frame_begin(void);
 void xr_frame_end(void);
 
+#ifdef LINDBERGH_GL4ES
 static void APIENTRY_GL4ES main_fb_size(int *w, int *h) { *w = 640; *h = 480; }
+#endif
 #endif
 #include "stereo.h"
 
@@ -463,7 +470,7 @@ void host_cabinet_input(CabinetInput *out)
     cabinet_p2_test();
     g_cab.gun2 = g_gun2_on;
     if (g_gun2_on) gun_reading(g_gun2_px, g_gun2_py, w, h, &g_cab.gun2_x, &g_cab.gun2_y);
-#if !defined(__ANDROID__)
+#if !defined(LINDBERGH_OPENXR)
     if (stereo_wide(NULL, NULL, NULL) || stereo_enabled()) {      /* the HUD keeps clear of them */
         stereo_set_gun(g_cab.gun_x, g_cab.gun_y);
         stereo_set_gun2(g_gun2_on ? g_cab.gun2_x : -100000, g_gun2_on ? g_cab.gun2_y : -100000);
@@ -722,6 +729,10 @@ int host_window_open(const char *title)
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+#elif defined(LINDBERGH_OPENXR) && defined(_WIN32)
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_COMPATIBILITY);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
 #else
     /* The game is a 2007 fixed-function + ARB-program GL program: a 2.1
      * compatibility context is what it was written for. */
@@ -793,16 +804,28 @@ int host_gl_context(void)
         fprintf(stderr, "[window] SDL_GL_CreateContext: %s\n", SDL_GetError());
         return 0;
     }
-#if defined(__ANDROID__)
+#if defined(LINDBERGH_OPENXR)
+#ifdef _WIN32
+    GLenum glew_status = glewInit();
+    if (glew_status != GLEW_OK) {
+        fprintf(stderr, "[window] GLEW: %s\n", glewGetErrorString(glew_status));
+        return 0;
+    }
+#endif
+#ifdef LINDBERGH_GL4ES
     set_getprocaddress(SDL_GL_GetProcAddress);
     set_getmainfbsize(main_fb_size);
     initialize_gl4es();
+#endif
     if (!xr_init()) {
         fprintf(stderr, "[window] no headset session - nothing to show the game on\n");
         return 0;
     }
     xr_frame_begin();
 #else
+#ifdef _WIN32
+    if (glewInit() != GLEW_OK) return 0;
+#endif
 #if defined(__APPLE__)
     { int pw, ph; picture_size(&pw, &ph); host_mac_fix_surface(g_win.win, pw, ph); }
     /* the context started with the window's size as its viewport and
@@ -882,7 +905,7 @@ static void maybe_screenshot(void)
     free(px);
 }
 
-#if defined(__ANDROID__)
+#if defined(LINDBERGH_OPENXR)
 /* Where a frame's time goes, summed over each [perf] period: the game's own
  * work (first eye included), the second eye's replay, handing both to the
  * headset, and waiting for its next frame. */
@@ -964,7 +987,7 @@ void host_swap(void)
 static void frame_gl(void *arg)
 {
     (void)arg;
-#if defined(__ANDROID__)
+#if defined(LINDBERGH_OPENXR)
     g_t_game += since_mark();
     stereo_frame_end();                 /* the second eye, then both to the headset */
     g_t_eye2 += since_mark();
@@ -979,7 +1002,7 @@ static void frame_gl(void *arg)
     maybe_screenshot();
     maybe_peek();
     g_frame++;
-#if defined(__ANDROID__)
+#if defined(LINDBERGH_OPENXR)
     xr_frame_begin();
     g_t_wait += since_mark();
     if (0) {
@@ -1024,7 +1047,7 @@ static void host_frame_done(void)
         Uint32 now = SDL_GetTicks();
         if (!t0) { t0 = now; f0 = g_frame; }
         else if (now - t0 >= 5000) {
-#if defined(__ANDROID__)
+#if defined(LINDBERGH_OPENXR)
             unsigned n = g_frame - f0 ? g_frame - f0 : 1;
             fprintf(stderr, "[perf] frame %u, %.1f fps; ms per frame: game %.1f, second eye %.1f, submit %.1f, headset wait %.1f;"
                             " late %u (over 25 ms %u), worst %.0f ms\n",
@@ -1032,6 +1055,7 @@ static void host_frame_done(void)
                     g_t_game / n, g_t_eye2 / n, g_t_submit / n, g_t_wait / n, g_late17, g_late25, g_worst);
             g_late17 = g_late25 = 0; g_worst = 0;
             g_t_game = g_t_eye2 = g_t_submit = g_t_wait = 0;
+#ifdef LINDBERGH_GL4ES
             {   /* shaders built in those 5 seconds: the driver's compiles and links
                  * (gl4es), and the programs the disk caches gave or did not */
                 extern unsigned gl4es_stat_compiles, gl4es_stat_links, gl4es_stat_fpe_hits, gl4es_stat_fpe_built, gl4es_stat_app_hits, gl4es_stat_app_built;
@@ -1048,6 +1072,7 @@ static void host_frame_done(void)
                 gl4es_stat_app_hits = gl4es_stat_app_built = 0;
                 gl4es_stat_compile_ms = gl4es_stat_link_ms = 0;
             }
+#endif
 #else
             /* the game thread's own CPU time: what a slower CPU (the Quest's)
              * scales, where the frame rate here is held at the display's */

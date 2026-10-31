@@ -11,6 +11,8 @@
 #if defined(__APPLE__)
 #include <OpenGL/gl.h>
 #include <OpenGL/glext.h>
+#elif defined(_WIN32)
+#include <GL/glew.h>
 #else
 #define GL_GLEXT_PROTOTYPES 1
 #include <GL/gl.h>

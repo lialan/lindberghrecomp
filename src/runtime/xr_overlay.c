@@ -10,20 +10,33 @@
  * reports poses in. The gun is a low-poly SMG built from boxes in code: its
  * barrel lies along the controller's aim ray, so the laser leaves the muzzle.
  */
-#if defined(__ANDROID__)
+#if defined(LINDBERGH_OPENXR)
 
+#ifdef __ANDROID__
 #include <dlfcn.h>
+#endif
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef __ANDROID__
 #include <GLES3/gl3.h>
+#ifndef APIENTRY
+#define APIENTRY GL_APIENTRY
+#endif
+#define XO_GLSL "#version 300 es\n"
+#else
+#include <windows.h>
+#include <GL/glew.h>
+#include <SDL.h>
+#define XO_GLSL "#version 430 compatibility\n"
+#endif
 
 #include "xr_overlay.h"
 
 static struct {
-#define F(ret, name, args) ret (*name) args;
+#define F(ret, name, args) ret (APIENTRY *name) args;
     F(GLuint, CreateShader, (GLenum)) F(void, ShaderSource, (GLuint, GLsizei, const GLchar *const *, const GLint *))
     F(void, CompileShader, (GLuint)) F(void, GetShaderiv, (GLuint, GLenum, GLint *))
     F(void, GetShaderInfoLog, (GLuint, GLsizei, GLsizei *, GLchar *)) F(GLuint, CreateProgram, (void))
@@ -166,9 +179,13 @@ static GLuint program(const char *vs, const char *fs, const char *a0, const char
 
 int xo_init(void)
 {
+#ifdef __ANDROID__
     void *lib = dlopen("libGLESv3.so", RTLD_NOW | RTLD_LOCAL);
     if (!lib) return 0;
 #define L(n) if (!(*(void **)&gl.n = dlsym(lib, "gl" #n))) { fprintf(stderr, "[overlay] no gl" #n "\n"); return 0; }
+#else
+#define L(n) if (!(*(void **)&gl.n = SDL_GL_GetProcAddress("gl" #n))) { fprintf(stderr, "[overlay] no gl" #n "\n"); return 0; }
+#endif
     L(CreateShader) L(ShaderSource) L(CompileShader) L(GetShaderiv) L(GetShaderInfoLog) L(CreateProgram)
     L(AttachShader) L(BindAttribLocation) L(LinkProgram) L(UseProgram) L(GetUniformLocation) L(UniformMatrix4fv)
     L(Uniform4f) L(GenVertexArrays) L(BindVertexArray) L(GenBuffers) L(BindBuffer) L(BufferData)
@@ -181,20 +198,20 @@ int xo_init(void)
     L(Uniform2iv) L(Uniform1f) L(FenceSync) L(ClientWaitSync) L(DeleteSync)
 #undef L
     prog_gun = program(
-        "#version 300 es\nlayout(location=0) in vec3 p; layout(location=1) in vec3 n; layout(location=2) in vec3 c;\n"
+        XO_GLSL "layout(location=0) in vec3 p; layout(location=1) in vec3 n; layout(location=2) in vec3 c;\n"
         "uniform mat4 mvp, model; out vec3 col;\n"
         "void main() { vec3 wn = normalize(mat3(model) * n);\n"
         "  float l = 0.35 + 0.65 * max(dot(wn, normalize(vec3(0.3, 1.0, 0.4))), 0.0);\n"
         "  float rim = pow(1.0 - abs(wn.z), 3.0) * 0.08;\n"
         "  col = c * l + rim; gl_Position = mvp * vec4(p, 1.0); }\n",
-        "#version 300 es\nprecision mediump float; in vec3 col; out vec4 o;\n"
+        XO_GLSL "precision mediump float; in vec3 col; out vec4 o;\n"
         "void main() { o = vec4(col, 1.0); }\n", "p", "n", "c");
     u_gun_mvp = gl.GetUniformLocation(prog_gun, "mvp");
     u_gun_model = gl.GetUniformLocation(prog_gun, "model");
     prog_beam = program(
-        "#version 300 es\nlayout(location=0) in vec3 p; layout(location=1) in vec2 uv;\n"
+        XO_GLSL "layout(location=0) in vec3 p; layout(location=1) in vec2 uv;\n"
         "uniform mat4 mvp; out vec2 t; void main() { t = uv; gl_Position = mvp * vec4(p, 1.0); }\n",
-        "#version 300 es\nprecision mediump float; in vec2 t; uniform vec4 color; uniform vec2 shape; out vec4 o;\n"
+        XO_GLSL "precision mediump float; in vec2 t; uniform vec4 color; uniform vec2 shape; out vec4 o;\n"
         "void main() { float d = length(t);\n"
         "  float a = shape.y > 0.0 ? clamp(1.0 - abs(d - shape.x) / shape.y, 0.0, 1.0)  /* a ring */\n"
         "                          : clamp(1.0 - d, 0.0, 1.0);\n"
@@ -206,20 +223,20 @@ int xo_init(void)
 
     for (int a = 0; a < 2; a++) {
         prog_screen[a] = program(
-            "#version 300 es\nlayout(location=0) in vec2 p; uniform mat4 mvp; out vec2 t;\n"
+            XO_GLSL "layout(location=0) in vec2 p; uniform mat4 mvp; out vec2 t;\n"
             "void main() { t = p * 0.5 + 0.5; gl_Position = mvp * vec4(p, 0.0, 1.0); }\n",
-            a ? "#version 300 es\nprecision highp float; precision highp sampler2DArray; in vec2 t; uniform sampler2DArray tex; out vec4 o;\n"
+            a ? XO_GLSL "precision highp float; precision highp sampler2DArray; in vec2 t; uniform sampler2DArray tex; out vec4 o;\n"
                 "void main() { o = vec4(texture(tex, vec3(t, 0.0)).rgb, 1.0); }\n"
-              : "#version 300 es\nprecision highp float; in vec2 t; uniform sampler2D tex; out vec4 o;\n"
+              : XO_GLSL "precision highp float; in vec2 t; uniform sampler2D tex; out vec4 o;\n"
                 "void main() { o = vec4(texture(tex, t).rgb, 1.0); }\n",
             "p", NULL, NULL);
         u_screen_mvp[a] = gl.GetUniformLocation(prog_screen[a], "mvp");
         u_screen_tex[a] = gl.GetUniformLocation(prog_screen[a], "tex");
     }
     prog_panel = program(   /* the panel's picture: row 0 at the top */
-        "#version 300 es\nlayout(location=0) in vec2 p; uniform mat4 mvp; out vec2 t;\n"
+        XO_GLSL "layout(location=0) in vec2 p; uniform mat4 mvp; out vec2 t;\n"
         "void main() { t = vec2(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5); gl_Position = mvp * vec4(p, 0.0, 1.0); }\n",
-        "#version 300 es\nprecision mediump float; in vec2 t; uniform sampler2D tex; out vec4 o;\n"
+        XO_GLSL "precision mediump float; in vec2 t; uniform sampler2D tex; out vec4 o;\n"
         "void main() { o = texture(tex, t); }\n", "p", NULL, NULL);
     u_panel_mvp = gl.GetUniformLocation(prog_panel, "mvp");
     u_panel_tex = gl.GetUniformLocation(prog_panel, "tex");
@@ -617,8 +634,8 @@ static int probe_init(void)
 {
     if (prog_probe) return 1;
     prog_probe = program(
-        "#version 300 es\nlayout(location=0) in vec2 p; void main() { gl_Position = vec4(p, 0.0, 1.0); }\n",
-        "#version 300 es\nprecision highp float; precision highp int; precision highp sampler2DArray;\n"
+        XO_GLSL "layout(location=0) in vec2 p; void main() { gl_Position = vec4(p, 0.0, 1.0); }\n",
+        XO_GLSL "precision highp float; precision highp int; precision highp sampler2DArray;\n"
         "uniform sampler2DArray d; uniform ivec2 px[64]; uniform int selftest; out vec4 o;\n"
         "void main() { int i = int(gl_FragCoord.x);\n"
         "  vec2 sz = vec2(textureSize(d, 0).xy);\n"
@@ -660,8 +677,8 @@ void xo_copy_depth(unsigned depth_array, int layer, int w, int h)
 {
     if (!prog_depth) {
         prog_depth = program(
-            "#version 300 es\nlayout(location=0) in vec2 p; void main() { gl_Position = vec4(p, 0.0, 1.0); }\n",
-            "#version 300 es\nprecision highp float; precision highp sampler2DArray;\n"
+            XO_GLSL "layout(location=0) in vec2 p; void main() { gl_Position = vec4(p, 0.0, 1.0); }\n",
+            XO_GLSL "precision highp float; precision highp sampler2DArray;\n"
             "uniform sampler2DArray d; uniform float layer; uniform vec2 size; out vec4 o;\n"
             "void main() { gl_FragDepth = texture(d, vec3(gl_FragCoord.xy / size, layer)).r; o = vec4(0.0); }\n",
             "p", NULL, NULL);

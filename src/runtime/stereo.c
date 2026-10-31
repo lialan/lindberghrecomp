@@ -33,7 +33,9 @@
  * view, put on the screen like the HUD.
  */
 
+#ifdef LINDBERGH_GL4ES
 #include <dlfcn.h>
+#endif
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -3144,6 +3146,8 @@ void stereo_rect_scale(float *x, float *y)
 unsigned stereo_eye_texture(int eye) { return g_eye_tex[eye]; }
 #ifdef LINDBERGH_GL4ES
 unsigned stereo_eye_array(void) { return g_mv ? gl4es_multiview_array(g_eye_tex[0]) : 0; }
+#else
+unsigned stereo_eye_array(void) { return 0; }
 #endif
 unsigned stereo_eye_framebuffer(int eye) { return g_eye_fbo[eye]; }
 

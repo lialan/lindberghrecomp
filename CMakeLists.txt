@@ -15,9 +15,12 @@ endif()
 #   add_executable(mygame src/host.c ${GENERATED})
 #   lindbergh_runtime(mygame games/mygame/generated)
 #
-# The build must be 32-bit. The CPU model in pcrecomp/runtime/recomp32_cpu is
-# flat - a guest register holds a real host address - and a Lindbergh ELF is
-# linked at 0x08048000, which only exists as an address in a 32-bit process.
+# 64-bit hosts use the shared guest-memory window and typed GL thunks.
+# Legacy 32-bit Windows retains its direct-address backend.
+option(LINDBERGH_OPENXR "Build the shared OpenXR VR host" ${ANDROID})
+if(LINDBERGH_OPENXR AND NOT ANDROID AND NOT (WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8))
+    message(FATAL_ERROR "OpenXR host supports Android and Windows x64")
+endif()
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -34,19 +37,16 @@ if(NOT EXISTS "${LINDBERGH_CPU_DIR}/cpu.h")
 endif()
 
 function(lindbergh_runtime target generated_dir)
-    if(WIN32)
-        if(CMAKE_SIZEOF_VOID_P EQUAL 8)
-            message(FATAL_ERROR
-                "${target} is being built 64-bit. On Windows the recompiled code holds "
-                "guest addresses in host registers and the game maps at 0x08048000, "
-                "so the host must be 32-bit: cmake -B build -A Win32")
-        endif()
+    if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND NOT MINGW)
+        message(FATAL_ERROR "Windows x64 requires MinGW-w64 GNU C; use the MINGW64 build instructions")
+    endif()
+    if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 4)
         set(platform_sources
             "${LINDBERGH_RUNTIME_DIR}/hle_window.c"
             "${LINDBERGH_RUNTIME_DIR}/hle_gl.c"
             "${LINDBERGH_RUNTIME_DIR}/hle_cg.c")
     else()
-        # A 64-bit POSIX host (macOS, Android): guest addresses are offsets into
+        # A 64-bit host (macOS, Android, Windows): guest addresses are offsets into
         # one 4 GB window (guest_mem.c), and GL goes through typed thunks.
         set(platform_sources
             "${LINDBERGH_RUNTIME_DIR}/guest_mem.c"
@@ -119,7 +119,13 @@ function(lindbergh_runtime target generated_dir)
             # checked memcpy/strcpy. Debug builds keep them.
             "$<$<CONFIG:Release>:-fno-stack-protector;-U_FORTIFY_SOURCE>")
         find_package(SDL2 REQUIRED)
-        target_link_libraries(${target} PRIVATE SDL2::SDL2 z)
+        target_link_libraries(${target} PRIVATE SDL2::SDL2)
+        if(WIN32)
+            find_package(ZLIB REQUIRED)
+            target_link_libraries(${target} PRIVATE ZLIB::ZLIB)
+        else()
+            target_link_libraries(${target} PRIVATE z)
+        endif()
         if(ANDROID)
             # Meta Quest: GL 2.1 through gl4es on GLES 3, OpenAL Soft, and
             # the headset through OpenXR (host_xr.c). Paths to the three are
@@ -131,7 +137,7 @@ function(lindbergh_runtime target generated_dir)
             endforeach()
             target_sources(${target} PRIVATE "${LINDBERGH_RUNTIME_DIR}/host_xr.c"
                 "${LINDBERGH_RUNTIME_DIR}/xr_overlay.c" "${LINDBERGH_RUNTIME_DIR}/xr_menu.c")
-            target_compile_definitions(${target} PRIVATE LINDBERGH_GL4ES)
+            target_compile_definitions(${target} PRIVATE LINDBERGH_GL4ES LINDBERGH_OPENXR)
             # printf and friends are handed the guest's own format strings
             target_compile_options(${target} PRIVATE -Wno-format-security)
             target_include_directories(${target} PRIVATE
@@ -139,6 +145,23 @@ function(lindbergh_runtime target generated_dir)
             target_link_libraries(${target} PRIVATE
                 "${GL4ES_LIB}" "${OPENAL_LIB}" "${OPENXR_LIB}" EGL log android dl m)
             target_link_options(${target} PRIVATE "-Wl,-z,max-page-size=16384" "-Wl,--no-undefined")
+        endif()
+        if(WIN32)
+            if(NOT MINGW OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+                message(FATAL_ERROR "Shared Windows runtime requires MinGW-w64 x64 (GNU C)")
+            endif()
+            find_package(GLEW REQUIRED)
+            find_package(OpenAL REQUIRED)
+            target_compile_definitions(${target} PRIVATE SDL_MAIN_HANDLED _WIN32_WINNT=0x0601)
+            target_link_libraries(${target} PRIVATE GLEW::GLEW OpenAL::OpenAL opengl32 winpthread)
+            target_link_options(${target} PRIVATE -Wl,--stack,268435456 -static-libgcc)
+            if(LINDBERGH_OPENXR)
+                find_package(OpenXR CONFIG REQUIRED)
+                target_sources(${target} PRIVATE "${LINDBERGH_RUNTIME_DIR}/host_xr.c"
+                    "${LINDBERGH_RUNTIME_DIR}/xr_overlay.c" "${LINDBERGH_RUNTIME_DIR}/xr_menu.c")
+                target_compile_definitions(${target} PRIVATE LINDBERGH_OPENXR)
+                target_link_libraries(${target} PRIVATE OpenXR::openxr_loader)
+            endif()
         endif()
         if(APPLE)
             target_link_libraries(${target} PRIVATE "-framework OpenGL" "-framework AppKit" "-framework OpenAL" objc)

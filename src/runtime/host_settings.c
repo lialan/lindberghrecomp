@@ -86,7 +86,7 @@ static void load(void)
 {
     settings_reset_controls();
     settings_reset_aim();
-#ifdef __ANDROID__
+#ifdef LINDBERGH_OPENXR
     g_set.muted = 0;                 /* the headset has no mute key to undo it */
 #else
     g_set.muted = 1;                 /* a development build: quiet until asked */

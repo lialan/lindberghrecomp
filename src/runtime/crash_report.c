@@ -113,7 +113,7 @@ static int readable(uint32_t va)
 {
 #ifdef _WIN32
     MEMORY_BASIC_INFORMATION mbi;
-    if (!VirtualQuery((LPCVOID)(uintptr_t)va, &mbi, sizeof mbi)) {
+    if (!VirtualQuery(G2H(va), &mbi, sizeof mbi)) {
         fprintf(stderr, "  (cannot query %#010x)\n", va);
         return 0;
     }
@@ -179,10 +179,17 @@ static LONG CALLBACK on_exception(EXCEPTION_POINTERS *ep)
     char why[160];
 
     if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2) {
-        uint32_t addr = (uint32_t)er->ExceptionInformation[1];
-        snprintf(why, sizeof why, "access violation: %s %#010x %s",
-                 er->ExceptionInformation[0] ? "write to" : "read from",
-                 addr, region(addr));
+        uintptr_t host = er->ExceptionInformation[1];
+#ifdef RECOMP_GUEST_BASE
+        uintptr_t base = (uintptr_t)g_guest_base;
+        if (g_guest_base && host >= base && host - base < (1ull << 32)) {
+            uint32_t addr = (uint32_t)(host - base);
+            snprintf(why, sizeof why, "access violation at guest %#010x %s (host %p)",
+                     addr, region(addr), (void *)host);
+        } else
+#endif
+        snprintf(why, sizeof why, "access violation: %s host %p",
+                 er->ExceptionInformation[0] ? "write to" : "read from", (void *)host);
     } else {
         snprintf(why, sizeof why, "exception %08lX", (unsigned long)er->ExceptionCode);
     }
@@ -237,7 +244,9 @@ static void on_exit_note(void)
  * the main thread installed. */
 void guest_install_thread_handlers(void)
 {
+#ifdef _MSC_VER
     _set_thread_local_invalid_parameter_handler(on_invalid_parameter);
+#endif
     signal(SIGABRT, on_abort_signal);
 }
 

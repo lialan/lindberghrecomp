@@ -20,6 +20,9 @@
  */
 
 #include <pthread.h>
+#ifdef __MINGW32__
+#include <unistd.h>
+#endif
 #include <ctype.h>
 #include <math.h>
 #include <stdio.h>
@@ -901,7 +904,13 @@ static void h_setlocale(CPU *c) { RET(guest_strdup_static("C")); }
 static void h_getcwd(CPU *c)
 {
 #ifdef _WIN32
-    RET(_getcwd(ASTR(0), AI32(1)));
+    if (A32(0)) { RET(_getcwd(ASTR(0), AI32(1))); return; }
+    char *host = _getcwd(NULL, AI32(1));
+    if (!host) { RET(0); return; }
+    char *copy = gmalloc(strlen(host) + 1, 16);
+    if (copy) strcpy(copy, host);
+    free(host);
+    RET(copy);
 #else
     RET(getcwd(ASTR(0), A32(1)));
 #endif
@@ -912,7 +921,12 @@ static void h_realpath(CPU *c)
 #ifdef _WIN32
     /* _fullpath allocates when handed NULL, same as realpath does; when the
      * guest supplies a buffer it must be PATH_MAX, which is what it passes. */
-    RET(_fullpath(A32(1) ? ASTR(1) : NULL, ASTR(0), 260));
+    if (A32(1)) { RET(_fullpath(ASTR(1), ASTR(0), 260)); return; }
+    char host[260];
+    if (!_fullpath(host, ASTR(0), sizeof host)) { RET(0); return; }
+    char *copy = gmalloc(strlen(host) + 1, 16);
+    if (copy) strcpy(copy, host);
+    RET(copy);
 #else
     /* realpath(p, NULL) mallocs the result, and the guest frees it with its
      * own free() - so it has to come from this file's allocator. */
@@ -1530,12 +1544,13 @@ static void h_opendir(CPU *c)
     if (!path) { RET(0); return; }
 
     char pattern[1024];
-    snprintf(pattern, sizeof pattern, "%s\*", path);
+    snprintf(pattern, sizeof pattern, "%s\\*", path);
 
-    GuestDir *d = (GuestDir *)calloc(1, sizeof *d);
+    GuestDir *d = (GuestDir *)gmalloc(sizeof *d, 16);
+    if (d) memset(d, 0, sizeof *d);
     if (!d) { RET(0); return; }
     d->find = _findfirst(pattern, &d->data);
-    if (d->find == -1) { free(d); RET(0); return; }
+    if (d->find == -1) { gfree(d); RET(0); return; }
     d->first = 1;
     RET(d);
 }
@@ -1557,7 +1572,7 @@ static void h_readdir(CPU *c)
 static void h_closedir(CPU *c)
 {
     GuestDir *d = (GuestDir *)APTR(0);
-    if (d) { if (d->find != -1) _findclose(d->find); free(d); }
+    if (d) { if (d->find != -1) _findclose(d->find); gfree(d); }
     RET(0);
 }
 

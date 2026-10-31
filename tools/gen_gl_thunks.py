@@ -68,8 +68,8 @@ OFFSET_ARGS = {
     "glGetTexImage": (4, "GL_PIXEL_PACK_BUFFER"),
 }
 
-PROC = re.compile(r"typedef\s+(.+?)\s*\(\s*(?:APIENTRYP|\*)\s*(?:PFN(\w+)PROC|(\w+)ProcPtr)\s*\)\s*\((.*?)\)\s*;", re.S)
-EXTERN = re.compile(r"(?:extern|GLAPI)\s+(.+?)\s*(?:(?:GL)?APIENTRY\s+)?\b(gl\w+)\s*\((.*?)\)", re.S)
+PROC = re.compile(r"typedef\s+([^;{}\n]+?)\s*\(\s*(?:APIENTRYP|(?:GL)?APIENTRY\s*\*|\*)\s*(?:PFN(\w+)PROC|(\w+)ProcPtr)\s*\)\s*\((.*?)\)\s*;", re.S)
+EXTERN = re.compile(r"(?:extern|GLAPI|WINGDIAPI)\s+([^;{}\n]+?)\s*(?:(?:GL)?APIENTRY\s+)?\b(gl\w+)\s*\((.*?)\)", re.S)
 
 
 EXPORTED = set()      # names with a real prototype: the library exports them
@@ -95,10 +95,20 @@ def visible(headers):
 
 def load(headers):
     sig = {}
+    # GLEW declares extension functions as PFN typedefs and exposes the GL
+    # names as macros rather than extern prototypes. Keep its exact types.
+    macro_names = {}
+    for h in headers:
+        for name in re.findall(r"^#define\s+(gl[A-Z]\w*)\b", open(h, encoding="latin-1").read(), re.M):
+            macro_names[name.upper()] = name
     for h in headers:
         text = open(h, encoding="latin-1").read()
         for m in PROC.finditer(text):
             ret, upper, name, args = m.groups()
+            if upper:
+                name = macro_names.get(upper)
+                if name:
+                    EXPORTED.add(name)
             if name:
                 sig.setdefault(name, (ret.strip(), args))
         for m in EXTERN.finditer(text):
@@ -138,6 +148,10 @@ WORDS = {}      # name -> dwords of arguments on the guest stack
 
 
 def emit(name, target, ret, types):
+    # Opaque host handles need a token table, never a truncated host pointer.
+    opaque = {"GLsync", "GLeglImageOES", "GLeglClientBufferEXT", "GLvdpauSurfaceNV"}
+    if ret.strip() in opaque or any(t.replace("const", "").strip() in opaque for t in types):
+        return None
     lines, call, slot = [], [], 0
     off = OFFSET_ARGS.get(target)
     for i, t in enumerate(types):
@@ -190,6 +204,8 @@ def main():
     sig = load(headers)
     seen = visible(headers)
     if seen is not None:
+        for h in headers:
+            seen.update(re.findall(r"^#define\s+(gl[A-Z]\w*)\b", open(h, encoding="latin-1").read(), re.M))
         EXPORTED.intersection_update(seen)
     if defined is not None:
         EXPORTED.intersection_update(defined)

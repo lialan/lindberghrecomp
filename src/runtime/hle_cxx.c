@@ -36,7 +36,7 @@
 /* Memory the guest frees through these handlers again. On a 32-bit host the
  * host heap is guest-addressable; on a 64-bit one it has to be the guest
  * window, or the pointer truncates on the way in. */
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(RECOMP_GUEST_BASE)
 #define CXX_ALLOC(n) malloc(n)
 #define CXX_FREE(p)  free(p)
 #else

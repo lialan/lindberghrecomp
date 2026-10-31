@@ -25,10 +25,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <sys/mman.h>
+#endif
 
 #include "lindbergh_rt.h"
 
+#ifdef _WIN32
+#define FORCEINLINE inline
+#endif
 #define ONLY_MSPACES 1
 #define HAVE_MMAP 0
 #define HAVE_MORECORE 0
@@ -46,12 +53,46 @@
 uint8_t *g_guest_base;
 static mspace g_heap;
 
+#ifdef _WIN32
+/* Reserve without charging 4 GB against the Windows commit limit. Commit a
+ * 64 KB block on its first access, like mmap(MAP_NORESERVE) on POSIX. Only
+ * faults in our reservation are handled; the guest null guard still faults.
+ * VirtualAlloc is safe when two guest threads first touch the same block. */
+static LONG CALLBACK guest_commit_fault(EXCEPTION_POINTERS *e)
+{
+    EXCEPTION_RECORD *r = e->ExceptionRecord;
+    if (r->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || r->NumberParameters < 2 ||
+        r->ExceptionInformation[0] == 8 || !g_guest_base)
+        return EXCEPTION_CONTINUE_SEARCH;
+    uintptr_t addr = r->ExceptionInformation[1], base = (uintptr_t)g_guest_base;
+    if (addr < base + GUARD || addr >= base + WINDOW + GUARD)
+        return EXCEPTION_CONTINUE_SEARCH;
+    void *page = (void *)(addr & ~(uintptr_t)(GUARD - 1));
+    if (!VirtualAlloc(page, GUARD, MEM_COMMIT, PAGE_READWRITE))
+        return EXCEPTION_CONTINUE_SEARCH;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+#endif
+
 int guest_mem_init(void)
 {
     if (g_guest_base) return 0;
     /* One reservation for the whole window plus a guard, so a 4-byte access at
      * 0xFFFFFFFE stays inside memory we own. MAP_NORESERVE: pages cost nothing
      * until the guest touches them. */
+#ifdef _WIN32
+    void *p = VirtualAlloc(NULL, WINDOW + GUARD, MEM_RESERVE, PAGE_READWRITE);
+    if (!p) {
+        fprintf(stderr, "[mem] reserving guest window failed: %lu\n", GetLastError());
+        return -1;
+    }
+    g_guest_base = p;
+    if (!AddVectoredExceptionHandler(1, guest_commit_fault)) {
+        VirtualFree(p, 0, MEM_RELEASE);
+        g_guest_base = NULL;
+        return -1;
+    }
+#else
     void *p = mmap(NULL, WINDOW + GUARD, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (p == MAP_FAILED) {
@@ -60,6 +101,7 @@ int guest_mem_init(void)
     }
     g_guest_base = (uint8_t *)p;
     mprotect(p, GUARD, PROT_NONE);    /* guest null page */
+#endif
 
     g_heap = create_mspace_with_base(g_guest_base + HEAP_LO, HEAP_HI - HEAP_LO, 1);
     if (!g_heap) {
@@ -75,6 +117,14 @@ void *guest_alloc(size_t n, size_t align)
 {
     void *p = align > 16 ? mspace_memalign(g_heap, align, n ? n : 1)
                          : mspace_malloc(g_heap, n ? n : 1);
+#ifdef _WIN32
+    /* Kernel I/O probes do not invoke the userspace fault handler. Buffers
+     * handed to ReadFile/the CRT/graphics drivers must already be committed. */
+    if (p && !VirtualAlloc(p, n ? n : 1, MEM_COMMIT, PAGE_READWRITE)) {
+        mspace_free(g_heap, p);
+        p = NULL;
+    }
+#endif
     if (!p) {
         fprintf(stderr, "[mem] guest heap exhausted: %zu bytes (align %zu)\n", n, align);
         fflush(stderr);

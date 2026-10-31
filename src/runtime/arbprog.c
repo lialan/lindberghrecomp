@@ -1834,7 +1834,8 @@ void arb_set_source(GLenum target, const char *src, int len)
     ArbProg *p = prog_get(st, g_bound[st], 1);
     if (!p) return;
     free(p->src);
-    p->src = strndup(src, (size_t)len);
+    p->src = malloc((size_t)len + 1);
+    if (p->src) { memcpy(p->src, src, (size_t)len); p->src[len] = 0; }
     p->gen++;
     p->failed = 0;
 }

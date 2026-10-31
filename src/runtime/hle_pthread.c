@@ -31,7 +31,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(RECOMP_GUEST_BASE)
 #include <windows.h>
 #endif
 
@@ -44,7 +44,7 @@ typedef struct {
     void    *host;
 } GuestObj;
 
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(RECOMP_GUEST_BASE)
 
 /* One lock guards lazy creation of guest objects. Contended only on the first
  * touch of each object, so a single global is the right amount of machinery.

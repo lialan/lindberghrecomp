@@ -34,7 +34,7 @@
 
 #include "lindbergh_rt.h"
 
-#ifndef _WIN32
+#if !defined(_WIN32) || defined(RECOMP_GUEST_BASE)
 #include <SDL.h>
 #include "host_settings.h"
 #define HAVE_MIXER 1

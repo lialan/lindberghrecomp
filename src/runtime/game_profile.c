@@ -4,6 +4,7 @@
  * Settings the runtime reads from the environment are given as defaults
  * there: a LINDBERGH_* variable already set (env.txt, a test run) wins.
  */
+#include <SDL.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,7 +20,7 @@ const LgGameProfile *game_profile(void) { return &g_profile; }
 static void env_default(const char *name, const char *value)
 {
     const char *v = getenv(name);
-    if (!v || !*v) setenv(name, value, 1);
+    if (!v || !*v) SDL_setenv(name, value, 1);
 }
 
 void game_profile_apply(const LgGameProfile *p)
@@ -27,7 +28,7 @@ void game_profile_apply(const LgGameProfile *p)
     g_profile = *p;
     if (p->title) host_window_title(p->title);
     int w = p->width, h = p->height;
-#ifdef __ANDROID__
+#ifdef LINDBERGH_OPENXR
     if (p->vr.width) { w = p->vr.width; h = p->vr.height; }
 #endif
     if (w > 0 && h > 0) host_window_hint(w, h);
@@ -42,7 +43,7 @@ void game_profile_apply(const LgGameProfile *p)
         const unsigned char *s = p->action_switch[i];
         jvs_action_switch(i, s[2] ? s[0] : i, s[2] ? s[1] : 1, s[2] ? s[2] : 0x80);
     }
-#ifdef __ANDROID__
+#ifdef LINDBERGH_OPENXR
     if (p->vr.title) env_default("LINDBERGH_XR_TITLE", p->vr.title);
     if (p->vr.gl_thread) env_default("LINDBERGH_GL_THREAD", "1");
     if (p->vr.hud_head_locked) stereo_hud_head_locked(1);

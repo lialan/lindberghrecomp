@@ -16,8 +16,11 @@ const int g_solib_count = 1;
 void L_B4000010(CPU *c) { initialized++; c->eax = 99; c->ecx = 99; c->esp += 4; }
 void L_B4000000(CPU *c) { c->eax = rd32(c->esp + 4) + c->ecx; c->esp += 4; }
 
-#ifndef _WIN32
+#ifdef RECOMP_GUEST_BASE
 #include <SDL.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include "host_settings.h"
 #include "glsl_compat.h"
 static int fails;
@@ -111,6 +114,34 @@ static void test_tree(CPU cpu)
 int test_runtime_abis(void)
 {
     CHECK(guest_mem_init() == 0);
+#ifdef _WIN32
+    /* The 4 GB reservation must not consume 4 GB of commit. Exercise untouched
+     * image/stack pages, including a 64 KB boundary and the top of uint32_t. */
+    MEMORY_BASIC_INFORMATION mbi;
+    CHECK(VirtualQuery(GP(0), &mbi, sizeof mbi) != 0 && mbi.State == MEM_RESERVE);
+    CHECK(VirtualQuery(GP(0x1234fffcu), &mbi, sizeof mbi) != 0 && mbi.State == MEM_RESERVE);
+    wr32(0x1234fffcu, 0x12345678); wr32(0x12350000u, 0x87654321);
+    wr32(0xfffffffcu, 0xabcdef12);
+    CHECK(rd32(0x1234fffcu) == 0x12345678 && rd32(0x12350000u) == 0x87654321);
+    CHECK(rd32(0xfffffffcu) == 0xabcdef12);
+    CHECK(VirtualQuery(GP(0x12350000u), &mbi, sizeof mbi) != 0 && mbi.State == MEM_COMMIT);
+    CHECK(VirtualQuery(GP(0), &mbi, sizeof mbi) != 0 && mbi.State == MEM_RESERVE);
+    char *buffer = guest_alloc(512 * 1024, 4096);
+    CHECK(buffer != NULL);
+    if (buffer) {
+        HANDLE rd = NULL, wr = NULL;
+        DWORD written = 0, read = 0;
+        CHECK(VirtualQuery(buffer + 256 * 1024, &mbi, sizeof mbi) != 0 && mbi.State == MEM_COMMIT);
+        CHECK(CreatePipe(&rd, &wr, NULL, 0));
+        if (rd && wr) {
+            CHECK(WriteFile(wr, "guest kernel IO", 16, &written, NULL) && written == 16);
+            CHECK(ReadFile(rd, buffer + 256 * 1024, 16, &read, NULL) && read == 16);
+            CHECK(!memcmp(buffer + 256 * 1024, "guest kernel IO", 16));
+            CloseHandle(rd); CloseHandle(wr);
+        }
+        guest_free(buffer);
+    }
+#endif
     CPU c = {0};
     c.esp = H2G(guest_alloc(4096, 16)) + 2048;
     uint32_t out = H2G(guest_alloc(16, 16));

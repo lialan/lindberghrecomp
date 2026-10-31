@@ -1,5 +1,5 @@
 /*
- * host_xr.c - the headset, through OpenXR (Meta Quest, Android XR).
+ * host_xr.c - the headset, through OpenXR (Android and Windows PC VR).
  *
  * host_sdl.c still owns the window, the GL context and the cabinet; this adds
  * what a headset needs around each frame the game draws:
@@ -37,22 +37,34 @@
  * The laser setting is changed in the headset with the other hand's upper
  * button and saved back to vr.cfg.
  */
-#if defined(__ANDROID__)
+#if defined(LINDBERGH_OPENXR)
 
-#include <dlfcn.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-
+#include <SDL.h>
+#ifdef __ANDROID__
+#include <dlfcn.h>
 #include <EGL/egl.h>
 #include <GLES3/gl3.h>
+#ifndef APIENTRY
+#define APIENTRY GL_APIENTRY
+#endif
 #include <jni.h>
-#include <SDL.h>
-
 #define XR_USE_PLATFORM_ANDROID
 #define XR_USE_GRAPHICS_API_OPENGL_ES
+#define XR_GL_IMAGE XrSwapchainImageOpenGLESKHR
+#define XR_GL_IMAGE_TYPE XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR
+#else
+#include <windows.h>
+#include <GL/glew.h>
+#define XR_USE_PLATFORM_WIN32
+#define XR_USE_GRAPHICS_API_OPENGL
+#define XR_GL_IMAGE XrSwapchainImageOpenGLKHR
+#define XR_GL_IMAGE_TYPE XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_KHR
+#endif
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 
@@ -77,33 +89,37 @@ void host_vr_input2(int on, int gun2_x, int gun2_y);
 
 /* ---- raw GLES, past gl4es ---- */
 static struct {
-    void (*BindFramebuffer)(GLenum, GLuint);
-    void (*GenFramebuffers)(GLsizei, GLuint *);
-    void (*FramebufferTexture2D)(GLenum, GLenum, GLenum, GLuint, GLint);
-    GLenum (*CheckFramebufferStatus)(GLenum);
-    void (*BlitFramebuffer)(GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum);
-    void (*GetIntegerv)(GLenum, GLint *);
-    GLboolean (*IsEnabled)(GLenum);
-    void (*Enable)(GLenum);
-    void (*Disable)(GLenum);
-    const GLubyte *(*GetString)(GLenum);
-    void (*GenRenderbuffers)(GLsizei, GLuint *);
-    void (*BindRenderbuffer)(GLenum, GLuint);
-    void (*RenderbufferStorage)(GLenum, GLenum, GLsizei, GLsizei);
-    void (*FramebufferRenderbuffer)(GLenum, GLenum, GLenum, GLuint);
-    void (*FramebufferTextureLayer)(GLenum, GLenum, GLuint, GLint, GLint);
-    void (*ReadPixels)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void *);
-    GLenum (*GetError)(void);
-    void (*BindTexture)(GLenum, GLuint);
-    void (*GetTexLevelParameteriv)(GLenum, GLint, GLenum, GLint *);
+    void (APIENTRY *BindFramebuffer)(GLenum, GLuint);
+    void (APIENTRY *GenFramebuffers)(GLsizei, GLuint *);
+    void (APIENTRY *FramebufferTexture2D)(GLenum, GLenum, GLenum, GLuint, GLint);
+    GLenum (APIENTRY *CheckFramebufferStatus)(GLenum);
+    void (APIENTRY *BlitFramebuffer)(GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum);
+    void (APIENTRY *GetIntegerv)(GLenum, GLint *);
+    GLboolean (APIENTRY *IsEnabled)(GLenum);
+    void (APIENTRY *Enable)(GLenum);
+    void (APIENTRY *Disable)(GLenum);
+    const GLubyte *(APIENTRY *GetString)(GLenum);
+    void (APIENTRY *GenRenderbuffers)(GLsizei, GLuint *);
+    void (APIENTRY *BindRenderbuffer)(GLenum, GLuint);
+    void (APIENTRY *RenderbufferStorage)(GLenum, GLenum, GLsizei, GLsizei);
+    void (APIENTRY *FramebufferRenderbuffer)(GLenum, GLenum, GLenum, GLuint);
+    void (APIENTRY *FramebufferTextureLayer)(GLenum, GLenum, GLuint, GLint, GLint);
+    void (APIENTRY *ReadPixels)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void *);
+    GLenum (APIENTRY *GetError)(void);
+    void (APIENTRY *BindTexture)(GLenum, GLuint);
+    void (APIENTRY *GetTexLevelParameteriv)(GLenum, GLint, GLenum, GLint *);
 } gl;
 
 static int gl_load(void)
 {
+#ifdef __ANDROID__
     void *lib = dlopen("libGLESv3.so", RTLD_NOW | RTLD_LOCAL);
     if (!lib) lib = dlopen("libGLESv2.so", RTLD_NOW | RTLD_LOCAL);
     if (!lib) return 0;
 #define L(n) if (!(*(void **)&gl.n = dlsym(lib, "gl" #n))) { fprintf(stderr, "[xr] no gl" #n "\n"); return 0; }
+#else
+#define L(n) if (!(*(void **)&gl.n = SDL_GL_GetProcAddress("gl" #n))) { fprintf(stderr, "[xr] no gl" #n "\n"); return 0; }
+#endif
     L(BindFramebuffer) L(GenFramebuffers) L(FramebufferTexture2D) L(CheckFramebufferStatus)
     L(BlitFramebuffer) L(GetIntegerv) L(IsEnabled) L(Enable) L(Disable) L(GetString)
     L(GenRenderbuffers) L(BindRenderbuffer) L(RenderbufferStorage) L(FramebufferRenderbuffer)
@@ -206,12 +222,12 @@ static int         views_ok;
 static struct Eye {
     XrSwapchain chain;
     uint32_t    n, w, h;
-    XrSwapchainImageOpenGLESKHR img[8];
+    XR_GL_IMAGE img[8];
     GLuint      fb[8], depth;
     uint32_t    acquired;
     XrSwapchain dchain;                /* the world's depth, for the compositor */
     uint32_t    dn;
-    XrSwapchainImageOpenGLESKHR dimg[8];
+    XR_GL_IMAGE dimg[8];
     GLuint      dfb[8];
 } eye[2];
 /* XR_KHR_composition_layer_depth: with each eye's depth, the compositor
@@ -466,6 +482,7 @@ static void menu_items(XmItem *it)
  * (the activity's restartGame, which needs a game whose activity has it) */
 static void reset_game(void)
 {
+#ifdef __ANDROID__
     JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
     jobject activity = (jobject)SDL_AndroidGetActivity();
     if (!env || !activity) return;
@@ -481,6 +498,18 @@ static void reset_game(void)
     }
     (*env)->DeleteLocalRef(env, cls);
     (*env)->DeleteLocalRef(env, activity);
+#else
+    STARTUPINFOA startup = { .cb = sizeof startup };
+    PROCESS_INFORMATION process;
+    char *command = _strdup(GetCommandLineA());
+    if (command && CreateProcessA(NULL, command, NULL, NULL, FALSE, 0, NULL, NULL, &startup, &process)) {
+        CloseHandle(process.hThread); CloseHandle(process.hProcess);
+        free(command);
+        exit(0);
+    }
+    free(command);
+    fprintf(stderr, "[xr] restart failed: %lu\n", GetLastError());
+#endif
 }
 
 /* the panel's title: LINDBERGH_XR_TITLE, which the game's profile sets (game_profile.h) */
@@ -999,6 +1028,7 @@ int xr_init(void)
     cfg_load();
     stereo_show_game_sight(cfg.crosshair);
 
+#ifdef __ANDROID__
     JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
     JavaVM *vm = NULL;
     (*env)->GetJavaVM(env, &vm);
@@ -1011,15 +1041,31 @@ int xr_init(void)
     XRCHECK(init((XrLoaderInitInfoBaseHeaderKHR *)&li));
 
     const char *ext[6] = { XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME, XR_KHR_OPENGL_ES_ENABLE_EXTENSION_NAME };
-    uint32_t next = 2, n = 0;
-    xrEnumerateInstanceExtensionProperties(NULL, 0, &n, NULL);
+    uint32_t next = 2;
+#else
+    const char *ext[6] = { XR_KHR_OPENGL_ENABLE_EXTENSION_NAME };
+    uint32_t next = 1;
+#endif
+    uint32_t n = 0;
+    XRCHECK(xrEnumerateInstanceExtensionProperties(NULL, 0, &n, NULL));
     XrExtensionProperties *props = calloc(n ? n : 1, sizeof *props);
+    if (!props) return 0;
     for (uint32_t i = 0; i < n; i++) props[i].type = XR_TYPE_EXTENSION_PROPERTIES;
-    xrEnumerateInstanceExtensionProperties(NULL, n, &n, props);
-    int have_rate = 0, have_perf = 0, have_thread = 0;
+    XrResult enumerated = xrEnumerateInstanceExtensionProperties(NULL, n, &n, props);
+    if (XR_FAILED(enumerated)) { free(props); XRCHECK(enumerated); }
+    int have_rate = 0, have_perf = 0;
+#ifdef __ANDROID__
+    int have_thread = 0;
+#endif
+    int have_graphics = 0;
     have_depth_layer = 0;
     for (uint32_t i = 0; i < n; i++) {
+#ifdef __ANDROID__
         if (!strcmp(props[i].extensionName, XR_KHR_ANDROID_THREAD_SETTINGS_EXTENSION_NAME)) have_thread = 1;
+        if (!strcmp(props[i].extensionName, XR_KHR_OPENGL_ES_ENABLE_EXTENSION_NAME)) have_graphics = 1;
+#else
+        if (!strcmp(props[i].extensionName, XR_KHR_OPENGL_ENABLE_EXTENSION_NAME)) have_graphics = 1;
+#endif
         if (!strcmp(props[i].extensionName, XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME)) have_rate = 1;
         if (!strcmp(props[i].extensionName, XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME)) have_perf = 1;
         if (!strcmp(props[i].extensionName, XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME)) have_depth_layer = 1;
@@ -1034,15 +1080,20 @@ int xr_init(void)
         depth_div = mode == LG_COMPOSITOR_DEPTH_FULL ? 1 : 2;
     }
     free(props);
+    if (!have_graphics) { fprintf(stderr, "[xr] active runtime lacks required OpenGL graphics extension\n"); return 0; }
     if (have_rate) ext[next++] = XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME;
     if (have_perf) ext[next++] = XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME;
+#ifdef __ANDROID__
     if (have_thread) ext[next++] = XR_KHR_ANDROID_THREAD_SETTINGS_EXTENSION_NAME;
+#endif
     if (have_depth_layer) ext[next++] = XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME;
 
+    XrInstanceCreateInfo ic = { XR_TYPE_INSTANCE_CREATE_INFO };
+#ifdef __ANDROID__
     XrInstanceCreateInfoAndroidKHR ai = { XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR };
     ai.applicationVM = vm; ai.applicationActivity = activity;
-    XrInstanceCreateInfo ic = { XR_TYPE_INSTANCE_CREATE_INFO };
     ic.next = &ai;
+#endif
     ic.enabledExtensionCount = next; ic.enabledExtensionNames = ext;
     snprintf(ic.applicationInfo.applicationName, sizeof ic.applicationInfo.applicationName, "%s", app_title());
     strcpy(ic.applicationInfo.engineName, "lindberghrecomp");
@@ -1060,6 +1111,7 @@ int xr_init(void)
     sgi.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
     XRCHECK(xrGetSystem(instance, &sgi, &sys));
 
+#ifdef __ANDROID__
     PFN_xrGetOpenGLESGraphicsRequirementsKHR req_fn = NULL;
     XRCHECK(xrGetInstanceProcAddr(instance, "xrGetOpenGLESGraphicsRequirementsKHR", (PFN_xrVoidFunction *)&req_fn));
     XrGraphicsRequirementsOpenGLESKHR req = { XR_TYPE_GRAPHICS_REQUIREMENTS_OPENGL_ES_KHR };
@@ -1074,6 +1126,21 @@ int xr_init(void)
     eglChooseConfig(dpy, attrs, &config, 1, &count);
     XrGraphicsBindingOpenGLESAndroidKHR gb = { XR_TYPE_GRAPHICS_BINDING_OPENGL_ES_ANDROID_KHR };
     gb.display = dpy; gb.config = config; gb.context = ctx;
+#else
+    PFN_xrGetOpenGLGraphicsRequirementsKHR req_fn = NULL;
+    XRCHECK(xrGetInstanceProcAddr(instance, "xrGetOpenGLGraphicsRequirementsKHR", (PFN_xrVoidFunction *)&req_fn));
+    XrGraphicsRequirementsOpenGLKHR req = { XR_TYPE_GRAPHICS_REQUIREMENTS_OPENGL_KHR };
+    XRCHECK(req_fn(instance, sys, &req));
+    GLint major = 0, minor = 0;
+    gl.GetIntegerv(GL_MAJOR_VERSION, &major); gl.GetIntegerv(GL_MINOR_VERSION, &minor);
+    XrVersion version = XR_MAKE_VERSION(major, minor, 0);
+    if (version < req.minApiVersionSupported || version > req.maxApiVersionSupported) {
+        fprintf(stderr, "[xr] GL %d.%d outside runtime graphics requirements\n", major, minor);
+        return 0;
+    }
+    XrGraphicsBindingOpenGLWin32KHR gb = { XR_TYPE_GRAPHICS_BINDING_OPENGL_WIN32_KHR };
+    gb.hDC = wglGetCurrentDC(); gb.hGLRC = wglGetCurrentContext();
+#endif
     XrSessionCreateInfo sc = { XR_TYPE_SESSION_CREATE_INFO };
     sc.next = &gb; sc.systemId = sys;
     XRCHECK(xrCreateSession(instance, &sc, &session));
@@ -1091,12 +1158,15 @@ int xr_init(void)
     /* That thread is also the one that renders: registered as the
      * renderer, the runtime schedules it ahead of other work - the hitches
      * left are a frame now and then losing its core for a few ms. */
+#ifdef __ANDROID__
     if (have_thread) {
         PFN_xrSetAndroidApplicationThreadKHR set_thread = NULL;
         xrGetInstanceProcAddr(instance, "xrSetAndroidApplicationThreadKHR", (PFN_xrVoidFunction *)&set_thread);
         XrResult r = set_thread ? set_thread(session, XR_ANDROID_THREAD_TYPE_RENDERER_MAIN_KHR, (uint32_t)gettid()) : XR_ERROR_FUNCTION_UNSUPPORTED;
         fprintf(stderr, "[xr] game thread %d registered as the renderer: %s\n", (int)gettid(), XR_SUCCEEDED(r) ? "yes" : "refused");
     }
+
+#endif
 
     XrReferenceSpaceCreateInfo rc = { XR_TYPE_REFERENCE_SPACE_CREATE_INFO };
     rc.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
@@ -1145,7 +1215,7 @@ int xr_init(void)
         eye[i].w = w; eye[i].h = h;
         XRCHECK(xrEnumerateSwapchainImages(eye[i].chain, 0, &eye[i].n, NULL));
         if (eye[i].n > 8) eye[i].n = 8;
-        for (uint32_t j = 0; j < eye[i].n; j++) eye[i].img[j].type = XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR;
+        for (uint32_t j = 0; j < eye[i].n; j++) eye[i].img[j].type = XR_GL_IMAGE_TYPE;
         XRCHECK(xrEnumerateSwapchainImages(eye[i].chain, eye[i].n, &eye[i].n, (XrSwapchainImageBaseHeader *)eye[i].img));
         gl.GenFramebuffers((GLsizei)eye[i].n, eye[i].fb);
         GLint was = 0, was_rb = 0; gl.GetIntegerv(GL_FRAMEBUFFER_BINDING, &was);
@@ -1169,7 +1239,7 @@ int xr_init(void)
             if (XR_SUCCEEDED(xrCreateSwapchain(session, &dc, &eye[i].dchain))) {
                 xrEnumerateSwapchainImages(eye[i].dchain, 0, &eye[i].dn, NULL);
                 if (eye[i].dn > 8) eye[i].dn = 8;
-                for (uint32_t j = 0; j < eye[i].dn; j++) eye[i].dimg[j].type = XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR;
+                for (uint32_t j = 0; j < eye[i].dn; j++) eye[i].dimg[j].type = XR_GL_IMAGE_TYPE;
                 xrEnumerateSwapchainImages(eye[i].dchain, eye[i].dn, &eye[i].dn, (XrSwapchainImageBaseHeader *)eye[i].dimg);
                 gl.GenFramebuffers((GLsizei)eye[i].dn, eye[i].dfb);
                 for (uint32_t j = 0; j < eye[i].dn; j++) {
@@ -1533,15 +1603,15 @@ void xr_frame_end(void)
             gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, e->fb[e->acquired]);
             if (flat && overlay_ok) {
                 /* a menu: the game's flat picture, on the screen in front of the player */
-                float hw, hh, d, place[16], view[16], proj[16], m[16], n = 0.02f, far = 1000.0f;
+                float hw, hh, d, place[16], view[16], proj[16], m[16], n = 0.02f, clip_far = 1000.0f;
                 stereo_screen(&hw, &hh, &d);
                 memset(place, 0, sizeof place);
                 place[0] = hw; place[5] = hh; place[10] = 1; place[14] = -d; place[15] = 1;
                 view_matrix(views[i].pose, view);
                 float tx = tanf(fov[i].angleRight), ty = tanf(fov[i].angleUp);
                 memset(proj, 0, sizeof proj);
-                proj[0] = 1 / tx; proj[5] = 1 / ty; proj[10] = -(far + n) / (far - n);
-                proj[11] = -1; proj[14] = -2 * far * n / (far - n);
+                proj[0] = 1 / tx; proj[5] = 1 / ty; proj[10] = -(clip_far + n) / (clip_far - n);
+                proj[11] = -1; proj[14] = -2 * clip_far * n / (clip_far - n);
                 mat4_mul(m, view, place);
                 mat4_mul(m, proj, m);
                 xo_draw_screen(m, layers ? layers : stereo_eye_texture(0), layers != 0, (int)e->w, (int)e->h);
@@ -1573,12 +1643,12 @@ void xr_frame_end(void)
             if (fl_on) { fl_sample(i, (GLint)e->w, (GLint)e->h); gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, e->fb[e->acquired]); }
             if (overlay_ok) {
                 /* the gun and laser, seen from this eye */
-                float view[16], proj[16], vp[16], n = 0.02f, far = 100.0f;
+                float view[16], proj[16], vp[16], n = 0.02f, clip_far = 100.0f;
                 pose_view(views[i].pose, view);
                 float tx = tanf(fov[i].angleRight), ty = tanf(fov[i].angleUp);
                 memset(proj, 0, sizeof proj);
-                proj[0] = 1 / tx; proj[5] = 1 / ty; proj[10] = -(far + n) / (far - n);
-                proj[11] = -1; proj[14] = -2 * far * n / (far - n);
+                proj[0] = 1 / tx; proj[5] = 1 / ty; proj[10] = -(clip_far + n) / (clip_far - n);
+                proj[11] = -1; proj[14] = -2 * clip_far * n / (clip_far - n);
                 mat4_mul(vp, proj, view);
                 float eye_pos[3] = { views[i].pose.position.x, views[i].pose.position.y, views[i].pose.position.z };
                 xo_draw(&xo, vp, eye_pos, (int)e->w, (int)e->h);
