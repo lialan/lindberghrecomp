@@ -488,6 +488,67 @@ static void h_glGetInfoLogARB(CPU *c)
     }
 }
 
+#ifdef LINDBERGH_GL4ES
+/* Greyscale (GL_LUMINANCE) uploads, which gl4es loses on the headset: The
+ * House of the Dead 4 Special's movies come as three such planes a frame,
+ * combined by a shader, and showed black. Given to GL as RGBA (L, L, L, 1),
+ * which a shader's .r reads the same. */
+static unsigned char *lum_to_rgba(const unsigned char *src, GLsizei w, GLsizei h)
+{
+    GLint align = 4;
+    glGetIntegerv(GL_UNPACK_ALIGNMENT, &align);
+    if (align < 1) align = 1;
+    size_t stride = ((size_t)w + (size_t)align - 1) / (size_t)align * (size_t)align;
+    unsigned char *out = malloc((size_t)w * h * 4);
+    if (!out) return NULL;
+    static int told;
+    if (!told) { told = 1; fprintf(stderr, "[gl] greyscale uploads given to GL as RGBA (first %dx%d)\n", w, h); }
+    for (GLsizei y = 0; y < h; y++) {
+        const unsigned char *r = src + stride * (size_t)y;
+        unsigned char *o = out + (size_t)w * 4 * (size_t)y;
+        for (GLsizei x = 0; x < w; x++) { o[0] = o[1] = o[2] = r[x]; o[3] = 255; o += 4; }
+    }
+    return out;
+}
+static int is_lum(GLenum f) { return f == GL_LUMINANCE; }
+static int is_lum_ifmt(GLint f) { return f == 1 || f == GL_LUMINANCE || f == 0x8040 /* GL_LUMINANCE8 */; }
+
+static void h_glTexImage2D(CPU *c)
+{
+    GLenum fmt = A32(6), type = A32(7);
+    GLint ifmt = AI32(2);
+    GLsizei w = AI32(3), h = AI32(4);
+    const void *px = APTR(8);
+    if (is_lum(fmt) && type == GL_UNSIGNED_BYTE && is_lum_ifmt(ifmt)) {
+        unsigned char *rgba = px ? lum_to_rgba(px, w, h) : NULL;
+        GLint was = 4; glGetIntegerv(GL_UNPACK_ALIGNMENT, &was); glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        glTexImage2D(A32(0), AI32(1), GL_RGBA, w, h, AI32(5), GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, was);
+        free(rgba);
+        return;
+    }
+    glTexImage2D(A32(0), AI32(1), ifmt, w, h, AI32(5), fmt, type, px);
+}
+
+static void h_glTexSubImage2D(CPU *c)
+{
+    GLenum fmt = A32(6), type = A32(7);
+    GLsizei w = AI32(4), h = AI32(5);
+    const void *px = APTR(8);
+    if (is_lum(fmt) && type == GL_UNSIGNED_BYTE && px) {
+        unsigned char *rgba = lum_to_rgba(px, w, h);
+        if (rgba) {
+            GLint was = 4; glGetIntegerv(GL_UNPACK_ALIGNMENT, &was); glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+            glTexSubImage2D(A32(0), AI32(1), AI32(2), AI32(3), w, h, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, was);
+            free(rgba);
+            return;
+        }
+    }
+    glTexSubImage2D(A32(0), AI32(1), AI32(2), AI32(3), w, h, fmt, type, px);
+}
+#endif
+
 /* The source is an array of guest string pointers, each 4 bytes. */
 static void h_glShaderSourceARB(CPU *c)
 {
@@ -798,6 +859,10 @@ void hle_register_gl(void)
     hle_bind("glGetUniformLocationARB", h_glGetUniformLocationARB); gl_bind_named("glGetUniformLocationARB", h_glGetUniformLocationARB);
     hle_bind("glGetAttribLocationARB", h_glGetAttribLocationARB); gl_bind_named("glGetAttribLocationARB", h_glGetAttribLocationARB);
     hle_bind("glGetObjectParameterivARB", h_glGetObjectParameterivARB); gl_bind_named("glGetObjectParameterivARB", h_glGetObjectParameterivARB);
+#ifdef LINDBERGH_GL4ES
+    hle_bind("glTexImage2D", h_glTexImage2D); gl_bind_named("glTexImage2D", h_glTexImage2D);
+    hle_bind("glTexSubImage2D", h_glTexSubImage2D); gl_bind_named("glTexSubImage2D", h_glTexSubImage2D);
+#endif
     hle_bind("glGetInfoLogARB", h_glGetInfoLogARB); gl_bind_named("glGetInfoLogARB", h_glGetInfoLogARB);
     hle_bind("glShaderSourceARB", h_glShaderSourceARB); gl_bind_named("glShaderSourceARB", h_glShaderSourceARB);
     hle_bind("glProgramStringARB", h_glProgramStringARB); gl_bind_named("glProgramStringARB", h_glProgramStringARB);
