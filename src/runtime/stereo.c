@@ -143,6 +143,16 @@ void stereo_snipe_running(void) { g_snipe_frame = g_frame; }
 static unsigned g_cqc_frame = ~0u;
 void stereo_cqc_running(void) { g_cqc_frame = g_frame; }
 int stereo_cqc_active(void) { return g_cqc_frame != ~0u && g_frame - g_cqc_frame <= 2; }
+/* A game that draws its 2D with a perspective (The House of the Dead 4
+ * Special: quads hung 1.3-1.5 m before a 45-degree camera of their own) gives
+ * that camera's x scale; draws through it are screen content, not world. */
+static int is_2d_lens(const float *p)
+{
+    static float lens = -1;
+    if (lens < 0) { const char *v = getenv("LINDBERGH_STEREO_2D_LENS"); lens = v ? (float)atof(v) : 0; }
+    return lens > 0 && fabsf(p[0] - lens) < 0.002f;
+}
+
 static float zoom_limit(void)
 {
     return g_snipe_frame != ~0u && g_frame - g_snipe_frame <= 2 ? g_snipe_lens : g_zoom_lens;
@@ -1312,7 +1322,7 @@ static void aim_box_track(CPU *c, int k)
             memcpy(g_aim_box[1][i], g_imm_box, sizeof g_imm_box);
             /* where it hangs: on the screen for a flat projection, else at its
              * own depth in front of the game camera (the modelview is identity) */
-            g_aim_dist[1][i] = is_perspective(g_proj[g_proj_top]) ? -g_imm_z / (float)g_imm_n : g_screen_dist;
+            g_aim_dist[1][i] = is_perspective(g_proj[g_proj_top]) && !is_2d_lens(g_proj[g_proj_top]) ? -g_imm_z / (float)g_imm_n : g_screen_dist;
         }
     }
 }
@@ -1534,7 +1544,7 @@ static int transform_call(CPU *c, HleId id, const char *n)
                 g_proj_dirty = 1;
             }
         }
-        int persp = is_perspective(g_proj[g_proj_top]);
+        int persp = is_perspective(g_proj[g_proj_top]) && !is_2d_lens(g_proj[g_proj_top]);
         if (persp && !g_flat && (g_game_fb == g_world_fb || g_game_fb == g_world_fb_next)) {
             if (!g_replaying) tally_lens(g_proj[g_proj_top]);
             if (is_draw(k) && weapon_draw()) return 1;
@@ -1555,6 +1565,10 @@ static int transform_call(CPU *c, HleId id, const char *n)
                         : !(g_unit0_rect || picture_2d(g_tex2d_bound) || picture_fb(g_game_fb)) || !covers_viewport(c, n);
         if (offscreen_fb(g_game_fb) || g_flat) hud = 2;  /* the game's own projection, untouched */
         if (hud == 1 && !persp && g_mv && fills_screen(c, n)) hud = 3;
+        { static long dl = -2; if (dl == -2) { const char *v = getenv("LINDBERGH_DRAW_LOG"); dl = v ? atol(v) : -1; }
+          if (dl >= 0 && g_frame == (unsigned)dl && !g_replaying)     /* LINDBERGH_DRAW_LOG=<frame>: each draw's class */
+              fprintf(stderr, "[draw] %s fb %u tex %u persp %d ident %d hud %d lens %.3f,%.3f vp %d,%d %dx%d\n", hle_name(g_cur_id), (unsigned)g_game_fb,
+                      g_tex2d_bound, persp, g_mv_ident, hud, g_proj[g_proj_top][0], g_proj[g_proj_top][5], g_vp[0], g_vp[1], g_vp[2], g_vp[3]); }
         g_fill_track = hud == 1 && !persp && g_mv && k == K_BEGIN;    /* glBegin: measured until glEnd */
         if (g_fill_track) { g_fill_box[0] = g_fill_box[1] = 1e9f; g_fill_box[2] = g_fill_box[3] = -1e9f; }
         if (hud == 1 && !is_perspective(g_proj[g_proj_top]) && !g_replaying) g_hud_fb_next = g_game_fb;
@@ -2534,10 +2548,10 @@ void stereo_frame_begin(void)
         last_sig = sig;
     }
     static int hud_log = -1;
-    static char last_hud[160];
+    static char last_hud[256];
     if (hud_log < 0) { const char *v = getenv("LINDBERGH_HUD_LOG"); hud_log = v && *v && *v != '0'; }
     if (hud_log) {
-        char sig[160];
+        char sig[256];
         snprintf(sig, sizeof sig, "HUD target %d, world target %d, 2D on screen %u, passes %u, 3D into HUD %u, menu state %d, screen 3D viewport %d,%d %dx%d",
                  (int)g_hud_fb_next, (int)g_world_fb_next, g_hud2d, g_pass2d, g_hudfb_draws,
                  menu_state(), g_menu_vp[0], g_menu_vp[1], g_menu_vp[2], g_menu_vp[3]);
