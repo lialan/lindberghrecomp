@@ -782,6 +782,8 @@ static void input_frame(XrTime t)
     if (grip[g] && !menu.open) held |= CAB_P1_RELOAD;
     if (held & CAB_P1_RELOAD) reload_t = t;
     stereo_game_gun_reloading(reload_t && t - reload_t < 1500000000);
+    /* the other hand's X/A: a capture of what is on screen now, for a report */
+    if (btn_a[off] && !prev[off][2] && !menu.open) { stereo_capture(); rumble(off, 0.4f, 30); }
     if (btn_a[g] && !menu.open) held |= CAB_P1_ACTION;
     if (btn_b[g] && !menu.open) held |= CAB_P1_FIREMODE;
     if (menu.test_frames) { menu.test_frames--; held |= CAB_TEST; }

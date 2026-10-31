@@ -38,6 +38,7 @@ int  stereo_ray_to_screen(const float o[3], const float d[3], float *x, float *y
 int  stereo_aim_box(const float o[3], const float d[3], int head, float *x, float *y, float *reach);
 int  stereo_hud_is_head_locked(void);
 void stereo_set_hud_pitch(float degrees);
+void stereo_capture(void);
 int  stereo_aim_box_rect(int i, float r[4]);
 void stereo_game_size(int *w, int *h);
 void stereo_picture_size(int w, int h);   /* the world drawn into a target of this size */

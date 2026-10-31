@@ -231,6 +231,7 @@ static int is_perspective(const float *m) { return fabsf(m[11] + 1) < 1e-4f && f
  * exactly where the arcade monitor showed it. */
 /* The view the HUD's screen is seen through: the game camera's, so it stays
  * put in the world, or the head's, so it stays in front of the face */
+static long g_cap_frame = -100;                 /* stereo_capture: the frame whose draws are logged */
 static float g_hud_pitch;                       /* a head-locked HUD tilted up (+) or down, radians */
 static const float *hud_view(int eye)
 {
@@ -1290,6 +1291,8 @@ static void aim_box_track(CPU *c, int k)
         else if (k == K_LOADMATRIX || k == K_MULTMATRIX || k == K_TRANSLATE || k == K_SCALE ||
                  k == K_ORTHO || k == K_ORTHO2D || k == K_FRUSTUM || k == K_PERSPECTIVE) g_mv_ident = 0;
     }
+    if ((k == K_COPYTEXSUB || k == K_COPYTEX) && getenv("LINDBERGH_COPY_LOG"))    /* each copy of the screen */
+        fprintf(stderr, "[copy] frame %u: %s fb %u tex %u\n", g_frame, k == K_COPYTEX ? "whole" : "part", (unsigned)g_game_fb, g_tex2d_bound);
     if (k == K_COPYTEXSUB || k == K_COPYTEX) {         /* a texture the game renders into: a view */
         /* the game's own name for it, as the draws bind it: in the headset GL
          * may have a larger stand-in of a render target bound instead */
@@ -1588,7 +1591,7 @@ static int transform_call(CPU *c, HleId id, const char *n)
         if (offscreen_fb(g_game_fb) || g_flat) hud = 2;  /* the game's own projection, untouched */
         if (hud == 1 && !persp && g_mv && fills_screen(c, n)) hud = 3;
         { static long dl = -2; if (dl == -2) { const char *v = getenv("LINDBERGH_DRAW_LOG"); dl = v ? atol(v) : -1; }
-          if (dl >= 0 && g_frame == (unsigned)dl && !g_replaying) {   /* LINDBERGH_DRAW_LOG=<frame>: each draw's class */
+          if (((dl >= 0 && g_frame == (unsigned)dl) || (long)g_frame == g_cap_frame) && !g_replaying) {   /* LINDBERGH_DRAW_LOG=<frame>: each draw's class */
               float mv[16]; glGetFloatv(GL_MODELVIEW_MATRIX, mv);
               fprintf(stderr, "[draw] %s fb %u tex %u persp %d ident %d hud %d lens %.3f,%.3f vp %d,%d %dx%d mv-t %.3f,%.3f,%.3f gun %.3f,%.3f\n", hle_name(g_cur_id), (unsigned)g_game_fb,
                       g_tex2d_bound, persp, g_mv_ident, hud, g_proj[g_proj_top][0], g_proj[g_proj_top][5], g_vp[0], g_vp[1], g_vp[2], g_vp[3],
@@ -2294,6 +2297,15 @@ static void write_ppm(const char *name, int w, int h, const unsigned char *rgba)
     fclose(f);
 }
 
+/* A capture asked for while playing (the headset's X button): the next
+ * frame's draws logged, and the eyes saved then and twice more after */
+void stereo_capture(void)
+{
+    g_cap_frame = (long)g_frame + 1;
+    fprintf(stderr, "[capture] frames %ld, %ld, %ld: eyes saved as eye_<frame>.ppm, draws logged\n",
+            g_cap_frame, g_cap_frame + 6, g_cap_frame + 12);
+}
+
 static void dump_targets(void)
 {
     /* LINDBERGH_EYE_DUMP=<first>,<count>: the left eye's image every frame
@@ -2306,7 +2318,9 @@ static void dump_targets(void)
         const char *s2 = v && strchr(v, ',') ? strchr(strchr(v, ',') + 1, ',') : NULL;
         if (s2) es = atol(s2 + 1) > 0 ? atol(s2 + 1) : 1;   /* ,<stride>: every stride-th frame, a quarter the size */
     }
-    if (e0 >= 0 && (long)g_frame >= e0 && (long)g_frame < e0 + en && ((long)g_frame - e0) % es == 0) {
+    long cf = (long)g_frame - g_cap_frame;
+    if ((e0 >= 0 && (long)g_frame >= e0 && (long)g_frame < e0 + en && ((long)g_frame - e0) % es == 0) ||
+        cf == 0 || cf == 6 || cf == 12) {
         for (int layer = 0; layer < (g_mv ? 2 : 1); layer++) {     /* eye_ the left eye, eyeR_ the right */
         GLint w = g_ew, h = g_eh;
         unsigned char *px = malloc((size_t)w * h * 4);
