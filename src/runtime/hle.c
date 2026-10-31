@@ -165,8 +165,15 @@ static void maybe_break(CPU *c, HleId id)
 
 void hle_call(CPU *c, HleId id)
 {
-    maybe_break(c, id);
-    if (tracing()) {
+    /* the debug options (a break at the Nth call, the call trace), looked at
+     * once: every GL call of a frame comes through here */
+    static int debug = -1;
+    if (__builtin_expect(debug < 0, 0)) {
+        const char *b = getenv("LINDBERGH_HLE_BREAK"), *t = getenv("LINDBERGH_HLE_TRACE"), *f = getenv("LINDBERGH_HLE_TRACE_FRAME");
+        debug = (b && *b && atol(b)) || (t && *t && *t != '0') || (f && *f);
+    }
+    if (__builtin_expect(debug, 0)) maybe_break(c, id);
+    if (__builtin_expect(debug, 0) && tracing()) {
         static int next_tid;
         static __thread int tid;
         if (!tid) tid = __sync_add_and_fetch(&next_tid, 1);

@@ -244,9 +244,13 @@ static Rec *ring_take(uint32_t n)
     n = (n + 15u) & ~15u;
     uint64_t h = g_head_mine;
     uint32_t off = (uint32_t)(h % RING_SIZE);
+    /* the worker's tail as last read: the real one (the cache line the worker
+     * keeps writing) is read only when that says the ring may be full */
+    static uint64_t tail_seen;
     if (off + n > RING_SIZE) {         /* to the end, a marker the worker skips */
         uint32_t pad = RING_SIZE - off;
-        if (h + pad - atomic_load_explicit(&g_tail, memory_order_acquire) > RING_SIZE) publish();   /* about to wait for room */
+        if (h + pad + n - tail_seen > RING_SIZE) tail_seen = atomic_load_explicit(&g_tail, memory_order_acquire);
+        if (h + pad - tail_seen > RING_SIZE) publish();   /* about to wait for room */
         GAME_WAIT(h + pad - atomic_load_explicit(&g_tail, memory_order_acquire) <= RING_SIZE);
         Rec *w = (Rec *)(g_ring + off);
         w->size = pad; w->kind = R_WRAP;
@@ -254,8 +258,11 @@ static Rec *ring_take(uint32_t n)
         g_head_mine = h;
         off = 0;
     }
-    if (h + n - atomic_load_explicit(&g_tail, memory_order_acquire) > RING_SIZE) publish();
-    GAME_WAIT(h + n - atomic_load_explicit(&g_tail, memory_order_acquire) <= RING_SIZE);
+    if (h + n - tail_seen > RING_SIZE) {
+        tail_seen = atomic_load_explicit(&g_tail, memory_order_acquire);
+        if (h + n - tail_seen > RING_SIZE) publish();
+        GAME_WAIT(h + n - (tail_seen = atomic_load_explicit(&g_tail, memory_order_acquire)) <= RING_SIZE);
+    }
     Rec *r = (Rec *)(g_ring + off);
     r->size = n;
     return r;
@@ -282,6 +289,7 @@ static void *worker(void *arg)
     (void)arg;
     if (g_take_context) g_take_context();
     CPU cpu;
+    memset(&cpu, 0, sizeof cpu);
     for (;;) {
         uint64_t t = atomic_load_explicit(&g_tail, memory_order_relaxed);
         if (atomic_load_explicit(&g_head, memory_order_acquire) == t) {
@@ -302,7 +310,10 @@ static void *worker(void *arg)
         uint32_t size = r->size;
         switch (r->kind) {
         case R_ASYNC:
-            memset(&cpu, 0, sizeof cpu);
+            /* a GL handler reads its arguments off esp and answers in eax:
+             * the rest of the CPU is cleared once, not for every call (352
+             * bytes, 40,000 times a frame) */
+            cpu.eax = cpu.edx = 0; cpu.fpu_top = 0;
             cpu.esp = va_of((uint8_t *)r + HDR);
             if (g_prev && cls((HleId)r->id)->kind != C_RAW) g_prev(&cpu, (HleId)r->id, r->fn); else r->fn(&cpu);
             break;
