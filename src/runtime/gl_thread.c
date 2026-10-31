@@ -461,7 +461,7 @@ void glq_report(unsigned frames)
             game0 ? (game - game0) / frames : 0, g_wait_ms / frames, work0 ? (work - work0) / frames : 0);
     game0 = game; work0 = work; g_wait_ms = 0;
     fprintf(stderr, "per frame: %u queued, %u waited for", g_n_async / frames, g_n_sync / frames);
-    for (int k = 0; k < 5; k++) {
+    for (int k = 0; k < 10; k++) {
         unsigned best = 0;
         for (unsigned i = 1; i < HLE_ID_MAX; i++) if (g_sync_by_id[i] > g_sync_by_id[best]) best = i;
         if (!g_sync_by_id[best]) break;
