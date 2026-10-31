@@ -95,7 +95,7 @@ enum {
 };
 /* ok: classified; sh: a call the game thread keeps a shadow of (viewport,
  * scissor) or may answer from it (glGetIntegerv), so the rest skip that check */
-typedef struct { uint8_t kind, a, b, c, ok, sh, words, inv; } Cls;
+typedef struct { uint8_t kind, a, b, c, ok, sh, words, inv, st, sinv; } Cls;
 static Cls g_cls[HLE_ID_MAX];
 
 /* the client arrays as the game set them: on, and whether in client memory */
@@ -197,6 +197,13 @@ static const struct { const char *name; uint8_t kind, a, b, c; } T[] = {
     { "glBindFramebufferEXT", C_VAL }, { "glBindFramebuffer", C_VAL }, { "glBindRenderbufferEXT", C_VAL },
     { "glFlush", C_VAL }, { "glUnlockArraysEXT", C_UNLOCK },
     /* one array, its size fixed by the call */
+    /* Let's Go Jungle!: NV program constants and a few more that return
+     * nothing - each waited, about 370 times a frame */
+    { "glProgramParameters4fvNV", C_VEC, 3, 2, 16 }, { "glProgramParameter4fvNV", C_BLOB, 2, 16 },
+    { "glMultiTexCoord2fvARB", C_BLOB, 1, 8 }, { "glMultiTexCoord2fv", C_BLOB, 1, 8 },
+    { "glMultiTexCoord3fvARB", C_BLOB, 1, 12 }, { "glMultiTexCoord4fvARB", C_BLOB, 1, 16 },
+    { "glFramebufferTexture2DEXT", C_VAL }, { "glFramebufferTexture2D", C_VAL },
+    { "glBlendEquationSeparateEXT", C_VAL }, { "glBlendEquationSeparate", C_VAL },
     { "glMaterialfv", C_BLOB, 2, 16 }, { "glLightfv", C_BLOB, 2, 16 }, { "glFogfv", C_BLOB, 1, 16 },
     { "glLightModelfv", C_BLOB, 1, 16 }, { "glColor4fv", C_BLOB, 0, 16 }, { "glColor3fv", C_BLOB, 0, 12 },
     { "glSecondaryColor3fv", C_BLOB, 0, 12 }, { "glSecondaryColor3fvEXT", C_BLOB, 0, 12 },
@@ -236,6 +243,43 @@ static const struct { const char *name; uint8_t kind, a, b, c; } T[] = {
  * a call copies that many (at least 4, in steps of 4 to keep the arrays
  * after them aligned) instead of 16 - most take one to four, and at 40,000
  * calls a frame the copy is the queue's memory traffic */
+/* ---- redundant server-state calls ----
+ * The same for glEnable/glDisable (a texture target's per active unit),
+ * glMatrixMode, glActiveTexture, glBindTexture (per unit and target),
+ * glDepthMask, glDepthFunc, glShadeModel, glAlphaFunc, glBlendFunc and
+ * glFogf: a call setting what the game thread last set is not queued. The
+ * record is a small table, emptied by glPopAttrib, any glX call, another
+ * glFog* or a texture deleted. LINDBERGH_GLQ_NODEDUP=1 and
+ * LINDBERGH_GLQ_DEDUP_CHECK=1 cover these as well. */
+enum { ST_NONE, ST_ENABLE, ST_DISABLE, ST_MATRIXMODE, ST_ACTIVETEX, ST_BINDTEX, ST_DEPTHMASK,
+       ST_DEPTHFUNC, ST_SHADE, ST_ALPHAFUNC, ST_BLENDFUNC, ST_FOGF };
+#define SRV_N 1024
+static struct { uint64_t key, val; uint32_t gen; } g_srv[SRV_N];
+static uint32_t g_srv_gen = 1;
+static int g_srv_unit = -1;            /* the active texture unit, -1 unknown */
+static void srv_unknown(void) { g_srv_gen++; g_srv_unit = -1; }
+static uint32_t srv_slot(uint64_t key)
+{
+    uint64_t h = key * 0x9E3779B97F4A7C15ull;
+    uint32_t i = (uint32_t)(h >> 54);
+    for (int n = 0; n < 8; n++, i = (i + 1) & (SRV_N - 1))
+        if (g_srv[i].gen != g_srv_gen || g_srv[i].key == key) return i;
+    return (uint32_t)(h >> 54);        /* full around here: take the first */
+}
+/* 1: already set to val (the call can go); else recorded as set now */
+static int srv_same(uint64_t key, uint64_t val)
+{
+    uint32_t i = srv_slot(key);
+    if (g_srv[i].gen == g_srv_gen && g_srv[i].key == key && g_srv[i].val == val) return 1;
+    g_srv[i].gen = g_srv_gen; g_srv[i].key = key; g_srv[i].val = val;
+    return 0;
+}
+static int tex_cap(uint32_t cap)
+{
+    return cap == 0x0DE0 || cap == 0x0DE1 || cap == 0x806F || cap == 0x8513 || cap == 0x84F5 ||
+           (cap >= 0x0C60 && cap <= 0x0C63);   /* the texture targets, GL_TEXTURE_GEN_S..Q */
+}
+
 static struct { const char *name; uint8_t words; } g_words[4096];
 static int g_nwords;
 void gl_arg_words(const char *name, int words)
@@ -262,6 +306,18 @@ static const Cls *cls(HleId id)
     /* calls after which the client state is no longer what the game thread
      * last set: a restore, or another context (its own state) */
     k.inv = !strcmp(n, "glPopClientAttrib") || !strncmp(n, "glX", 3);
+    /* server state the game thread keeps a record of (srv_* below), and the
+     * calls after which that record is no longer GL's */
+    static const struct { const char *name; uint8_t st; } S[] = {
+        { "glEnable", ST_ENABLE }, { "glDisable", ST_DISABLE }, { "glMatrixMode", ST_MATRIXMODE },
+        { "glActiveTexture", ST_ACTIVETEX }, { "glActiveTextureARB", ST_ACTIVETEX },
+        { "glBindTexture", ST_BINDTEX }, { "glDepthMask", ST_DEPTHMASK }, { "glDepthFunc", ST_DEPTHFUNC },
+        { "glShadeModel", ST_SHADE }, { "glAlphaFunc", ST_ALPHAFUNC }, { "glBlendFunc", ST_BLENDFUNC },
+        { "glFogf", ST_FOGF },
+    };
+    for (unsigned i = 0; i < sizeof S / sizeof S[0]; i++) if (!strcmp(n, S[i].name)) k.st = S[i].st;
+    k.sinv = k.inv || !strcmp(n, "glPopAttrib") || (!strncmp(n, "glFog", 5) && strcmp(n, "glFogf")) ||
+             !strncmp(n, "glDeleteTextures", 16);
     k.words = words_of(n);
     for (unsigned i = 0; i < sizeof T / sizeof T[0]; i++)
         if (!strcmp(n, T[i].name)) { k.kind = T[i].kind; k.a = T[i].a; k.b = T[i].b; k.c = T[i].c; break; }
@@ -616,12 +672,74 @@ static void unlock_restore(void)
         if (g_ptr[s].copied) { g_ptr[s].copied = 0; g_slot_client[s] = 1; put_pointer(s, g_ptr[s].args[g_ptr[s].a]); }
 }
 
+static void srv_verify(void *arg);
+/* a server-state call: 1 if it sets what is set (dropped, or checked) */
+static int srv_redundant(CPU *c, int st)
+{
+    uint32_t a0 = A32(0), a1 = A32(1);
+    uint64_t key = (uint64_t)st << 56, val = 0;
+    switch (st) {
+    case ST_ENABLE: case ST_DISABLE:
+        if (tex_cap(a0)) { if (g_srv_unit < 0) return 0; key |= (uint64_t)g_srv_unit << 40; }
+        key = (uint64_t)ST_ENABLE << 56 | (key & 0x00FFFFFFFFFFFFFFull) | a0; val = st == ST_ENABLE;
+        break;
+    case ST_ACTIVETEX:
+        g_srv_unit = (int)(a0 - 0x84C0) & 31; val = a0;
+        break;
+    case ST_BINDTEX:
+        if (g_srv_unit < 0) return 0;
+        key |= (uint64_t)g_srv_unit << 40 | a0; val = a1;
+        break;
+    case ST_ALPHAFUNC: case ST_BLENDFUNC: val = (uint64_t)a1 << 32 | a0; break;
+    case ST_FOGF: key |= a0; val = a1; break;
+    default: val = a0; break;           /* matrix mode, depth mask and func, shade model */
+    }
+    if (!srv_same(key, val)) return 0;
+    if (!dedup_on()) return 0;
+    g_n_dropped++;
+    if (dedup_check()) {
+        static uint64_t ring[65536][2]; static unsigned at;
+        uint64_t *e = ring[at++ & 65535];
+        e[0] = (uint64_t)st << 56 | a0; e[1] = a1;
+        glq_job(srv_verify, e);
+    }
+    return 1;
+}
+static void srv_verify(void *arg)
+{
+    const uint64_t *e = arg;
+    int st = (int)(e[0] >> 56);
+    uint32_t a0 = (uint32_t)e[0], a1 = (uint32_t)e[1];
+    GLint i = 0, j = 0; GLfloat f = 0; GLboolean b = 0;
+    int ok = 1;
+    switch (st) {
+    case ST_ENABLE: case ST_DISABLE: ok = (glIsEnabled((GLenum)a0) != 0) == (st == ST_ENABLE); break;
+    case ST_MATRIXMODE: glGetIntegerv(0x0BA0, &i); ok = (uint32_t)i == a0; break;
+    case ST_ACTIVETEX: glGetIntegerv(0x84E0, &i); ok = (uint32_t)i == a0; break;
+    case ST_BINDTEX: {
+        GLenum q = a0 == 0x0DE1 ? 0x8069 : a0 == 0x0DE0 ? 0x8068 : a0 == 0x806F ? 0x806A : a0 == 0x8513 ? 0x8514 : 0x84F6;
+        glGetIntegerv(q, &i); ok = (uint32_t)i == a1; break; }
+    case ST_DEPTHMASK: glGetBooleanv(0x0B72, &b); ok = (b != 0) == (a0 != 0); break;
+    case ST_DEPTHFUNC: glGetIntegerv(0x0B74, &i); ok = (uint32_t)i == a0; break;
+    case ST_SHADE: glGetIntegerv(0x0B54, &i); ok = (uint32_t)i == a0; break;
+    case ST_ALPHAFUNC: { float r; memcpy(&r, &a1, 4); glGetIntegerv(0x0BC1, &i); glGetFloatv(0x0BC2, &f); ok = (uint32_t)i == a0 && f == r; break; }
+    case ST_BLENDFUNC: glGetIntegerv(0x0BE1, &i); glGetIntegerv(0x0BE0, &j); ok = (uint32_t)i == a0 && (uint32_t)j == a1; break;
+    case ST_FOGF: { float v; memcpy(&v, &a1, 4); glGetFloatv((GLenum)a0, &f); ok = f == v; break; }
+    }
+    if (!ok) {
+        unsigned n = atomic_fetch_add(&g_dedup_wrong, 1);
+        if (n < 40) fprintf(stderr, "[glq] dedup check: state %d (%#x, %#x) - GL has %d/%d/%g/%d\n", st, a0, a1, (int)i, (int)j, (double)f, (int)b);
+    }
+}
+
 static void glq_hook(CPU *c, HleId id, HleHandler fn)
 {
     const Cls *k = cls(id);
     uint32_t a0 = A32(0);
     if (__builtin_expect(k->sh, 0) && shadow_state(c, id)) return;
     if (__builtin_expect(k->inv, 0)) client_state_unknown();
+    if (__builtin_expect(k->sinv, 0)) srv_unknown();
+    if (k->st && srv_redundant(c, k->st)) return;
     int async = 1;
     uint32_t extra = 0;                /* bytes of arrays after the arguments */
     switch (k->kind) {
