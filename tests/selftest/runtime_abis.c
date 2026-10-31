@@ -43,6 +43,71 @@ static void shader(const char *input, const char *expected)
     free(s);
 }
 
+static int tree_height(uint32_t node, uint32_t parent, int lo, int hi, int *count, unsigned depth)
+{
+    if (!node) return 1;
+    CHECK(depth < 65);
+    if (depth >= 65) return 0;
+    int key = (int)rd32(node + 16);
+    uint32_t l = rd32(node + 8), r = rd32(node + 12);
+    CHECK(key > lo && key < hi && rd32(node + 4) == parent);
+    CHECK(rd32(node) <= 1);
+    if (!rd32(node)) { CHECK(!l || rd32(l) == 1); CHECK(!r || rd32(r) == 1); }
+    (*count)++;
+    int lh = tree_height(l, node, lo, key, count, depth + 1);
+    int rh = tree_height(r, node, key, hi, count, depth + 1);
+    CHECK(lh == rh);
+    return lh + (int)rd32(node);
+}
+static void check_tree(uint32_t header, const unsigned char *alive, int expected)
+{
+    uint32_t root = rd32(header + 4);
+    int count = 0;
+    CHECK(!root || rd32(root) == 1);
+    tree_height(root, header, -1, 64, &count, 0);
+    CHECK(count == expected);
+    int first = 0, last = 63;
+    while (first < 64 && !alive[first]) first++;
+    while (last >= 0 && !alive[last]) last--;
+    if (expected) {
+        CHECK((int)rd32(rd32(header + 8) + 16) == first);
+        CHECK((int)rd32(rd32(header + 12) + 16) == last);
+    } else CHECK(!root && rd32(header + 8) == header && rd32(header + 12) == header);
+}
+static void test_tree(CPU cpu)
+{
+    CPU c = cpu;
+    uint32_t memory = H2G(guest_alloc(16 + 64 * 20, 16));
+    uint32_t random = 713;
+    for (int round = 0; round < 32; round++) {
+        memset(GP(memory), 0, 16 + 64 * 20);
+        wr32(memory + 8, memory); wr32(memory + 12, memory);
+        int order[64]; unsigned char alive[64] = {0};
+        for (int i = 0; i < 64; i++) order[i] = i;
+        for (int i = 63; i > 0; i--) {
+            random = random * 1664525u + 1013904223u;
+            int j = (int)(random % (unsigned)(i + 1)), t = order[i]; order[i] = order[j]; order[j] = t;
+        }
+        for (int i = 0; i < 64; i++) {
+            int key = order[i], left = 1;
+            uint32_t node = memory + 16 + 20u * key, parent = memory, at = rd32(memory + 4);
+            wr32(node + 16, (uint32_t)key);
+            while (at) { parent = at; left = key < (int)rd32(at + 16); at = rd32(at + (left ? 8 : 12)); }
+            CALL(HLE_rb_insert, left, node, parent, memory);
+            alive[key] = 1; check_tree(memory, alive, i + 1);
+        }
+        for (int i = 0; i < 64; i++) {
+            int key;
+            if (i % 4 == 0) key = (int)rd32(rd32(memory + 4) + 16); /* root / two-child erase */
+            else { random = random * 1664525u + 1013904223u; key = (int)(random % 64); while (!alive[key]) key = (key + 1) % 64; }
+            uint32_t node = memory + 16 + 20u * key;
+            CHECK(CALL(HLE_rb_erase, node, memory) == node);
+            alive[key] = 0; check_tree(memory, alive, 63 - i);
+        }
+    }
+    guest_free(GP(memory));
+}
+
 int test_runtime_abis(void)
 {
     CHECK(guest_mem_init() == 0);
@@ -50,6 +115,7 @@ int test_runtime_abis(void)
     c.esp = H2G(guest_alloc(4096, 16)) + 2048;
     uint32_t out = H2G(guest_alloc(16, 16));
     hle_register_libc(); hle_register_cxx(); hle_register_alsa();
+    test_tree(c);
 
     CHECK(jvs_switch_byte(CAB_P1_ACTION, 0, 1) == 0x80);
     CHECK(jvs_switch_byte(CAB_P2_ACTION, 1, 1) == 0x80);

@@ -202,6 +202,86 @@ static void h_rb_insert(CPU *c)
     RET(0);
 }
 
+static unsigned rb_colour(uint32_t n) { return n ? COLOUR(n) : RB_BLACK; }
+static uint32_t rb_child(uint32_t n, int right) { return n ? (right ? RIGHT(n) : LEFT(n)) : 0; }
+static void rb_rotate(uint32_t n, uint32_t *root, int left)
+{
+    if (left) rb_rotate_left(n, root); else rb_rotate_right(n, root);
+}
+static void rb_transplant(uint32_t from, uint32_t to, uint32_t *root)
+{
+    uint32_t p = PARENT(from);
+    if (from == *root) *root = to;
+    else if (from == LEFT(p)) SET_LEFT(p, to);
+    else SET_RIGHT(p, to);
+    if (to) SET_PARENT(to, p);
+}
+
+/* Erase the requested node, moving its successor into place when it has
+ * two children. Return the original node for the caller to destroy: copying
+ * the successor's payload would invalidate iterators to a different value.
+ * A null child has no parent field, so carry its parent through fixup. */
+static void h_rb_erase(CPU *c)
+{
+    uint32_t z = A32(0), header = A32(1), root = PARENT(header);
+    uint32_t y = z, x, parent;
+    unsigned colour = COLOUR(y);
+    if (!LEFT(z)) {
+        x = RIGHT(z); parent = PARENT(z); rb_transplant(z, x, &root);
+    } else if (!RIGHT(z)) {
+        x = LEFT(z); parent = PARENT(z); rb_transplant(z, x, &root);
+    } else {
+        y = RIGHT(z); while (LEFT(y)) y = LEFT(y);
+        colour = COLOUR(y); x = RIGHT(y);
+        if (PARENT(y) == z) {
+            parent = y;
+            if (x) SET_PARENT(x, y);
+        } else {
+            parent = PARENT(y); rb_transplant(y, x, &root);
+            SET_RIGHT(y, RIGHT(z)); SET_PARENT(RIGHT(y), y);
+        }
+        rb_transplant(z, y, &root);
+        SET_LEFT(y, LEFT(z)); SET_PARENT(LEFT(y), y);
+        SET_COLOUR(y, COLOUR(z));
+    }
+    if (colour == RB_BLACK) {
+        while (x != root && rb_colour(x) == RB_BLACK) {
+            int side = x == LEFT(parent) ? 0 : 1;
+            uint32_t sibling = rb_child(parent, !side);
+            if (rb_colour(sibling) == RB_RED) {
+                SET_COLOUR(sibling, RB_BLACK); SET_COLOUR(parent, RB_RED);
+                rb_rotate(parent, &root, !side);
+                sibling = rb_child(parent, !side);
+            }
+            uint32_t near = rb_child(sibling, side), far = rb_child(sibling, !side);
+            if (rb_colour(near) == RB_BLACK && rb_colour(far) == RB_BLACK) {
+                if (sibling) SET_COLOUR(sibling, RB_RED);
+                x = parent; parent = PARENT(x);
+            } else {
+                if (rb_colour(far) == RB_BLACK) {
+                    if (near) SET_COLOUR(near, RB_BLACK);
+                    SET_COLOUR(sibling, RB_RED); rb_rotate(sibling, &root, side);
+                    sibling = rb_child(parent, !side); far = rb_child(sibling, !side);
+                }
+                SET_COLOUR(sibling, COLOUR(parent)); SET_COLOUR(parent, RB_BLACK);
+                if (far) SET_COLOUR(far, RB_BLACK);
+                rb_rotate(parent, &root, !side); x = root;
+            }
+        }
+        if (x) SET_COLOUR(x, RB_BLACK);
+    }
+    SET_PARENT(header, root);
+    uint32_t first = root, last = root;
+    if (root) {
+        SET_PARENT(root, header);
+        while (LEFT(first)) first = LEFT(first);
+        while (RIGHT(last)) last = RIGHT(last);
+    }
+    SET_LEFT(header, first ? first : header);
+    SET_RIGHT(header, last ? last : header);
+    RET(z);
+}
+
 /* ---- the C++ ABI, as far as reporting goes ----
  *
  * These four are what a C++ program calls when something has already gone
@@ -508,6 +588,7 @@ void hle_register_cxx(void)
     n += hle_bind("_ZSt18_Rb_tree_decrementPKSt18_Rb_tree_node_base", h_rb_decrement);
     n += hle_bind("_ZSt29_Rb_tree_insert_and_rebalancebPSt18_Rb_tree_node_baseS0_RS_",
                   h_rb_insert);
+    n += hle_bind("_ZSt28_Rb_tree_rebalance_for_erasePSt18_Rb_tree_node_baseRS_", h_rb_erase);
 
     n += hle_bind("__cxa_pure_virtual", h_cxa_pure_virtual);
     n += hle_bind("_Unwind_Resume", h_unwind_resume);

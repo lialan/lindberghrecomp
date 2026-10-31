@@ -8,6 +8,8 @@
     X(HLE___cxa_vec_delete2, "__cxa_vec_delete2") \
     X(HLE_list_hook, "_ZNSt15_List_node_base4hookEPS_") \
     X(HLE_list_unhook, "_ZNSt15_List_node_base6unhookEv") \
+    X(HLE_rb_insert, "_ZSt29_Rb_tree_insert_and_rebalancebPSt18_Rb_tree_node_baseS0_RS_") \
+    X(HLE_rb_erase, "_ZSt28_Rb_tree_rebalance_for_erasePSt18_Rb_tree_node_baseRS_") \
     X(HLE_snd_pcm_open, "snd_pcm_open") \
     X(HLE_snd_pcm_close, "snd_pcm_close") \
     X(HLE_snd_pcm_hw_params_malloc, "snd_pcm_hw_params_malloc") \
