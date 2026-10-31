@@ -307,17 +307,72 @@ static uint32_t put_sync(CPU *c, HleId id, HleHandler fn)
     return r->seq;
 }
 
+/* the viewport and scissor box the game last set (shadow_state, below) */
+static HleId g_id_viewport, g_id_scissor, g_id_popattrib, g_id_getint;
+static int32_t g_vp_shadow[4], g_sc_shadow[4];
+static int g_vp_known, g_sc_known;
+extern unsigned g_frame;
 static void call_sync(CPU *c, HleId id, HleHandler fn)
 {
+    {   /* LINDBERGH_GLQ_GETS=1: each state read the game waits for, by what it asks (once) */
+        static int on = -1; static uint32_t seen[64]; static int nseen;
+        if (on < 0) { const char *v = getenv("LINDBERGH_GLQ_GETS"); on = v && *v == '1'; }
+        const char *n = on ? hle_name(id) : NULL;
+        if (n && g_frame > 1500 && !strncmp(n, "glGet", 5) && nseen < 64) {
+            uint32_t key = (uint32_t)id << 20 ^ A32(0);
+            int i = 0;
+            while (i < nseen && seen[i] != key) i++;
+            if (i == nseen) { seen[nseen++] = key; fprintf(stderr, "[glq] frame %u: %s(%#x) waits\n", g_frame, n, A32(0)); }
+        }
+    }
     uint32_t s = put_sync(c, id, fn);
     GAME_WAIT((int32_t)(atomic_load_explicit(&g_done_seq, memory_order_acquire) - s) >= 0);
     g_n_sync++; g_sync_by_id[id]++;
+    if (id && id == g_id_getint && A32(1)) {      /* the answer, kept for the next read */
+        uint32_t pname = A32(0), out = A32(1);
+        int32_t *v = pname == 0x0BA2 ? g_vp_shadow : pname == 0x0C10 ? g_sc_shadow : NULL;
+        if (v) { for (int i = 0; i < 4; i++) v[i] = (int32_t)rd32(out + 4u * (uint32_t)i); if (pname == 0x0BA2) g_vp_known = 1; else g_sc_known = 1; }
+    }
+}
+
+/* The viewport and scissor box, as the game last set them: its glGetIntegerv
+ * of either is answered here, without waiting for the worker (8 times a frame
+ * in The House of the Dead 4). glPopAttrib may put back older ones: then the
+ * next read waits, and its answer is kept. */
+static void shadow_ids(void)
+{
+    for (unsigned i = 0; i < HLE_COUNT; i++) {
+        const char *n = hle_name((HleId)i);
+        if (!strcmp(n, "glViewport")) g_id_viewport = (HleId)i;
+        else if (!strcmp(n, "glScissor")) g_id_scissor = (HleId)i;
+        else if (!strcmp(n, "glPopAttrib")) g_id_popattrib = (HleId)i;
+        else if (!strcmp(n, "glGetIntegerv")) g_id_getint = (HleId)i;
+    }
+}
+/* 1: the call was a read answered here */
+static int shadow_state(CPU *c, HleId id)
+{
+    static int off = -1;        /* LINDBERGH_GLQ_NOSHADOW=1: every read waits, as before */
+    if (off < 0) { const char *v = getenv("LINDBERGH_GLQ_NOSHADOW"); off = v && *v == '1'; }
+    if (!id || off) return 0;
+    if (id == g_id_viewport) { for (int i = 0; i < 4; i++) g_vp_shadow[i] = (int32_t)A32(i); g_vp_known = 1; return 0; }
+    if (id == g_id_scissor)  { for (int i = 0; i < 4; i++) g_sc_shadow[i] = (int32_t)A32(i); g_sc_known = 1; return 0; }
+    if (id == g_id_popattrib) { g_vp_known = g_sc_known = 0; return 0; }
+    if (id == g_id_getint) {
+        uint32_t pname = A32(0), out = A32(1);
+        const int32_t *v = pname == 0x0BA2 && g_vp_known ? g_vp_shadow : pname == 0x0C10 && g_sc_known ? g_sc_shadow : NULL;
+        if (!v || !out) return 0;
+        for (int i = 0; i < 4; i++) wr32(out + 4u * (uint32_t)i, (uint32_t)v[i]);
+        return 1;
+    }
+    return 0;
 }
 
 static void glq_hook(CPU *c, HleId id, HleHandler fn)
 {
     const Cls *k = cls(id);
     uint32_t a0 = A32(0);
+    if (shadow_state(c, id)) return;
     int async = 1;
     uint32_t extra = 0;                /* bytes of arrays after the arguments */
     switch (k->kind) {
@@ -432,6 +487,7 @@ int glq_start(void (*release)(void), void (*take)(void))
         if (n[0] == 'g' && n[1] == 'l' && strncmp(n, "glut", 4)) g_gl_ids[i] = 1;
     }
     g_prev = g_gl_hook;
+    shadow_ids();
     g_take_context = take;
     if (release) release();
     if (pthread_create(&g_thread, NULL, worker, NULL)) {
