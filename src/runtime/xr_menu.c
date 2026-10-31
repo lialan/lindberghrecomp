@@ -35,6 +35,25 @@ static void text(unsigned char *img, int x, int y, const char *s, const unsigned
 
 static int text_w(const char *s) { return (int)strlen(s) * (FONT_W - 3); }
 
+void xm_paint_label(unsigned char *img, const char *s)
+{
+    const unsigned char bg[4] = { 16, 16, 20, 190 }, fg[3] = { 140, 255, 140 };
+    for (int i = 0; i < XM_LABEL_W * XM_LABEL_H; i++) memcpy(img + (size_t)i * 4, bg, 4);
+    int x = (XM_LABEL_W - text_w(s)) / 2, y = (XM_LABEL_H - FONT_H) / 2;
+    for (; *s && x + FONT_W <= XM_LABEL_W; s++, x += FONT_W - 3) {
+        int ch = (unsigned char)*s - FONT_FIRST;
+        if (ch < 0 || ch >= FONT_COUNT) continue;
+        for (int j = 0; j < FONT_H && y + j < XM_LABEL_H; j++)
+            for (int i = 0; i < FONT_W; i++) {
+                unsigned a = FONT[ch][j * FONT_W + i];
+                if (!a) continue;
+                unsigned char *p = img + ((size_t)(y + j) * XM_LABEL_W + x + i) * 4;
+                for (int k = 0; k < 3; k++) p[k] = (unsigned char)((p[k] * (255 - a) + fg[k] * a) / 255);
+                if (p[3] < a) p[3] = (unsigned char)a;
+            }
+    }
+}
+
 void xm_paint(unsigned char *img, const char *title, const XmItem *items, int n, int hover, const char *hint)
 {
     static const unsigned char bg[4] = { 18, 22, 28, 235 }, bar[4] = { 40, 70, 52, 255 },

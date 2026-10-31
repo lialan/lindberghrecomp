@@ -32,6 +32,9 @@ void xo_draw_screen(const float mvp[16], unsigned tex, int array_layer0, int w, 
 /* The settings panel: its picture, then drawn on the quad -1..1 through mvp. */
 void xo_panel_upload(const unsigned char *rgba, int w, int h);
 void xo_draw_panel(const float mvp[16], int w, int h);
+/* A small label the same way (the frame rate readout), its own picture. */
+void xo_label_upload(const unsigned char *rgba, int w, int h);
+void xo_draw_label(const float mvp[16], int w, int h);
 
 /* What gun g's (0/1) ray points at: queues a read of the world's depth array at
  * the n samples' pixels, and returns the distance t of the first sample that

@@ -543,10 +543,10 @@ void xo_panel_upload(const unsigned char *rgba, int w, int h)
     gl.ActiveTexture((GLenum)unit);
 }
 
-/* The panel on the quad -1..1 placed by mvp, blended over the eye's image. */
-void xo_draw_panel(const float mvp[16], int w, int h)
+/* A picture on the quad -1..1 placed by mvp, blended over the eye's image. */
+static void draw_quad_tex(GLuint tex, const float mvp[16], int w, int h)
 {
-    if (!prog_screen[0] || !panel_tex) return;
+    if (!prog_screen[0] || !tex) return;
     Saved s;
     save(&s);
     GLint unit = 0, bound = 0;
@@ -564,7 +564,7 @@ void xo_draw_panel(const float mvp[16], int w, int h)
     gl.UseProgram(prog_panel);
     gl.UniformMatrix4fv(u_panel_mvp, 1, GL_FALSE, mvp);
     gl.Uniform1i(u_panel_tex, 0);
-    gl.BindTexture(GL_TEXTURE_2D, panel_tex);
+    gl.BindTexture(GL_TEXTURE_2D, tex);
     gl.BindSampler(0, smp_screen);
     gl.BindVertexArray(vao_screen);
     gl.DrawArrays(GL_TRIANGLE_STRIP, 0, 4);
@@ -574,6 +574,25 @@ void xo_draw_panel(const float mvp[16], int w, int h)
     if (scissor) gl.Enable(GL_SCISSOR_TEST);
     restore(&s);
 }
+
+void xo_draw_panel(const float mvp[16], int w, int h) { draw_quad_tex(panel_tex, mvp, w, h); }
+
+/* ---- a small label (the frame rate) ---- */
+static GLuint label_tex;
+void xo_label_upload(const unsigned char *rgba, int w, int h)
+{
+    if (!prog_screen[0]) return;
+    GLint unit = 0, bound = 0;
+    gl.GetIntegerv(GL_ACTIVE_TEXTURE, &unit);
+    gl.ActiveTexture(GL_TEXTURE0);
+    gl.GetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
+    if (!label_tex) gl.GenTextures(1, &label_tex);
+    gl.BindTexture(GL_TEXTURE_2D, label_tex);
+    gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+    gl.BindTexture(GL_TEXTURE_2D, (GLuint)bound);
+    gl.ActiveTexture((GLenum)unit);
+}
+void xo_draw_label(const float mvp[16], int w, int h) { draw_quad_tex(label_tex, mvp, w, h); }
 
 #endif /* __ANDROID__ */
 

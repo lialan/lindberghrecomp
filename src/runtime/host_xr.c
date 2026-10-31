@@ -126,6 +126,7 @@ static struct {
     int   sight, crosshair, show_gun;         /* XO_SIGHT_*; the game's own sight; the gun model */
     int   hud_pitch;                          /* a head-locked HUD tilted up (+) or down, degrees */
     int   dual;                               /* dual wielding: a gun in each hand, players 1 and 2 */
+    int   show_fps;                           /* the frame rate, shown low in the view */
 } cfg = { 1.0f, 3.0f, 15.0f, 2280, 2064, 120, 0, LASER_ON, 1, XO_SIGHT_NONE, 1, 1 };
 
 static void cfg_save(void)
@@ -133,10 +134,10 @@ static void cfg_save(void)
     FILE *f = fopen("vr.cfg", "w");
     if (!f) return;
     fprintf(f, "scale %g\nscreen %g\naim %g\nresolution %d\nwidth %d\nrefresh %d\nhand %s\nlaser %s\ncoins %s\n"
-               "sight %s\ncrosshair %s\ngun %s\nhud_pitch %d\ndual %s\n",
+               "sight %s\ncrosshair %s\ngun %s\nhud_pitch %d\ndual %s\nfps %s\n",
             cfg.scale, cfg.screen, cfg.aim, cfg.resolution, cfg.width, cfg.refresh, cfg.left_handed ? "left" : "right",
             LASER_NAME[cfg.laser], cfg.auto_coins ? "auto" : "manual",
-            SIGHT_NAME[cfg.sight], cfg.crosshair ? "on" : "off", cfg.show_gun ? "on" : "off", cfg.hud_pitch, cfg.dual ? "on" : "off");
+            SIGHT_NAME[cfg.sight], cfg.crosshair ? "on" : "off", cfg.show_gun ? "on" : "off", cfg.hud_pitch, cfg.dual ? "on" : "off", cfg.show_fps ? "on" : "off");
     fclose(f);
 }
 
@@ -183,6 +184,7 @@ static void cfg_set(const char *key, const char *val)
         else if (!strcmp(key, "crosshair")) cfg.crosshair = strcmp(val, "off") != 0;
         else if (!strcmp(key, "gun")) cfg.show_gun = strcmp(val, "off") != 0;
         else if (!strcmp(key, "dual")) cfg.dual = !strcmp(val, "on");
+        else if (!strcmp(key, "fps")) cfg.show_fps = !strcmp(val, "on");
     }
 }
 
@@ -409,7 +411,7 @@ static int fake_gun(void)
  * towards them, the game's screen still in view (the arcade's own Test menu
  * is worked from here too). Point the gun at a row and pull the trigger;
  * the game gets no input meanwhile. */
-enum { M_SIGHT, M_LASER, M_CROSSHAIR, M_GUN, M_HAND, M_DUAL, M_SCREEN, M_HUD, M_RATE, M_RES, M_COINS, M_COIN, M_RECENTRE,
+enum { M_SIGHT, M_LASER, M_CROSSHAIR, M_GUN, M_HAND, M_DUAL, M_FPS, M_SCREEN, M_HUD, M_RATE, M_RES, M_COINS, M_COIN, M_RECENTRE,
        M_TEST, M_SERVICE, M_RESET, M_CLOSE, M_COUNT };
 static struct {
     int open, hover, dirty;
@@ -434,7 +436,7 @@ static void menu_items(XmItem *it)
     static const char *const sight[] = { "Point shooting", "Red dot", "Holographic" };
     static const char *const laser[] = { "Laser and dot", "Dot only", "Off" };
     static const char *const labels[M_COUNT] = {
-        "Sight", "Laser", "Game crosshair", "Gun model", "Gun hand", "Dual wield", "Screen distance", "HUD position", "Display rate", "Resolution per eye",
+        "Sight", "Laser", "Game crosshair", "Gun model", "Gun hand", "Dual wield", "Show FPS", "Screen distance", "HUD position", "Display rate", "Resolution per eye",
         "Coins", "Insert a coin", "Recentre view", "Arcade Test button (select)",
         "Arcade Service button (next)", "Reset game", "Close" };
     for (int i = 0; i < M_COUNT; i++) { it[i].label = labels[i]; it[i].value[0] = 0; }
@@ -445,6 +447,7 @@ static void menu_items(XmItem *it)
     snprintf(it[M_HAND].value, 40, "%s", gun_hand == HAND_L ? "Left" : "Right");
     if (cfg.dual) it[M_HAND].label = "Player 1 hand";    /* the other is player 2's */
     snprintf(it[M_DUAL].value, 40, "%s", !cfg.dual ? "Off" : gun_hand == HAND_L ? "On (right hand P2)" : "On (left hand P2)");
+    snprintf(it[M_FPS].value, 40, "%s", cfg.show_fps ? "On" : "Off");
     snprintf(it[M_SCREEN].value, 40, "%.1f m", cfg.screen);
     if (!stereo_hud_is_head_locked()) snprintf(it[M_HUD].value, 40, "With the screen");
     else if (cfg.hud_pitch == 0) snprintf(it[M_HUD].value, 40, "Centre");
@@ -518,6 +521,39 @@ static void menu_place(void)
     menu.hw = 0.33f; menu.hh = menu.hw * XM_H / XM_W;
 }
 
+/* ---- the frame rate readout (cfg.show_fps) ----
+ * Frames shown in each half second, repainted when the number changes; drawn
+ * low and to the left of where the head looks, a metre out, in both eyes. */
+static struct { float c[3], right[3], up[3], n[3], hw, hh; int shown; } fpsl = { .shown = -1 };
+static void fps_update(XrTime now)
+{
+    static XrTime t0; static int frames;
+    frames++;
+    if (!t0) t0 = now;
+    if (now - t0 >= 500000000) {
+        int fps = (int)(frames * 1e9 / (double)(now - t0) + 0.5);
+        t0 = now; frames = 0;
+        if (fps != fpsl.shown) {
+            static unsigned char img[XM_LABEL_W * XM_LABEL_H * 4];
+            char s[16];
+            snprintf(s, sizeof s, "%d FPS", fps);
+            xm_paint_label(img, s);
+            xo_label_upload(img, XM_LABEL_W, XM_LABEL_H);
+            fpsl.shown = fps;
+        }
+    }
+    float head[3];
+    static const float ax[3] = { 1, 0, 0 }, ay[3] = { 0, 1, 0 }, az[3] = { 0, 0, 1 }, at[3] = { -0.30f, -0.26f, -1.0f };
+    float off[3];
+    for (int i = 0; i < 3; i++) head[i] = 0.5f * ((&views[0].pose.position.x)[i] + (&views[1].pose.position.x)[i]);
+    qrot(views[0].pose.orientation, ax, fpsl.right);
+    qrot(views[0].pose.orientation, ay, fpsl.up);
+    qrot(views[0].pose.orientation, az, fpsl.n);
+    qrot(views[0].pose.orientation, at, off);
+    for (int i = 0; i < 3; i++) fpsl.c[i] = head[i] + off[i];
+    fpsl.hw = 0.07f; fpsl.hh = fpsl.hw * XM_LABEL_H / XM_LABEL_W;
+}
+
 /* where the ray meets the panel: 0..1 from its top left; 0 if it misses */
 static int menu_hit(const float p[3], const float d[3], float *u, float *v, float hit[3])
 {
@@ -545,6 +581,7 @@ static void menu_choose(int item)
     case M_GUN: cfg.show_gun = !cfg.show_gun; break;
     case M_HAND: gun_hand = 1 - gun_hand; cfg.left_handed = gun_hand == HAND_L; break;
     case M_DUAL: cfg.dual = !cfg.dual; fprintf(stderr, "[xr] dual wield %s\n", cfg.dual ? "on" : "off"); break;
+    case M_FPS: cfg.show_fps = !cfg.show_fps; break;
     case M_SCREEN: {
         int k = 0;
         while (k < 5 && screens[k] <= cfg.screen + 0.01f) k++;
@@ -1357,6 +1394,7 @@ void xr_frame_begin(void)
         head_ok = 1;
     }
     if (state == XR_SESSION_STATE_FOCUSED) input_frame(frame.predictedDisplayTime);
+    if (cfg.show_fps) fps_update(frame.predictedDisplayTime);
     else {
         host_vr_input(-100000, -100000, 0, 0); host_vr_input2(0, -100000, -100000);
         xo.gun_valid = xo.beam = xo.dot = xo.flash = 0; xo2.gun_valid = xo2.beam = xo2.dot = xo2.flash = 0;
@@ -1527,6 +1565,17 @@ void xr_frame_end(void)
                 float eye_pos[3] = { views[i].pose.position.x, views[i].pose.position.y, views[i].pose.position.z };
                 xo_draw(&xo, vp, eye_pos, (int)e->w, (int)e->h);
                 if (xo2.gun_valid) xo_draw(&xo2, vp, eye_pos, (int)e->w, (int)e->h);
+                if (cfg.show_fps && fpsl.shown >= 0) {
+                    float pm[16], m[16];
+                    memset(pm, 0, sizeof pm);
+                    for (int k = 0; k < 3; k++) {
+                        pm[k] = fpsl.right[k] * fpsl.hw; pm[4 + k] = fpsl.up[k] * fpsl.hh;
+                        pm[8 + k] = fpsl.n[k]; pm[12 + k] = fpsl.c[k];
+                    }
+                    pm[15] = 1;
+                    mat4_mul(m, vp, pm);
+                    xo_draw_label(m, (int)e->w, (int)e->h);
+                }
                 if (menu.open) {
                     float pm[16], m[16];
                     memset(pm, 0, sizeof pm);
