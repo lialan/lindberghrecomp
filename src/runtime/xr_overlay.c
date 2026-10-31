@@ -408,6 +408,8 @@ void xo_draw(const XoFrame *f, const float viewproj[16], const float eye_pos[3],
 
     float model[16];
     int sight = f->sight;
+    /* the laser's colour: red, or blue for the second player's gun (the cabinet's 1P red, 2P blue) */
+    const float cr = f->p2 ? 0.15f : 1.0f, cg = f->p2 ? 0.45f : 0.12f, cb = f->p2 ? 1.0f : 0.08f;
     if (f->gun_valid && (sight != cur_sight || f->gun_model != cur_model)) {
         build_gun(sight, f->gun_model);
         gl.BindBuffer(GL_ARRAY_BUFFER, vbo_gun);
@@ -457,10 +459,10 @@ void xo_draw(const XoFrame *f, const float viewproj[16], const float eye_pos[3],
         float dx = f->end[0] - eye_pos[0], dy = f->end[1] - eye_pos[1], dz = f->end[2] - eye_pos[2];
         float dist = sqrtf(dx * dx + dy * dy + dz * dz);
         if (sight == XO_SIGHT_RED_DOT)          /* a 2 MOA dot */
-            spot(viewproj, eye_pos, f->end, 0.0012f * dist, 1.0f, 0.08f, 0.05f, 1.0f);
+            spot(viewproj, eye_pos, f->end, 0.0012f * dist, cr, cg, cb, 1.0f);
         else {                                  /* a 65 MOA ring round a 1 MOA dot */
-            spot_shape(viewproj, eye_pos, f->end, 0.0105f * dist, 1.0f, 0.10f, 0.06f, 0.95f, 0.90f, 0.08f);
-            spot(viewproj, eye_pos, f->end, 0.0009f * dist, 1.0f, 0.10f, 0.06f, 1.0f);
+            spot_shape(viewproj, eye_pos, f->end, 0.0105f * dist, cr, cg, cb, 0.95f, 0.90f, 0.08f);
+            spot(viewproj, eye_pos, f->end, 0.0009f * dist, cr, cg, cb, 1.0f);
         }
         gl.DepthRangef(0, 1);
         gl.ClearDepthf(1);
@@ -477,11 +479,11 @@ void xo_draw(const XoFrame *f, const float viewproj[16], const float eye_pos[3],
     gl.BlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
     gl.UseProgram(prog_beam);
     gl.BindVertexArray(vao_beam);
-    if (f->beam) beam(viewproj, eye_pos, f->muzzle, f->end, 0.0015f, 1.0f, 0.12f, 0.08f, 0.85f);
+    if (f->beam) beam(viewproj, eye_pos, f->muzzle, f->end, 0.0015f, cr, cg, cb, 0.85f);
     if (f->dot) {
         float dx = f->end[0] - eye_pos[0], dy = f->end[1] - eye_pos[1], dz = f->end[2] - eye_pos[2];
         float dist = sqrtf(dx * dx + dy * dy + dz * dz);
-        spot(viewproj, eye_pos, f->end, 0.006f * dist, 1.0f, 0.15f, 0.1f, 1.0f);
+        spot(viewproj, eye_pos, f->end, 0.006f * dist, cr, cg, cb, 1.0f);
     }
     if (f->flash) spot(viewproj, eye_pos, f->muzzle, 0.045f, 1.0f, 0.75f, 0.3f, 0.9f);
 
@@ -580,10 +582,10 @@ void xo_draw_panel(const float mvp[16], int w, int h)
  * ring of pixel buffers two frames later, so the GPU is never waited on. */
 #define PROBE_MAX 64
 #define PROBE_RING 5
-static GLuint prog_probe, probe_fb, probe_tex, probe_pbo[PROBE_RING], probe_smp;
+static GLuint prog_probe, probe_fb, probe_tex, probe_pbo[2][PROBE_RING], probe_smp;   /* a ring per gun */
 static GLint u_probe_px, u_probe_d;
-static struct { int n, pending; GLsync fence; float z[PROBE_MAX], t[PROBE_MAX], zn, zf; } probe_slot[PROBE_RING];
-static unsigned probe_k;
+static struct { int n, pending; GLsync fence; float z[PROBE_MAX], t[PROBE_MAX], zn, zf; } probe_slot[2][PROBE_RING];
+static unsigned probe_k[2];
 
 static int probe_init(void)
 {
@@ -615,9 +617,9 @@ static int probe_init(void)
     gl.BindFramebuffer(GL_FRAMEBUFFER, (GLuint)fb);
     GLint pb = 0;
     gl.GetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &pb);
-    gl.GenBuffers(PROBE_RING, probe_pbo);
-    for (int i = 0; i < PROBE_RING; i++) {
-        gl.BindBuffer(GL_PIXEL_PACK_BUFFER, probe_pbo[i]);
+    gl.GenBuffers(2 * PROBE_RING, &probe_pbo[0][0]);
+    for (int i = 0; i < 2 * PROBE_RING; i++) {
+        gl.BindBuffer(GL_PIXEL_PACK_BUFFER, (&probe_pbo[0][0])[i]);
         gl.BufferData(GL_PIXEL_PACK_BUFFER, PROBE_MAX * 4, NULL, GL_STREAM_READ);
     }
     gl.BindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)pb);
@@ -671,44 +673,44 @@ void xo_copy_depth(unsigned depth_array, int layer, int w, int h)
     restore(&s);
 }
 
-float xo_probe(unsigned depth_array, const float (*px)[2], const float *z, const float *t, int n, float zn, float zf)
+float xo_probe(int g, unsigned depth_array, const float (*px)[2], const float *z, const float *t, int n, float zn, float zf)
 {
-    if (!prog_screen[0] || !probe_init()) return -1;
+    if (g < 0 || g > 1 || !prog_screen[0] || !probe_init()) return -1;
     if (n > PROBE_MAX) n = PROBE_MAX;
     /* the oldest slot's answer, if it is ready: the first sample behind a surface */
     float hit = -2;
-    int o = (int)(probe_k % PROBE_RING);
-    if (probe_slot[o].pending) {
+    int o = (int)(probe_k[g] % PROBE_RING);
+    if (probe_slot[g][o].pending) {
         /* not drawn yet: no answer, and no new question either - reading it
          * now would wait on the GPU */
-        GLenum st = gl.ClientWaitSync(probe_slot[o].fence, 0, 0);
+        GLenum st = gl.ClientWaitSync(probe_slot[g][o].fence, 0, 0);
         if (st != GL_ALREADY_SIGNALED && st != GL_CONDITION_SATISFIED) return -2;
         GLint pb = 0;
         gl.GetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &pb);
-        gl.DeleteSync(probe_slot[o].fence);
-        gl.BindBuffer(GL_PIXEL_PACK_BUFFER, probe_pbo[o]);
+        gl.DeleteSync(probe_slot[g][o].fence);
+        gl.BindBuffer(GL_PIXEL_PACK_BUFFER, probe_pbo[g][o]);
         const unsigned char *b = gl.MapBufferRange(GL_PIXEL_PACK_BUFFER, 0, PROBE_MAX * 4, GL_MAP_READ_BIT);
         hit = -1;
         static unsigned dbg;
         if (b && ENV_ON("LINDBERGH_AIM_LOG") && ++dbg % 60 == 0)
-            for (int i = 0; i < probe_slot[o].n; i += 6)
-                fprintf(stderr, "[aim] t %.2f: ray depth %.6f, scene %.6f\n", probe_slot[o].t[i], probe_slot[o].z[i],
+            for (int i = 0; i < probe_slot[g][o].n; i += 6)
+                fprintf(stderr, "[aim] t %.2f: ray depth %.6f, scene %.6f\n", probe_slot[g][o].t[i], probe_slot[g][o].z[i],
                         (float)(b[i * 4] | b[i * 4 + 1] << 8 | b[i * 4 + 2] << 16) / 16777215.0f);
         /* The first sample behind a surface that lies between it and the one
          * before: something much nearer only hides the ray from the eye (the
          * eye and the gun see from different places), the ray passes behind */
-        float zn = probe_slot[o].zn, zf = probe_slot[o].zf, prev = 0;
+        float zn = probe_slot[g][o].zn, zf = probe_slot[g][o].zf, prev = 0;
 #define LIN(w) (2.0f * zn * zf / (zf + zn - (2.0f * (w) - 1.0f) * (zf - zn)))
-        for (int i = 0; b && i < probe_slot[o].n; i++) {
+        for (int i = 0; b && i < probe_slot[g][o].n; i++) {
             float dz = (float)(b[i * 4] | b[i * 4 + 1] << 8 | b[i * 4 + 2] << 16) / 16777215.0f;
-            float ray = LIN(probe_slot[o].z[i]), scene = LIN(dz);
-            if (prev > 0 && dz < 1.0f && scene < ray && scene > prev * 0.9f) { hit = probe_slot[o].t[i] * scene / ray; break; }
+            float ray = LIN(probe_slot[g][o].z[i]), scene = LIN(dz);
+            if (prev > 0 && dz < 1.0f && scene < ray && scene > prev * 0.9f) { hit = probe_slot[g][o].t[i] * scene / ray; break; }
             prev = ray;
         }
 #undef LIN
         if (b) gl.UnmapBuffer(GL_PIXEL_PACK_BUFFER);
         gl.BindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)pb);
-        probe_slot[o].pending = 0;
+        probe_slot[g][o].pending = 0;
     }
     if (n > 0 && depth_array) {
         Saved s;
@@ -735,15 +737,15 @@ float xo_probe(unsigned depth_array, const float (*px)[2], const float *z, const
         gl.BindSampler(0, probe_smp);
         gl.BindVertexArray(vao_screen);
         gl.DrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-        int w = (int)(probe_k % PROBE_RING);
-        gl.BindBuffer(GL_PIXEL_PACK_BUFFER, probe_pbo[w]);
+        int w = (int)(probe_k[g] % PROBE_RING);
+        gl.BindBuffer(GL_PIXEL_PACK_BUFFER, probe_pbo[g][w]);
         gl.ReadPixels(0, 0, n, 1, GL_RGBA, GL_UNSIGNED_BYTE, 0);
-        probe_slot[w].fence = gl.FenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-        probe_slot[w].n = n;
-        probe_slot[w].zn = zn; probe_slot[w].zf = zf;
-        memcpy(probe_slot[w].z, z, sizeof(float) * n);
-        memcpy(probe_slot[w].t, t, sizeof(float) * n);
-        probe_slot[w].pending = 1;
+        probe_slot[g][w].fence = gl.FenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        probe_slot[g][w].n = n;
+        probe_slot[g][w].zn = zn; probe_slot[g][w].zf = zf;
+        memcpy(probe_slot[g][w].z, z, sizeof(float) * n);
+        memcpy(probe_slot[g][w].t, t, sizeof(float) * n);
+        probe_slot[g][w].pending = 1;
         gl.BindSampler(0, 0);
         gl.BindTexture(GL_TEXTURE_2D_ARRAY, (GLuint)bound);
         gl.BindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)pb);
@@ -752,6 +754,6 @@ float xo_probe(unsigned depth_array, const float (*px)[2], const float *z, const
         if (scissor) gl.Enable(GL_SCISSOR_TEST);
         restore(&s);
     }
-    probe_k++;
+    probe_k[g]++;
     return hit;
 }

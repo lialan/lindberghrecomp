@@ -28,8 +28,8 @@ void stereo_set_eye(int eye, const float view[16], float tan_l, float tan_r, flo
 void stereo_set_eye_head(int eye, const float view[16]);
 void stereo_hud_head_locked(int on);
 void stereo_aim_on_hud(int on);
-void stereo_set_gun_ray(const float o[3], const float d[3], int ok);
-int  stereo_gun_ray(float o[3], float d[3]);   /* the headset gun's ray in the game camera's space; 0: none */
+void stereo_set_gun_ray(int player, const float o[3], const float d[3], int ok);
+int  stereo_gun_ray(int player, float o[3], float d[3]);   /* a headset gun's ray (player 0/1) in the game camera's space; 0: none */
 int  stereo_aims_on_hud(void);
 int  stereo_ray_to_hud(const float o[3], const float d[3], int head, float *x, float *y, float *reach);
 /* The HUD is drawn on a screen this far in front of the game camera. */
@@ -88,6 +88,7 @@ void stereo_screen(float *half_w, float *half_h, float *dist);
 /* Where the gun points this frame, in the game's 640x480 (off the screen:
  * below -1000); and whether the game's own sight is drawn. */
 void stereo_set_gun(int x, int y);
+void stereo_set_gun2(int x, int y);    /* the second gun (dual wielding); off the screen: none */
 void stereo_show_game_sight(int show);
 /* a sniping event (qte_ctrl_snipe) ran this frame: its zoom steps are scopes */
 void stereo_snipe_running(void);

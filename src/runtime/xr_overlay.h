@@ -18,6 +18,7 @@ typedef struct {
     int   sight;                /* XO_SIGHT_*: the optic on the rail */
     int   show_gun;             /* 0: the controller shows only the laser */
     int   gun_model;            /* XO_GUN_* */
+    int   p2;                   /* the second player's gun: its laser and dots blue */
 } XoFrame;
 
 int  xo_init(void);
@@ -32,10 +33,10 @@ void xo_draw_screen(const float mvp[16], unsigned tex, int array_layer0, int w, 
 void xo_panel_upload(const unsigned char *rgba, int w, int h);
 void xo_draw_panel(const float mvp[16], int w, int h);
 
-/* What the gun's ray points at: queues a read of the world's depth array at
+/* What gun g's (0/1) ray points at: queues a read of the world's depth array at
  * the n samples' pixels, and returns the distance t of the first sample that
  * lay behind a surface two frames ago (zn, zf: the view's near and far) (-1 none, -2 no answer yet). */
-float xo_probe(unsigned depth_array, const float (*px)[2], const float *z, const float *t, int n, float zn, float zf);
+float xo_probe(int g, unsigned depth_array, const float (*px)[2], const float *z, const float *t, int n, float zn, float zf);
 
 /* Layer `layer` of the world's depth array into the bound framebuffer's depth
  * (w x h), for the headset's depth layer. */

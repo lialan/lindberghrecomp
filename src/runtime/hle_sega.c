@@ -176,25 +176,22 @@ static void jvs_command(const unsigned char *p)
         ack_report();
         ack_byte((in.buttons & CAB_TEST) ? 0x80 : 0x00);
         for (unsigned pl = 0; pl < players; pl++) {
+            /* P2's gun switches are P1's, shifted (CAB_P2_SHIFT) */
+            unsigned g = pl == 0 ? in.buttons : pl == 1 ? (in.buttons >> CAB_P2_SHIFT) : 0;
             unsigned char b0 = 0;
-            if (pl == 0) {
-                if (in.buttons & CAB_P1_START)   b0 |= 0x80;
-                if (in.buttons & CAB_SERVICE)    b0 |= 0x40;
-                if (in.buttons & CAB_P1_TRIGGER) b0 |= 0x02;
-                if ((in.buttons & CAB_P1_RELOAD) && g_reload_byte == 0) b0 |= (unsigned char)g_reload_mask;
-            } else if (pl == 1) {
-                if (in.buttons & CAB_P2_START)   b0 |= 0x80;
-            }
+            if (pl == 0 && (in.buttons & CAB_P1_START)) b0 |= 0x80;
+            if (pl == 1 && (in.buttons & CAB_P2_START)) b0 |= 0x80;
+            if (pl == 0 && (in.buttons & CAB_SERVICE))  b0 |= 0x40;
+            if (g & CAB_P1_TRIGGER) b0 |= 0x02;
+            if ((g & CAB_P1_RELOAD) && g_reload_byte == 0) b0 |= (unsigned char)g_reload_mask;
             ack_byte(b0);
             if (bytes > 1) {
                 /* second byte: bit 7 is the gun's action button, bit 6 its
                  * fire-mode selector - the masks the game's gun code holds */
                 unsigned char b1 = 0;
-                if (pl == 0) {        /* the gun's other two buttons */
-                    if (in.buttons & CAB_P1_ACTION)   b1 |= 0x80;
-                    if (in.buttons & CAB_P1_FIREMODE) b1 |= 0x40;  /* single/burst/auto/grenade */
-                    if ((in.buttons & CAB_P1_RELOAD) && g_reload_byte == 1) b1 |= (unsigned char)g_reload_mask;
-                }
+                if (g & CAB_P1_ACTION)   b1 |= 0x80;
+                if (g & CAB_P1_FIREMODE) b1 |= 0x40;  /* single/burst/auto/grenade */
+                if ((g & CAB_P1_RELOAD) && g_reload_byte == 1) b1 |= (unsigned char)g_reload_mask;
                 ack_byte(b1);
                 ack_zeros(bytes - 2);
             }
@@ -224,6 +221,15 @@ static void jvs_command(const unsigned char *p)
         unsigned y = (unsigned)((long)in.gun_y * 65535 / h);
         if (in.gun_x < 0) x = 0; if (x > 65535) x = 65535;
         if (in.gun_y < 0) y = 0; if (y > 65535) y = 65535;
+        unsigned x2 = x, y2 = y;     /* channels 2/3: the second gun, or a copy of the first */
+        if (in.gun2) {
+            x2 = in.gun2_x < 0 ? 0 : (unsigned)((long)in.gun2_x * 65535 / w);
+            y2 = in.gun2_y < 0 ? 0 : (unsigned)((long)in.gun2_y * 65535 / h);
+            if (x2 > 65535) x2 = 65535; if (y2 > 65535) y2 = 65535;
+        }
+        {   static int shown;   /* LINDBERGH_JVS: how many channels the game reads */
+            if (!shown && getenv("LINDBERGH_JVS")) { shown = 1; fprintf(stderr, "[jvs] analog read: %u channels\n", p[1]); }
+        }
         ack_report();
         {   /* LINDBERGH_NO_GUN=1 reports a centred, still gun. A test, not a
              * setting: it tells apart a game upset by where the gun is from a
@@ -233,8 +239,7 @@ static void jvs_command(const unsigned char *p)
                             flat = (v && *v && *v != '0') ? 1 : 0; }
             for (unsigned ch = 0; ch < p[1]; ch++) {
                 unsigned v = flat ? 0x8000u
-                           : (ch == 0 || ch == 2) ? x
-                           : (ch == 1 || ch == 3) ? y : 0x8000u;
+                           : ch == 0 ? x : ch == 1 ? y : ch == 2 ? x2 : ch == 3 ? y2 : 0x8000u;
                 /* The game keeps only the first byte: amJvspAckAnalogInput
                  * copies the two bytes as they came and the game reads them
                  * as a little-endian word scaled by 1/256, which is right

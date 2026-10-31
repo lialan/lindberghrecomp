@@ -168,6 +168,7 @@ static unsigned g_cab_latch;
 static Uint64 g_lat_t; static unsigned g_lat_f;
 static unsigned g_auto;       /* buttons driven by LINDBERGH_AUTOSTART/AUTOGUN */
 static int      g_scripted;   /* the gun is scripted: real input is ignored */
+static int      g_gun2_on, g_gun2_px = -100000, g_gun2_py = -100000;   /* the second gun (host_vr_input2, LINDBERGH_P2_TEST) */
 
 static int g_capture = -1;    /* binding the next key or click, for this action */
 static int g_calib;           /* aim calibration step, 0 = off */
@@ -393,25 +394,58 @@ static void cabinet_script(void)
     }
 }
 
+/* Where a pointer at px,py puts the cabinet's gun: the game's own calibration
+ * undone, so the sight is under the pointer, and a game whose gun is not a
+ * plain screen position mapped (on the screen only: off it is the reload). */
+static void gun_reading(int px, int py, double w, double h, int *gx, int *gy)
+{
+    HostSettings *st = settings();
+    *gx = (int)((px - st->aim_ox) / st->aim_sx);
+    *gy = (int)((py - st->aim_oy) / st->aim_sy);
+    if (g_gun_map && *gx >= 0 && *gy >= 0 && *gx < w && *gy < h) g_gun_map(gx, gy);
+}
+
+/* LINDBERGH_P2_TEST=1: a second, scripted gun - a coin and P2 Start every
+ * eight seconds from frame 600, its own sweep (the other way round to P1's
+ * auto-gun) and half-second bursts, one second in six off the screen with
+ * its reload - for checking a game takes Player 2's gun. */
+static void cabinet_p2_test(void)
+{
+    static int on = -1;
+    if (on < 0) on = env_int("LINDBERGH_P2_TEST", 0) != 0;
+    if (!on || g_frame < 600) return;
+    g_gun2_on = 1;
+    int w = g_win.w ? g_win.w : DEFAULT_W, h = g_win.h ? g_win.h : DEFAULT_H;
+    double t = g_frame / 70.0;
+    g_gun2_px = (int)(w / 2 - w / 3 * cos(t));
+    g_gun2_py = (int)(h / 2 + h / 4 * sin(t * 1.3));
+    unsigned p2 = CAB_P2_TRIGGER | CAB_P2_RELOAD | CAB_P2_START;
+    g_auto &= ~p2;
+    static unsigned coined;
+    if (g_frame % 480u == 0 && coined != g_frame) { coined = g_frame; g_cab.coins[0]++; fprintf(stderr, "[cab] p2 test: coin at frame %u\n", g_frame); }
+    if (g_frame % 480u >= 30u && g_frame % 480u < 50u) g_auto |= CAB_P2_START;
+    if (g_frame % 360u < 60u) {
+        g_gun2_px = g_gun2_py = -100000;
+        if (g_frame % 360u >= 20u && g_frame % 360u < 30u) g_auto |= CAB_P2_RELOAD;
+    } else if (g_frame % 40u < 20u) g_auto |= CAB_P2_TRIGGER;
+}
+
 void host_cabinet_input(CabinetInput *out)
 {
     cabinet_autostart();
     cabinet_script();
-    HostSettings *st = settings();
     double w = g_win.w ? g_win.w : DEFAULT_W, h = g_win.h ? g_win.h : DEFAULT_H;
     if (g_calib == 1)      { g_cab.gun_x = (int)(CAL_AX * w); g_cab.gun_y = (int)(CAL_AY * h); }
     else if (g_calib == 2) { g_cab.gun_x = (int)(CAL_BX * w); g_cab.gun_y = (int)(CAL_BY * h); }
-    else {
-        /* undo the game's own calibration, so the sight is under the pointer */
-        g_cab.gun_x = (int)((g_mouse_x - st->aim_ox) / st->aim_sx);
-        g_cab.gun_y = (int)((g_mouse_y - st->aim_oy) / st->aim_sy);
-        /* a game whose gun is not a plain screen position maps it (on the
-         * screen only: off it is the reload) */
-        if (g_gun_map && g_cab.gun_x >= 0 && g_cab.gun_y >= 0 && g_cab.gun_x < w && g_cab.gun_y < h)
-            g_gun_map(&g_cab.gun_x, &g_cab.gun_y);
-    }
+    else gun_reading(g_mouse_x, g_mouse_y, w, h, &g_cab.gun_x, &g_cab.gun_y);
+    cabinet_p2_test();
+    g_cab.gun2 = g_gun2_on;
+    if (g_gun2_on) gun_reading(g_gun2_px, g_gun2_py, w, h, &g_cab.gun2_x, &g_cab.gun2_y);
 #if !defined(__ANDROID__)
-    if (stereo_wide(NULL, NULL, NULL) || stereo_enabled()) stereo_set_gun(g_cab.gun_x, g_cab.gun_y);   /* the HUD keeps clear of it */
+    if (stereo_wide(NULL, NULL, NULL) || stereo_enabled()) {      /* the HUD keeps clear of them */
+        stereo_set_gun(g_cab.gun_x, g_cab.gun_y);
+        stereo_set_gun2(g_gun2_on ? g_cab.gun2_x : -100000, g_gun2_on ? g_cab.gun2_y : -100000);
+    }
 #endif
     g_cab.screen_w = (int)w;
     g_cab.screen_h = (int)h;
@@ -447,7 +481,14 @@ void host_vr_input(int gun_x, int gun_y, unsigned held, int coin)
     g_mouse_x = gun_x; g_mouse_y = gun_y;
     g_cab_latch |= held & ~g_held;
     g_held = held;
-    if (coin) g_cab.coins[0]++;
+    if (coin) g_cab.coins[0] += (unsigned)coin;
+}
+
+/* Two guns (dual wielding): the second one's place too; on 0, P1's alone. */
+void host_vr_input2(int on, int gun2_x, int gun2_y)
+{
+    g_gun2_on = on;
+    g_gun2_px = gun2_x; g_gun2_py = gun2_y;
 }
 
 /* The board has reported the switches: latched taps have been seen. */

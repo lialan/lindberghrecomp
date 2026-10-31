@@ -67,6 +67,7 @@
 
 /* host_sdl.c: the gun and the cabinet's buttons, from the controllers */
 void host_vr_input(int gun_x, int gun_y, unsigned held, int coin);
+void host_vr_input2(int on, int gun2_x, int gun2_y);
 
 #ifndef GL_TEXTURE_INTERNAL_FORMAT
 #define GL_TEXTURE_WIDTH            0x1000
@@ -124,6 +125,7 @@ static struct {
     int   resolution, width, refresh, left_handed, laser, auto_coins;
     int   sight, crosshair, show_gun;         /* XO_SIGHT_*; the game's own sight; the gun model */
     int   hud_pitch;                          /* a head-locked HUD tilted up (+) or down, degrees */
+    int   dual;                               /* dual wielding: a gun in each hand, players 1 and 2 */
 } cfg = { 1.0f, 3.0f, 15.0f, 2280, 2064, 120, 0, LASER_ON, 1, XO_SIGHT_NONE, 1, 1 };
 
 static void cfg_save(void)
@@ -131,10 +133,10 @@ static void cfg_save(void)
     FILE *f = fopen("vr.cfg", "w");
     if (!f) return;
     fprintf(f, "scale %g\nscreen %g\naim %g\nresolution %d\nwidth %d\nrefresh %d\nhand %s\nlaser %s\ncoins %s\n"
-               "sight %s\ncrosshair %s\ngun %s\nhud_pitch %d\n",
+               "sight %s\ncrosshair %s\ngun %s\nhud_pitch %d\ndual %s\n",
             cfg.scale, cfg.screen, cfg.aim, cfg.resolution, cfg.width, cfg.refresh, cfg.left_handed ? "left" : "right",
             LASER_NAME[cfg.laser], cfg.auto_coins ? "auto" : "manual",
-            SIGHT_NAME[cfg.sight], cfg.crosshair ? "on" : "off", cfg.show_gun ? "on" : "off", cfg.hud_pitch);
+            SIGHT_NAME[cfg.sight], cfg.crosshair ? "on" : "off", cfg.show_gun ? "on" : "off", cfg.hud_pitch, cfg.dual ? "on" : "off");
     fclose(f);
 }
 
@@ -180,6 +182,7 @@ static void cfg_set(const char *key, const char *val)
         else if (!strcmp(key, "sight")) cfg.sight = !strcmp(val, "reddot") ? XO_SIGHT_RED_DOT : !strcmp(val, "holo") ? XO_SIGHT_HOLO : XO_SIGHT_NONE;
         else if (!strcmp(key, "crosshair")) cfg.crosshair = strcmp(val, "off") != 0;
         else if (!strcmp(key, "gun")) cfg.show_gun = strcmp(val, "off") != 0;
+        else if (!strcmp(key, "dual")) cfg.dual = !strcmp(val, "on");
     }
 }
 
@@ -220,7 +223,7 @@ static int depth_blit;                 /* the world's depth blits straight acros
 static unsigned depth_checked;         /* the depth array depth_blit was decided for */
 static GLuint depth_read_fb;
 static int64_t depth_format;
-static XoFrame xo;                     /* the gun and laser for this frame */
+static XoFrame xo, xo2;                /* the gun and laser for this frame; xo2: player 2's (dual wielding) */
 static int overlay_ok;
 static GLuint read_fb;
 
@@ -393,11 +396,11 @@ static void qrot(XrQuaternionf q, const float v[3], float out[3])
 }
 
 /* Cabinet bits, as in lindbergh_rt.h */
-/* LINDBERGH_XR_FAKE_GUN=1: a stand-in for a controller (see below) */
+/* LINDBERGH_XR_FAKE_GUN=1: a stand-in for a controller (fake_pose); =2 two of them */
 static int fake_gun(void)
 {
     static int fake = -1;
-    if (fake < 0) { const char *v = getenv("LINDBERGH_XR_FAKE_GUN"); fake = v && *v && *v != '0'; }
+    if (fake < 0) { const char *v = getenv("LINDBERGH_XR_FAKE_GUN"); fake = v && *v && *v != '0' ? (atoi(v) > 1 ? 2 : 1) : 0; }
     return fake;
 }
 
@@ -406,7 +409,7 @@ static int fake_gun(void)
  * towards them, the game's screen still in view (the arcade's own Test menu
  * is worked from here too). Point the gun at a row and pull the trigger;
  * the game gets no input meanwhile. */
-enum { M_SIGHT, M_LASER, M_CROSSHAIR, M_GUN, M_HAND, M_SCREEN, M_HUD, M_RATE, M_RES, M_COINS, M_COIN, M_RECENTRE,
+enum { M_SIGHT, M_LASER, M_CROSSHAIR, M_GUN, M_HAND, M_DUAL, M_SCREEN, M_HUD, M_RATE, M_RES, M_COINS, M_COIN, M_RECENTRE,
        M_TEST, M_SERVICE, M_RESET, M_CLOSE, M_COUNT };
 static struct {
     int open, hover, dirty;
@@ -417,11 +420,11 @@ static struct {
 static float rates[16];
 static int running_resolution, running_width;
 /* the gun's ray this frame (game units), what it reached two frames ago */
-static float probe_o[3], probe_d[3], aim_hit_t = -1, aim_reach;
+static float probe_o[2][3], probe_d[2][3], aim_hit_t[2] = { -1, -1 }, aim_reach[2];   /* per player */
 static XrPosef head_pose;            /* between the eyes, facing as they do: where a head-locked HUD hangs */
 static int head_ok;
-static int aim_on_box;              /* this frame's aim went to a box on the screen */
-static int probe_on;
+static int aim_on_box[2];           /* this frame's aim went to a box on the screen */
+static int probe_on[2];
 static XrTime reload_t;            /* when the player last reloaded */
 static void aim_probe(void);   /* the eye size this run was set up with */
 static int nrates;
@@ -431,7 +434,7 @@ static void menu_items(XmItem *it)
     static const char *const sight[] = { "Point shooting", "Red dot", "Holographic" };
     static const char *const laser[] = { "Laser and dot", "Dot only", "Off" };
     static const char *const labels[M_COUNT] = {
-        "Sight", "Laser", "Game crosshair", "Gun model", "Gun hand", "Screen distance", "HUD position", "Display rate", "Resolution per eye",
+        "Sight", "Laser", "Game crosshair", "Gun model", "Gun hand", "Dual wield", "Screen distance", "HUD position", "Display rate", "Resolution per eye",
         "Coins", "Insert a coin", "Recentre view", "Arcade Test button (select)",
         "Arcade Service button (next)", "Reset game", "Close" };
     for (int i = 0; i < M_COUNT; i++) { it[i].label = labels[i]; it[i].value[0] = 0; }
@@ -440,6 +443,8 @@ static void menu_items(XmItem *it)
     snprintf(it[M_CROSSHAIR].value, 40, "%s", cfg.crosshair ? "Shown" : "Hidden");
     snprintf(it[M_GUN].value, 40, "%s", cfg.show_gun ? "Shown" : "Hidden");
     snprintf(it[M_HAND].value, 40, "%s", gun_hand == HAND_L ? "Left" : "Right");
+    if (cfg.dual) it[M_HAND].label = "Player 1 hand";    /* the other is player 2's */
+    snprintf(it[M_DUAL].value, 40, "%s", !cfg.dual ? "Off" : gun_hand == HAND_L ? "On (right hand P2)" : "On (left hand P2)");
     snprintf(it[M_SCREEN].value, 40, "%.1f m", cfg.screen);
     if (!stereo_hud_is_head_locked()) snprintf(it[M_HUD].value, 40, "With the screen");
     else if (cfg.hud_pitch == 0) snprintf(it[M_HUD].value, 40, "Centre");
@@ -539,6 +544,7 @@ static void menu_choose(int item)
     case M_CROSSHAIR: cfg.crosshair = !cfg.crosshair; stereo_show_game_sight(cfg.crosshair); break;
     case M_GUN: cfg.show_gun = !cfg.show_gun; break;
     case M_HAND: gun_hand = 1 - gun_hand; cfg.left_handed = gun_hand == HAND_L; break;
+    case M_DUAL: cfg.dual = !cfg.dual; fprintf(stderr, "[xr] dual wield %s\n", cfg.dual ? "on" : "off"); break;
     case M_SCREEN: {
         int k = 0;
         while (k < 5 && screens[k] <= cfg.screen + 0.01f) k++;
@@ -587,66 +593,53 @@ static void menu_choose(int item)
     menu.dirty = 1;
 }
 
-static void input_frame(XrTime t)
+/* the stand-in for a controller (LINDBERGH_XR_FAKE_GUN, for a headset or
+ * emulator without them): a gun at the hip sweeping across the screen,
+ * firing in half-second bursts, and for one second in six pointed at the
+ * floor with the trigger held - the arcade's reload. =2: a second one at the
+ * left hip, as player 2, sweeping the other way. */
+static void fake_pose(int pl, XrTime t, XrSpaceLocation *loc, int *trig)
 {
-    XrActiveActionSet as = { set, XR_NULL_PATH };
-    XrActionsSyncInfo sy = { XR_TYPE_ACTIONS_SYNC_INFO };
-    sy.countActiveActionSets = 1; sy.activeActionSets = &as;
-    if (XR_FAILED(xrSyncActions(session, &sy))) return;
-
-    int trig[2], grip[2], btn_a[2], btn_b[2], stick[2];
-    for (int h = 0; h < 2; h++) {
-        trig[h] = get_float(a_trigger, h) > 0.55f;
-        grip[h] = get_float(a_grip, h) > 0.6f;
-        btn_a[h] = get_bool(a_a, h); btn_b[h] = get_bool(a_b, h); stick[h] = get_bool(a_stick, h);
-        /* pulling the trigger on the other hand moves the gun there */
-        if (trig[h] && !prev[h][0] && h != gun_hand) gun_hand = h;
+    double s = (double)t / 1e9 + (pl ? 3.0 : 0.0);
+    float yaw = (float)(0.25 * sin(s * 0.7)), pitch = (float)(0.05 + 0.08 * sin(s * 1.1));
+    if (pl) yaw = -yaw;
+    static int fixed = -1; static float fyaw, fpitch;   /* LINDBERGH_XR_FAKE_AIM=yaw,pitch (radians): held still */
+    if (fixed < 0) { const char *v = getenv("LINDBERGH_XR_FAKE_AIM"); fixed = v && sscanf(v, "%f,%f", &fyaw, &fpitch) == 2; }
+    if (fixed && !pl) { yaw = fyaw; pitch = fpitch; }
+    int reload = fmod(s, 6.0) >= 5.0;
+    if (reload) pitch = -0.9f;
+    float cy = cosf(yaw / 2), sy = sinf(yaw / 2), cp = cosf(pitch / 2), sp = sinf(pitch / 2);
+    loc->pose.orientation = (XrQuaternionf){ sp * cy, cp * sy, -sp * sy, cp * cy };
+    loc->pose.position = (XrVector3f){ pl ? -0.16f : 0.16f, -0.22f, -0.28f };
+    static int ads = -1;            /* LINDBERGH_XR_FAKE_ADS=1: shouldered, looking through the sight */
+    if (ads < 0) { const char *v = getenv("LINDBERGH_XR_FAKE_ADS"); ads = v && *v == '1'; }
+    if (ads && !pl) {
+        loc->pose.position = (XrVector3f){ 0.0f, -0.080f, -0.16f };
+        yaw *= 0.15f; pitch = 0.0f; reload = 0;
+        cy = cosf(yaw / 2); sy = sinf(yaw / 2); cp = 1; sp = 0;
+        loc->pose.orientation = (XrQuaternionf){ sp * cy, cp * sy, -sp * sy, cp * cy };
     }
-    int menu_btn = get_bool(a_menu, HAND_L);
-    static int fake_menu = -1;          /* LINDBERGH_XR_FAKE_MENU=1 with the stand-in gun: the panel open, no clicks */
-    if (fake_menu < 0) { const char *v = getenv("LINDBERGH_XR_FAKE_MENU"); fake_menu = v && *v == '1'; }
-    if (fake_menu && !menu.open && views_ok) { menu.open = 1; menu_place(); menu.hover = -1; menu.dirty = 1; }
-    if (menu_btn && !prev[HAND_L][6]) {
-        menu.open = !menu.open; menu.reset_armed = 0;
-        fprintf(stderr, "[xr] settings panel %s\n", menu.open ? "open" : "closed");
-        if (menu.open) { menu_place(); menu.hover = -1; menu.dirty = 1; }
-    }
-    int g = gun_hand;
+    *trig = reload || fmod(s, 1.0) < 0.5;
+}
 
+static int fake_menu = -1;          /* LINDBERGH_XR_FAKE_MENU=1 with the stand-in gun: the panel open, no clicks */
+
+/* One gun: hand h's controller (or the stand-in) as player pl. Where the
+ * game is to be told it points (gx, gy: off the screen when not), what the
+ * overlay draws for it, and - the panel open - which row it points at and
+ * its clicks. Returns whether it points at the game's screen. */
+static int aim_gun(int h, int pl, XrTime t, int *trig, XoFrame *x, float *gx_, float *gy_)
+{
     float gx = -100000, gy = -100000;
     XrSpaceLocation loc = { XR_TYPE_SPACE_LOCATION };
     int aimed = 0;
-    xo.gun_valid = 0;
-    int located = XR_SUCCEEDED(xrLocateSpace(aim_space[g], local, t, &loc)) &&
+    x->gun_valid = 0;
+    x->p2 = pl;
+    int located = XR_SUCCEEDED(xrLocateSpace(aim_space[h], local, t, &loc)) &&
                   (loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) &&
                   (loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT);
-    if (!located && fake_gun()) {
-        /* LINDBERGH_XR_FAKE_GUN=1, for a headset or emulator without
-         * controllers: a gun at the right hip sweeping across the screen,
-         * firing in half-second bursts, and for one second in six pointed at
-         * the floor with the trigger held - the arcade's reload */
-        double s = (double)t / 1e9;
-        float yaw = (float)(0.25 * sin(s * 0.7)), pitch = (float)(0.05 + 0.08 * sin(s * 1.1));
-        static int fixed = -1; static float fyaw, fpitch;   /* LINDBERGH_XR_FAKE_AIM=yaw,pitch (radians): held still */
-        if (fixed < 0) { const char *v = getenv("LINDBERGH_XR_FAKE_AIM"); fixed = v && sscanf(v, "%f,%f", &fyaw, &fpitch) == 2; }
-        if (fixed) { yaw = fyaw; pitch = fpitch; }
-        int reload = fmod(s, 6.0) >= 5.0;
-        if (reload) pitch = -0.9f;
-        float cy = cosf(yaw / 2), sy = sinf(yaw / 2), cp = cosf(pitch / 2), sp = sinf(pitch / 2);
-        loc.pose.orientation = (XrQuaternionf){ sp * cy, cp * sy, -sp * sy, cp * cy };
-        loc.pose.position = (XrVector3f){ 0.16f, -0.22f, -0.28f };
-        static int ads = -1;            /* LINDBERGH_XR_FAKE_ADS=1: shouldered, looking through the sight */
-        if (ads < 0) { const char *v = getenv("LINDBERGH_XR_FAKE_ADS"); ads = v && *v == '1'; }
-        if (ads) {
-            loc.pose.position = (XrVector3f){ 0.0f, -0.080f, -0.16f };
-            yaw *= 0.15f; pitch = 0.0f; reload = 0;
-            cy = cosf(yaw / 2); sy = sinf(yaw / 2); cp = 1; sp = 0;
-            loc.pose.orientation = (XrQuaternionf){ sp * cy, cp * sy, -sp * sy, cp * cy };
-        }
-        trig[g] = reload || fmod(s, 1.0) < 0.5;
-        located = 1;
-    }
-    stereo_set_gun_ray(NULL, NULL, 0);     /* until the gun is found this frame */
+    if (!located && fake_gun() > pl) { fake_pose(pl, t, &loc, &trig[h]); located = 1; }
+    stereo_set_gun_ray(pl, NULL, NULL, 0);     /* until the gun is found this frame */
     if (located) {
         static const float fwd[3] = { 0, 0, -1 }, tip[3] = { 0, -0.006f, -0.26f };
         float d[3], p[3] = { loc.pose.position.x, loc.pose.position.y, loc.pose.position.z };
@@ -663,23 +656,23 @@ static void input_frame(XrTime t)
          * a scope, a menu - is a picture on the screen: aimed at where the
          * laser meets it. So is CQC, whose markers are 2D on the screen while
          * the enemy stands a metre away. */
-        float x, y, ah[3] = { 0, 0, 0 }, at, ax[3];
+        float xs_, ys_, ah[3] = { 0, 0, 0 }, at, ax[3];
         int flat = stereo_flat_frame() || stereo_cqc_active();
         if (flat) at = d[2] < -1e-4f ? (-cfg.screen * cfg.scale - o[2]) / d[2] : -1;
-        else if (aim_hit_t > 0) at = aim_hit_t;
+        else if (aim_hit_t[pl] > 0) at = aim_hit_t[pl];
         else at = d[2] < -1e-4f ? (-cfg.aim * cfg.scale - o[2]) / d[2] : -1;
         for (int i = 0; i < 3; i++) ax[i] = o[i] + d[i] * at;
-        memcpy(probe_o, o, sizeof probe_o); memcpy(probe_d, d, sizeof probe_d); probe_on = 1;
-        stereo_set_gun_ray(o, d, !menu.open);
+        memcpy(probe_o[pl], o, sizeof probe_o[pl]); memcpy(probe_d[pl], d, sizeof probe_d[pl]); probe_on[pl] = 1;
+        stereo_set_gun_ray(pl, o, d, !menu.open);
         int gw, gh;
         stereo_game_size(&gw, &gh);
-        if (at > 0 && stereo_ray_to_screen(ah, ax, &x, &y) && x >= 0 && x < gw && y >= 0 && y < gh) {
-            gx = x; gy = y; aimed = 1; aim_reach = at / cfg.scale;
+        if (at > 0 && stereo_ray_to_screen(ah, ax, &xs_, &ys_) && xs_ >= 0 && xs_ < gw && ys_ >= 0 && ys_ < gh) {
+            gx = xs_; gy = ys_; aimed = 1; aim_reach[pl] = at / cfg.scale;
         }
         /* A box the game hangs in front of its camera - the path choice's
          * views - is aimed at where the laser crosses it, not where it meets
          * the world behind: from the hand those are degrees apart */
-        aim_on_box = 0;
+        aim_on_box[pl] = 0;
         {
             float xs, ys, ts;
             /* a head-locked HUD's boxes hang in front of the face: the laser in the head's frame */
@@ -691,69 +684,114 @@ static void input_frame(XrTime t)
                                o[2] - head_pose.position.z * cfg.scale };
                 qrot(iq, r, ho); qrot(iq, d, hd);
             }
-            if (!flat && stereo_aim_box(head ? ho : o, head ? hd : d, head, &xs, &ys, &ts)) { gx = xs; gy = ys; aimed = 1; aim_reach = ts / cfg.scale; aim_on_box = 1; }
+            if (!flat && stereo_aim_box(head ? ho : o, head ? hd : d, head, &xs, &ys, &ts)) { gx = xs; gy = ys; aimed = 1; aim_reach[pl] = ts / cfg.scale; aim_on_box[pl] = 1; }
             /* or every shot where the laser crosses the HUD's screen: the game
              * draws its hit there, on its 2D (The House of the Dead 4 Special) */
             else if (!flat && stereo_aims_on_hud()) {
                 /* the laser still runs on to what it meets; only the game's
                  * point moves (a game firing from the gun's own ray hits by that) */
-                int was = aimed; float reach = aim_reach;
+                int was = aimed; float reach = aim_reach[pl];
                 aimed = 0; gx = gy = -100000;
                 if (stereo_ray_to_hud(head ? ho : o, head ? hd : d, head, &xs, &ys, &ts) && xs >= 0 && xs < gw && ys >= 0 && ys < gh) {
-                    gx = xs; gy = ys; aimed = 1; aim_reach = was ? reach : ts / cfg.scale;
+                    gx = xs; gy = ys; aimed = 1; aim_reach[pl] = was ? reach : ts / cfg.scale;
                 }
             }
         }
         /* the overlay: the gun on the aim pose, the laser to the game's screen */
-        xo.gun_valid = 1;
-        xo.gun_q[0] = loc.pose.orientation.x; xo.gun_q[1] = loc.pose.orientation.y;
-        xo.gun_q[2] = loc.pose.orientation.z; xo.gun_q[3] = loc.pose.orientation.w;
-        memcpy(xo.gun_p, p, sizeof p);
+        x->gun_valid = 1;
+        x->gun_q[0] = loc.pose.orientation.x; x->gun_q[1] = loc.pose.orientation.y;
+        x->gun_q[2] = loc.pose.orientation.z; x->gun_q[3] = loc.pose.orientation.w;
+        memcpy(x->gun_p, p, sizeof p);
         float m[3];
         qrot(loc.pose.orientation, tip, m);
-        for (int i = 0; i < 3; i++) xo.muzzle[i] = p[i] + m[i];
+        for (int i = 0; i < 3; i++) x->muzzle[i] = p[i] + m[i];
         float reach = 5.0f;
-        if (aimed) reach = aim_reach;
-        for (int i = 0; i < 3; i++) xo.end[i] = p[i] + d[i] * reach;
-        xo.beam = cfg.laser == LASER_ON;
-        xo.dot = aimed && cfg.laser != LASER_OFF;
+        if (aimed) reach = aim_reach[pl];
+        for (int i = 0; i < 3; i++) x->end[i] = p[i] + d[i] * reach;
+        x->beam = cfg.laser == LASER_ON;
+        x->dot = aimed && cfg.laser != LASER_OFF;
         if (menu.open) {        /* the laser points at the panel; the game is not aimed at */
             float u, v, hit[3];
             int on = menu_hit(p, d, &u, &v, hit);
             int row = on ? xm_row_at(u, v, M_COUNT) : -1;
-            if (row != menu.hover) { menu.hover = row; menu.dirty = 1; }
-            if (on) memcpy(xo.end, hit, sizeof hit);
-            xo.beam = 1; xo.dot = on;
-            if (trig[g] && !prev[g][0])     /* every pull on the panel, for a click that seems lost */
-                fprintf(stderr, "[xr] panel trigger: %s hand, %s at %.2f,%.2f, row %d\n", g == HAND_L ? "left" : "right",
+            /* the panel's highlight follows the gun last on it */
+            if (on && row != menu.hover) { menu.hover = row; menu.dirty = 1; }
+            if (!on && pl == 0 && !cfg.dual && menu.hover != -1) { menu.hover = -1; menu.dirty = 1; }
+            if (on) memcpy(x->end, hit, sizeof hit);
+            x->beam = 1; x->dot = on;
+            if (trig[h] && !prev[h][0])     /* every pull on the panel, for a click that seems lost */
+                fprintf(stderr, "[xr] panel trigger: %s hand, %s at %.2f,%.2f, row %d\n", h == HAND_L ? "left" : "right",
                         on ? "on the panel" : "off it", on ? u : -1, on ? v : -1, row);
-            if (trig[g] && !prev[g][0] && row >= 0 && !fake_menu) { menu_choose(row); rumble(g, 0.25f, 15); }
+            if (trig[h] && !prev[h][0] && row >= 0 && !fake_menu) { menu_choose(row); rumble(h, 0.25f, 15); }
             aimed = 0; gx = gy = -100000;
         }
     }
-    xo.sight = cfg.show_gun ? cfg.sight : XO_SIGHT_NONE;
-    xo.show_gun = cfg.show_gun;
-    xo.gun_model = game_profile()->vr.gun_model;
+    x->sight = cfg.show_gun ? cfg.sight : XO_SIGHT_NONE;
+    x->show_gun = cfg.show_gun;
+    x->gun_model = game_profile()->vr.gun_model;
+    *gx_ = gx; *gy_ = gy;
+    return aimed;
+}
+
+/* Firing: a kick, a flash and a pulse ten times a second while held on the
+ * screen - the cabinet gun's recoil. Returns whether the gun fires. */
+static int gun_fire(int pl, int h, XrTime t, int trig, int aimed, XoFrame *x)
+{
+    static XrTime fire_start[2];
+    static float last_phase[2] = { 1.0f, 1.0f };
+    int firing = trig && aimed && !menu.open;
+    if (firing && !prev[h][0]) fire_start[pl] = t;
+    float phase = firing ? fmodf((float)((t - fire_start[pl]) / 1000000) / 100.0f, 1.0f) : 1.0f;
+    x->recoil = firing ? 0.018f * (1.0f - phase) * (1.0f - phase) : 0;
+    x->flash = firing && phase < 0.35f;
+    if (firing && (phase < last_phase[pl])) rumble(h, 0.7f, 35);
+    last_phase[pl] = phase;
+    return firing;
+}
+
+static void input_frame(XrTime t)
+{
+    XrActiveActionSet as = { set, XR_NULL_PATH };
+    XrActionsSyncInfo sy = { XR_TYPE_ACTIONS_SYNC_INFO };
+    sy.countActiveActionSets = 1; sy.activeActionSets = &as;
+    if (XR_FAILED(xrSyncActions(session, &sy))) return;
+
+    /* Dual wielding (cfg.dual): each hand its own gun - gun_hand player 1,
+     * the other player 2. Otherwise one gun, in the hand last pulled with. */
+    int dual = cfg.dual;
+    int trig[2], grip[2], btn_a[2], btn_b[2], stick[2];
+    for (int h = 0; h < 2; h++) {
+        trig[h] = get_float(a_trigger, h) > 0.55f;
+        grip[h] = get_float(a_grip, h) > 0.6f;
+        btn_a[h] = get_bool(a_a, h); btn_b[h] = get_bool(a_b, h); stick[h] = get_bool(a_stick, h);
+        /* pulling the trigger on the other hand moves the gun there */
+        if (!dual && trig[h] && !prev[h][0] && h != gun_hand) gun_hand = h;
+    }
+    int menu_btn = get_bool(a_menu, HAND_L);
+    if (fake_menu < 0) { const char *v = getenv("LINDBERGH_XR_FAKE_MENU"); fake_menu = v && *v == '1'; }
+    if (fake_menu && !menu.open && views_ok) { menu.open = 1; menu_place(); menu.hover = -1; menu.dirty = 1; }
+    if (menu_btn && !prev[HAND_L][6]) {
+        menu.open = !menu.open; menu.reset_armed = 0;
+        fprintf(stderr, "[xr] settings panel %s\n", menu.open ? "open" : "closed");
+        if (menu.open) { menu_place(); menu.hover = -1; menu.dirty = 1; }
+    }
+    int g = gun_hand, off = 1 - g;
+
+    float gx, gy, g2x = -100000, g2y = -100000;
+    int aimed = aim_gun(g, 0, t, trig, &xo, &gx, &gy), aimed2 = 0;
+    if (dual) aimed2 = aim_gun(off, 1, t, trig, &xo2, &g2x, &g2y);
+    else { xo2.gun_valid = xo2.beam = xo2.dot = xo2.flash = 0; stereo_set_gun_ray(1, NULL, NULL, 0); }
     if (menu.open && menu.dirty) menu_paint();
 
-    /* firing: a kick, a flash and a pulse ten times a second while held on
-     * the screen - the cabinet gun's recoil */
-    static XrTime fire_start;
-    int firing = trig[g] && aimed && !menu.open;
-    if (firing && !prev[g][0]) fire_start = t;
-    float phase = firing ? fmodf((float)((t - fire_start) / 1000000) / 100.0f, 1.0f) : 1.0f;
-    static float last_phase = 1.0f;
-    xo.recoil = firing ? 0.018f * (1.0f - phase) * (1.0f - phase) : 0;
-    xo.flash = firing && phase < 0.35f;
-    if (firing && (phase < last_phase)) rumble(g, 0.7f, 35);
-    last_phase = phase;
+    int firing = gun_fire(0, g, t, trig[g], aimed, &xo);
+    int firing2 = dual && gun_fire(1, off, t, trig[off], aimed2, &xo2);
 
     /* the other hand's upper button (Y for the right-handed), held for a
-     * second, opens and closes the settings panel too */
-    int off = 1 - g;
+     * second, opens and closes the settings panel too - not when that hand
+     * is player 2's gun, whose buttons they are */
     static XrTime panel_held;
-    if (btn_b[off] && !prev[off][3]) panel_held = t;
-    if (btn_b[off] && panel_held && t - panel_held >= 1000000000) {
+    if (!dual && btn_b[off] && !prev[off][3]) panel_held = t;
+    if (!dual && btn_b[off] && panel_held && t - panel_held >= 1000000000) {
         panel_held = 0;
         menu.open = !menu.open; menu.reset_armed = 0;
         if (menu.open) { menu_place(); menu.hover = -1; menu.dirty = 1; }
@@ -788,38 +826,61 @@ static void input_frame(XrTime t)
         }
     }
 
-    if (trig[g] && !prev[g][0] && !menu.open)       /* each pull: where the game is told it went */
-        fprintf(stderr, "[aim] frame %u: pull at %d,%d%s (reach %.2f m, depth %s, flat %d%s)\n", g_frame, (int)gx, (int)gy,
-                aimed ? "" : " - off the screen", aim_reach, aim_hit_t > 0 ? "read" : "assumed", stereo_flat_frame(),
-                aim_on_box ? ", on a box" : "");
+    for (int pl = 0; pl < (dual ? 2 : 1); pl++) {      /* each pull: where the game is told it went */
+        int h = pl ? off : g, on = pl ? aimed2 : aimed;
+        if (trig[h] && !prev[h][0] && !menu.open)
+            fprintf(stderr, "[aim] frame %u: P%d pull at %d,%d%s (reach %.2f m, depth %s, flat %d%s)\n", g_frame, pl + 1,
+                    (int)(pl ? g2x : gx), (int)(pl ? g2y : gy), on ? "" : " - off the screen", aim_reach[pl],
+                    aim_hit_t[pl] > 0 ? "read" : "assumed", stereo_flat_frame(), aim_on_box[pl] ? ", on a box" : "");
+    }
 
+    /* each gun's buttons: player 1's, and with two guns player 2's (the same
+     * four, CAB_P2_SHIFT up) */
     unsigned held = 0;
-    if (firing) held |= CAB_P1_TRIGGER;
-    if (trig[g] && !aimed && !menu.open) held |= CAB_P1_RELOAD;  /* the arcade's reload: fire off the screen */
-    if (grip[g] && !menu.open) held |= CAB_P1_RELOAD;
+    for (int pl = 0; pl < (dual ? 2 : 1); pl++) {
+        int h = pl ? off : g, on = pl ? aimed2 : aimed;
+        unsigned b = 0;
+        if (pl ? firing2 : firing) b |= CAB_P1_TRIGGER;
+        if (trig[h] && !on && !menu.open) b |= CAB_P1_RELOAD;  /* the arcade's reload: fire off the screen */
+        if (grip[h] && !menu.open) b |= CAB_P1_RELOAD;
+        if (btn_a[h] && !menu.open) b |= CAB_P1_ACTION;
+        if (btn_b[h] && !menu.open) b |= CAB_P1_FIREMODE;
+        held |= pl ? b << CAB_P2_SHIFT : b;
+    }
     if (held & CAB_P1_RELOAD) reload_t = t;
     stereo_game_gun_reloading(reload_t && t - reload_t < 1500000000);
-    /* the other hand's X/A: a capture of what is on screen now, for a report */
-    if (btn_a[off] && !prev[off][2] && !menu.open) { stereo_capture(); rumble(off, 0.4f, 30); }
-    if (btn_a[g] && !menu.open) held |= CAB_P1_ACTION;
-    if (btn_b[g] && !menu.open) held |= CAB_P1_FIREMODE;
+    /* the other hand's X/A: a capture of what is on screen now, for a report
+     * (with two guns that hand's A is player 2's action button) */
+    if (!dual && btn_a[off] && !prev[off][2] && !menu.open) { stereo_capture(); rumble(off, 0.4f, 30); }
     if (menu.test_frames) { menu.test_frames--; held |= CAB_TEST; }
     if (menu.service_frames) { menu.service_frames--; held |= CAB_SERVICE; }
-    int start = (stick[0] || stick[1]) && !menu.open;
-    /* the stand-in gun presses Start for a moment every ten seconds too */
+    /* Start: either stick's click; with two guns each hand's is its player's */
+    int start = (dual ? stick[g] : stick[0] || stick[1]) && !menu.open;
+    int start2 = dual && stick[off] && !menu.open;
+    /* the stand-in gun presses Start for a moment every ten seconds too (its
+     * second one, five seconds later) */
     if (fake_gun() && fmod((double)t / 1e9, 10.0) < 0.2) start = 1;
+    if (dual && fake_gun() > 1 && fmod((double)t / 1e9 + 5.0, 10.0) < 0.2) start2 = 1;
     if (start) held |= CAB_P1_START;
+    if (start2) held |= CAB_P2_START;
     /* Coins: the left menu button, and with automatic coins one at start-up
-     * and one with every press of Start - Start alone plays and continues. */
+     * and one with every press of either Start - Start alone plays and continues. */
     static unsigned frames;
     int coin = menu.coin;
     menu.coin = 0;
-    if (cfg.auto_coins && ((++frames == 240) || (start && !prev[HAND_L][7]))) coin = 1;
-    prev[HAND_L][7] = start;
+    if (cfg.auto_coins) {
+        if (++frames == 240) coin++;
+        if (start && !prev[HAND_L][7]) coin++;
+        if (start2 && !prev[HAND_R][7]) coin++;
+    }
+    prev[HAND_L][7] = start; prev[HAND_R][7] = start2;
     stereo_set_gun((int)gx, (int)gy);
+    stereo_set_gun2((int)g2x, (int)g2y);
     host_vr_input((int)gx, (int)gy, held, coin);
+    host_vr_input2(dual, (int)g2x, (int)g2y);
 
     if (trig[g] && !aimed && !prev[g][0] && !menu.open) rumble(g, 0.3f, 40);
+    if (dual && trig[off] && !aimed2 && !prev[off][0] && !menu.open) rumble(off, 0.3f, 40);
     for (int h = 0; h < 2; h++) {
         prev[h][0] = trig[h]; prev[h][1] = grip[h]; prev[h][2] = btn_a[h];
         prev[h][3] = btn_b[h]; prev[h][4] = stick[h];
@@ -1296,7 +1357,11 @@ void xr_frame_begin(void)
         head_ok = 1;
     }
     if (state == XR_SESSION_STATE_FOCUSED) input_frame(frame.predictedDisplayTime);
-    else { host_vr_input(-100000, -100000, 0, 0); xo.gun_valid = xo.beam = xo.dot = xo.flash = 0; stereo_set_gun_ray(NULL, NULL, 0); }
+    else {
+        host_vr_input(-100000, -100000, 0, 0); host_vr_input2(0, -100000, -100000);
+        xo.gun_valid = xo.beam = xo.dot = xo.flash = 0; xo2.gun_valid = xo2.beam = xo2.dot = xo2.flash = 0;
+        stereo_set_gun_ray(0, NULL, NULL, 0); stereo_set_gun_ray(1, NULL, NULL, 0);
+    }
 }
 
 /* This frame's world depth, copied into each eye's depth swapchain image -
@@ -1364,17 +1429,18 @@ static void depth_capture(void)
 static void aim_probe(void)
 {
     depth_capture();
-    if (overlay_ok && probe_on) {
+    for (int pl = 0; overlay_ok && pl < 2; pl++) {
+        if (!probe_on[pl]) continue;
         float px[48][2], z[48], t[48];
         unsigned arr = 0;
         float zn = 0, zf = 0;
-        int n = stereo_aim_samples(probe_o, probe_d, 48, px, z, t, &arr, &zn, &zf);
-        float h = xo_probe(arr, (const float (*)[2])px, z, t, n, zn, zf);
-        if (h != -2) aim_hit_t = h;
-        probe_on = 0;
+        int n = stereo_aim_samples(probe_o[pl], probe_d[pl], 48, px, z, t, &arr, &zn, &zf);
+        float h = xo_probe(pl, arr, (const float (*)[2])px, z, t, n, zn, zf);
+        if (h != -2) aim_hit_t[pl] = h;
+        probe_on[pl] = 0;
         static int log = -1; static unsigned k;
         if (log < 0) { const char *v = getenv("LINDBERGH_AIM_LOG"); log = v && *v == '1'; }
-        if (log && ++k % 30 == 0) fprintf(stderr, "[aim] %d samples, laser reaches %.2f m\n", n, aim_hit_t / cfg.scale);
+        if (log && ++k % 30 == 0) fprintf(stderr, "[aim] P%d: %d samples, laser reaches %.2f m\n", pl + 1, n, aim_hit_t[pl] / cfg.scale);
     }
 }
 
@@ -1460,6 +1526,7 @@ void xr_frame_end(void)
                 mat4_mul(vp, proj, view);
                 float eye_pos[3] = { views[i].pose.position.x, views[i].pose.position.y, views[i].pose.position.z };
                 xo_draw(&xo, vp, eye_pos, (int)e->w, (int)e->h);
+                if (xo2.gun_valid) xo_draw(&xo2, vp, eye_pos, (int)e->w, (int)e->h);
                 if (menu.open) {
                     float pm[16], m[16];
                     memset(pm, 0, sizeof pm);
@@ -1471,6 +1538,7 @@ void xr_frame_end(void)
                     mat4_mul(m, vp, pm);
                     xo_draw_panel(m, (int)e->w, (int)e->h);
                     xo_draw(&xo, vp, eye_pos, (int)e->w, (int)e->h);   /* the gun and laser over the panel */
+                    if (xo2.gun_valid) xo_draw(&xo2, vp, eye_pos, (int)e->w, (int)e->h);
                 }
             }
             XrSwapchainImageReleaseInfo ri = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };

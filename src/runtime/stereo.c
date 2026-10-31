@@ -191,8 +191,11 @@ static int movie_draw(void)
     return 0;
 }
 static float    g_gun_ndc[2] = { -9, -9 };   /* where the gun points, in the game's NDC */
+static float    g_gun2_ndc[2] = { -9, -9 };  /* the second gun's (dual wielding); -9: none */
 static int      g_show_sight = 1;
 static GLuint   g_sight_tex, g_sight_cand;
+static GLuint   g_sight2_tex, g_sight2_cand;   /* the second gun's sight, when it differs */
+static unsigned g_sight2_hits, g_sight2_frame;
 static unsigned g_sight_hits, g_sight_frame;
 static float    g_sight_from[2];
 static GLint    g_menu_vp[4];           /* this frame's first sub-viewport a screen 3D draw used (LINDBERGH_HUD_LOG) */             /* the lens the screen was sized by at this frame's first 2D draw on it */
@@ -1034,7 +1037,8 @@ static float wide_place(CPU *c, const char *n)
      * being hit (two full-height halves) */
     if (w >= 1.9f || h >= 1.9f) { g_wide_span = 1; return 0; }
     float gx = (b[0] + b[2]) * 0.5f - g_gun_ndc[0], gy = (b[1] + b[3]) * 0.5f - g_gun_ndc[1];
-    int near_gun = g_gun_ndc[0] > -2 && gx * gx + gy * gy < 0.04f;
+    float g2x = (b[0] + b[2]) * 0.5f - g_gun2_ndc[0], g2y = (b[1] + b[3]) * 0.5f - g_gun2_ndc[1];
+    int near_gun = (g_gun_ndc[0] > -2 && gx * gx + gy * gy < 0.04f) || (g_gun2_ndc[0] > -2 && g2x * g2x + g2y * g2y < 0.04f);
     int follows = 0;
     if (last_frame == g_frame) {
         float lh = last[3] - last[1];
@@ -1073,7 +1077,20 @@ static int sight_draw(CPU *c, const char *n)
                     w * 320, h * 240, cx * 320, -cy * 240, (g_gun_ndc[0] + 1) * 320, (1 - g_gun_ndc[1]) * 240);
         }
     }
-    if (cx * cx * 100 + cy * cy * 56 > 0.02f) return 0;    /* centred on the gun, within a few pixels */
+    if (cx * cx * 100 + cy * cy * 56 > 0.02f) {            /* centred on the gun, within a few pixels */
+        /* or on the second gun: a sight already found (its own texture, or the same) */
+        float c2x = (b[0] + b[2]) * 0.5f - g_gun2_ndc[0], c2y = (b[1] + b[3]) * 0.5f - g_gun2_ndc[1];
+        if (g_gun2_ndc[0] < -2 || c2x * c2x * 100 + c2y * c2y * 56 > 0.02f) return 0;
+        if (g_tex2d_bound != g_sight_tex && !g_sight2_tex && g_sight_tex) {
+            if (g_tex2d_bound != g_sight2_cand) { g_sight2_cand = g_tex2d_bound; g_sight2_hits = 0; }
+            if (g_frame != g_sight2_frame) { g_sight2_frame = g_frame; g_sight2_hits++; }
+            if (g_sight2_hits >= 30) {      /* on the second gun, frame after frame */
+                g_sight2_tex = g_sight2_cand;
+                fprintf(stderr, "[stereo] frame %u: the second gun's sight is texture %u\n", g_frame, g_sight2_tex);
+            }
+        }
+        return !g_show_sight && g_sight_tex && (g_tex2d_bound == g_sight_tex || g_tex2d_bound == g_sight2_tex);
+    }
     if (!g_sight_tex) {
         if (g_tex2d_bound != g_sight_cand) {
             g_sight_cand = g_tex2d_bound; g_sight_hits = 0;
@@ -1087,7 +1104,7 @@ static int sight_draw(CPU *c, const char *n)
         }
         return 0;
     }
-    return !g_show_sight && g_tex2d_bound == g_sight_tex;
+    return !g_show_sight && (g_tex2d_bound == g_sight_tex || (g_sight2_tex && g_tex2d_bound == g_sight2_tex));
 }
 
 /* The world's lens: the one most of a frame's 3D is drawn with. The game's
@@ -3065,21 +3082,22 @@ void stereo_game_size(int *w, int *h) { *w = GAME_W; *h = GAME_H; }
 
 /* The gun's ray, from the headset, in the game camera's space and units: for
  * a game that fires from the gun itself (its own shot ray replaced) */
-static float g_gun_ray[6];
-static int   g_gun_ray_ok;
-void stereo_set_gun_ray(const float o[3], const float d[3], int ok)
+static float g_gun_ray[2][6];   /* per player: dual wielding has two */
+static int   g_gun_ray_ok[2];
+void stereo_set_gun_ray(int player, const float o[3], const float d[3], int ok)
 {
-    g_gun_ray_ok = 0;
+    if (player < 0 || player > 1) return;
+    g_gun_ray_ok[player] = 0;
     if (!ok) return;
     float co[3], cd[3];
     from_level(o, co); from_level(d, cd);
-    memcpy(g_gun_ray, co, sizeof co); memcpy(g_gun_ray + 3, cd, sizeof cd);
-    g_gun_ray_ok = 1;
+    memcpy(g_gun_ray[player], co, sizeof co); memcpy(g_gun_ray[player] + 3, cd, sizeof cd);
+    g_gun_ray_ok[player] = 1;
 }
-int stereo_gun_ray(float o[3], float d[3])
+int stereo_gun_ray(int player, float o[3], float d[3])
 {
-    if (!g_gun_ray_ok) return 0;
-    memcpy(o, g_gun_ray, 12); memcpy(d, g_gun_ray + 3, 12);
+    if (player < 0 || player > 1 || !g_gun_ray_ok[player]) return 0;
+    memcpy(o, g_gun_ray[player], 12); memcpy(d, g_gun_ray[player] + 3, 12);
     return 1;
 }
 
@@ -3246,6 +3264,13 @@ void stereo_start(void)
     }
     g_on = 1;
     fprintf(stderr, "[stereo] on: %dx%d per eye (x%.2f, x%.2f of the game's %dx%d)\n", g_ew, g_eh, g_sx, g_sy, GAME_W, GAME_H);
+}
+
+void stereo_set_gun2(int x, int y)
+{
+    if (x < -1000 || y < -1000) { g_gun2_ndc[0] = g_gun2_ndc[1] = -9; return; }
+    g_gun2_ndc[0] = x / (GAME_W * 0.5f) - 1;
+    g_gun2_ndc[1] = 1 - y / (GAME_H * 0.5f);
 }
 
 void stereo_set_gun(int x, int y)
