@@ -505,6 +505,12 @@ static uint32_t put_sync(CPU *c, HleId id, HleHandler fn)
 
 /* the viewport and scissor box the game last set (shadow_state, below) */
 static HleId g_id_viewport, g_id_scissor, g_id_popattrib, g_id_getint, g_id_makecurrent;
+static HleId g_id_getctx, g_id_getdraw;
+/* the drawable the game last made current, for glXGetCurrentDrawable without
+ * waiting (hle_glx_posix.c says what that call answers for it) */
+static uint32_t g_draw_answer; static int g_draw_known;
+__attribute__((weak)) uint32_t glx_current_context(void);
+__attribute__((weak)) uint32_t glx_drawable_answer(uint32_t drawable);
 static int32_t g_vp_shadow[4], g_sc_shadow[4];
 static int g_vp_known, g_sc_known;
 extern unsigned g_frame;
@@ -551,6 +557,8 @@ static void shadow_ids(void)
         else if (!strcmp(n, "glPopAttrib")) g_id_popattrib = (HleId)i;
         else if (!strcmp(n, "glGetIntegerv")) g_id_getint = (HleId)i;
         else if (!strcmp(n, "glXMakeCurrent")) g_id_makecurrent = (HleId)i;
+        else if (!strcmp(n, "glXGetCurrentContext")) g_id_getctx = (HleId)i;
+        else if (!strcmp(n, "glXGetCurrentDrawable")) g_id_getdraw = (HleId)i;
     }
 }
 /* 1: the call was a read answered here */
@@ -749,7 +757,18 @@ static void glq_hook(CPU *c, HleId id, HleHandler fn)
          * framebuffer and succeeds (the window is up by then) - queued, and
          * answered here. Twice a frame in The House of the Dead 4, around a
          * pass into a pbuffer; each made the game wait for the whole queue. */
-        if (id == g_id_makecurrent && g_id_makecurrent && A32(2) && copy_on()) { c->eax = 1; break; }
+        if (id == g_id_makecurrent && g_id_makecurrent && A32(2) && copy_on()) {
+            if (glx_drawable_answer) { g_draw_answer = glx_drawable_answer(A32(1)); g_draw_known = 1; }
+            c->eax = 1; break;
+        }
+        /* where the game is drawing, asked twice a frame by Let's Go Jungle!:
+         * answered here, as the worker will have it */
+        if (id == g_id_getctx && g_id_getctx && glx_current_context && copy_on()) { c->eax = glx_current_context(); return; }
+        if (id == g_id_getdraw && g_id_getdraw && g_draw_known && copy_on()) { c->eax = g_draw_answer; return; }
+        if (id == g_id_getdraw && g_id_getdraw) {       /* asked the worker once: kept until the next glXMakeCurrent */
+            call_sync(c, id, fn); g_draw_answer = c->eax; g_draw_known = 1; return;
+        }
+        g_draw_known = 0;                  /* any other glX call: asked again next time */
         async = 0; break;
     case C_DIRECT: fn(c); return;
     case C_VAL: break;

@@ -245,6 +245,14 @@ static void h_glXSwapBuffers(CPU *c)
 }
 
 static void h_glXGetCurrentContext(CPU *c)  { RET(TOK_CONTEXT); }
+/* the GL queue's answers on the game thread (gl_thread.c): the same as the
+ * handlers give once the worker has made that drawable current */
+uint32_t glx_current_context(void) { return TOK_CONTEXT; }
+uint32_t glx_drawable_answer(uint32_t drawable)
+{
+    int i = pb_index(drawable);
+    return i > 0 ? TOK_PBUFFER | (uint32_t)i : TOK_WINDOW;
+}
 static void h_glXGetCurrentDisplay(CPU *c)  { RET(build_display()); }
 static void h_glXGetCurrentDrawable(CPU *c)
 {
