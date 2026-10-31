@@ -1519,7 +1519,20 @@ static int transform_call(CPU *c, HleId id, const char *n)
         return 1;
     }
     if (k == K_TEXSUB) {                /* noted for a capture only */
-        if (A32(1) == 0) { GLint bt = 0; glGetIntegerv(GL_TEXTURE_BINDING_2D, &bt); tex_hist((GLuint)bt, "updated (glTexSubImage2D)", AI32(4), AI32(5)); }
+        if (A32(1) == 0) { GLint bt = 0; glGetIntegerv(GL_TEXTURE_BINDING_2D, &bt); tex_hist((GLuint)bt, "updated (glTexSubImage2D)", AI32(4), AI32(5));
+            static int lg = -1;     /* LINDBERGH_TEXSUB_LOG=1: big updates, now and then, with how bright their pixels are */
+            if (lg < 0) { const char *v = getenv("LINDBERGH_TEXSUB_LOG"); lg = v && *v == '1'; }
+            if (lg && AI32(4) * AI32(5) >= 256 * 256 && g_frame % 60 == 0) {
+                const unsigned char *src = (const unsigned char *)APTR(8);
+                long sum = 0; int n = 0;
+                GLenum fmt = A32(6), type = A32(7);
+                int bpp = type == GL_UNSIGNED_BYTE ? (fmt == GL_RGB || fmt == 0x80E0 ? 3 : fmt == GL_LUMINANCE || fmt == GL_ALPHA ? 1 : 4) : 4;
+                size_t bytes = (size_t)AI32(4) * AI32(5) * bpp;
+                for (size_t o = 0; src && o + 3 < bytes; o += bytes / 997 / bpp * bpp + bpp) { sum += src[o]; n++; }
+                fprintf(stderr, "[texsub] frame %u: texture %d %dx%d at %d,%d format %#x type %#x, source mean %.1f\n", g_frame, bt,
+                        AI32(4), AI32(5), AI32(2), AI32(3), fmt, type, n ? (double)sum / n : -1.0);
+            }
+        }
         return 0;
     }
     if (k == K_TEXIMAGE) {
