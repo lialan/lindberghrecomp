@@ -5,7 +5,7 @@
 #define XR_OVERLAY_H
 
 enum { XO_SIGHT_NONE, XO_SIGHT_RED_DOT, XO_SIGHT_HOLO };
-enum { XO_GUN_SMG, XO_GUN_TP9 };
+enum { XO_GUN_SMG, XO_GUN_TP9, XO_GUN_GHOST_SQUAD };
 
 /* One headset frame's worth, in metres in the LOCAL space. */
 typedef struct {

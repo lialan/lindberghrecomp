@@ -68,13 +68,14 @@ static GLint u_gun_mvp, u_gun_model, u_beam_mvp, u_beam_color, u_beam_shape;
 static int gun_verts;
 
 /* ---- the gun ----
- * Two models, chosen by the game's profile: Quaternius' SubmachineGun_2 (CC0),
- * made into xr_gun_model.h by quest/tools/obj2gun.py, and a B&T TP9 built by
- * quest/tools/tp9gun.py into xr_gun_tp9.h. Both: barrel along -Z on the aim
+ * Chosen by the game's profile: Quaternius' SubmachineGun_2 (CC0), made into
+ * xr_gun_model.h by quest/tools/obj2gun.py; a B&T TP9 and the Ghost Squad
+ * cabinet's gun, built by quest/tools/gunbuild.py (xr_gun_tp9.h, xr_gun_gs.h). Both: barrel along -Z on the aim
  * ray, the rail on top. A sight goes on the rail, built from boxes here: its
  * glass is where the reticle shows. */
 #include "xr_gun_model.h"
 #include "xr_gun_tp9.h"
+#include "xr_gun_gs.h"
 
 /* a debug switch, looked up once */
 #define ENV_ON(name) ({ static int _on = -1; if (_on < 0) _on = getenv(name) != NULL; _on; })
@@ -99,7 +100,8 @@ static const Box HOLO[] = {             /* a window sight, like an EOTech */
 static const float GLASS[3][4] = { { 0, 0, 0, 0 }, { 0.018f, 0.0095f, 0.0085f, 0.0145f },
                                    { 0.004f, 0.016f, 0.017f, 0.030f } };
 
-#define MAX_VERTS (GUN_VERTS > TP9_VERTS ? GUN_VERTS : TP9_VERTS)
+#define MAX2(a, b) ((a) > (b) ? (a) : (b))
+#define MAX_VERTS MAX2(MAX2(GUN_VERTS, TP9_VERTS), GS_VERTS)
 static float mesh[(MAX_VERTS + 8 * 36) * 9];
 static float rail_y;                    /* the current gun's rail top */
 
@@ -130,6 +132,7 @@ static void build_gun(int sight, int model)
 {
     int n;
     if (model == XO_GUN_TP9) { memcpy(mesh, TP9_MESH, sizeof TP9_MESH); n = TP9_VERTS; rail_y = TP9_RAIL_Y; }
+    else if (model == XO_GUN_GHOST_SQUAD) { memcpy(mesh, GS_MESH, sizeof GS_MESH); n = GS_VERTS; rail_y = GS_RAIL_Y; }
     else { memcpy(mesh, GUN_MESH, sizeof GUN_MESH); n = GUN_VERTS; rail_y = GUN_RAIL_Y; }
     if (sight == XO_SIGHT_RED_DOT) add_boxes(&n, RED_DOT, (int)(sizeof RED_DOT / sizeof *RED_DOT));
     if (sight == XO_SIGHT_HOLO) add_boxes(&n, HOLO, (int)(sizeof HOLO / sizeof *HOLO));
