@@ -3063,6 +3063,27 @@ int stereo_ray_to_screen(const float o_[3], const float d_[3], float *x, float *
 
 void stereo_game_size(int *w, int *h) { *w = GAME_W; *h = GAME_H; }
 
+/* The gun's ray, from the headset, in the game camera's space and units: for
+ * a game that fires from the gun itself (its own shot ray replaced) */
+static float g_gun_ray[6];
+static int   g_gun_ray_ok;
+void stereo_set_gun_ray(const float o[3], const float d[3], int ok)
+{
+    g_gun_ray_ok = 0;
+    if (!ok) return;
+    float co[3], cd[3];
+    from_level(o, co); from_level(d, cd);
+    memcpy(g_gun_ray, co, sizeof co); memcpy(g_gun_ray + 3, cd, sizeof cd);
+    g_gun_ray_ok = 1;
+}
+int stereo_gun_ray(float o[3], float d[3])
+{
+    if (!g_gun_ray_ok) return 0;
+    memcpy(o, g_gun_ray, 12); memcpy(d, g_gun_ray + 3, 12);
+    return 1;
+}
+
+
 /* Where the laser crosses the HUD's screen - in front of the face, for a
  * head-locked HUD (the ray then in the head's frame) - in game pixels, and
  * how far along the ray. A game aimed there (vr.aim_on_hud) puts its shot

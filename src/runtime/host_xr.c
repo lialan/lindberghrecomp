@@ -646,6 +646,7 @@ static void input_frame(XrTime t)
         trig[g] = reload || fmod(s, 1.0) < 0.5;
         located = 1;
     }
+    stereo_set_gun_ray(NULL, NULL, 0);     /* until the gun is found this frame */
     if (located) {
         static const float fwd[3] = { 0, 0, -1 }, tip[3] = { 0, -0.006f, -0.26f };
         float d[3], p[3] = { loc.pose.position.x, loc.pose.position.y, loc.pose.position.z };
@@ -669,6 +670,7 @@ static void input_frame(XrTime t)
         else at = d[2] < -1e-4f ? (-cfg.aim * cfg.scale - o[2]) / d[2] : -1;
         for (int i = 0; i < 3; i++) ax[i] = o[i] + d[i] * at;
         memcpy(probe_o, o, sizeof probe_o); memcpy(probe_d, d, sizeof probe_d); probe_on = 1;
+        stereo_set_gun_ray(o, d, !menu.open);
         int gw, gh;
         stereo_game_size(&gw, &gh);
         if (at > 0 && stereo_ray_to_screen(ah, ax, &x, &y) && x >= 0 && x < gw && y >= 0 && y < gh) {
@@ -1290,7 +1292,7 @@ void xr_frame_begin(void)
         head_ok = 1;
     }
     if (state == XR_SESSION_STATE_FOCUSED) input_frame(frame.predictedDisplayTime);
-    else { host_vr_input(-100000, -100000, 0, 0); xo.gun_valid = xo.beam = xo.dot = xo.flash = 0; }
+    else { host_vr_input(-100000, -100000, 0, 0); xo.gun_valid = xo.beam = xo.dot = xo.flash = 0; stereo_set_gun_ray(NULL, NULL, 0); }
 }
 
 /* This frame's world depth, copied into each eye's depth swapchain image -
