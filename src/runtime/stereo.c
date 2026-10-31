@@ -231,7 +231,9 @@ static int is_perspective(const float *m) { return fabsf(m[11] + 1) < 1e-4f && f
  * exactly where the arcade monitor showed it. */
 /* The view the HUD's screen is seen through: the game camera's, so it stays
  * put in the world, or the head's, so it stays in front of the face */
-static long g_cap_frame = -100;                 /* stereo_capture: the frame whose draws are logged */
+static long g_cap_frame = -100;
+static void tex_hist(GLuint tex, const char *how, int w, int h);
+static void cap_note_tex(GLuint tex);                 /* stereo_capture: the frame whose draws are logged */
 static float g_hud_pitch;                       /* a head-locked HUD tilted up (+) or down, radians */
 static const float *hud_view(int eye)
 {
@@ -1292,7 +1294,9 @@ static void aim_box_track(CPU *c, int k)
                  k == K_ORTHO || k == K_ORTHO2D || k == K_FRUSTUM || k == K_PERSPECTIVE) g_mv_ident = 0;
     }
     if ((k == K_COPYTEXSUB || k == K_COPYTEX) && getenv("LINDBERGH_COPY_LOG"))    /* each copy of the screen */
-        fprintf(stderr, "[copy] frame %u: %s fb %u tex %u\n", g_frame, k == K_COPYTEX ? "whole" : "part", (unsigned)g_game_fb, g_tex2d_bound);
+        { GLint bt = 0; glGetIntegerv(GL_TEXTURE_BINDING_2D, &bt);
+          fprintf(stderr, "[copy] frame %u: %s fb %u into texture %d (unit0 has %u), %dx%d\n", g_frame, k == K_COPYTEX ? "whole" : "part",
+                  (unsigned)g_game_fb, bt, g_tex2d_bound, k == K_COPYTEX ? AI32(5) : AI32(6), k == K_COPYTEX ? AI32(6) : AI32(7)); }
     if (k == K_COPYTEXSUB || k == K_COPYTEX) {         /* a texture the game renders into: a view */
         /* the game's own name for it, as the draws bind it: in the headset GL
          * may have a larger stand-in of a render target bound instead */
@@ -1442,6 +1446,11 @@ static int transform_call(CPU *c, HleId id, const char *n)
         return 1;
     }
     if (k == K_OTHER) return 0;
+    if (k == K_COPYTEXSUB || k == K_COPYTEX) {
+        GLint bt = 0; glGetIntegerv(GL_TEXTURE_BINDING_2D, &bt);
+        tex_hist((GLuint)bt, g_side ? "copied from a side pass" : g_game_fb ? "copied from a target" : "copied from the eyes",
+                 k == K_COPYTEX ? AI32(5) : AI32(6), k == K_COPYTEX ? AI32(6) : AI32(7));
+    }
     if (g_on && (k == K_COPYTEXSUB || k == K_COPYTEX)) return copy_from_eyes(c, k);
     /* A copy of the screen drawn back over a world drawn this frame (a post
      * effect) would flatten it to one eye's picture: left out. Over no world
@@ -1510,6 +1519,7 @@ static int transform_call(CPU *c, HleId id, const char *n)
         return 1;
     }
     if (k == K_TEXIMAGE) {
+        if (A32(1) == 0) { GLint bt = 0; glGetIntegerv(GL_TEXTURE_BINDING_2D, &bt); tex_hist((GLuint)bt, APTR(8) ? "uploaded" : "allocated", AI32(3), AI32(4)); }
         GLenum ifmt = A32(2);
         int is_float = ifmt == 0x881A || ifmt == 0x881B || ifmt == 0x8814 || ifmt == 0x8815;   /* RGBA/RGB 16F, 32F */
         static int rt8 = -1;           /* LINDBERGH_RT_8BIT=1: not kept (a debugging aid) */
@@ -1527,6 +1537,7 @@ static int transform_call(CPU *c, HleId id, const char *n)
         return 0;
     }
     if (k == K_FBTEX2D) {
+        if (A32(1) == GL_COLOR_ATTACHMENT0) tex_hist(A32(3), "rendered into (attached)", 0, 0);
         scale_target(A32(2), A32(3), A32(1));
         note_fb_scale(g_game_fb, A32(3));
         if (!g_side) fb_scale(g_game_fb, g_cur_k);
@@ -1590,10 +1601,12 @@ static int transform_call(CPU *c, HleId id, const char *n)
                         : !(g_unit0_rect || picture_2d(g_tex2d_bound) || picture_fb(g_game_fb)) || !covers_viewport(c, n);
         if (offscreen_fb(g_game_fb) || g_flat) hud = 2;  /* the game's own projection, untouched */
         if (hud == 1 && !persp && g_mv && fills_screen(c, n)) hud = 3;
-        { static long dl = -2; if (dl == -2) { const char *v = getenv("LINDBERGH_DRAW_LOG"); dl = v ? atol(v) : -1; }
-          if (((dl >= 0 && g_frame == (unsigned)dl) || (long)g_frame == g_cap_frame) && !g_replaying) {   /* LINDBERGH_DRAW_LOG=<frame>: each draw's class */
+        { static long dl = -2, dl1; if (dl == -2) { const char *v = getenv("LINDBERGH_DRAW_LOG"); dl = v ? atol(v) : -1;
+                                                     dl1 = v && strchr(v, '-') ? atol(strchr(v, '-') + 1) : dl; }   /* =<frame>[-<last>] */
+          if ((long)g_frame == g_cap_frame && !g_replaying) cap_note_tex(g_tex2d_bound);
+          if (((dl >= 0 && (long)g_frame >= dl && (long)g_frame <= dl1) || (long)g_frame == g_cap_frame) && !g_replaying) {   /* LINDBERGH_DRAW_LOG=<frame>: each draw's class */
               float mv[16]; glGetFloatv(GL_MODELVIEW_MATRIX, mv);
-              fprintf(stderr, "[draw] %s fb %u tex %u persp %d ident %d hud %d lens %.3f,%.3f vp %d,%d %dx%d mv-t %.3f,%.3f,%.3f gun %.3f,%.3f\n", hle_name(g_cur_id), (unsigned)g_game_fb,
+              fprintf(stderr, "[draw] f%u %s fb %u tex %u persp %d ident %d hud %d lens %.3f,%.3f vp %d,%d %dx%d mv-t %.3f,%.3f,%.3f gun %.3f,%.3f\n", g_frame, hle_name(g_cur_id), (unsigned)g_game_fb,
                       g_tex2d_bound, persp, g_mv_ident, hud, g_proj[g_proj_top][0], g_proj[g_proj_top][5], g_vp[0], g_vp[1], g_vp[2], g_vp[3],
                       mv[12], mv[13], mv[14], g_gun_ndc[0], g_gun_ndc[1]);
           } }
@@ -2297,6 +2310,42 @@ static void write_ppm(const char *name, int w, int h, const unsigned char *rgba)
     fclose(f);
 }
 
+/* How each texture was last filled, for a capture to report (the last 64) */
+#define MAX_TEX_HIST 64
+static struct { GLuint tex; unsigned frame; int w, h; char how[32]; } g_tex_hist[MAX_TEX_HIST];
+static unsigned g_ntex_hist;
+static void tex_hist(GLuint tex, const char *how, int w, int h)
+{
+    if (!tex) return;
+    unsigned i = 0;
+    while (i < g_ntex_hist && i < MAX_TEX_HIST && g_tex_hist[i].tex != tex) i++;
+    if (i >= MAX_TEX_HIST) i = g_ntex_hist++ % MAX_TEX_HIST;
+    else if (i == g_ntex_hist) g_ntex_hist++;
+    g_tex_hist[i].tex = tex; g_tex_hist[i].frame = g_frame; g_tex_hist[i].w = w; g_tex_hist[i].h = h;
+    snprintf(g_tex_hist[i].how, sizeof g_tex_hist[i].how, "%s", how);
+}
+static GLuint g_cap_tex[16];
+static unsigned g_ncap_tex;
+static void cap_note_tex(GLuint tex)
+{
+    for (unsigned i = 0; i < g_ncap_tex; i++) if (g_cap_tex[i] == tex) return;
+    if (g_ncap_tex < 16) g_cap_tex[g_ncap_tex++] = tex;
+}
+static void cap_report(void)
+{
+    for (unsigned i = 0; i < g_ncap_tex; i++) {
+        GLuint t = g_cap_tex[i];
+        unsigned j = 0;
+        while (j < g_ntex_hist && j < MAX_TEX_HIST && g_tex_hist[j].tex != t) j++;
+        if (j < g_ntex_hist && j < MAX_TEX_HIST)
+            fprintf(stderr, "[capture] texture %u: %s at frame %u, %dx%d%s%s\n", t, g_tex_hist[j].how, g_tex_hist[j].frame,
+                    g_tex_hist[j].w, g_tex_hist[j].h, screen_copy(t) ? ", a screen copy" : "", scaled(t) ? ", eye-sized target" : "");
+        else fprintf(stderr, "[capture] texture %u: not seen filled (glTexSubImage2D, or before the last 64)%s\n", t,
+                     scaled(t) ? ", eye-sized target" : "");
+    }
+    g_ncap_tex = 0;
+}
+
 /* A capture asked for while playing (the headset's X button): the next
  * frame's draws logged, and the eyes saved then and twice more after */
 void stereo_capture(void)
@@ -2319,6 +2368,7 @@ static void dump_targets(void)
         if (s2) es = atol(s2 + 1) > 0 ? atol(s2 + 1) : 1;   /* ,<stride>: every stride-th frame, a quarter the size */
     }
     long cf = (long)g_frame - g_cap_frame;
+    if (cf == 0) cap_report();
     if ((e0 >= 0 && (long)g_frame >= e0 && (long)g_frame < e0 + en && ((long)g_frame - e0) % es == 0) ||
         cf == 0 || cf == 6 || cf == 12) {
         for (int layer = 0; layer < (g_mv ? 2 : 1); layer++) {     /* eye_ the left eye, eyeR_ the right */
