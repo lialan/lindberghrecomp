@@ -1012,16 +1012,18 @@ static void host_frame_done(void)
             g_t_game = g_t_eye2 = g_t_submit = g_t_wait = 0;
             {   /* shaders built in those 5 seconds: the driver's compiles and links
                  * (gl4es), and the programs the disk caches gave or did not */
-                extern unsigned gl4es_stat_compiles, gl4es_stat_links, gl4es_stat_fpe_hits, gl4es_stat_fpe_built;
+                extern unsigned gl4es_stat_compiles, gl4es_stat_links, gl4es_stat_fpe_hits, gl4es_stat_fpe_built, gl4es_stat_app_hits, gl4es_stat_app_built;
                 extern double gl4es_stat_compile_ms, gl4es_stat_link_ms;
                 void arbprog_build_stats(unsigned *, unsigned *, double *);
                 unsigned ah, ab; double ams;
                 arbprog_build_stats(&ah, &ab, &ams);
-                if (gl4es_stat_compiles || gl4es_stat_links || ah || ab || gl4es_stat_fpe_hits || gl4es_stat_fpe_built)
+                if (gl4es_stat_compiles || gl4es_stat_links || ah || ab || gl4es_stat_fpe_hits || gl4es_stat_fpe_built || gl4es_stat_app_hits || gl4es_stat_app_built)
                     fprintf(stderr, "[shaders] frame %u: driver compiled %u (%.0f ms), linked %u (%.0f ms); Cg programs %u cached, %u built (%.0f ms);"
-                                    " fixed-function %u cached, %u built\n", g_frame, gl4es_stat_compiles, gl4es_stat_compile_ms,
-                            gl4es_stat_links, gl4es_stat_link_ms, ah, ab, ams, gl4es_stat_fpe_hits, gl4es_stat_fpe_built);
+                                    " fixed-function %u cached, %u built; all programs %u cached, %u built\n", g_frame, gl4es_stat_compiles, gl4es_stat_compile_ms,
+                            gl4es_stat_links, gl4es_stat_link_ms, ah, ab, ams, gl4es_stat_fpe_hits, gl4es_stat_fpe_built,
+                            gl4es_stat_app_hits, gl4es_stat_app_built);
                 gl4es_stat_compiles = gl4es_stat_links = gl4es_stat_fpe_hits = gl4es_stat_fpe_built = 0;
+                gl4es_stat_app_hits = gl4es_stat_app_built = 0;
                 gl4es_stat_compile_ms = gl4es_stat_link_ms = 0;
             }
 #else
