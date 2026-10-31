@@ -198,6 +198,8 @@ def compile_pair(row, root, output, validator, reflector):
             "spirv_sha256": {stage: hashlib.sha256((dest / (stage + ".spv")).read_bytes()).hexdigest()
                              for stage in ("vert", "frag")},
             "sources": {stage: hashlib.sha256(data).hexdigest() for stage, data in zip(("vert", "frag"), raw)},
+            "lookup_sources": {stage: hashlib.sha256((root / row.get("original_" + kind, row[kind])).read_bytes()).hexdigest()
+                               for stage, kind in (("vert", "vertex"), ("frag", "fragment"))},
             "attributes": bound_attributes, "samplers": samplers, "reflection": reflection}
     (dest / "program.json").write_text(json.dumps(meta, indent=2) + "\n")
     return meta

@@ -11,7 +11,12 @@ converter = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(converter)
 output = Path(sys.argv[1]).resolve()
 output.mkdir(parents=True, exist_ok=True)
-result = converter.compile_pair({"program": 1, "vertex": "legacy.vert", "fragment": "legacy.frag", "attributes": []},
+# Model an offline compatibility repair: compile the repaired source while
+# retaining the original guest source identity for runtime lookup.
+patched = output / "repaired.vert"
+patched.write_text((Path(__file__).parent / "legacy.vert").read_text().replace("void main() {", "void main() { float unused_repair_value = 0.0;"))
+result = converter.compile_pair({"program": 1, "vertex": str(patched), "fragment": "legacy.frag",
+                                 "original_vertex": "legacy.vert", "attributes": []},
                                 Path(__file__).parent, output, sys.argv[2], sys.argv[3])
 for stage in ("vert", "frag"):
     shutil.copy2(output / result["key"] / (stage + ".spv"), output / (stage + ".spv"))

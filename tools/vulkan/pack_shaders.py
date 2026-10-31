@@ -61,7 +61,7 @@ def pack(programs, root, output):
         meta = json.loads((root / key / "program.json").read_text())
         data.extend(bytes.fromhex(key))
         for stage in ("vert", "frag"):
-            data.extend(bytes.fromhex(meta["sources"][stage]))
+            data.extend(bytes.fromhex(meta.get("lookup_sources", meta["sources"])[stage]))
             spv = (root / key / (stage + ".spv")).read_bytes()
             if len(spv) % 4 or len(spv) < 20 or struct.unpack_from("<I", spv)[0] != 0x07230203:
                 raise ValueError(f"Invalid SPIR-V module: {key}/{stage}")
