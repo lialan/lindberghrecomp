@@ -119,6 +119,8 @@ static int      g_loaded_hud;           /* the projection GL has is the HUD's sc
 static int      g_hud_nowrite;          /* this 2D draw's depth writes are off, to be put back */
 static int      g_hud_offset;           /* this 2D draw is pulled nearer by a polygon offset, to be put back */
 static unsigned g_2d_seq;               /* 2D-camera draws so far this frame */
+static unsigned g_3d_draws;             /* 3D draws so far this frame, wherever they went (g_scene_draws leaves out
+                                         * the HUD's target - the window, for a game that draws both there) */
 static GLuint   g_unit0_rect;           /* render target bound to texture unit 0 */
 static GLenum   g_active_unit = GL_TEXTURE0;
 static GLuint   g_rect_bound[8];        /* rectangle texture bound to each unit */
@@ -1625,6 +1627,7 @@ static int transform_call(CPU *c, HleId id, const char *n)
             if (!g_replaying) tally_lens(g_proj[g_proj_top]);
             if (is_draw(k) && weapon_draw()) return 1;
         }
+        if (persp && !g_flat && !g_replaying && !offscreen_fb(g_game_fb)) g_3d_draws++;
         if (persp && g_game_fb != g_hud_fb && !g_replaying && !offscreen_fb(g_game_fb)) { g_scene_draws++; g_world_fb_next = g_game_fb; if (g_env_proj) arb_camera_count(); }
         if (persp && g_proj[g_proj_top][0] > g_lens_seen) g_lens_seen = g_proj[g_proj_top][0];
         if (persp && !g_replaying && g_game_fb != g_hud_fb) {
@@ -1723,12 +1726,12 @@ static int transform_call(CPU *c, HleId id, const char *n)
         /* Only on a frame with no world (the loading screen, the opening's
          * screens): over a world it writes no depth, as below - the aim reads
          * the world's depth at the frame's end, and that 2D lay over it */
-        if (hud == 1 && !persp && is_perspective(g_proj[g_proj_top]) && g_mv && !g_replaying && !g_scene_draws) {
+        if (hud == 1 && !persp && is_perspective(g_proj[g_proj_top]) && g_mv && !g_replaying && !g_3d_draws) {
             glEnable(GL_POLYGON_OFFSET_FILL);
             glPolygonOffset(0, -4.0f * (float)(++g_2d_seq));
             g_hud_offset = 1;
         }
-        if (hud == 1 && !persp && (!is_perspective(g_proj[g_proj_top]) || g_scene_draws)) {
+        if (hud == 1 && !persp && (!is_perspective(g_proj[g_proj_top]) || g_3d_draws)) {
             GLboolean wm = GL_FALSE;
             glGetBooleanv(GL_DEPTH_WRITEMASK, &wm);
             if (wm) { glDepthMask(GL_FALSE); g_hud_nowrite = 1; }
@@ -2823,6 +2826,7 @@ void stereo_frame_begin(void)
     g_near_seen = 0;
     g_scene_draws = 0;
     g_2d_seq = 0;
+    g_3d_draws = 0;
     {
         static int flat_env = -1;
         if (flat_env < 0) { const char *v = getenv("LINDBERGH_FLAT_MENUS"); flat_env = !v || *v != '0'; }
