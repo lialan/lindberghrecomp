@@ -2312,7 +2312,7 @@ static void write_ppm(const char *name, int w, int h, const unsigned char *rgba)
 
 /* How each texture was last filled, for a capture to report (the last 64) */
 #define MAX_TEX_HIST 64
-static struct { GLuint tex; unsigned frame; int w, h; char how[32]; } g_tex_hist[MAX_TEX_HIST];
+static struct { GLuint tex; unsigned frame; int w, h, attached; char how[32]; } g_tex_hist[MAX_TEX_HIST];
 static unsigned g_ntex_hist;
 static void tex_hist(GLuint tex, const char *how, int w, int h)
 {
@@ -2321,6 +2321,8 @@ static void tex_hist(GLuint tex, const char *how, int w, int h)
     while (i < g_ntex_hist && i < MAX_TEX_HIST && g_tex_hist[i].tex != tex) i++;
     if (i >= MAX_TEX_HIST) i = g_ntex_hist++ % MAX_TEX_HIST;
     else if (i == g_ntex_hist) g_ntex_hist++;
+    if (g_tex_hist[i].tex != tex) g_tex_hist[i].attached = 0;
+    if (!strncmp(how, "rendered", 8)) g_tex_hist[i].attached = 1;
     g_tex_hist[i].tex = tex; g_tex_hist[i].frame = g_frame; g_tex_hist[i].w = w; g_tex_hist[i].h = h;
     snprintf(g_tex_hist[i].how, sizeof g_tex_hist[i].how, "%s", how);
 }
@@ -2331,15 +2333,52 @@ static void cap_note_tex(GLuint tex)
     for (unsigned i = 0; i < g_ncap_tex; i++) if (g_cap_tex[i] == tex) return;
     if (g_ncap_tex < 16) g_cap_tex[g_ncap_tex++] = tex;
 }
+/* a 2D texture's level 0 as tex_<name>_<frame>.ppm (read through a framebuffer of its own) */
+static void cap_save_tex(GLuint t)
+{
+    GLint was_fb = 0, was_tex = 0, w = 0, h = 0;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &was_tex);
+    glBindTexture(GL_TEXTURE_2D, t);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &h);
+    glBindTexture(GL_TEXTURE_2D, (GLuint)was_tex);
+    if (w <= 0 || h <= 0 || w > 4096 || h > 4096) { fprintf(stderr, "[capture] texture %u: size %dx%d, not saved\n", t, w, h); return; }
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &was_fb);
+    GLuint fb = 0;
+    glGenFramebuffers(1, &fb);
+    glBindFramebuffer(GL_FRAMEBUFFER, fb);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t, 0);
+    unsigned char *px = malloc((size_t)w * h * 4);
+    if (px && glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+        glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        char name[64];
+        snprintf(name, sizeof name, "tex_%u_%u.ppm", t, g_frame);
+        FILE *f = fopen(name, "wb");
+        if (f) {
+            fprintf(f, "P6\n%d %d\n255\n", w, h);
+            for (int y = h - 1; y >= 0; y--) for (int x = 0; x < w; x++) fwrite(px + ((size_t)y * w + x) * 4, 1, 3, f);
+            fclose(f);
+        }
+        long sum = 0;
+        for (size_t k = 0; k < (size_t)w * h * 4; k += 4) sum += px[k] + px[k + 1] + px[k + 2];
+        fprintf(stderr, "[capture] texture %u: %dx%d saved as %s, mean level %.1f\n", t, w, h, name, sum / (3.0 * w * h));
+    } else fprintf(stderr, "[capture] texture %u: cannot be read through a framebuffer\n", t);
+    free(px);
+    glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)was_fb);
+    glDeleteFramebuffers(1, &fb);
+}
+
 static void cap_report(void)
 {
     for (unsigned i = 0; i < g_ncap_tex; i++) {
         GLuint t = g_cap_tex[i];
+        cap_save_tex(t);
         unsigned j = 0;
         while (j < g_ntex_hist && j < MAX_TEX_HIST && g_tex_hist[j].tex != t) j++;
         if (j < g_ntex_hist && j < MAX_TEX_HIST)
-            fprintf(stderr, "[capture] texture %u: %s at frame %u, %dx%d%s%s\n", t, g_tex_hist[j].how, g_tex_hist[j].frame,
-                    g_tex_hist[j].w, g_tex_hist[j].h, screen_copy(t) ? ", a screen copy" : "", scaled(t) ? ", eye-sized target" : "");
+            fprintf(stderr, "[capture] texture %u: %s at frame %u, %dx%d%s%s%s\n", t, g_tex_hist[j].how, g_tex_hist[j].frame,
+                    g_tex_hist[j].w, g_tex_hist[j].h, g_tex_hist[j].attached ? ", a render target" : "",
+                    screen_copy(t) ? ", a screen copy" : "", scaled(t) ? ", eye-sized target" : "");
         else fprintf(stderr, "[capture] texture %u: not seen filled (glTexSubImage2D, or before the last 64)%s\n", t,
                      scaled(t) ? ", eye-sized target" : "");
     }
@@ -2366,6 +2405,11 @@ static void dump_targets(void)
         en = v && strchr(v, ',') ? atol(strchr(v, ',') + 1) : 1;
         const char *s2 = v && strchr(v, ',') ? strchr(strchr(v, ',') + 1, ',') : NULL;
         if (s2) es = atol(s2 + 1) > 0 ? atol(s2 + 1) : 1;   /* ,<stride>: every stride-th frame, a quarter the size */
+    }
+    {   /* LINDBERGH_CAPTURE=<frame>: the X button's capture, at that frame */
+        static long at = -2;
+        if (at == -2) { const char *v = getenv("LINDBERGH_CAPTURE"); at = v ? atol(v) : -1; }
+        if (at > 0 && (long)g_frame + 1 == at) stereo_capture();
     }
     long cf = (long)g_frame - g_cap_frame;
     if (cf == 0) cap_report();
