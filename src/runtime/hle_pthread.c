@@ -611,9 +611,16 @@ unsigned guest_threads(pthread_t *out, unsigned max)
     return n;
 }
 
+/* pthread_self: the pthread_t pthread_create handed out for a guest thread,
+ * a distinct number for any other (main, audio). Unique per thread - the
+ * game's recursive locks compare owners by it. */
+static __thread uint32_t g_self;
+static uint32_t g_self_next = 0xFFF00001u;   /* above any guest address */
+
 static void *thread_trampoline(void *p)
 {
     GuestThread *t = (GuestThread *)p;
+    g_self = H2G(t);
     {
         unsigned i = __atomic_fetch_add(&g_nthreads, 1, __ATOMIC_ACQ_REL);
         if (i < 64) g_threads[i] = pthread_self(); else g_nthreads = 64;
@@ -667,12 +674,9 @@ static void h_pthread_join(CPU *c)
     RET(0);
 }
 
-/* pthread_self has to agree with the pthread_t pthread_create handed out for
- * the same thread, and be stable and non-zero for the main thread. */
-static __thread uint32_t g_self;
 static void h_pthread_self(CPU *c)
 {
-    if (!g_self) g_self = 0x54480000u | ((uint32_t)(uintptr_t)pthread_self() & 0xFFFFu);
+    if (!g_self) g_self = __atomic_fetch_add(&g_self_next, 1, __ATOMIC_RELAXED);
     RET(g_self);
 }
 static void h_pthread_detach(CPU *c) { RET(0); }
