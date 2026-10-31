@@ -62,6 +62,9 @@
 #include "xr_overlay.h"
 #include "xr_menu.h"
 
+/* a debug switch, looked up once */
+#define ENV_ON(name) ({ static int _on = -1; if (_on < 0) _on = getenv(name) != NULL; _on; })
+
 /* host_sdl.c: the gun and the cabinet's buttons, from the controllers */
 void host_vr_input(int gun_x, int gun_y, unsigned held, int coin);
 
@@ -1244,7 +1247,7 @@ void xr_frame_begin(void)
             }
         }
     }
-    if (views_ok && getenv("LINDBERGH_POSE_LOG")) {
+    if (views_ok && ENV_ON("LINDBERGH_POSE_LOG")) {
         XrQuaternionf q = views[0].pose.orientation;
         fprintf(stderr, "[pose] frame %u: q %.5f %.5f %.5f %.5f pos %.4f %.4f %.4f t %lld\n", g_frame, q.x, q.y, q.z, q.w,
                 views[0].pose.position.x, views[0].pose.position.y, views[0].pose.position.z,

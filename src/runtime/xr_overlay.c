@@ -74,6 +74,9 @@ static int gun_verts;
  * reticle shows. */
 #include "xr_gun_model.h"
 
+/* a debug switch, looked up once */
+#define ENV_ON(name) ({ static int _on = -1; if (_on < 0) _on = getenv(name) != NULL; _on; })
+
 typedef struct { float c[3], h[3], rgb[3]; } Box;
 #define OPTIC_Y (GUN_RAIL_Y + 0.030f)   /* the sight line, above the bore */
 static const Box RED_DOT[] = {          /* a tube sight, like an Aimpoint */
@@ -678,7 +681,7 @@ float xo_probe(unsigned depth_array, const float (*px)[2], const float *z, const
         const unsigned char *b = gl.MapBufferRange(GL_PIXEL_PACK_BUFFER, 0, PROBE_MAX * 4, GL_MAP_READ_BIT);
         hit = -1;
         static unsigned dbg;
-        if (b && getenv("LINDBERGH_AIM_LOG") && ++dbg % 60 == 0)
+        if (b && ENV_ON("LINDBERGH_AIM_LOG") && ++dbg % 60 == 0)
             for (int i = 0; i < probe_slot[o].n; i += 6)
                 fprintf(stderr, "[aim] t %.2f: ray depth %.6f, scene %.6f\n", probe_slot[o].t[i], probe_slot[o].z[i],
                         (float)(b[i * 4] | b[i * 4 + 1] << 8 | b[i * 4 + 2] << 16) / 16777215.0f);
@@ -717,7 +720,8 @@ float xo_probe(unsigned depth_array, const float (*px)[2], const float *z, const
         gl.UseProgram(prog_probe);
         gl.Uniform2iv(u_probe_px, n, ipx);
         gl.Uniform1i(u_probe_d, 0);
-        { const char *v = getenv("LINDBERGH_AIM_SELFTEST"); gl.Uniform1i(gl.GetUniformLocation(prog_probe, "selftest"), v ? atoi(v) : 0); }
+        { static int st = -1; if (st < 0) { const char *v = getenv("LINDBERGH_AIM_SELFTEST"); st = v ? atoi(v) : 0; }
+          if (st) gl.Uniform1i(gl.GetUniformLocation(prog_probe, "selftest"), st); }   /* test only: the uniform starts at 0 */
         gl.BindTexture(GL_TEXTURE_2D_ARRAY, depth_array);
         gl.BindSampler(0, probe_smp);
         gl.BindVertexArray(vao_screen);

@@ -46,6 +46,9 @@
 #include <EGL/egl.h>
 #endif
 #include "arbprog.h"
+
+/* a debug switch, looked up once */
+#define ENV_ON(name) ({ static int _on = -1; if (_on < 0) _on = getenv(name) != NULL; _on; })
 #ifdef LINDBERGH_GL4ES
 /* gl4es' multiview (multiview.c in quest/gl4es.patch) */
 int gl4es_multiview_enable(void);
@@ -916,7 +919,7 @@ void stereo_guest_state(uint32_t va)
             g_state_frame = g_frame;
         }
         else g_state_frame = ~0u;
-        if (va != g_state_last && getenv("LINDBERGH_HUD_LOG"))
+        if (va != g_state_last && ENV_ON("LINDBERGH_HUD_LOG"))
             fprintf(stderr, "[state] frame %u: %#x (%s)\n", g_frame, va, i < g_nmenu ? "menu" : "play");
         g_state_last = va;
         return;
@@ -1009,11 +1012,11 @@ static float wide_place(CPU *c, const char *n)
     static float last[4]; static float last_s; static unsigned last_frame = ~0u;
     float b[4];
     if (!ndc_box(c, n, b)) {
-        if (getenv("LINDBERGH_NOBOX")) fprintf(stderr, "[nobox] frame %u %s tex %u\n", g_frame, n, g_tex2d_bound);
+        if (ENV_ON("LINDBERGH_NOBOX")) fprintf(stderr, "[nobox] frame %u %s tex %u\n", g_frame, n, g_tex2d_bound);
         return 0;
     }
     float edge = 1 - g_wide_k, w = b[2] - b[0], h = b[3] - b[1], s = 0;
-    if (getenv("LINDBERGH_NOBOX") && (w > 0.9f || h > 0.9f))
+    if (ENV_ON("LINDBERGH_NOBOX") && (w > 0.9f || h > 0.9f))
         fprintf(stderr, "[big2d] frame %u box %.2f..%.2f x %.2f..%.2f tex %u\n", g_frame, b[0], b[2], b[1], b[3], g_tex2d_bound);
     /* spans the screen's width or height: a banner, a fade, the orange of
      * being hit (two full-height halves) */
@@ -1130,7 +1133,7 @@ static int weapon_draw(void)
     float mv[16];
     glGetFloatv(GL_MODELVIEW_MATRIX, mv);
     if (mv[12] * mv[12] + mv[13] * mv[13] + mv[14] * mv[14] > 9.0f) return 0;
-    if (getenv("LINDBERGH_GUN_LOG") && g_weapon_learn && !g_replaying)
+    if (ENV_ON("LINDBERGH_GUN_LOG") && g_weapon_learn && !g_replaying)
         fprintf(stderr, "[gun] frame %u: lens %.3f (world %.3f), at %.2f %.2f %.2f, tex %u\n", g_frame, P[0], g_world_persp[0],
                 mv[12], mv[13], mv[14], g_tex2d_bound);
     /* The gun is drawn with a lens of its own (1.732) while the world uses
@@ -1300,7 +1303,7 @@ static void aim_box_track(CPU *c, int k)
         else if (k == K_LOADMATRIX || k == K_MULTMATRIX || k == K_TRANSLATE || k == K_SCALE ||
                  k == K_ORTHO || k == K_ORTHO2D || k == K_FRUSTUM || k == K_PERSPECTIVE) g_mv_ident = 0;
     }
-    if ((k == K_COPYTEXSUB || k == K_COPYTEX) && getenv("LINDBERGH_COPY_LOG"))    /* each copy of the screen */
+    if ((k == K_COPYTEXSUB || k == K_COPYTEX) && ENV_ON("LINDBERGH_COPY_LOG"))    /* each copy of the screen */
         { GLint bt = 0; glGetIntegerv(GL_TEXTURE_BINDING_2D, &bt);
           fprintf(stderr, "[copy] frame %u: %s fb %u into texture %d (unit0 has %u), %dx%d\n", g_frame, k == K_COPYTEX ? "whole" : "part",
                   (unsigned)g_game_fb, bt, g_tex2d_bound, k == K_COPYTEX ? AI32(5) : AI32(6), k == K_COPYTEX ? AI32(6) : AI32(7)); }
@@ -1338,7 +1341,7 @@ static void aim_box_track(CPU *c, int k)
         if (gx < g_imm_box[0]) g_imm_box[0] = gx; if (gy < g_imm_box[1]) g_imm_box[1] = gy;
         if (gx > g_imm_box[2]) g_imm_box[2] = gx; if (gy > g_imm_box[3]) g_imm_box[3] = gy;
         g_imm_n++;
-        if (getenv("LINDBERGH_AIM_BOX_DEBUG") && g_frame % 10 == 0)
+        if (ENV_ON("LINDBERGH_AIM_BOX_DEBUG") && g_frame % 10 == 0)
             fprintf(stderr, "[aimbox?] frame %u vertex %.3f,%.3f,%.3f -> %.1f,%.1f (proj %.3f %.3f %.3f %.3f)\n", g_frame, x, y, z, gx, gy, m[0], m[5], m[8], m[9]);
     } else if (k == K_END && g_imm) {
         g_imm = 0;
@@ -2019,7 +2022,7 @@ static void trace_draw(const char *n)
     static long at = -2;
     if (at == -2) { const char *v = getenv("LINDBERGH_RT_DUMP"); at = v && *v ? atol(v) : -1; }
 #ifdef LINDBERGH_GL4ES
-    gl4es_mv_trace = ((long)g_frame == at || (long)g_frame == g_rt_dump_at) && getenv("LIBGL_MV_CHECK");
+    gl4es_mv_trace = ((long)g_frame == at || (long)g_frame == g_rt_dump_at) && ENV_ON("LIBGL_MV_CHECK");
 #endif
     if ((long)g_frame != at || (strncmp(n, "glDraw", 6) && strcmp(n, "glEnd"))) return;
     static unsigned k;
@@ -2775,7 +2778,7 @@ void stereo_frame_begin(void)
         world_frames = 0;
         if (++g_menu_frames >= 120) g_menu = 1;
     }
-    if (getenv("LINDBERGH_SCENE_STATS") && g_frame % 30 == 0)
+    if (ENV_ON("LINDBERGH_SCENE_STATS") && g_frame % 30 == 0)
         fprintf(stderr, "[stereo] frame %u: %u world draws%s, lens %.2f, near %.4f; world %.3f %.3f (%.3f %.3f), screen lens %.3f %.3f\n",
                 g_frame, g_scene_draws, g_menu ? " (menu)" : "", g_lens_seen, g_near_seen, g_world_persp[0], g_world_persp[5],
                 g_world_persp[8], g_world_persp[9], g_screen_lens[0], g_screen_lens[1]);
@@ -2991,7 +2994,7 @@ int stereo_aim_samples(const float o_[3], const float d_[3], int max, float (*px
     if (g_world_fb_next == 0) dt = g_eye_tex[1];      /* the window: the eyes' own target (The House of the Dead 4 Special) */
     unsigned arr = dt ? gl4es_multiview_array(dt) : 0;
     static unsigned dbg;
-    if (getenv("LINDBERGH_AIM_LOG") && ++dbg % 120 == 1) {
+    if (ENV_ON("LINDBERGH_AIM_LOG") && ++dbg % 120 == 1) {
         fprintf(stderr, "[aim] world fb %u, depth texture %u, array %u; depth attachments:", g_world_fb, dt, arr);
         for (unsigned i = 0; i < g_nfb_depth; i++) fprintf(stderr, " fb%u=%u", g_fb_depth[i].fb, g_fb_depth[i].depth);
         fprintf(stderr, "\n");
