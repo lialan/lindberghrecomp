@@ -2,6 +2,7 @@
 
 #include <vulkan/vulkan.h>
 #include <memory>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -24,6 +25,11 @@ struct DeviceOptions {
     bool allow_software = false; // explicit opt-in for device-free tests
     bool require_foveation = true;
     bool require_multiview = true;
+    std::vector<const char *> instance_extensions, device_extensions;
+    std::function<VkResult(const VkInstanceCreateInfo *, VkInstance *)> create_instance;
+    std::function<VkPhysicalDevice(VkInstance)> select_physical;
+    std::function<VkResult(VkPhysicalDevice, const VkDeviceCreateInfo *, VkDevice *)> create_device;
+    std::function<VkSurfaceKHR(VkInstance)> create_surface;
 };
 
 // Device creation through OpenXR will supply these same handles. A borrowed
@@ -34,6 +40,7 @@ struct DeviceHandles {
     VkDevice device = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;
     uint32_t queue_family = 0;
+    VkSurfaceKHR surface = VK_NULL_HANDLE;
 };
 
 class Device {

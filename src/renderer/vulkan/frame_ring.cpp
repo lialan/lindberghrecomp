@@ -90,7 +90,7 @@ VkBuffer FrameRing::upload_buffer(uint32_t slot) const
     return slots_[slot].upload;
 }
 
-Submission FrameRing::submit()
+Submission FrameRing::submit(VkSemaphore wait, VkSemaphore signal, VkPipelineStageFlags wait_stage)
 {
     if (!recording_) throw std::logic_error("Submit outside Vulkan frame");
     auto &s = slots_[current_];
@@ -100,6 +100,8 @@ Submission FrameRing::submit()
     VkSubmitInfo info{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     info.commandBufferCount = 1;
     info.pCommandBuffers = &s.cmd;
+    info.waitSemaphoreCount = wait ? 1 : 0; info.pWaitSemaphores = &wait; info.pWaitDstStageMask = &wait_stage;
+    info.signalSemaphoreCount = signal ? 1 : 0; info.pSignalSemaphores = &signal;
     check(vkQueueSubmit(device_.handles.queue, 1, &info, s.fence), "submit frame commands");
     s.submitted = true;
     const Submission result{current_, s.generation};

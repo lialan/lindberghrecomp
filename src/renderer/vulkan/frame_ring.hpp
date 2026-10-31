@@ -19,7 +19,8 @@ public:
     FrameRing &operator=(const FrameRing &) = delete;
     VkCommandBuffer begin();
     Upload upload(const void *data, size_t bytes, VkDeviceSize alignment = 16);
-    Submission submit();
+    Submission submit(VkSemaphore wait = VK_NULL_HANDLE, VkSemaphore signal = VK_NULL_HANDLE,
+                      VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
     void wait(Submission submission);
     uint64_t submissions() const { return submissions_; }
     uint32_t slot_count() const { return static_cast<uint32_t>(slots_.size()); }

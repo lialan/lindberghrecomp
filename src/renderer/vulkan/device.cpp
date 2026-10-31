@@ -56,6 +56,12 @@ Capabilities query_capabilities(VkPhysicalDevice physical)
     return out;
 }
 
+static void unique_extensions(std::vector<const char *> &names)
+{
+    std::sort(names.begin(), names.end(), [](const auto a, const auto b) { return std::strcmp(a,b)<0; });
+    names.erase(std::unique(names.begin(), names.end(), [](const auto a, const auto b) { return std::strcmp(a,b)==0; }),names.end());
+}
+
 std::unique_ptr<Device> Device::create(const DeviceOptions &options)
 {
     auto out = std::unique_ptr<Device>(new Device);
@@ -66,13 +72,26 @@ std::unique_ptr<Device> Device::create(const DeviceOptions &options)
     app.apiVersion = VK_API_VERSION_1_1;
     VkInstanceCreateInfo instance{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     instance.pApplicationInfo = &app;
-    check(vkCreateInstance(&instance, nullptr, &out->handles.instance), "vkCreateInstance");
+    // MoltenVK devices are hidden by the loader unless portability is opted in.
+    std::vector<const char *> instance_extensions = options.instance_extensions;
+#ifdef __APPLE__
+    instance_extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+    instance.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+#endif
+    unique_extensions(instance_extensions);
+    instance.enabledExtensionCount = static_cast<uint32_t>(instance_extensions.size());
+    instance.ppEnabledExtensionNames = instance_extensions.data();
+    check(options.create_instance ? options.create_instance(&instance, &out->handles.instance) :
+          vkCreateInstance(&instance, nullptr, &out->handles.instance), "vkCreateInstance");
+    if (options.create_surface) out->handles.surface = options.create_surface(out->handles.instance);
+    const auto requested = options.select_physical ? options.select_physical(out->handles.instance) : VK_NULL_HANDLE;
     uint32_t count = 0;
     check(vkEnumeratePhysicalDevices(out->handles.instance, &count, nullptr), "physical devices");
     std::vector<VkPhysicalDevice> physical(count);
     check(vkEnumeratePhysicalDevices(out->handles.instance, &count, physical.data()), "physical devices");
     int best = -1;
     for (auto p : physical) {
+        if (options.select_physical && p != requested) continue;
         auto caps = query_capabilities(p);
         if (caps.properties.apiVersion < VK_API_VERSION_1_1) continue;
         if (!options.allow_software && caps.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) continue;
@@ -84,6 +103,11 @@ std::unique_ptr<Device> Device::create(const DeviceOptions &options)
         vkGetPhysicalDeviceQueueFamilyProperties(p, &families, q.data());
         for (uint32_t i = 0; i < families; i++) {
             if (!(q[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) continue;
+            if (out->handles.surface) {
+                VkBool32 supported = VK_FALSE;
+                check(vkGetPhysicalDeviceSurfaceSupportKHR(p, i, out->handles.surface, &supported), "present queue support");
+                if (!supported) continue;
+            }
             int score = caps.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 3 :
                         caps.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 2 : 1;
             if (score > best) {
@@ -107,7 +131,12 @@ std::unique_ptr<Device> Device::create(const DeviceOptions &options)
     views.multiview = out->capabilities.multiview;
     VkPhysicalDeviceFragmentDensityMapFeaturesEXT density{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_FEATURES_EXT};
     VkPhysicalDeviceFragmentShadingRateFeaturesKHR rate{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR};
-    std::vector<const char *> extensions;
+    std::vector<const char *> extensions = options.device_extensions;
+    uint32_t extension_count = 0;
+    check(vkEnumerateDeviceExtensionProperties(out->handles.physical, nullptr, &extension_count, nullptr), "selected device extensions");
+    std::vector<VkExtensionProperties> available(extension_count);
+    check(vkEnumerateDeviceExtensionProperties(out->handles.physical, nullptr, &extension_count, available.data()), "selected device extensions");
+    if (extension(available, "VK_KHR_portability_subset")) extensions.push_back("VK_KHR_portability_subset");
     // Enable one mechanism, never both competing attachments in a render pass.
     if (out->capabilities.density_map) {
         extensions.push_back(VK_EXT_FRAGMENT_DENSITY_MAP_EXTENSION_NAME);
@@ -129,9 +158,11 @@ std::unique_ptr<Device> Device::create(const DeviceOptions &options)
     device.pNext = &views;
     device.queueCreateInfoCount = 1;
     device.pQueueCreateInfos = &queue;
+    unique_extensions(extensions);
     device.enabledExtensionCount = static_cast<uint32_t>(extensions.size());
     device.ppEnabledExtensionNames = extensions.data();
-    check(vkCreateDevice(out->handles.physical, &device, nullptr, &out->handles.device), "vkCreateDevice");
+    check(options.create_device ? options.create_device(out->handles.physical, &device, &out->handles.device) :
+          vkCreateDevice(out->handles.physical, &device, nullptr, &out->handles.device), "vkCreateDevice");
     vkGetDeviceQueue(out->handles.device, out->handles.queue_family, 0, &out->handles.queue);
     std::fprintf(stderr, "[vulkan] %s; multiview %s, density-map capability %s, shading-rate capability %s\n",
         out->capabilities.properties.deviceName, out->capabilities.multiview ? "yes" : "no",
@@ -155,6 +186,7 @@ Device::~Device()
         vkDeviceWaitIdle(handles.device); // shutdown only; never a draw-path wait
         vkDestroyDevice(handles.device, nullptr);
     }
+    if (owned_ && handles.surface) vkDestroySurfaceKHR(handles.instance, handles.surface, nullptr);
     if (owned_ && handles.instance) vkDestroyInstance(handles.instance, nullptr);
 }
 
