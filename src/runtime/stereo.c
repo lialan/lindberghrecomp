@@ -1623,6 +1623,21 @@ static int transform_call(CPU *c, HleId id, const char *n)
           if ((long)g_frame == g_cap_frame && !g_replaying) cap_note_tex(g_tex2d_bound);
           if (((dl >= 0 && (long)g_frame >= dl && (long)g_frame <= dl1) || (long)g_frame == g_cap_frame) && !g_replaying) {   /* LINDBERGH_DRAW_LOG=<frame>: each draw's class */
               float mv[16]; glGetFloatv(GL_MODELVIEW_MATRIX, mv);
+              if ((long)g_frame == g_cap_frame) {     /* a capture: every unit, and what combines them */
+                  GLint was = 0; glGetIntegerv(GL_ACTIVE_TEXTURE, &was);
+                  char u[160] = ""; size_t o = 0;
+                  for (int i = 0; i < 4; i++) {
+                      GLint t2 = 0, en = 0, mode = 0; glActiveTexture(GL_TEXTURE0 + i);
+                      glGetIntegerv(GL_TEXTURE_BINDING_2D, &t2); en = glIsEnabled(GL_TEXTURE_2D);
+                      glGetTexEnviv(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, &mode);
+                      o += (size_t)snprintf(u + o, sizeof u - o, " u%d=%d%s/%#x", i, t2, en ? "" : "(off)", mode);
+                  }
+                  glActiveTexture((GLenum)was);
+                  int fpon = 0, vpon = 0; arb_is_enabled(GL_FRAGMENT_PROGRAM_ARB, &fpon); arb_is_enabled(GL_VERTEX_PROGRAM_ARB, &vpon);
+                  GLint prog = 0; glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
+                  GLboolean bl = glIsEnabled(GL_BLEND); GLint bs = 0, bd = 0; glGetIntegerv(GL_BLEND_SRC, &bs); glGetIntegerv(GL_BLEND_DST, &bd);
+                  fprintf(stderr, "[units]%s fp %d vp %d glsl %d blend %d %#x/%#x\n", u, fpon, vpon, prog, bl, bs, bd);
+              }
               fprintf(stderr, "[draw] f%u %s fb %u tex %u persp %d ident %d hud %d lens %.3f,%.3f vp %d,%d %dx%d mv-t %.3f,%.3f,%.3f gun %.3f,%.3f\n", g_frame, hle_name(g_cur_id), (unsigned)g_game_fb,
                       g_tex2d_bound, persp, g_mv_ident, hud, g_proj[g_proj_top][0], g_proj[g_proj_top][5], g_vp[0], g_vp[1], g_vp[2], g_vp[3],
                       mv[12], mv[13], mv[14], g_gun_ndc[0], g_gun_ndc[1]);
