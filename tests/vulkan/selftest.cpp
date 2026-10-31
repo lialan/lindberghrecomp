@@ -3,6 +3,7 @@
 #include "renderer.hpp"
 #include "guest_state.hpp"
 #include "uniforms.hpp"
+#include "resources.hpp"
 #include <array>
 #include <chrono>
 #include <cstdio>
@@ -163,10 +164,13 @@ static void render_stereo(Device &device)
     const auto vs = shader(std::string(LV_TEST_SHADER_DIR) + "/vert.spv");
     const auto fs = shader(std::string(LV_TEST_SHADER_DIR) + "/frag.spv");
     UniformSet uniforms(device, ring, {{0, 16}});
+    Texture texture(device, {2, 2, 2});
+    Sampler sampler(device);
+    SampledSet material(device, {{0, texture.view(), sampler.handle()}});
     ProgramSource legacy{vs.data(), fs.data(), vs.size() * 4, fs.size() * 4,
         {{0, sizeof(Vertex), VK_VERTEX_INPUT_RATE_VERTEX}},
         {{0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Vertex, position)},
-         {3, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Vertex, color)}}, {uniforms.layout(), uniforms.layout()}};
+         {3, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Vertex, color)}}, {uniforms.layout(), uniforms.layout(), material.layout()}};
     Renderer converted(device, target, cache, legacy);
     converted.prepare(state);
     for (auto &m : matrices.view_projection) {
@@ -175,7 +179,12 @@ static void render_stereo(Device &device)
     }
     matrices.view_projection[1][12] = 0.8f;
     cmd = ring.begin();
+    const uint32_t white[] = {0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff};
+    texture.upload(cmd, ring, 0, 0, white, sizeof white);
+    texture.upload(cmd, ring, 1, 0, white, 4);
     converted.begin(cmd, {0, 0, 0, 1});
+    auto sampled = material.handle();
+    converted.bind_descriptors(2, 1, &sampled);
     const float tint[] = {1, 1, 1, 1};
     auto offset = uniforms.upload(0, tint, sizeof tint);
     auto descriptors = uniforms.current_set();
@@ -199,6 +208,7 @@ static void render_stereo(Device &device)
     for (unsigned frame = 0; frame < frames; ++frame) {
         cmd = ring.begin();
         converted.begin(cmd, {0, 0, 0, 1});
+        converted.bind_descriptors(2, 1, &sampled);
         const float color[] = {float(frame & 1), 1, 1, 1};
         rejected([&] { uniforms.upload(0, color, 12); }, "truncated uniform block accepted");
         offset = uniforms.upload(0, color, sizeof color);
@@ -228,6 +238,68 @@ static void render_stereo(Device &device)
     }
     require(converted.pipeline_count() == 1, "uniform changes created new pipelines");
     std::puts("ok: converted shader uniforms retain snapshots across 12 asynchronously submitted frames");
+
+    // Feed native formats directly: separate float positions and normalized
+    // byte colors, with an immutable uint16 index buffer. Upload geometry once.
+    ProgramSource separate = legacy;
+    separate.bindings = {{0, 16, VK_VERTEX_INPUT_RATE_VERTEX}, {1, 4, VK_VERTEX_INPUT_RATE_VERTEX}};
+    separate.attributes = {{0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0}, {3, 1, VK_FORMAT_R8G8B8A8_UNORM, 0}};
+    Renderer textured(device, target, cache, separate);
+    textured.prepare(state);
+    const float positions[][4] = {{-1, -1, 0, 1}, {1, -1, 0, 1}, {1, 1, 0, 1}, {-1, 1, 0, 1}};
+    const uint32_t colors[] = {0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff};
+    const uint16_t elements[] = {0, 1, 2, 0, 2, 3};
+    GeometryBuffer positions_gpu(device, sizeof positions), colors_gpu(device, sizeof colors), indices_gpu(device, sizeof elements);
+    Upload streams[] = {{positions_gpu.handle(), 0}, {colors_gpu.handle(), 0}};
+    IndexStream elements_gpu{indices_gpu.handle(), 0, VK_INDEX_TYPE_UINT16};
+    SamplerInfo mip_info;
+    mip_info.min_lod = mip_info.max_lod = 1;
+    Sampler mip_sampler(device, mip_info);
+    SampledSet mip_material(device, {{0, texture.view(), mip_sampler.handle()}});
+    const uint8_t texels[] = {255,0,0,255, 0,255,0,255, 0,0,255,255, 255,255,255,255};
+    const uint8_t mip[] = {255,255,0,255};
+    for (auto &m : matrices.view_projection) m[12] = 0;
+    for (unsigned frame = 0; frame < frames; ++frame) {
+        cmd = ring.begin();
+        if (!frame) {
+            positions_gpu.upload(cmd, ring, positions, sizeof positions);
+            colors_gpu.upload(cmd, ring, colors, sizeof colors);
+            indices_gpu.upload(cmd, ring, elements, sizeof elements);
+            texture.upload(cmd, ring, 0, 0, texels, sizeof texels);
+            texture.upload(cmd, ring, 1, 0, mip, sizeof mip);
+        }
+        textured.begin(cmd, {0, 0, 0, 1});
+        offset = uniforms.upload(0, tint, sizeof tint);
+        descriptors = uniforms.current_set();
+        textured.bind_descriptors(1, 1, &descriptors, 1, &offset);
+        sampled = (frame & 1) ? mip_material.handle() : material.handle();
+        textured.bind_descriptors(2, 1, &sampled);
+        textured.draw_buffers(streams, 2, 6, matrices, state, &elements_gpu);
+        textured.end();
+        copy.bufferOffset = frame * image_bytes;
+        vkCmdCopyImageToBuffer(cmd, target.color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, history.buffer, 1, &copy);
+        barrier.offset = copy.bufferOffset;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                             0, 0, nullptr, 1, &barrier, 0, nullptr);
+        last = ring.submit();
+    }
+    ring.wait(last);
+    for (unsigned frame = 0; frame < frames; ++frame) {
+        const auto bytes = static_cast<const uint8_t *>(history.mapped) + frame * image_bytes;
+        for (unsigned eye = 0; eye < 2; ++eye) {
+            const auto base = bytes + eye * image_bytes / 2;
+            auto sample = [&](unsigned x, unsigned y, const uint8_t *expected) {
+                const auto p = base + (y * 32 + x) * 4;
+                require(std::memcmp(p, (frame & 1) ? mip : expected, 4) == 0,
+                        "texture orientation/mip or GPU vertex/index buffer raster output changed");
+            };
+            sample(8, 8, texels + 8); sample(24, 8, texels + 12);
+            sample(8, 24, texels); sample(24, 24, texels + 4);
+        }
+    }
+    require(textured.draw_count() == frames && textured.pipeline_count() == 1,
+            "static textured stereo geometry was replayed or recompiled");
+    std::puts("ok: direct textured multiview draws reuse GPU geometry, normalized colors, uint16 indices and mip descriptors");
 }
 
 int main()

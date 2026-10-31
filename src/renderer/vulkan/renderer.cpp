@@ -273,14 +273,8 @@ void Renderer::draw(FrameRing &ring, const Vertex *vertices, uint32_t count, con
     if (!vertices || !count || (state.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST && count % 3) ||
         (state.topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST && count % 2))
         throw std::invalid_argument("Invalid Vulkan primitive list");
-    auto p = pipelines_.find(state.key());
-    if (p == pipelines_.end()) throw std::logic_error("Unprepared Vulkan pipeline encountered during drawing");
     auto data = ring.upload(vertices, size_t(count) * sizeof(Vertex));
-    if (bound_ != p->second) { vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, p->second); bound_ = p->second; }
-    vkCmdBindVertexBuffers(cmd_, 0, 1, &data.buffer, &data.offset);
-    vkCmdPushConstants(cmd_, layout_, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof matrices, &matrices);
-    vkCmdDraw(cmd_, count, 1, 0, 0);
-    ++draws_;
+    draw_buffers(&data, 1, count, matrices, state);
 }
 
 void Renderer::draw_indexed(FrameRing &ring, const Vertex *vertices, uint32_t vertex_count,
@@ -290,15 +284,36 @@ void Renderer::draw_indexed(FrameRing &ring, const Vertex *vertices, uint32_t ve
     if (!cmd_) throw std::logic_error("Vulkan draw outside render pass");
     if (!vertices || !vertex_count || !indices || !index_count)
         throw std::invalid_argument("Invalid Vulkan indexed draw");
-    auto p = pipelines_.find(state.key());
-    if (p == pipelines_.end()) throw std::logic_error("Unprepared Vulkan pipeline encountered during drawing");
     auto vertex = ring.upload(vertices, size_t(vertex_count) * sizeof(Vertex));
     auto index = ring.upload(indices, size_t(index_count) * sizeof(uint32_t), 4);
+    const IndexStream indexed{index.buffer, index.offset, VK_INDEX_TYPE_UINT32};
+    draw_buffers(&vertex, 1, index_count, matrices, state, &indexed);
+}
+
+void Renderer::draw_buffers(const Upload *streams, uint32_t stream_count, uint32_t count,
+                            const Matrices &matrices, RasterState state, const IndexStream *indices)
+{
+    if (!cmd_) throw std::logic_error("Vulkan draw outside render pass");
+    if (!count || stream_count != bindings_.size() || (stream_count && !streams) ||
+        (state.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST && count % 3) ||
+        (state.topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST && count % 2))
+        throw std::invalid_argument("Invalid Vulkan geometry streams or primitive count");
+    for (uint32_t i = 0; i < stream_count; ++i)
+        if (!streams[i].buffer) throw std::invalid_argument("Null Vulkan vertex buffer");
+    if (indices && (!indices->buffer ||
+        (indices->type != VK_INDEX_TYPE_UINT16 && indices->type != VK_INDEX_TYPE_UINT32) ||
+        indices->offset % (indices->type == VK_INDEX_TYPE_UINT16 ? 2 : 4)))
+        throw std::invalid_argument("Invalid Vulkan index stream");
+    auto p = pipelines_.find(state.key());
+    if (p == pipelines_.end()) throw std::logic_error("Unprepared Vulkan pipeline encountered during drawing");
     if (bound_ != p->second) { vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, p->second); bound_ = p->second; }
-    vkCmdBindVertexBuffers(cmd_, 0, 1, &vertex.buffer, &vertex.offset);
-    vkCmdBindIndexBuffer(cmd_, index.buffer, index.offset, VK_INDEX_TYPE_UINT32);
+    for (uint32_t i = 0; i < stream_count; ++i)
+        vkCmdBindVertexBuffers(cmd_, bindings_[i].binding, 1, &streams[i].buffer, &streams[i].offset);
     vkCmdPushConstants(cmd_, layout_, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof matrices, &matrices);
-    vkCmdDrawIndexed(cmd_, index_count, 1, 0, 0, 0);
+    if (indices) {
+        vkCmdBindIndexBuffer(cmd_, indices->buffer, indices->offset, indices->type);
+        vkCmdDrawIndexed(cmd_, count, 1, 0, 0, 0);
+    } else vkCmdDraw(cmd_, count, 1, 0, 0);
     ++draws_;
 }
 

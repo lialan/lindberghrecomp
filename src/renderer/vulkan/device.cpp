@@ -52,6 +52,7 @@ Capabilities query_capabilities(VkPhysicalDevice physical)
     out.density_map = density.fragmentDensityMap;
     out.density_map_non_subsampled = density.fragmentDensityMapNonSubsampledImages;
     out.shading_rate = rate.attachmentFragmentShadingRate;
+    out.texture_compression_bc = features.features.textureCompressionBC;
     return out;
 }
 
@@ -122,6 +123,9 @@ std::unique_ptr<Device> Device::create(const DeviceOptions &options)
         views.pNext = &rate;
     }
     VkDeviceCreateInfo device{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+    VkPhysicalDeviceFeatures core{};
+    core.textureCompressionBC = out->capabilities.texture_compression_bc;
+    device.pEnabledFeatures = &core;
     device.pNext = &views;
     device.queueCreateInfoCount = 1;
     device.pQueueCreateInfos = &queue;

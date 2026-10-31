@@ -25,6 +25,12 @@ struct ProgramSource {
     std::vector<VkDescriptorSetLayout> descriptor_layouts;
 };
 
+struct IndexStream {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceSize offset = 0;
+    VkIndexType type = VK_INDEX_TYPE_UINT32;
+};
+
 struct TargetInfo {
     uint32_t width = 0, height = 0, layers = 2;
     VkFormat color_format = VK_FORMAT_R8G8B8A8_UNORM;
@@ -71,6 +77,11 @@ public:
     void draw_indexed(FrameRing &ring, const Vertex *vertices, uint32_t vertex_count,
                       const uint32_t *indices, uint32_t index_count,
                       const Matrices &matrices, RasterState state);
+    // Streams follow ProgramSource::bindings order. Already uploaded/static
+    // geometry can be drawn repeatedly without another CPU copy.
+    void draw_buffers(const Upload *streams, uint32_t stream_count, uint32_t count,
+                      const Matrices &matrices, RasterState state,
+                      const IndexStream *indices = nullptr);
     void end();
     uint64_t draw_count() const { return draws_; }
     size_t pipeline_count() const { return pipelines_.size(); }

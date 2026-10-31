@@ -12,6 +12,7 @@ void check(VkResult result, const char *operation);
 struct Capabilities {
     VkPhysicalDeviceProperties properties{};
     bool multiview = false;
+    bool texture_compression_bc = false;
     bool density_map = false;
     bool density_map_non_subsampled = false;
     bool shading_rate = false;
