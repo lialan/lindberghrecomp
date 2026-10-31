@@ -411,7 +411,7 @@ void host_cabinet_input(CabinetInput *out)
             g_gun_map(&g_cab.gun_x, &g_cab.gun_y);
     }
 #if !defined(__ANDROID__)
-    if (stereo_wide(NULL, NULL, NULL)) stereo_set_gun(g_cab.gun_x, g_cab.gun_y);   /* the HUD keeps clear of it */
+    if (stereo_wide(NULL, NULL, NULL) || stereo_enabled()) stereo_set_gun(g_cab.gun_x, g_cab.gun_y);   /* the HUD keeps clear of it */
 #endif
     g_cab.screen_w = (int)w;
     g_cab.screen_h = (int)h;
