@@ -408,7 +408,10 @@ static void cabinet_script(void)
             g_mouse_x = (int)(w / 2 + w / 3 * cos(t)); g_mouse_y = (int)(h / 2 + h / 4 * sin(t * 1.7));
         } else if (ln[i].x >= 0 && ln[i].y >= 0) { g_mouse_x = ln[i].x * w / 640; g_mouse_y = ln[i].y * h / 480; }
         g_auto |= ln[i].buttons;
-        if (g_frame == ln[i].from) g_cab.coins[0] += ln[i].coins;
+        if (g_frame == ln[i].from) {
+            g_cab.coins[0] += ln[i].coins;
+            ln[i].coins = 0; /* host_pump can run several times in one frame */
+        }
     }
 }
 

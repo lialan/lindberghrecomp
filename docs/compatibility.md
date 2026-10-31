@@ -3,6 +3,15 @@
 What has actually been run, and how far it got. Every number here was
 measured; nothing is inferred from a title looking similar to another.
 
+## Platform ports
+
+The original tables below record the Windows toolkit survey. The shared
+runtime also supports the macOS and Quest builds in
+[lindbergh-recomp-ports](https://github.com/lialan/lindbergh-recomp-ports).
+The House of the Dead EX now has an experimental macOS port there: gun and
+pedal gameplay, widescreen rendering, movies and CRI PCM output have been
+exercised. Full campaign completion and all minigames remain unverified.
+
 ## What the stages mean
 
 A recompiled game passes through five of them, and each is a different kind of
@@ -63,7 +72,7 @@ SEGA Race TV · The House of the Dead 4 · The House of the Dead 4 Special ·
 Virtua Fighter 5 (Version B, Version C) · Virtua Fighter 5 R ·
 Virtua Fighter 5 Final Showdown
 
-**Red** — 2Spicy · Primeval Hunt · The House of the Dead EX
+**Red** — 2Spicy · Primeval Hunt
 
 **Red EX** — Harley Davidson: King of the Road · Rambo
 
