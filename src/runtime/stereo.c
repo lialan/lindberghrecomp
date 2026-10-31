@@ -844,7 +844,7 @@ enum {
     K_DRAWARRAYS, K_DRAWELEMENTS, K_DRAWOTHER, K_BEGIN, K_END, K_MATRIXMODE, K_VERTEX,
     K_LOADID, K_LOADMATRIX, K_MULTMATRIX, K_ORTHO, K_ORTHO2D, K_FRUSTUM, K_PERSPECTIVE,
     K_PUSHMATRIX, K_POPMATRIX, K_TRANSLATE, K_SCALE, K_GETINTEGERV, K_GETFLOATV, K_GETOTHER, K_UNMAP, K_CLEAR, K_COPYTEXSUB, K_COPYTEX,
-    K_TEXIMAGE, K_FBSTATUS,
+    K_TEXIMAGE, K_FBSTATUS, K_TEXSUB,
 };
 typedef struct {
     uint8_t ok, kind, live, track;          /* live: run, never recorded; track: client array state */
@@ -964,7 +964,7 @@ static const Cls *cls(HleId id)
         { "glTranslatef", K_TRANSLATE }, { "glScalef", K_SCALE },
         { "glGetIntegerv", K_GETINTEGERV }, { "glGetFloatv", K_GETFLOATV },
         { "glUnmapBufferARB", K_UNMAP }, { "glUnmapBuffer", K_UNMAP }, { "glClear", K_CLEAR },
-        { "glCopyTexSubImage2D", K_COPYTEXSUB }, { "glCopyTexImage2D", K_COPYTEX }, { "glTexImage2D", K_TEXIMAGE },
+        { "glCopyTexSubImage2D", K_COPYTEXSUB }, { "glCopyTexImage2D", K_COPYTEX }, { "glTexImage2D", K_TEXIMAGE }, { "glTexSubImage2D", K_TEXSUB },
         { "glCheckFramebufferStatusEXT", K_FBSTATUS }, { "glCheckFramebufferStatus", K_FBSTATUS },
     };
     k->kind = K_OTHER;
@@ -1517,6 +1517,10 @@ static int transform_call(CPU *c, HleId id, const char *n)
             fprintf(stderr, "[stereo] framebuffer %u incomplete (%#x)\n", g_game_fb, st);
         c->eax = st;
         return 1;
+    }
+    if (k == K_TEXSUB) {                /* noted for a capture only */
+        if (A32(1) == 0) { GLint bt = 0; glGetIntegerv(GL_TEXTURE_BINDING_2D, &bt); tex_hist((GLuint)bt, "updated (glTexSubImage2D)", AI32(4), AI32(5)); }
+        return 0;
     }
     if (k == K_TEXIMAGE) {
         if (A32(1) == 0) { GLint bt = 0; glGetIntegerv(GL_TEXTURE_BINDING_2D, &bt); tex_hist((GLuint)bt, APTR(8) ? "uploaded" : "allocated", AI32(3), AI32(4)); }
