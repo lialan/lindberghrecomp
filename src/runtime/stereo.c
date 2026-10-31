@@ -119,10 +119,6 @@ static int      g_loaded_hud;           /* the projection GL has is the HUD's sc
 static int      g_hud_nowrite;          /* this 2D draw's depth writes are off, to be put back */
 static int      g_hud_offset;           /* this 2D draw is pulled nearer by a polygon offset, to be put back */
 static unsigned g_2d_seq;               /* 2D-camera draws so far this frame */
-static long     g_movie_frame = -100;    /* the last frame a movie picture was uploaded: greyscale planes, big */
-/* A movie playing - a transition over the world too: its 2D keeps its depth,
- * which hides the black behind the picture (the aim is not wanted then) */
-static int movie_now(void) { return (long)g_frame - g_movie_frame <= 4; }
 static unsigned g_3d_draws;             /* 3D draws so far this frame, wherever they went (g_scene_draws leaves out
                                          * the HUD's target - the window, for a game that draws both there) */
 static GLuint   g_unit0_rect;           /* render target bound to texture unit 0 */
@@ -183,6 +179,17 @@ static float    g_hud_lens;
  * moves; hidden on request (stereo_show_game_sight) by skipping draws of
  * that texture at the gun's place. */
 static GLuint   g_tex2d_bound;          /* GL_TEXTURE_2D bound on unit 0 */
+static GLuint    g_movie_tex[4];          /* the textures last filled as a movie's planes: greyscale, big */
+static unsigned  g_movie_n;
+/* A draw of a movie's picture - a transition over the world too: it keeps its
+ * depth, which hides the black behind it. Not every 2D on a frame with a
+ * movie somewhere: the game decodes movies in play too (its monitors), and
+ * that 2D's depth over the world was what the aim read. */
+static int movie_draw(void)
+{
+    for (unsigned i = 0; i < 4; i++) if (g_movie_tex[i] && g_movie_tex[i] == g_tex2d_bound) return 1;
+    return 0;
+}
 static float    g_gun_ndc[2] = { -9, -9 };   /* where the gun points, in the game's NDC */
 static int      g_show_sight = 1;
 static GLuint   g_sight_tex, g_sight_cand;
@@ -1536,7 +1543,12 @@ static int transform_call(CPU *c, HleId id, const char *n)
         return 1;
     }
     if (k == K_TEXSUB) {                /* noted for a capture, and a movie's frames */
-        if (A32(6) == GL_LUMINANCE && AI32(4) * AI32(5) >= 256 * 256) g_movie_frame = (long)g_frame;
+        if (A32(6) == GL_LUMINANCE && AI32(4) * AI32(5) >= 256 * 256) {
+            GLint mt = 0; glGetIntegerv(GL_TEXTURE_BINDING_2D, &mt);     /* on whichever unit is active */
+            int seen = 0;
+            for (unsigned i = 0; i < 4; i++) seen |= g_movie_tex[i] == (GLuint)mt;
+            if (!seen) g_movie_tex[g_movie_n++ & 3] = (GLuint)mt;
+        }
         if (A32(1) == 0) { GLint bt = 0; glGetIntegerv(GL_TEXTURE_BINDING_2D, &bt); { char how[32]; snprintf(how, sizeof how, "updated, format %#x", A32(6)); tex_hist((GLuint)bt, how, AI32(4), AI32(5)); }
             static int lg = -1;     /* LINDBERGH_TEXSUB_LOG=1: big updates, now and then, with how bright their pixels are */
             if (lg < 0) { const char *v = getenv("LINDBERGH_TEXSUB_LOG"); lg = v && *v == '1'; }
@@ -1731,12 +1743,12 @@ static int transform_call(CPU *c, HleId id, const char *n)
         /* Only on a frame with no world (the loading screen, the opening's
          * screens): over a world it writes no depth, as below - the aim reads
          * the world's depth at the frame's end, and that 2D lay over it */
-        if (hud == 1 && !persp && is_perspective(g_proj[g_proj_top]) && g_mv && !g_replaying && (!g_3d_draws || movie_now())) {
+        if (hud == 1 && !persp && is_perspective(g_proj[g_proj_top]) && g_mv && !g_replaying && (!g_3d_draws || movie_draw())) {
             glEnable(GL_POLYGON_OFFSET_FILL);
             glPolygonOffset(0, -4.0f * (float)(++g_2d_seq));
             g_hud_offset = 1;
         }
-        if (hud == 1 && !persp && (!is_perspective(g_proj[g_proj_top]) || (g_3d_draws && !movie_now()))) {
+        if (hud == 1 && !persp && (!is_perspective(g_proj[g_proj_top]) || (g_3d_draws && !movie_draw()))) {
             GLboolean wm = GL_FALSE;
             glGetBooleanv(GL_DEPTH_WRITEMASK, &wm);
             if (wm) { glDepthMask(GL_FALSE); g_hud_nowrite = 1; }
