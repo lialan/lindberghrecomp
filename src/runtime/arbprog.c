@@ -1409,6 +1409,15 @@ static void cache_save(GLuint prog, const char *path)
 
 extern unsigned g_frame;
 static struct timespec g_link_t0;
+/* program pairs since the last report: from the disk cache, built, and the
+ * milliseconds all of them took (translating included) */
+static unsigned g_stat_hits, g_stat_built;
+static double g_stat_ms;
+void arbprog_build_stats(unsigned *cached, unsigned *built, double *ms)
+{
+    *cached = g_stat_hits; *built = g_stat_built; *ms = g_stat_ms;
+    g_stat_hits = g_stat_built = 0; g_stat_ms = 0;
+}
 static Linked *link_pair(GLuint vid, GLuint fid)
 {
     ArbProg *vp = vid ? prog_get(0, vid, 0) : NULL;
@@ -1506,6 +1515,7 @@ static Linked *link_pair(GLuint vid, GLuint fid)
 #endif
     if (!l->prog) l->prog = glCreateProgram();
     GLint ok = 0;
+    int from_cache = 0;
     struct timespec t_link, t_tr;
     clock_gettime(CLOCK_MONOTONIC, &t_tr);
 #ifdef LINDBERGH_GL4ES
@@ -1523,6 +1533,7 @@ static Linked *link_pair(GLuint vid, GLuint fid)
         }
         clock_gettime(CLOCK_MONOTONIC, &t_link);
         ok = cache_load(l->prog, path);
+        if (ok) { g_stat_hits++; from_cache = 1; }
     }
 #endif
     if (!ok) {
@@ -1557,6 +1568,12 @@ static Linked *link_pair(GLuint vid, GLuint fid)
 #endif
     }
     for (int st = 0; st < 2; st++) { if (sh[st]) glDeleteShader(sh[st]); free(glsl_s[st]); }
+    {   /* every pair this took, cached or built: arbprog_build_stats */
+        struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
+        double ms = (t1.tv_sec - g_link_t0.tv_sec) * 1e3 + (t1.tv_nsec - g_link_t0.tv_nsec) / 1e6;
+        g_stat_ms += ms;
+        if (!from_cache) g_stat_built++;
+    }
     if (getenv("LINDBERGH_LATENCY")) {        /* linking waits on the driver */
         static double total; static unsigned n;
         struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
