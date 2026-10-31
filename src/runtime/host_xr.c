@@ -695,9 +695,12 @@ static void input_frame(XrTime t)
             /* or every shot where the laser crosses the HUD's screen: the game
              * draws its hit there, on its 2D (The House of the Dead 4 Special) */
             else if (!flat && stereo_aims_on_hud()) {
+                /* the laser still runs on to what it meets; only the game's
+                 * point moves (a game firing from the gun's own ray hits by that) */
+                int was = aimed; float reach = aim_reach;
                 aimed = 0; gx = gy = -100000;
                 if (stereo_ray_to_hud(head ? ho : o, head ? hd : d, head, &xs, &ys, &ts) && xs >= 0 && xs < gw && ys >= 0 && ys < gh) {
-                    gx = xs; gy = ys; aimed = 1; aim_reach = ts / cfg.scale;
+                    gx = xs; gy = ys; aimed = 1; aim_reach = was ? reach : ts / cfg.scale;
                 }
             }
         }

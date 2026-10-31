@@ -28,7 +28,6 @@ void stereo_set_eye(int eye, const float view[16], float tan_l, float tan_r, flo
 void stereo_set_eye_head(int eye, const float view[16]);
 void stereo_hud_head_locked(int on);
 void stereo_aim_on_hud(int on);
-void stereo_drop_sprite_tex(const unsigned *ids, unsigned n);   /* world sprites with these textures are left out (vr.drop_sprite_tex) */
 void stereo_set_gun_ray(const float o[3], const float d[3], int ok);
 int  stereo_gun_ray(float o[3], float d[3]);   /* the headset gun's ray in the game camera's space; 0: none */
 int  stereo_aims_on_hud(void);
