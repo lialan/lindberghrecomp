@@ -690,6 +690,14 @@ static void input_frame(XrTime t)
                 qrot(iq, r, ho); qrot(iq, d, hd);
             }
             if (!flat && stereo_aim_box(head ? ho : o, head ? hd : d, head, &xs, &ys, &ts)) { gx = xs; gy = ys; aimed = 1; aim_reach = ts / cfg.scale; aim_on_box = 1; }
+            /* or every shot where the laser crosses the HUD's screen: the game
+             * draws its hit there, on its 2D (The House of the Dead 4 Special) */
+            else if (!flat && stereo_aims_on_hud()) {
+                aimed = 0; gx = gy = -100000;
+                if (stereo_ray_to_hud(head ? ho : o, head ? hd : d, head, &xs, &ys, &ts) && xs >= 0 && xs < gw && ys >= 0 && ys < gh) {
+                    gx = xs; gy = ys; aimed = 1; aim_reach = ts / cfg.scale;
+                }
+            }
         }
         /* the overlay: the gun on the aim pose, the laser to the game's screen */
         xo.gun_valid = 1;

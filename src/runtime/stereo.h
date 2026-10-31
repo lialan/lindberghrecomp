@@ -27,6 +27,9 @@ void stereo_set_eye(int eye, const float view[16], float tan_l, float tan_r, flo
 /* head -> eye, for a HUD that follows the head; whether it does */
 void stereo_set_eye_head(int eye, const float view[16]);
 void stereo_hud_head_locked(int on);
+void stereo_aim_on_hud(int on);
+int  stereo_aims_on_hud(void);
+int  stereo_ray_to_hud(const float o[3], const float d[3], int head, float *x, float *y, float *reach);
 /* The HUD is drawn on a screen this far in front of the game camera. */
 void stereo_set_screen_distance(float d);
 /* A ray in game camera space -> the point it aims at on that screen, in the

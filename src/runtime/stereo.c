@@ -3042,6 +3042,38 @@ int stereo_ray_to_screen(const float o_[3], const float d_[3], float *x, float *
 
 void stereo_game_size(int *w, int *h) { *w = GAME_W; *h = GAME_H; }
 
+/* Where the laser crosses the HUD's screen - in front of the face, for a
+ * head-locked HUD (the ray then in the head's frame) - in game pixels, and
+ * how far along the ray. A game aimed there (vr.aim_on_hud) puts its shot
+ * under the laser's dot on its 2D, whatever lies behind. */
+static int g_aim_hud = -1;
+void stereo_aim_on_hud(int on) { if (!getenv("LINDBERGH_XR_AIM_HUD")) g_aim_hud = on; }
+int stereo_aims_on_hud(void)
+{
+    if (g_aim_hud < 0) { const char *v = getenv("LINDBERGH_XR_AIM_HUD"); g_aim_hud = v && *v == '1'; }
+    return g_aim_hud;
+}
+
+int stereo_ray_to_hud(const float o_[3], const float d_[3], int head, float *x, float *y, float *reach)
+{
+    float o[3], d[3];
+    if (head) {         /* turned back by the HUD's tilt */
+        float cp = cosf(g_hud_pitch), sp = sinf(g_hud_pitch);
+        o[0] = o_[0]; o[1] = cp * o_[1] + sp * o_[2]; o[2] = -sp * o_[1] + cp * o_[2];
+        d[0] = d_[0]; d[1] = cp * d_[1] + sp * d_[2]; d[2] = -sp * d_[1] + cp * d_[2];
+    }
+    else { from_level(o_, o); from_level(d_, d); }
+    if (d[2] > -1e-4f) return 0;
+    float t = (-g_screen_dist - o[2]) / d[2];
+    if (t <= 0) return 0;
+    float u = (o[0] + t * d[0]) * g_screen_lens[0] / g_screen_dist, v = (o[1] + t * d[1]) * g_screen_lens[1] / g_screen_dist;
+    *x = GAME_W * 0.5f * (1 + u);
+    *y = GAME_H * 0.5f * (1 - v);
+    *reach = t;
+    return 1;
+}
+
+
 int stereo_is_render_target(unsigned tex) { return g_on && scaled(tex); }
 
 void stereo_rect_scale(float *x, float *y)

@@ -42,6 +42,7 @@ void game_profile_apply(const LgGameProfile *p)
     if (p->vr.title) env_default("LINDBERGH_XR_TITLE", p->vr.title);
     if (p->vr.gl_thread) env_default("LINDBERGH_GL_THREAD", "1");
     if (p->vr.hud_head_locked) stereo_hud_head_locked(1);
+    if (p->vr.aim_on_hud) stereo_aim_on_hud(1);
     if (p->vr.hud_lens > 0) {
         char s[32];
         snprintf(s, sizeof s, "%g", p->vr.hud_lens);
