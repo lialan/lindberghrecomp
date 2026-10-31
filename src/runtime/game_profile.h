@@ -59,6 +59,7 @@ typedef struct {
         int   gl_thread;        /* the GL on a thread of its own (gl_thread.c; LINDBERGH_GL_THREAD=0 off) */
         int   hud_head_locked;  /* the 2D HUD stays in front of the face, not in the world (LINDBERGH_XR_HUD_LOCK=0 off) */
         int   aim_on_hud;       /* each shot goes where the laser crosses the HUD's screen (LINDBERGH_XR_AIM_HUD=0 off) */
+        float near_sprites;     /* world sprites nearer the camera than this, in game units, left out (LINDBERGH_XR_NEAR_SPRITES=0 keeps them) */
         float hud_lens;         /* the game draws its 2D through a perspective of its own: one with this x scale
                                  * (projection[0]) is screen content, not world (LINDBERGH_STEREO_2D_LENS) */
     } vr;

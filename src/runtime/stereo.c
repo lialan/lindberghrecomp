@@ -119,6 +119,7 @@ static int      g_loaded_hud;           /* the projection GL has is the HUD's sc
 static int      g_hud_nowrite;          /* this 2D draw's depth writes are off, to be put back */
 static int      g_hud_offset;           /* this 2D draw is pulled nearer by a polygon offset, to be put back */
 static unsigned g_2d_seq;               /* 2D-camera draws so far this frame */
+static int near_sprite(void);
 static unsigned g_3d_draws;             /* 3D draws so far this frame, wherever they went (g_scene_draws leaves out
                                          * the HUD's target - the window, for a game that draws both there) */
 static GLuint   g_unit0_rect;           /* render target bound to texture unit 0 */
@@ -1643,6 +1644,7 @@ static int transform_call(CPU *c, HleId id, const char *n)
         if (persp && !g_flat && (g_game_fb == g_world_fb || g_game_fb == g_world_fb_next)) {
             if (!g_replaying) tally_lens(g_proj[g_proj_top]);
             if (is_draw(k) && weapon_draw()) return 1;
+            if (k == K_BEGIN && near_sprite()) { g_skip_begin = 1; return 1; }
         }
         if (persp && !g_flat && !g_replaying && !offscreen_fb(g_game_fb)) g_3d_draws++;
         if (persp && g_game_fb != g_hud_fb && !g_replaying && !offscreen_fb(g_game_fb)) { g_scene_draws++; g_world_fb_next = g_game_fb; if (g_env_proj) arb_camera_count(); }
@@ -3062,6 +3064,24 @@ int stereo_ray_to_screen(const float o_[3], const float d_[3], float *x, float *
 }
 
 void stereo_game_size(int *w, int *h) { *w = GAME_W; *h = GAME_H; }
+
+/* A sprite the game hangs just before its camera, in the world's lens - The
+ * House of the Dead 4 Special's shot splash, 20-40 units out along the gun's
+ * line from the head. In the headset it floats a few metres before the face,
+ * off the laser and at the wrong depth for both eyes: left out
+ * (vr.near_sprites, in game units; LINDBERGH_XR_NEAR_SPRITES=0 keeps them). */
+static float g_near_sprites = -1;
+void stereo_near_sprites(float units) { if (!getenv("LINDBERGH_XR_NEAR_SPRITES")) g_near_sprites = units; }
+static int near_sprite(void)
+{
+    if (g_near_sprites < 0) { const char *v = getenv("LINDBERGH_XR_NEAR_SPRITES"); g_near_sprites = v ? (float)atof(v) : 0; }
+    if (!(g_near_sprites > 0) || !g_mv || g_mv_ident) return 0;
+    float m[16];
+    glGetFloatv(GL_MODELVIEW_MATRIX, m);
+    float d = sqrtf(m[12] * m[12] + m[13] * m[13] + m[14] * m[14]);
+    return d > 1 && d < g_near_sprites;
+}
+
 
 /* The gun's ray, from the headset, in the game camera's space and units: for
  * a game that fires from the gun itself (its own shot ray replaced) */
