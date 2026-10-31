@@ -24,6 +24,7 @@
  *
  * LINDBERGH_GL_THREAD=1 turns it on (or a game's profile); =0 off. */
 #include "lindbergh_rt.h"
+#include "gl_posix.h"
 #include <pthread.h>
 #include <stdatomic.h>
 #include <string.h>
@@ -94,7 +95,7 @@ enum {
 };
 /* ok: classified; sh: a call the game thread keeps a shadow of (viewport,
  * scissor) or may answer from it (glGetIntegerv), so the rest skip that check */
-typedef struct { uint8_t kind, a, b, c, ok, sh, words; } Cls;
+typedef struct { uint8_t kind, a, b, c, ok, sh, words, inv; } Cls;
 static Cls g_cls[HLE_ID_MAX];
 
 /* the client arrays as the game set them: on, and whether in client memory */
@@ -107,6 +108,64 @@ static uint32_t g_array_buf, g_element_buf;
 static struct { uint8_t set, unit, copied; HleId id; HleHandler fn; uint32_t args[16]; uint8_t a; } g_ptr[S_N];
 static HleId g_cat_id; static HleHandler g_cat_fn;   /* glClientActiveTexture, for a texture unit's pointer */
 static unsigned g_client_unit;
+/* ---- redundant client-state calls ----
+ * glClientActiveTexture, glEnable/DisableClientState, glEnable/Disable-
+ * VertexAttribArray and glBindBuffer that set what is already set are not
+ * queued: about a third of The House of the Dead 4's ~40,000 calls a frame
+ * are these, and each costs a queue record here and gl4es's handling on the
+ * GL thread. Only while the state is known: the game set it here since the
+ * last glPopClientAttrib or context switch (the runtime's own GL on the
+ * worker puts back what it changes). LINDBERGH_GLQ_NODEDUP=1: all queued. */
+static uint8_t g_slot_known[S_N], g_unit_known, g_buf_known[2];
+static unsigned g_n_dropped;
+static int dedup_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *v = getenv("LINDBERGH_GLQ_NODEDUP"); on = !(v && *v == '1'); }
+    return on;
+}
+/* LINDBERGH_GLQ_DEDUP_CHECK=1: each call that would be dropped is queued as
+ * a check instead - the worker asks GL, in queue order, whether the state
+ * really is already that, and the report counts the times it was not */
+static _Atomic unsigned g_dedup_wrong;
+static int dedup_check(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *v = getenv("LINDBERGH_GLQ_DEDUP_CHECK"); on = v && *v == '1'; }
+    return on;
+}
+enum { DC_UNIT, DC_ARRAY, DC_ATTRIB, DC_BUF };
+static void dedup_verify(void *arg)
+{
+    uintptr_t a = (uintptr_t)arg;
+    unsigned what = (unsigned)(a >> 40) & 0xFF, on = (unsigned)(a >> 32) & 1, v = (unsigned)a;
+    GLint got = 0;
+    int ok = 1;
+    switch (what) {
+    case DC_UNIT: glGetIntegerv(0x84E1 /* GL_CLIENT_ACTIVE_TEXTURE */, &got); ok = (unsigned)got == v; break;
+    case DC_ARRAY: ok = (glIsEnabled((GLenum)v) != 0) == (int)on; break;
+    case DC_ATTRIB: glGetVertexAttribiv(v, 0x8622 /* GL_VERTEX_ATTRIB_ARRAY_ENABLED */, &got); ok = (got != 0) == (int)on; break;
+    case DC_BUF: glGetIntegerv(on ? 0x8895 : 0x8894 /* element / array buffer binding */, &got); ok = (unsigned)got == v; break;
+    }
+    if (!ok) {
+        unsigned n = atomic_fetch_add(&g_dedup_wrong, 1);
+        if (n < 20) fprintf(stderr, "[glq] dedup check: kind %u value %#x on %u - GL has %d\n", what, v, on, (int)got);
+    }
+}
+uint32_t glq_job(void (*job)(void *), void *arg);
+/* a call found redundant: dropped, or (checking) a check in its place */
+static int drop(unsigned what, unsigned on, unsigned v)
+{
+    if (!dedup_on()) return 0;
+    g_n_dropped++;
+    if (dedup_check()) { glq_job(dedup_verify, (void *)((uintptr_t)what << 40 | (uintptr_t)on << 32 | v)); return 1; }
+    return 1;
+}
+static void client_state_unknown(void)
+{
+    memset(g_slot_known, 0, sizeof g_slot_known);
+    g_unit_known = 0; g_buf_known[0] = g_buf_known[1] = 0;
+}
 
 static const struct { const char *name; uint8_t kind, a, b, c; } T[] = {
     /* values */
@@ -199,7 +258,10 @@ static const Cls *cls(HleId id)
 {
     if (g_cls[id].ok) return &g_cls[id];
     const char *n = hle_name(id);
-    Cls k = { C_SYNC, 0, 0, 0, 1, 0, 0 };
+    Cls k = { C_SYNC, 0, 0, 0, 1, 0, 0, 0 };
+    /* calls after which the client state is no longer what the game thread
+     * last set: a restore, or another context (its own state) */
+    k.inv = !strcmp(n, "glPopClientAttrib") || !strncmp(n, "glX", 3);
     k.words = words_of(n);
     for (unsigned i = 0; i < sizeof T / sizeof T[0]; i++)
         if (!strcmp(n, T[i].name)) { k.kind = T[i].kind; k.a = T[i].a; k.b = T[i].b; k.c = T[i].c; break; }
@@ -559,6 +621,7 @@ static void glq_hook(CPU *c, HleId id, HleHandler fn)
     const Cls *k = cls(id);
     uint32_t a0 = A32(0);
     if (__builtin_expect(k->sh, 0) && shadow_state(c, id)) return;
+    if (__builtin_expect(k->inv, 0)) client_state_unknown();
     int async = 1;
     uint32_t extra = 0;                /* bytes of arrays after the arguments */
     switch (k->kind) {
@@ -584,15 +647,33 @@ static void glq_hook(CPU *c, HleId id, HleHandler fn)
             }
         break; }
     case C_BIND:
-        if (a0 == 0x8892) g_array_buf = A32(1);
-        else if (a0 == 0x8893) g_element_buf = A32(1);
+        if (a0 == 0x8892 || a0 == 0x8893) {
+            int e = a0 == 0x8893;
+            uint32_t *b = e ? &g_element_buf : &g_array_buf;
+            if (g_buf_known[e] && *b == A32(1) && drop(DC_BUF, (unsigned)e, A32(1))) return;
+            *b = A32(1); g_buf_known[e] = 1;
+        }
         break;
     case C_ENABLE_CS: case C_DISABLE_CS: {
-        int s = slot_of(a0); if (s >= 0) g_slot_on[s] = k->kind == C_ENABLE_CS;
+        int s = slot_of(a0), on = k->kind == C_ENABLE_CS;
+        if (s >= 0) {
+            /* a texture coordinate slot is the client unit's: known only with it */
+            int known = g_slot_known[s] && (s < S_TEX0 || s >= S_ATTR0 || g_unit_known);
+            if (known && g_slot_on[s] == on && drop(DC_ARRAY, (unsigned)on, a0)) return;
+            g_slot_on[s] = (uint8_t)on; g_slot_known[s] = s < S_TEX0 || s >= S_ATTR0 || g_unit_known;
+        }
         break; }
-    case C_CLIENT_TEX: g_client_unit = a0 - 0x84C0; g_cat_id = id; g_cat_fn = fn; break;
+    case C_CLIENT_TEX:
+        g_cat_id = id; g_cat_fn = fn;
+        if (g_unit_known && g_client_unit == a0 - 0x84C0 && drop(DC_UNIT, 0, a0)) return;
+        g_client_unit = a0 - 0x84C0; g_unit_known = 1;
+        break;
     case C_ENABLE_VA: case C_DISABLE_VA:
-        if (a0 < 16) g_slot_on[S_ATTR0 + a0] = k->kind == C_ENABLE_VA;
+        if (a0 < 16) {
+            int s = S_ATTR0 + (int)a0, on = k->kind == C_ENABLE_VA;
+            if (g_slot_known[s] && g_slot_on[s] == on && drop(DC_ATTRIB, (unsigned)on, a0)) return;
+            g_slot_on[s] = (uint8_t)on; g_slot_known[s] = 1;
+        }
         break;
     case C_PTR: {
         int s = k->b == S_TEX0 ? S_TEX0 + (int)(g_client_unit & 7) : k->b == S_ATTR0 ? (a0 < 16 ? S_ATTR0 + (int)a0 : -1) : k->b;
@@ -689,7 +770,8 @@ void glq_report(unsigned frames)
     fprintf(stderr, "[glq] ms per frame: game thread %.1f (waiting %.1f), GL thread %.1f; ",
             game0 ? (game - game0) / frames : 0, g_wait_ms / frames, work0 ? (work - work0) / frames : 0);
     game0 = game; work0 = work; g_wait_ms = 0;
-    fprintf(stderr, "per frame: %u queued, %u waited for", g_n_async / frames, g_n_sync / frames);
+    fprintf(stderr, "per frame: %u queued, %u dropped as redundant, %u waited for", g_n_async / frames, g_n_dropped / frames, g_n_sync / frames);
+    if (dedup_check()) fprintf(stderr, " (dedup check: %u wrong so far)", atomic_load(&g_dedup_wrong));
     for (int k = 0; k < 10; k++) {
         unsigned best = 0;
         for (unsigned i = 1; i < HLE_ID_MAX; i++) if (g_sync_by_id[i] > g_sync_by_id[best]) best = i;
@@ -699,7 +781,7 @@ void glq_report(unsigned frames)
     }
     fputc('\n', stderr);
     memset(g_sync_by_id, 0, sizeof g_sync_by_id);
-    g_n_async = g_n_sync = 0;
+    g_n_async = g_n_sync = g_n_dropped = 0;
 }
 
 /* Start, from the game thread at its first swap. release() lets go of the GL
