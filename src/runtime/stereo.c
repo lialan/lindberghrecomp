@@ -231,12 +231,24 @@ static int is_perspective(const float *m) { return fabsf(m[11] + 1) < 1e-4f && f
  * exactly where the arcade monitor showed it. */
 /* The view the HUD's screen is seen through: the game camera's, so it stays
  * put in the world, or the head's, so it stays in front of the face */
+static float g_hud_pitch;                       /* a head-locked HUD tilted up (+) or down, radians */
 static const float *hud_view(int eye)
 {
     if (g_hud_lock < 0) { const char *v = getenv("LINDBERGH_XR_HUD_LOCK"); g_hud_lock = v && *v == '1'; }
-    return g_hud_lock ? g_hud_view[eye] : g_view[eye];
+    if (!g_hud_lock) return g_view[eye];
+    if (g_hud_pitch == 0) return g_hud_view[eye];
+    static float tilted[2][16];
+    float r[16] = { 1, 0, 0, 0,  0, cosf(g_hud_pitch), sinf(g_hud_pitch), 0,  0, -sinf(g_hud_pitch), cosf(g_hud_pitch), 0,  0, 0, 0, 1 };
+    mat_mul(tilted[eye], g_hud_view[eye], r);
+    return tilted[eye];
 }
+void stereo_set_hud_pitch(float degrees) { g_hud_pitch = degrees * (float)M_PI / 180.0f; }
 void stereo_hud_head_locked(int on) { if (!getenv("LINDBERGH_XR_HUD_LOCK")) g_hud_lock = on; }
+int stereo_hud_is_head_locked(void)
+{
+    if (g_hud_lock < 0) { const char *v = getenv("LINDBERGH_XR_HUD_LOCK"); g_hud_lock = v && *v == '1'; }
+    return g_hud_lock;
+}
 
 static void effective_projection(const float *p, int hud, float *out)
 {
@@ -1354,10 +1366,16 @@ int stereo_aim_box_rect(int i, float r[4])
     return 1;
 }
 
-int stereo_aim_box(const float o_[3], const float d_[3], float *x, float *y, float *reach)
+int stereo_aim_box(const float o_[3], const float d_[3], int head, float *x, float *y, float *reach)
 {
     float o[3], d[3];
-    from_level(o_, o); from_level(d_, d);
+    /* head: the ray is already in the head's frame, where a head-locked HUD hangs */
+    if (head) {         /* and turned back by the HUD's tilt */
+        float cp = cosf(g_hud_pitch), sp = sinf(g_hud_pitch);
+        o[0] = o_[0]; o[1] = cp * o_[1] + sp * o_[2]; o[2] = -sp * o_[1] + cp * o_[2];
+        d[0] = d_[0]; d[1] = cp * d_[1] + sp * d_[2]; d[2] = -sp * d_[1] + cp * d_[2];
+    }
+    else { from_level(o_, o); from_level(d_, d); }
     if (d[2] > -1e-4f) return 0;
     for (int i = 0; i < g_n_aim_box[0]; i++) {
         float dist = g_aim_dist[0][i], t = (-dist - o[2]) / d[2];
@@ -1422,7 +1440,11 @@ static int transform_call(CPU *c, HleId id, const char *n)
     }
     if (k == K_OTHER) return 0;
     if (g_on && (k == K_COPYTEXSUB || k == K_COPYTEX)) return copy_from_eyes(c, k);
-    if (g_on && g_mv && !g_side && (is_draw(k) || k == K_BEGIN) && g_tex2d_on && g_nscreen_copy && screen_copy(g_tex2d_bound)) {
+    /* A copy of the screen drawn back over a world drawn this frame (a post
+     * effect) would flatten it to one eye's picture: left out. Over no world
+     * it is the whole picture - a transition, last frame's view swept away -
+     * and leaving it out left the eyes black: it goes over the whole view. */
+    if (g_on && g_mv && !g_side && (is_draw(k) || k == K_BEGIN) && g_tex2d_on && g_nscreen_copy && screen_copy(g_tex2d_bound) && g_scene_draws) {
         if (k == K_BEGIN) g_skip_begin = 1;
         return 1;
     }

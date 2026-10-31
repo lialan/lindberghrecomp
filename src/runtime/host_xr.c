@@ -120,6 +120,7 @@ static struct {
     float scale, screen, aim;            /* aim: where the laser and the game's shot meet, metres */
     int   resolution, width, refresh, left_handed, laser, auto_coins;
     int   sight, crosshair, show_gun;         /* XO_SIGHT_*; the game's own sight; the gun model */
+    int   hud_pitch;                          /* a head-locked HUD tilted up (+) or down, degrees */
 } cfg = { 1.0f, 3.0f, 15.0f, 2280, 2064, 120, 0, LASER_ON, 1, XO_SIGHT_NONE, 1, 1 };
 
 static void cfg_save(void)
@@ -127,10 +128,10 @@ static void cfg_save(void)
     FILE *f = fopen("vr.cfg", "w");
     if (!f) return;
     fprintf(f, "scale %g\nscreen %g\naim %g\nresolution %d\nwidth %d\nrefresh %d\nhand %s\nlaser %s\ncoins %s\n"
-               "sight %s\ncrosshair %s\ngun %s\n",
+               "sight %s\ncrosshair %s\ngun %s\nhud_pitch %d\n",
             cfg.scale, cfg.screen, cfg.aim, cfg.resolution, cfg.width, cfg.refresh, cfg.left_handed ? "left" : "right",
             LASER_NAME[cfg.laser], cfg.auto_coins ? "auto" : "manual",
-            SIGHT_NAME[cfg.sight], cfg.crosshair ? "on" : "off", cfg.show_gun ? "on" : "off");
+            SIGHT_NAME[cfg.sight], cfg.crosshair ? "on" : "off", cfg.show_gun ? "on" : "off", cfg.hud_pitch);
     fclose(f);
 }
 
@@ -165,6 +166,7 @@ static void cfg_set(const char *key, const char *val)
     {
         if (!strcmp(key, "scale")) cfg.scale = (float)atof(val);
         else if (!strcmp(key, "screen")) cfg.screen = (float)atof(val);
+        else if (!strcmp(key, "hud_pitch")) cfg.hud_pitch = atoi(val);
         else if (!strcmp(key, "aim")) cfg.aim = (float)atof(val);
         else if (!strcmp(key, "resolution")) cfg.resolution = atoi(val);
         else if (!strcmp(key, "width")) cfg.width = atoi(val);
@@ -401,7 +403,7 @@ static int fake_gun(void)
  * towards them, the game's screen still in view (the arcade's own Test menu
  * is worked from here too). Point the gun at a row and pull the trigger;
  * the game gets no input meanwhile. */
-enum { M_SIGHT, M_LASER, M_CROSSHAIR, M_GUN, M_HAND, M_SCREEN, M_RATE, M_RES, M_COINS, M_COIN, M_RECENTRE,
+enum { M_SIGHT, M_LASER, M_CROSSHAIR, M_GUN, M_HAND, M_SCREEN, M_HUD, M_RATE, M_RES, M_COINS, M_COIN, M_RECENTRE,
        M_TEST, M_SERVICE, M_RESET, M_CLOSE, M_COUNT };
 static struct {
     int open, hover, dirty;
@@ -413,6 +415,8 @@ static float rates[16];
 static int running_resolution, running_width;
 /* the gun's ray this frame (game units), what it reached two frames ago */
 static float probe_o[3], probe_d[3], aim_hit_t = -1, aim_reach;
+static XrPosef head_pose;            /* between the eyes, facing as they do: where a head-locked HUD hangs */
+static int head_ok;
 static int aim_on_box;              /* this frame's aim went to a box on the screen */
 static int probe_on;
 static XrTime reload_t;            /* when the player last reloaded */
@@ -424,7 +428,7 @@ static void menu_items(XmItem *it)
     static const char *const sight[] = { "Point shooting", "Red dot", "Holographic" };
     static const char *const laser[] = { "Laser and dot", "Dot only", "Off" };
     static const char *const labels[M_COUNT] = {
-        "Sight", "Laser", "Game crosshair", "Gun model", "Gun hand", "Screen distance", "Display rate", "Resolution per eye",
+        "Sight", "Laser", "Game crosshair", "Gun model", "Gun hand", "Screen distance", "HUD position", "Display rate", "Resolution per eye",
         "Coins", "Insert a coin", "Recentre view", "Arcade Test button (select)",
         "Arcade Service button (next)", "Reset game", "Close" };
     for (int i = 0; i < M_COUNT; i++) { it[i].label = labels[i]; it[i].value[0] = 0; }
@@ -434,6 +438,9 @@ static void menu_items(XmItem *it)
     snprintf(it[M_GUN].value, 40, "%s", cfg.show_gun ? "Shown" : "Hidden");
     snprintf(it[M_HAND].value, 40, "%s", gun_hand == HAND_L ? "Left" : "Right");
     snprintf(it[M_SCREEN].value, 40, "%.1f m", cfg.screen);
+    if (!stereo_hud_is_head_locked()) snprintf(it[M_HUD].value, 40, "With the screen");
+    else if (cfg.hud_pitch == 0) snprintf(it[M_HUD].value, 40, "Centre");
+    else snprintf(it[M_HUD].value, 40, "%s %d deg", cfg.hud_pitch < 0 ? "Down" : "Up", abs(cfg.hud_pitch));
     snprintf(it[M_RATE].value, 40, "%d Hz", cfg.refresh);
     char res[24];
     if (cfg.width) snprintf(res, sizeof res, "%d x %d", cfg.width, cfg.resolution);
@@ -534,6 +541,14 @@ static void menu_choose(int item)
         while (k < 5 && screens[k] <= cfg.screen + 0.01f) k++;
         cfg.screen = screens[k % 5];
         stereo_set_screen_distance(cfg.screen * cfg.scale);
+        break;
+    }
+    case M_HUD: {       /* a head-locked HUD tilted, for where the eye rests */
+        static const int pitches[] = { 0, -10, -20, -30, 10 };
+        int k = 0;
+        while (k < 5 && pitches[k] != cfg.hud_pitch) k++;
+        cfg.hud_pitch = pitches[(k + 1) % 5];
+        stereo_set_hud_pitch((float)cfg.hud_pitch);
         break;
     }
     case M_RATE:
@@ -662,7 +677,16 @@ static void input_frame(XrTime t)
         aim_on_box = 0;
         {
             float xs, ys, ts;
-            if (!flat && stereo_aim_box(o, d, &xs, &ys, &ts)) { gx = xs; gy = ys; aimed = 1; aim_reach = ts / cfg.scale; aim_on_box = 1; }
+            /* a head-locked HUD's boxes hang in front of the face: the laser in the head's frame */
+            float ho[3], hd[3];
+            int head = stereo_hud_is_head_locked() && head_ok;
+            if (head) {
+                XrQuaternionf iq = { -head_pose.orientation.x, -head_pose.orientation.y, -head_pose.orientation.z, head_pose.orientation.w };
+                float r[3] = { o[0] - head_pose.position.x * cfg.scale, o[1] - head_pose.position.y * cfg.scale,
+                               o[2] - head_pose.position.z * cfg.scale };
+                qrot(iq, r, ho); qrot(iq, d, hd);
+            }
+            if (!flat && stereo_aim_box(head ? ho : o, head ? hd : d, head, &xs, &ys, &ts)) { gx = xs; gy = ys; aimed = 1; aim_reach = ts / cfg.scale; aim_on_box = 1; }
         }
         /* the overlay: the gun on the aim pose, the laser to the game's screen */
         xo.gun_valid = 1;
@@ -1033,6 +1057,7 @@ int xr_init(void)
     { const char *v = getenv("LINDBERGH_AIM_PROBE"); if (!v || *v != '0') stereo_set_aim_hook(aim_probe); }   /* =0: aim at cfg.aim */
     stereo_eye_size((int)w, (int)h);
     stereo_set_screen_distance(cfg.screen * cfg.scale);
+    stereo_set_hud_pitch((float)cfg.hud_pitch);
     stereo_start();
     gun_hand = cfg.left_handed ? HAND_L : HAND_R;
     fprintf(stderr, "[xr] ready: %ux%u per eye, %s swapchain, %.2f game units/m, HUD screen at %.1f m, on %s\n",
@@ -1245,6 +1270,11 @@ void xr_frame_begin(void)
             view_matrix(hp, m);
             stereo_set_eye_head(i, m);
         }
+        head_pose.orientation = views[0].pose.orientation;
+        head_pose.position.x = 0.5f * (views[0].pose.position.x + views[1].pose.position.x);
+        head_pose.position.y = 0.5f * (views[0].pose.position.y + views[1].pose.position.y);
+        head_pose.position.z = 0.5f * (views[0].pose.position.z + views[1].pose.position.z);
+        head_ok = 1;
     }
     if (state == XR_SESSION_STATE_FOCUSED) input_frame(frame.predictedDisplayTime);
     else { host_vr_input(-100000, -100000, 0, 0); xo.gun_valid = xo.beam = xo.dot = xo.flash = 0; }

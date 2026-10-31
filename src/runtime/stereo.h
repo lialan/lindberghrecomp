@@ -35,7 +35,9 @@ int  stereo_ray_to_screen(const float o[3], const float d[3], float *x, float *y
 /* The laser (origin o, direction d, game units) on a box the game drew last
  * frame from its own rendering - the path choice's views: where it crosses
  * the box, in the game's pixels, and how far along the laser */
-int  stereo_aim_box(const float o[3], const float d[3], float *x, float *y, float *reach);
+int  stereo_aim_box(const float o[3], const float d[3], int head, float *x, float *y, float *reach);
+int  stereo_hud_is_head_locked(void);
+void stereo_set_hud_pitch(float degrees);
 int  stereo_aim_box_rect(int i, float r[4]);
 void stereo_game_size(int *w, int *h);
 void stereo_picture_size(int w, int h);   /* the world drawn into a target of this size */
