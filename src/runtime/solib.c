@@ -52,12 +52,35 @@ int solib_dlopen(CPU *c, const char *path)
 uint32_t solib_dlsym(const char *name)
 {
     if (!g_loaded || !name) return 0;
+    return solib_export(name);
+}
+
+uint32_t solib_export(const char *name)
+{
+    if (!name) return 0;
 #define EXP(n, a) if (!strcmp(name, n)) return a;
     SOLIB_EXPORTS(EXP)
 #undef EXP
     return 0;
 }
+
+/* A main executable may link a lifted library through its PLT, without
+ * ever calling dlopen. HLE has already consumed the caller's return slot;
+ * restore one for the lifted callee, keeping its original arguments. */
+int solib_call(CPU *c, const char *name)
+{
+    uint32_t fn = solib_export(name);
+    if (!fn) return 0;
+    CPU saved = *c;
+    load_all(c);
+    *c = saved;
+    push32(c, 0xDEADBEEFu);
+    dispatch(c, fn);
+    return 1;
+}
 #else
 int solib_dlopen(CPU *c, const char *path) { (void)c; (void)path; return 0; }
 uint32_t solib_dlsym(const char *name) { (void)name; return 0; }
+uint32_t solib_export(const char *name) { (void)name; return 0; }
+int solib_call(CPU *c, const char *name) { (void)c; (void)name; return 0; }
 #endif

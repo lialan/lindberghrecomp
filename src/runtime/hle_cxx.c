@@ -447,6 +447,58 @@ static void h_sgi_deallocate(CPU *c) { if (A32(0)) CXX_FREE(GP(A32(0))); RET(0);
  * console the cabinet does not have. */
 static void h_ios_init(CPU *c) { RET(0); }
 
+/* std::list's i386 node base is {next, prev}. hook inserts this node before
+ * position; unhook preserves the neighbouring links, including a sentinel. */
+static void h_list_hook(CPU *c)
+{
+    uint32_t node = A32(0), position = A32(1), previous = rd32(position + 4);
+    wr32(node, position); wr32(node + 4, previous);
+    wr32(previous, node); wr32(position + 4, node);
+}
+static void h_list_unhook(CPU *c)
+{
+    uint32_t node = A32(0), next = rd32(node), previous = rd32(node + 4);
+    wr32(next + 4, previous); wr32(previous, next);
+}
+
+/* Itanium C++ ABI array helpers, with i386 size_t and array cookie. The
+ * allocator, constructors and destructors are guest functions: calling the
+ * host C++ ABI here would truncate pointers and use the wrong cookie size. */
+static void h_vec_new2(CPU *c)
+{
+    uint32_t count = A32(0), size = A32(1), padding = A32(2);
+    uint32_t ctor = A32(3), alloc = A32(5);
+    uint64_t bytes = (uint64_t)count * size + padding;
+    if (bytes > UINT32_MAX || !alloc || (padding && padding < 4)) {
+        fprintf(stderr, "[c++] invalid array allocation\n"); abort();
+    }
+    uint32_t n = (uint32_t)bytes;
+    uint32_t base = guest_call(c, alloc, &n, 1);
+    if (!base) { RET(0); return; }
+    uint32_t array = base + padding;
+    if (padding) wr32(array - 4, count);
+    if (ctor) for (uint32_t i = 0; i < count; i++) {
+        uint32_t element = array + i * size;
+        guest_call(c, ctor, &element, 1);
+    }
+    RET(array);
+}
+static void h_vec_delete2(CPU *c)
+{
+    uint32_t array = A32(0), size = A32(1), padding = A32(2);
+    uint32_t dtor = A32(3), dealloc = A32(4);
+    if (!array) return;
+    if (!dealloc || (padding && padding < 4)) {
+        fprintf(stderr, "[c++] invalid array deletion\n"); abort();
+    }
+    if (padding && dtor) for (uint32_t n = rd32(array - 4); n; n--) {
+        uint32_t element = array + (n - 1) * size;
+        guest_call(c, dtor, &element, 1);
+    }
+    uint32_t base = array - padding;
+    guest_call(c, dealloc, &base, 1);
+}
+
 void hle_register_cxx(void)
 {
     int n = 0;
@@ -462,6 +514,10 @@ void hle_register_cxx(void)
     n += hle_bind("__cxa_call_unexpected", h_cxa_call_unexpected);
     n += hle_bind("__gxx_personality_v0", h_gxx_personality);
     n += hle_bind("__cxa_atexit", h_cxa_atexit);
+    n += hle_bind("__cxa_vec_new2", h_vec_new2);
+    n += hle_bind("__cxa_vec_delete2", h_vec_delete2);
+    n += hle_bind("_ZNSt15_List_node_base4hookEPS_", h_list_hook);
+    n += hle_bind("_ZNSt15_List_node_base6unhookEv", h_list_unhook);
 
     /* std::string, the SGI allocator under it, and the iostream set up these
      * games do at start up. Mangled, but plain C-linkage to the PLT. */

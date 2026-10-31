@@ -62,7 +62,7 @@ static void test_hle_names(void)
 {
     CHECK(strcmp(hle_name(HLE_write), "write") == 0);
     CHECK(strcmp(hle_name(HLE_glClear), "glClear") == 0);
-    CHECK(HLE_COUNT == 2);
+    CHECK(HLE_COUNT == HLE_test_solib_function + 1);
 }
 
 int main(void)
@@ -71,6 +71,8 @@ int main(void)
     test_syscall_write();
     test_syscall_unknown();
     test_hle_names();
+    int test_runtime_abis(void);
+    fails += test_runtime_abis();
     if (fails) { fprintf(stderr, "%d check(s) failed\n", fails); return 1; }
     printf("ok: dispatch table, syscall layer, import names\n");
     return 0;

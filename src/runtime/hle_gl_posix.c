@@ -17,6 +17,7 @@
 #include "gl_posix.h"
 #include "arbprog.h"
 #include "glsl_pp.h"
+#include "glsl_compat.h"
 #include "stereo.h"
 
 int g_gl_trace;
@@ -616,15 +617,19 @@ static void h_glShaderSourceARB(CPU *c)
     }
     host[0] = has_version ? "" : "#version 120\n";
     hl[0] = (GLint)strlen(host[0]);
+    size_t total = 1;
+    for (GLsizei i = 0; i <= n; i++) total += (size_t)hl[i];
+    char *joined = malloc(total), *cursor = joined;
+    if (!joined) { for (GLsizei i = 0; i < n; i++) free(copy[i]); return; }
+    for (GLsizei i = 0; i <= n; i++) { memcpy(cursor, host[i], (size_t)hl[i]); cursor += hl[i]; }
+    *cursor = 0;
+    char *portable = glsl_compat(joined);
+    if (portable) { free(joined); joined = portable; }
 #ifdef LINDBERGH_GL4ES
     /* GLSL ES rejects an #if on a name that is not a macro, which desktop
      * GLSL reads as 0: the conditionals are decided here (glsl_pp.c) */
     {
-        size_t total = 1;
-        for (GLsizei i = 0; i <= n; i++) total += (size_t)hl[i];
-        char *all = malloc(total), *w = all;
-        for (GLsizei i = 0; i <= n; i++) { memcpy(w, host[i], (size_t)hl[i]); w += hl[i]; }
-        *w = 0;
+        char *all = joined;
         if (glsl_has_conditionals(all)) {
             char *done = glsl_resolve_conditionals(all);
             free(all);
@@ -646,7 +651,9 @@ static void h_glShaderSourceARB(CPU *c)
         free(all);
     }
 #else
-    glShaderSource(sh, n + 1, host, hl);
+    const GLchar *one = joined;
+    glShaderSource(sh, 1, &one, NULL);
+    free(joined);
 #endif
     for (GLsizei i = 0; i < n; i++) free(copy[i]);
 }

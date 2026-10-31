@@ -135,6 +135,8 @@ void hle_register_rideboard(void);
 void rideboard_enable(const char *dev);
 void sega_sysdata_region(int on);
 void jvs_reload_switch(unsigned byte, unsigned mask);  /* hle_sega.c: where the reload input lands */       /* hle_sega.c: the region goes into the EEPROM's system data */
+void jvs_action_switch(unsigned player, unsigned target, unsigned byte, unsigned mask);
+unsigned char jvs_switch_byte(unsigned buttons, unsigned player, unsigned byte);
 int  rideboard_open(const char *path);
 int  rideboard_is(int fd);
 int  rideboard_read(unsigned char *p, unsigned n);
@@ -310,11 +312,14 @@ void       host_swap(void);
 void       hle_register_gl(void);
 void       hle_register_zlib(void);
 void       hle_register_openal(void);
+void       hle_register_alsa(void);
 void       hle_register_libc4(void);
 void       hle_register_segaapi(void);
 void       hle_register_glx_posix(void);
 int        solib_dlopen(CPU *c, const char *path);
 uint32_t   solib_dlsym(const char *name);
+uint32_t   solib_export(const char *name);
+int        solib_call(CPU *c, const char *name);
 
 /* A callable address for a GL entry point the game asks for by name but does
  * not import. gl_token_call routes one; dispatch() consults it. */

@@ -38,6 +38,10 @@ void game_profile_apply(const LgGameProfile *p)
     if (p->ride_board) rideboard_enable(p->ride_board);
     if (p->sysdata_region) sega_sysdata_region(1);
     if (p->reload_switch[1]) jvs_reload_switch(p->reload_switch[0], p->reload_switch[1]);
+    for (unsigned i = 0; i < 2; i++) {
+        const unsigned char *s = p->action_switch[i];
+        jvs_action_switch(i, s[2] ? s[0] : i, s[2] ? s[1] : 1, s[2] ? s[2] : 0x80);
+    }
 #ifdef __ANDROID__
     if (p->vr.title) env_default("LINDBERGH_XR_TITLE", p->vr.title);
     if (p->vr.gl_thread) env_default("LINDBERGH_GL_THREAD", "1");

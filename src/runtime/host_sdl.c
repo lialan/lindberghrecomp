@@ -340,7 +340,17 @@ static void cabinet_autostart(void)
         static int press = -1;
         if (press < 0) { const char *v = getenv("LINDBERGH_AUTOPRESS"); press = v ? (int)strtol(v, NULL, 16) : 0; }
         g_auto &= ~(unsigned)press;
-        if (press && g_frame % 120u >= 60u && g_frame % 120u < 75u) g_auto |= (unsigned)press;
+        /* Pedal minigames need repeat presses faster than the default
+         * diagnostic pulse. These affect AUTOPRESS only, never real input. */
+        static unsigned press_period, press_hold;
+        if (!press_period) {
+            int period = env_int("LINDBERGH_AUTOPRESS_PERIOD", 120);
+            int hold = env_int("LINDBERGH_AUTOPRESS_HOLD", 15);
+            press_period = period > 1 ? (unsigned)period : 120;
+            press_hold = hold > 0 && (unsigned)hold < press_period / 2 ? (unsigned)hold : press_period / 2;
+        }
+        unsigned phase = g_frame % press_period;
+        if (press && phase >= press_period / 2 && phase < press_period / 2 + press_hold) g_auto |= (unsigned)press;
         /* LINDBERGH_AUTOGUN=2: one second in four off the screen, with a
          * press of the gun's screen-out signal - the arcade's reload */
         if (gun == 2) stereo_game_gun_reloading(g_frame % 240u >= 20u && g_frame % 240u < 110u);

@@ -43,7 +43,12 @@
 #define MI_privsize 28
 #define MI_private  32
 
-#define DOTCLOCK 85500        /* kHz, a real 1360x768 60 Hz pixel clock */
+/* Match the totals returned below. Games that calculate refresh from the
+ * clock and totals reject a fixed clock copied from another display mode. */
+static uint32_t dotclock(int w, int h)
+{
+    return (uint32_t)(((uint64_t)(w + 256) * (h + 22) * 60 + 500) / 1000);
+}
 
 static void fill_modeline(uint32_t p, int w, int h, int base)
 {
@@ -83,7 +88,7 @@ static void h_GetModeLine(CPU *c)
 {
     int w, h;
     lindbergh_window_size(&w, &h);
-    if (A32(2)) wr32(A32(2), DOTCLOCK);
+    if (A32(2)) wr32(A32(2), dotclock(w, h));
     if (A32(3)) {
         uint32_t p = A32(3);
         memset((void *)GP(p), 0, 32);
@@ -113,7 +118,7 @@ static void h_GetAllModeLines(CPU *c)
         g_mode_list = H2G(guest_alloc(4, 16));
     }
     uint32_t m = g_mode;
-    wr32(m + MI_dotclock, DOTCLOCK);
+    wr32(m + MI_dotclock, dotclock(w, h));
     fill_modeline(m, w, h, MI_body);
 
     wr32(g_mode_list, m);

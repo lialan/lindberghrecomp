@@ -24,6 +24,7 @@ import os
 import re
 import struct
 import sys
+import argparse
 
 from elftools.elf.elffile import ELFFile
 
@@ -121,9 +122,12 @@ class Lib:
 
 
 def main():
-    outdir, paths = sys.argv[1], sys.argv[2:]
-    if not paths:
-        raise SystemExit(__doc__)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("outdir")
+    parser.add_argument("--main-elf", help="resolve callbacks and data exported by the main executable")
+    parser.add_argument("libraries", nargs="+")
+    opts = parser.parse_intermixed_args()
+    outdir, paths = opts.outdir, opts.libraries
 
     libs, base = [], LIB_BASE
     for p in paths:
@@ -135,6 +139,18 @@ def main():
     for lib in libs:
         for n, a in lib.exports.items():
             exports.setdefault(n, a)
+
+    # ELF symbol interposition: the executable's definitions take priority.
+    # Libraries can call back into its CRI decoder and mutex helpers, and
+    # reference the RTTI objects copied there by the dynamic linker.
+    resolved = dict(exports)
+    if opts.main_elf:
+        with open(opts.main_elf, "rb") as stream:
+            dynsym = ELFFile(stream).get_section_by_name(".dynsym")
+            if dynsym:
+                for sym in dynsym.iter_symbols():
+                    if sym.name and sym["st_shndx"] != "SHN_UNDEF":
+                        resolved[sym.name] = sym["st_value"]
 
     # what the main ELF already imports: its HLE ids exist already
     main_imports = set(re.findall(r'X\(HLE_\w+, "([^"]+)"\)',
@@ -148,8 +164,8 @@ def main():
         s = lib.dynsym.get_symbol(symidx)
         if s["st_shndx"] != "SHN_UNDEF":
             return lib.base + s["st_value"]
-        if s.name in exports:
-            return exports[s.name]
+        if s.name in resolved:
+            return resolved[s.name]
         if s["st_info"]["bind"] == "STB_WEAK":
             return 0
         if s["st_info"]["type"] == "STT_OBJECT":
@@ -189,7 +205,7 @@ def main():
     alias = {}
     for lib in libs:
         for stub, name in lib.plt_stubs().items():
-            target = exports.get(name)
+            target = resolved.get(name)
             if target is not None:
                 alias[stub] = target
             elif name in tokens:

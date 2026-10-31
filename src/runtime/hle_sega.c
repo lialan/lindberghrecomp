@@ -104,6 +104,33 @@ static const unsigned char JVS_FEATURES[] = {
 static unsigned g_reload_byte, g_reload_mask = 0x01;
 void jvs_reload_switch(unsigned byte, unsigned mask) { g_reload_byte = byte; g_reload_mask = mask; }
 
+static unsigned char g_action_switch[2][3] = {{0, 1, 0x80}, {1, 1, 0x80}};
+void jvs_action_switch(unsigned player, unsigned target, unsigned byte, unsigned mask)
+{
+    if (player >= 2 || target >= 2 || byte >= 2) return;
+    g_action_switch[player][0] = (unsigned char)target;
+    g_action_switch[player][1] = (unsigned char)byte;
+    g_action_switch[player][2] = (unsigned char)mask;
+}
+
+unsigned char jvs_switch_byte(unsigned buttons, unsigned player, unsigned byte)
+{
+    if (player >= 2 || byte >= 2) return 0;
+    unsigned g = player ? buttons >> CAB_P2_SHIFT : buttons;
+    unsigned char b = 0;
+    if (!byte) {
+        if (buttons & (player ? CAB_P2_START : CAB_P1_START)) b |= 0x80;
+        if (!player && (buttons & CAB_SERVICE)) b |= 0x40;
+        if (g & CAB_P1_TRIGGER) b |= 0x02;
+    } else if (g & CAB_P1_FIREMODE) b |= 0x40;
+    if ((g & CAB_P1_RELOAD) && byte == g_reload_byte) b |= (unsigned char)g_reload_mask;
+    for (unsigned i = 0; i < 2; i++) {
+        const unsigned char *s = g_action_switch[i];
+        if (s[0] == player && s[1] == byte && (buttons & (i ? CAB_P2_ACTION : CAB_P1_ACTION))) b |= s[2];
+    }
+    return b;
+}
+
 /* One reply at a time: the game sends, then receives, on the same thread. */
 static unsigned char g_ack[0x200];
 static unsigned      g_ack_len;
@@ -176,23 +203,9 @@ static void jvs_command(const unsigned char *p)
         ack_report();
         ack_byte((in.buttons & CAB_TEST) ? 0x80 : 0x00);
         for (unsigned pl = 0; pl < players; pl++) {
-            /* P2's gun switches are P1's, shifted (CAB_P2_SHIFT) */
-            unsigned g = pl == 0 ? in.buttons : pl == 1 ? (in.buttons >> CAB_P2_SHIFT) : 0;
-            unsigned char b0 = 0;
-            if (pl == 0 && (in.buttons & CAB_P1_START)) b0 |= 0x80;
-            if (pl == 1 && (in.buttons & CAB_P2_START)) b0 |= 0x80;
-            if (pl == 0 && (in.buttons & CAB_SERVICE))  b0 |= 0x40;
-            if (g & CAB_P1_TRIGGER) b0 |= 0x02;
-            if ((g & CAB_P1_RELOAD) && g_reload_byte == 0) b0 |= (unsigned char)g_reload_mask;
-            ack_byte(b0);
+            ack_byte(jvs_switch_byte(in.buttons, pl, 0));
             if (bytes > 1) {
-                /* second byte: bit 7 is the gun's action button, bit 6 its
-                 * fire-mode selector - the masks the game's gun code holds */
-                unsigned char b1 = 0;
-                if (g & CAB_P1_ACTION)   b1 |= 0x80;
-                if (g & CAB_P1_FIREMODE) b1 |= 0x40;  /* single/burst/auto/grenade */
-                if ((g & CAB_P1_RELOAD) && g_reload_byte == 1) b1 |= (unsigned char)g_reload_mask;
-                ack_byte(b1);
+                ack_byte(jvs_switch_byte(in.buttons, pl, 1));
                 ack_zeros(bytes - 2);
             }
         }

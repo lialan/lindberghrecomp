@@ -74,6 +74,7 @@ void hle_register_all(void)
     hle_register_libc4();
     hle_register_segaapi();
 #ifndef _WIN32
+    hle_register_alsa();
     hle_register_glx_posix();
 #endif
 
@@ -84,7 +85,11 @@ void hle_register_all(void)
     if (u && *u == '1') {
         int n = 0;
         for (int i = 0; i < HLE_COUNT; i++)
-            if (!g_hle_handlers[i]) { fprintf(stderr, "[unbound] %s\n", hle_name((HleId)i)); n++; }
+            if (!g_hle_handlers[i]
+#ifndef _WIN32
+                && !solib_export(hle_name((HleId)i))
+#endif
+            ) { fprintf(stderr, "[unbound] %s\n", hle_name((HleId)i)); n++; }
         fprintf(stderr, "[unbound] %d of %d imports have no body\n", n, (int)HLE_COUNT);
         exit(0);
     }
@@ -188,6 +193,9 @@ void hle_call(CPU *c, HleId id)
         g_hle_handlers[id](c);
         return;
     }
+#ifndef _WIN32
+    if (solib_call(c, hle_name(id))) return;
+#endif
     if (permissive()) {
         if (!g_seen) g_seen = (unsigned char *)calloc(HLE_COUNT, 1);
         if (g_seen && !g_seen[id]) {

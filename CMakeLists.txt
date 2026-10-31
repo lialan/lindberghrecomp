@@ -56,9 +56,11 @@ function(lindbergh_runtime target generated_dir)
             "${LINDBERGH_RUNTIME_DIR}/hle_gl_posix.c"
             "${LINDBERGH_RUNTIME_DIR}/arbprog.c"
             "${LINDBERGH_RUNTIME_DIR}/glsl_pp.c"
+            "${LINDBERGH_RUNTIME_DIR}/glsl_compat.c"
             "${LINDBERGH_RUNTIME_DIR}/stereo.c"
             "${LINDBERGH_RUNTIME_DIR}/gl_thread.c"
             "${LINDBERGH_RUNTIME_DIR}/hle_openal.c"
+            "${LINDBERGH_RUNTIME_DIR}/hle_alsa.c"
             "${LINDBERGH_RUNTIME_DIR}/hle_glx_posix.c"
             "${LINDBERGH_RUNTIME_DIR}/hle_cg.c"
             "${LINDBERGH_RUNTIME_DIR}/hud_widen.c"
@@ -155,7 +157,7 @@ endfunction()
 # guest_load() is covered by the first real title.
 if(NOT ANDROID)     # it runs on the build machine
     enable_testing()
-    add_executable(lindbergh_rt_selftest tests/selftest/selftest.c)
+    add_executable(lindbergh_rt_selftest tests/selftest/selftest.c tests/selftest/runtime_abis.c)
     lindbergh_runtime(lindbergh_rt_selftest "${CMAKE_CURRENT_SOURCE_DIR}/tests/selftest")
     add_test(NAME lindbergh_rt_selftest COMMAND lindbergh_rt_selftest)
 endif()

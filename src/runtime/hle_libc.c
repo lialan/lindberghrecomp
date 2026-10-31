@@ -409,6 +409,17 @@ static void h_strrchr (CPU *c) { RET(strrchr(ASTR(0), AI32(1))); }
 static void h_strstr  (CPU *c) { RET(strstr(ASTR(0), ASTR(1))); }
 static void h_strerror(CPU *c) { RET(guest_strdup_static(strerror(AI32(0)))); }
 
+static void h_posix_memalign(CPU *c)
+{
+    uint32_t align = A32(1);
+    /* This is the i386 ABI: sizeof(void *) is four, even on a 64-bit host.
+     * POSIX returns an error number and leaves *memptr untouched on failure. */
+    if (!A32(0) || align < 4 || (align & (align - 1))) { RET(22); return; }
+    void *p = gmalloc(A32(2), align);
+    if (!p) { RET(12); return; }
+    wr32(A32(0), H2G(p)); RET(0);
+}
+
 static void h_strdup(CPU *c)
 {
     /* Not the host strdup: the guest hands the result to its own free(), which
@@ -941,6 +952,7 @@ void hle_register_libc(void)
     hle_bind("memcpy", h_memcpy);        hle_bind("memmove", h_memmove);
     hle_bind("memset", h_memset);        hle_bind("memchr", h_memchr);
     hle_bind("memalign", h_memalign);
+    hle_bind("posix_memalign", h_posix_memalign);
 
     hle_bind("strlen", h_strlen);        hle_bind("strcpy", h_strcpy);
     hle_bind("strncpy", h_strncpy);      hle_bind("strcat", h_strcat);
@@ -948,6 +960,7 @@ void hle_register_libc(void)
     hle_bind("strncmp", h_strncmp);      hle_bind("strchr", h_strchr);
     hle_bind("strrchr", h_strrchr);      hle_bind("strstr", h_strstr);
     hle_bind("strdup", h_strdup);        hle_bind("strerror", h_strerror);
+    hle_bind("__strdup", h_strdup);
     hle_bind("index", h_index);
 
     hle_bind("printf", h_printf);        hle_bind("fprintf", h_fprintf);
@@ -992,6 +1005,11 @@ void hle_register_libc(void)
     hle_bind("__divdi3", h_divdi3);
     hle_bind("__udivdi3", h_udivdi3);
     hle_bind("__umoddi3", h_umoddi3);
+    /* GCC shares the signed helper's body with an interior label of the
+     * unsigned helper. Override the public entries in static builds too. */
+    guest_override("__divdi3", h_divdi3);
+    guest_override("__udivdi3", h_udivdi3);
+    guest_override("__umoddi3", h_umoddi3);
 }
 
 /* ---- files, wide characters, and glibc's versioned internals ----
@@ -1766,6 +1784,9 @@ static void h_IO_putc(CPU *c) { RET(fputc(AI32(0), AFILE(1))); }
 static void h_fsync(CPU *c)  { RET(0); }
 static void h_fcntl(CPU *c)  { RET(0); }
 static void h_sched_yield(CPU *c) { RET(0); }
+/* Cabinet priority requests follow the pthread scheduling policy: keep
+ * normal host scheduling rather than changing the user's process priority. */
+static void h_nice(CPU *c) { RET(0); }
 static void h_signal(CPU *c) { RET(0); }               /* SIG_DFL: no host signals reach the guest */
 static void h_lseek64(CPU *c)
 {
@@ -1868,6 +1889,7 @@ void hle_register_libc4(void)
     hle_bind("open64", h_open);       hle_bind("fopen64", h_fopen);
     hle_bind("lseek64", h_lseek64);   hle_bind("fsync", h_fsync);
     hle_bind("fcntl", h_fcntl);       hle_bind("sched_yield", h_sched_yield);
+    hle_bind("nice", h_nice);
     hle_bind("signal", h_signal);     hle_bind("select", h_select);
     hle_bind("system", h_system);     hle_bind("popen", h_popen);
     hle_bind("pclose", h_pclose);     hle_bind("sysctl", h_sysctl);
