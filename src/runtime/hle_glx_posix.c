@@ -23,6 +23,9 @@
 
 #include "gl_posix.h"
 #include "stereo.h"
+#ifdef LINDBERGH_VULKAN
+#include "vulkan_host.h"
+#endif
 
 /* Tokens for things the game only hands back. Distinctive in a crash dump. */
 #define TOK_WINDOW   0x58570001u      /* "XW" */
@@ -118,6 +121,11 @@ static void h_glXCreatePbuffer(CPU *c)
     while (i < MAX_PB && g_pb[i].fb) i++;
     if (i == MAX_PB) { fprintf(stderr, "[glX] out of pbuffers\n"); RET(0); return; }
     int w = (int)glx_attrib(A32(2), 0x8041, 256), h = (int)glx_attrib(A32(2), 0x8040, 256);
+#ifdef LINDBERGH_VULKAN
+    g_pb[i].fb = lvk_create_drawable(w, h); g_pb[i].w = w; g_pb[i].h = h;
+    RET(TOK_PBUFFER | (uint32_t)i);
+    return;
+#endif
     if (stereo_enabled()) {
         /* in the headset a pbuffer is drawn as the eyes (h_glXMakeCurrent):
          * no framebuffer of its own, which gl4es would also keep in two
@@ -172,6 +180,9 @@ static void h_glXDestroyPbuffer(CPU *c)
 {
     int i = pb_index(A32(1));
     if (i < 0) return;
+#ifdef LINDBERGH_VULKAN
+    lvk_destroy_drawable(g_pb[i].fb); memset(&g_pb[i], 0, sizeof g_pb[i]); return;
+#endif
     if (g_pb[i].fb == ~0u) { memset(&g_pb[i], 0, sizeof g_pb[i]); return; }
     glDeleteFramebuffers(1, &g_pb[i].fb);
     glDeleteTextures(1, &g_pb[i].color);
@@ -226,6 +237,10 @@ static void h_glXMakeCurrent(CPU *c)
      * that over the window under its HUD: drawn into the eyes directly, the
      * scene is seen from each of them, and stereo.c leaves out the copy laid
      * back over it. */
+#ifdef LINDBERGH_VULKAN
+    lvk_bind_drawable(i > 0 ? g_pb[i].fb : 0);
+    RET(1); return;
+#endif
     if (stereo_enabled()) stereo_bind_window();
     else glBindFramebuffer(GL_FRAMEBUFFER, i > 0 ? g_pb[i].fb : 0);
     {

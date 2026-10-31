@@ -139,6 +139,7 @@ void host_menu_install(void)
  * game's shape when resized, so the picture is never stretched. */
 void host_mac_fix_surface(SDL_Window *win, int w, int h)
 {
+#ifndef LINDBERGH_VULKAN
     CGLContextObj ctx = CGLGetCurrentContext();
     if (ctx) {
         GLint size[2] = { w, h };
@@ -150,4 +151,5 @@ void host_mac_fix_surface(SDL_Window *win, int w, int h)
     SDL_VERSION(&info.version);
     if (SDL_GetWindowWMInfo(win, &info) && info.subsystem == SDL_SYSWM_COCOA)
         [info.info.cocoa.window setContentAspectRatio:NSMakeSize(w, h)];
+#endif
 }

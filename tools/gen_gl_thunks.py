@@ -259,4 +259,5 @@ def main():
     print(f"[gen_gl] {len(bound)} thunks, {len(extra)} by name only, {len(missing)} left: {missing}", file=sys.stderr)
 
 
-main()
+if __name__ == "__main__":
+    main()

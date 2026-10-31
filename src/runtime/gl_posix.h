@@ -19,6 +19,10 @@
 #include <GL/glext.h>
 #endif
 
+#ifdef LINDBERGH_VULKAN
+#include "vulkan_abi.h"
+#endif
+
 #include <string.h>
 #include "lindbergh_rt.h"
 

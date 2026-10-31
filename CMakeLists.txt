@@ -17,6 +17,24 @@ endif()
 #
 # 64-bit hosts use the shared guest-memory window and typed GL thunks.
 # Legacy 32-bit Windows retains its direct-address backend.
+set(LINDBERGH_RENDERER "OPENGL" CACHE STRING "Host renderer: OPENGL or VULKAN")
+set_property(CACHE LINDBERGH_RENDERER PROPERTY STRINGS OPENGL VULKAN)
+if(LINDBERGH_RENDERER STREQUAL "VULKAN")
+    if(NOT APPLE)
+        message(FATAL_ERROR "Game Vulkan integration currently targets macOS first")
+    endif()
+    enable_language(CXX)
+    set(LINDBERGH_VULKAN_SDL ON CACHE BOOL "SDL Vulkan host" FORCE)
+    add_subdirectory(src/renderer/vulkan)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    set(LINDBERGH_VULKAN_PYTHON "${Python3_EXECUTABLE}" CACHE INTERNAL "Vulkan build Python")
+    execute_process(COMMAND xcrun --show-sdk-path OUTPUT_VARIABLE mac_sdk OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
+    set(LINDBERGH_GL_HEADERS "${mac_sdk}/System/Library/Frameworks/OpenGL.framework/Headers/gl.h;${mac_sdk}/System/Library/Frameworks/OpenGL.framework/Headers/glext.h" CACHE INTERNAL "guest ABI headers")
+    set(LINDBERGH_VULKAN_GENERATOR "${CMAKE_CURRENT_SOURCE_DIR}/tools/vulkan/gen_abi.py" CACHE INTERNAL "guest ABI generator")
+elseif(NOT LINDBERGH_RENDERER STREQUAL "OPENGL")
+    message(FATAL_ERROR "Unknown LINDBERGH_RENDERER=${LINDBERGH_RENDERER}")
+endif()
+
 option(LINDBERGH_OPENXR "Build the shared OpenXR VR host" ${ANDROID})
 if(LINDBERGH_OPENXR AND NOT ANDROID AND NOT (WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8))
     message(FATAL_ERROR "OpenXR host supports Android and Windows x64")
@@ -66,6 +84,30 @@ function(lindbergh_runtime target generated_dir)
             "${LINDBERGH_RUNTIME_DIR}/hud_widen.c"
             "${LINDBERGH_RUNTIME_DIR}/solib.c")
         target_compile_definitions(${target} PRIVATE RECOMP_GUEST_BASE=1)
+    endif()
+    if(LINDBERGH_RENDERER STREQUAL "VULKAN")
+        list(REMOVE_ITEM platform_sources "${LINDBERGH_RUNTIME_DIR}/stereo.c")
+        set(abi "${CMAKE_CURRENT_BINARY_DIR}/vulkan-abi-${target}")
+        set(abi_inputs "${LINDBERGH_RUNTIME_DIR}/hle_gl_posix.c"
+            "${LINDBERGH_RUNTIME_DIR}/arbprog.c" "${LINDBERGH_RUNTIME_DIR}/host_sdl.c"
+            "${LINDBERGH_RUNTIME_DIR}/gl_thread.c" "${LINDBERGH_RUNTIME_DIR}/hud_widen.c"
+            "${LINDBERGH_RUNTIME_DIR}/hle_glut.c" "${LINDBERGH_RUNTIME_DIR}/hle_glx_posix.c")
+        if(DEFINED LINDBERGH_VULKAN_THUNKS_${target})
+            list(APPEND abi_inputs "${LINDBERGH_VULKAN_THUNKS_${target}}")
+        elseif(EXISTS "${generated_dir}/recomp_gl_thunks.c")
+            list(APPEND abi_inputs "${generated_dir}/recomp_gl_thunks.c")
+        endif()
+        execute_process(COMMAND "${LINDBERGH_VULKAN_PYTHON}" "${LINDBERGH_VULKAN_GENERATOR}" "${abi}"
+            "${LINDBERGH_RUNTIME_DIR}/vulkan_guest.cpp" "${LINDBERGH_GL_HEADERS}" ${abi_inputs}
+            COMMAND_ERROR_IS_FATAL ANY)
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${LINDBERGH_VULKAN_GENERATOR}"
+            "${LINDBERGH_RUNTIME_DIR}/vulkan_guest.cpp" ${abi_inputs})
+        target_sources(${target} PRIVATE "${LINDBERGH_RUNTIME_DIR}/vulkan_guest.cpp"
+            "${abi}/vulkan_missing.cpp" "${abi}/vulkan_desktop_stereo.c")
+        target_include_directories(${target} PRIVATE "${abi}")
+        target_compile_definitions(${target} PRIVATE LINDBERGH_VULKAN=1)
+        target_link_libraries(${target} PRIVATE lindbergh_vulkan_sdl)
+        set_target_properties(${target} PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
     endif()
     target_sources(${target} PRIVATE
         "${LINDBERGH_RUNTIME_DIR}/guest.c"
@@ -164,7 +206,10 @@ function(lindbergh_runtime target generated_dir)
             endif()
         endif()
         if(APPLE)
-            target_link_libraries(${target} PRIVATE "-framework OpenGL" "-framework AppKit" "-framework OpenAL" objc)
+            target_link_libraries(${target} PRIVATE "-framework AppKit" "-framework OpenAL" objc)
+            if(NOT LINDBERGH_RENDERER STREQUAL "VULKAN")
+                target_link_libraries(${target} PRIVATE "-framework OpenGL")
+            endif()
             # the menu bar (Controls, Aim, Sound, Language)
             target_sources(${target} PRIVATE "${LINDBERGH_RUNTIME_DIR}/host_menu_mac.m")
             set_source_files_properties("${LINDBERGH_RUNTIME_DIR}/host_menu_mac.m"

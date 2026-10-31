@@ -38,6 +38,9 @@ static void mac_activate(void)
 #endif
 #include "gl_posix.h"
 #include "host_settings.h"
+#ifdef LINDBERGH_VULKAN
+#include "vulkan_host.h"
+#endif
 
 #if defined(LINDBERGH_OPENXR)
 /* Shared VR frame loop; Android uses gl4es, Windows uses desktop GL. */
@@ -722,6 +725,7 @@ int host_window_open(const char *title)
     g_win.w = env_int("LINDBERGH_WIDTH", g_hint_w ? g_hint_w : DEFAULT_W);
     g_win.h = env_int("LINDBERGH_HEIGHT", g_hint_h ? g_hint_h : DEFAULT_H);
 
+#ifndef LINDBERGH_VULKAN
 #if defined(__ANDROID__)
     /* GLES 3 under gl4es, which plays the 2.1 context the game expects. The
      * headset keeps running while the activity is paused. */
@@ -742,6 +746,7 @@ int host_window_open(const char *title)
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
     SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
+#endif
     /* The window: LINDBERGH_WINDOW=WxH, else 1080 tall at the game's aspect
      * (1920x1080 for a 16:9 game), shrunk to fit the screen. Resizable; the
      * picture is scaled to it. */
@@ -765,7 +770,12 @@ int host_window_open(const char *title)
     int hidden = hv && *hv && *hv != '0';
     g_win.win = SDL_CreateWindow(title && *title ? title : "lindberghrecomp",
                                  SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                                 dw, dh, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE |
+                                 dw, dh,
+#ifdef LINDBERGH_VULKAN
+                                 SDL_WINDOW_VULKAN |
+#else
+                                 SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE |
+#endif
                                  (hidden ? SDL_WINDOW_HIDDEN : SDL_WINDOW_SHOWN));
     if (!g_win.win) {
         fprintf(stderr, "[window] SDL_CreateWindow: %s\n", SDL_GetError());
@@ -798,6 +808,9 @@ int host_window_open(const char *title)
 int host_gl_context(void)
 {
     if (!g_win.win && !host_window_open(NULL)) return 0;
+#ifdef LINDBERGH_VULKAN
+    return lvk_host_init(g_win.win, g_win.w, g_win.h);
+#else
     if (g_win.gl) return 1;
     g_win.gl = SDL_GL_CreateContext(g_win.win);
     if (!g_win.gl) {
@@ -839,6 +852,7 @@ int host_gl_context(void)
             (const char *)glGetString(GL_RENDERER), (const char *)glGetString(GL_VERSION));
     stereo_frame_begin();
     return 1;
+#endif
 }
 
 void host_pump(void) { pump(); }
@@ -987,6 +1001,12 @@ void host_swap(void)
 static void frame_gl(void *arg)
 {
     (void)arg;
+#ifdef LINDBERGH_VULKAN
+    lvk_host_present();
+    maybe_peek();
+    ++g_frame;
+    return;
+#endif
 #if defined(LINDBERGH_OPENXR)
     g_t_game += since_mark();
     stereo_frame_end();                 /* the second eye, then both to the headset */
