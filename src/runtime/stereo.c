@@ -553,7 +553,6 @@ static void scale_target(GLenum textarget, GLuint tex, GLenum attachment)
 }
 
 static void (*g_aim_hook)(void);
-static unsigned g_aim_2d_frame = ~0u;  /* the frame the aim read the window's depth before its 2D */
 void stereo_set_aim_hook(void (*fn)(void)) { g_aim_hook = fn; }
 
 /* the game's viewport (vp) or scissor box, in the bound target's pixels */
@@ -1721,19 +1720,15 @@ static int transform_call(CPU *c, HleId id, const char *n)
          * how-to-play screen lost its sprites). Each is pulled a little nearer
          * than the one before - ties go to the later draw, as on the cabinet;
          * the whole frame's pull is far under the gaps between its layers. */
-        /* A world drawn straight into the window has no leaving to read its
-         * depth at, and that 2D's depth lands on it: read it before the first */
-        if (hud == 1 && !persp && is_perspective(g_proj[g_proj_top]) && g_mv && !g_replaying && g_aim_hook &&
-            !g_flat && g_game_fb == 0 && g_world_fb_next == 0 && g_scene_draws > 0 && g_aim_2d_frame != g_frame) {
-            g_aim_2d_frame = g_frame;
-            g_aim_hook();
-        }
-        if (hud == 1 && !persp && is_perspective(g_proj[g_proj_top]) && g_mv && !g_replaying) {
+        /* Only on a frame with no world (the loading screen, the opening's
+         * screens): over a world it writes no depth, as below - the aim reads
+         * the world's depth at the frame's end, and that 2D lay over it */
+        if (hud == 1 && !persp && is_perspective(g_proj[g_proj_top]) && g_mv && !g_replaying && !g_scene_draws) {
             glEnable(GL_POLYGON_OFFSET_FILL);
             glPolygonOffset(0, -4.0f * (float)(++g_2d_seq));
             g_hud_offset = 1;
         }
-        if (hud == 1 && !persp && !is_perspective(g_proj[g_proj_top])) {
+        if (hud == 1 && !persp && (!is_perspective(g_proj[g_proj_top]) || g_scene_draws)) {
             GLboolean wm = GL_FALSE;
             glGetBooleanv(GL_DEPTH_WRITEMASK, &wm);
             if (wm) { glDepthMask(GL_FALSE); g_hud_nowrite = 1; }
