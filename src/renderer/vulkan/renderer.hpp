@@ -7,6 +7,11 @@ namespace lindbergh::vk {
 
 struct Vertex { float position[4], color[4]; };
 struct Matrices { float view_projection[2][16]; };
+struct RasterKey {
+    uint64_t a, b;
+    bool operator==(const RasterKey &v) const { return a==v.a && b==v.b; }
+};
+struct RasterHash { size_t operator()(const RasterKey &k) const { return size_t(k.a ^ (k.b * 0x9e3779b97f4a7c15ull)); } };
 struct RasterState {
     bool depth_test = true;
     bool depth_write = true;
@@ -14,7 +19,14 @@ struct RasterState {
     VkCullModeFlags cull = VK_CULL_MODE_NONE;
     VkCompareOp depth_compare = VK_COMPARE_OP_LESS_OR_EQUAL;
     VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-    uint32_t key() const;
+    VkBlendFactor src_rgb=VK_BLEND_FACTOR_ONE, dst_rgb=VK_BLEND_FACTOR_ZERO;
+    VkBlendFactor src_alpha=VK_BLEND_FACTOR_ONE, dst_alpha=VK_BLEND_FACTOR_ZERO;
+    VkBlendOp blend_rgb=VK_BLEND_OP_ADD, blend_alpha=VK_BLEND_OP_ADD;
+    uint32_t color_mask=15, alpha_func=0, fixed_texture=0, fixed_env=0, fog_mode=0;
+    bool stencil=false, depth_bias=false, clockwise=false;
+    VkCompareOp stencil_compare=VK_COMPARE_OP_ALWAYS;
+    VkStencilOp stencil_fail=VK_STENCIL_OP_KEEP, stencil_depth_fail=VK_STENCIL_OP_KEEP, stencil_pass=VK_STENCIL_OP_KEEP;
+    RasterKey key() const;
 };
 
 struct ProgramSource {
@@ -37,6 +49,7 @@ struct TargetInfo {
     VkImage color = VK_NULL_HANDLE; // optional borrowed OpenXR swapchain image
     VkImageLayout final_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     VkImageView density_map = VK_NULL_HANDLE; // borrowed runtime foveation image
+    bool guest_bottom_origin = false; // offscreen rows follow guest GL texture storage
 };
 
 class Target {
@@ -47,7 +60,9 @@ public:
     Target &operator=(const Target &) = delete;
     const TargetInfo info;
     VkImage color = VK_NULL_HANDLE;
-    VkRenderPass render_pass = VK_NULL_HANDLE;
+    VkRenderPass render_pass = VK_NULL_HANDLE, load_pass = VK_NULL_HANDLE;
+    VkImage depth_image() const { return depth_; }
+    static constexpr VkFormat depth_format = VK_FORMAT_D32_SFLOAT_S8_UINT;
     VkFramebuffer framebuffer = VK_NULL_HANDLE;
 
 private:
@@ -69,7 +84,13 @@ public:
     Renderer(const Renderer &) = delete;
     Renderer &operator=(const Renderer &) = delete;
     void prepare(RasterState state);
-    void begin(VkCommandBuffer cmd, std::array<float, 4> clear);
+    void begin(VkCommandBuffer cmd, std::array<float, 4> clear, bool preserve = false);
+    void viewport(float x, float y, float width, float height, VkRect2D scissor);
+    void dynamic_state(uint32_t stencil_ref, uint32_t stencil_compare_mask, uint32_t stencil_write_mask,
+                       float depth_bias_factor, float depth_bias_units, const float blend_constants[4]);
+    void clear(VkImageAspectFlags aspects, std::array<float, 4> color, float depth, uint32_t stencil, VkRect2D rect);
+    void attach(VkCommandBuffer cmd);
+    void detach();
     void bind_descriptors(uint32_t first_set, uint32_t count, const VkDescriptorSet *sets,
                           uint32_t offset_count = 0, const uint32_t *dynamic_offsets = nullptr);
     void draw(FrameRing &ring, const Vertex *vertices, uint32_t count,
@@ -94,7 +115,7 @@ private:
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
     VkCommandBuffer cmd_ = VK_NULL_HANDLE;
     VkPipeline bound_ = VK_NULL_HANDLE;
-    std::unordered_map<uint32_t, VkPipeline> pipelines_;
+    std::unordered_map<RasterKey, VkPipeline, RasterHash> pipelines_;
     uint64_t draws_ = 0;
     std::vector<VkVertexInputBindingDescription> bindings_;
     std::vector<VkVertexInputAttributeDescription> attributes_;

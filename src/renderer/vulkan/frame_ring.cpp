@@ -53,6 +53,7 @@ VkCommandBuffer FrameRing::begin()
         s.submitted = false;
     }
     check(vkResetCommandPool(device_.handles.device, s.pool, 0), "reset frame pool");
+    s.resources.clear();
     s.used = 0;
     ++s.generation;
     VkCommandBufferBeginInfo info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -88,6 +89,12 @@ VkBuffer FrameRing::upload_buffer(uint32_t slot) const
 {
     if (slot >= slots_.size()) throw std::out_of_range("Unknown Vulkan upload slot");
     return slots_[slot].upload;
+}
+
+void FrameRing::keep_alive(std::shared_ptr<void> resource)
+{
+    if (!recording_) throw std::logic_error("Resource retention outside frame");
+    slots_[current_].resources.push_back(std::move(resource));
 }
 
 Submission FrameRing::submit(VkSemaphore wait, VkSemaphore signal, VkPipelineStageFlags wait_stage)

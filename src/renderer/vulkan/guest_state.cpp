@@ -39,6 +39,10 @@ const GuestState::Stack &GuestState::stack() const
     return mode_ == guest::Modelview ? modelview_ : mode_ == guest::Projection ? projection_ : texture_[texture_unit_];
 }
 const Matrix &GuestState::current_matrix() const { return stack().matrices[stack().top]; }
+const Matrix &GuestState::matrix(uint32_t mode,unsigned unit) const {
+    const auto &s=mode==guest::Modelview?modelview_:mode==guest::Projection?projection_:texture_.at(unit);
+    return s.matrices[s.top];
+}
 
 bool GuestState::matrix_allowed()
 {

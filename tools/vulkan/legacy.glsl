@@ -42,11 +42,13 @@ layout(std140, set=0, binding=0) uniform LegacyState {
     LegacyLightModelProduct front_light_model;
     LegacyDepthRange depth_range;
     float viewport_height;
+    float alpha_ref;
 } legacy;
 
 vec4 legacy_shadow2D(sampler2DShadow s, vec3 p) { return vec4(texture(s, p)); }
 vec4 legacy_shadow2DProj(sampler2DShadow s, vec4 p) { return vec4(textureProj(s, p)); }
+layout(constant_id=0) const bool legacy_bottom_origin = false;
 vec4 legacy_frag_coord() {
-    return vec4(gl_FragCoord.x, legacy.viewport_height - gl_FragCoord.y,
+    return vec4(gl_FragCoord.x, legacy_bottom_origin ? gl_FragCoord.y : legacy.viewport_height - gl_FragCoord.y,
                 gl_FragCoord.z, gl_FragCoord.w);
 }

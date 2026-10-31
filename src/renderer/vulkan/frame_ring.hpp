@@ -22,6 +22,7 @@ public:
     Submission submit(VkSemaphore wait = VK_NULL_HANDLE, VkSemaphore signal = VK_NULL_HANDLE,
                       VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
     void wait(Submission submission);
+    void keep_alive(std::shared_ptr<void> resource);
     uint64_t submissions() const { return submissions_; }
     uint32_t slot_count() const { return static_cast<uint32_t>(slots_.size()); }
     uint32_t recording_slot() const;
@@ -39,6 +40,7 @@ private:
         VkDeviceSize used = 0;
         uint64_t generation = 0;
         bool submitted = false;
+        std::vector<std::shared_ptr<void>> resources;
     };
     Device &device_;
     std::vector<Slot> slots_;

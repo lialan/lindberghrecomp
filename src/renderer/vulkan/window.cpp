@@ -46,7 +46,7 @@ Window::Window(Device &device, SDL_Window *window, uint32_t frames) : device_(de
         if (caps.maxImageCount) create.minImageCount = std::min(create.minImageCount, caps.maxImageCount);
         create.imageFormat = format.format; create.imageColorSpace = format.colorSpace;
         create.imageExtent = extent; create.imageArrayLayers = 1;
-        create.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        create.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
         create.preTransform = caps.currentTransform;
         create.compositeAlpha = static_cast<VkCompositeAlphaFlagBitsKHR>(caps.supportedCompositeAlpha & -caps.supportedCompositeAlpha);
         create.presentMode = VK_PRESENT_MODE_FIFO_KHR; create.clipped = VK_TRUE;

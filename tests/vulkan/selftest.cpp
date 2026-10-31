@@ -180,6 +180,14 @@ static void render_stereo(Device &device)
     UniformData guest_uniforms(*uniform_layout);
     const auto tint_location = guest_uniforms.find("guestTint");
     require(tint_location >= 0 && guest_uniforms.find("not_a_uniform") == -1, "uniform name lookup changed");
+    const auto legacy_layout = std::find_if(record->uniforms.begin(),record->uniforms.end(),[](const auto &b){return b.set==0;});
+    require(legacy_layout!=record->uniforms.end(), "missing legacy uniform block");
+    UniformData legacy_data(*legacy_layout);
+    UniformSet legacy_uniforms(device,ring,{{0,legacy_layout->bytes}});
+    auto bind_legacy = [&](Renderer &r) {
+        auto offset=legacy_uniforms.upload(0,legacy_data.bytes().data(),legacy_data.bytes().size());
+        auto ds=legacy_uniforms.current_set();r.bind_descriptors(0,1,&ds,1,&offset);
+    };
     UniformSet uniforms(device, ring, {{0, 16}});
     Texture texture(device, {2, 2, 2});
     Sampler sampler(device);
@@ -187,7 +195,7 @@ static void render_stereo(Device &device)
     ProgramSource legacy{vs.data(), fs.data(), vs.size() * 4, fs.size() * 4,
         {{0, sizeof(Vertex), VK_VERTEX_INPUT_RATE_VERTEX}},
         {{0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Vertex, position)},
-         {3, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Vertex, color)}}, {uniforms.layout(), uniforms.layout(), material.layout()}};
+         {3, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Vertex, color)}}, {legacy_uniforms.layout(), uniforms.layout(), material.layout()}};
     Renderer converted(device, target, cache, legacy);
     converted.prepare(state);
     for (auto &m : matrices.view_projection) {
@@ -200,6 +208,7 @@ static void render_stereo(Device &device)
     texture.upload(cmd, ring, 0, 0, white, sizeof white);
     texture.upload(cmd, ring, 1, 0, white, 4);
     converted.begin(cmd, {0, 0, 0, 1});
+    bind_legacy(converted);
     auto sampled = material.handle();
     converted.bind_descriptors(2, 1, &sampled);
     const float tint[] = {1, 1, 1, 1};
@@ -229,6 +238,7 @@ static void render_stereo(Device &device)
     for (unsigned frame = 0; frame < frames; ++frame) {
         cmd = ring.begin();
         converted.begin(cmd, {0, 0, 0, 1});
+    bind_legacy(converted);
         converted.bind_descriptors(2, 1, &sampled);
         const float color[] = {float(frame & 1), 1, 1, 1};
         rejected([&] { uniforms.upload(0, color, 12); }, "truncated uniform block accepted");
@@ -335,6 +345,7 @@ static void render_stereo(Device &device)
         }
         auto &draw = frame % 3 == 2 ? *constant_color : *textured;
         draw.begin(cmd, {0, 0, 0, 1});
+        bind_legacy(draw);
         offset = uniforms.upload(0, tint, sizeof tint);
         descriptors = uniforms.current_set();
         draw.bind_descriptors(1, 1, &descriptors, 1, &offset);
@@ -372,6 +383,45 @@ static void render_stereo(Device &device)
     std::puts("ok: guest VBO/client/current arrays render directly with textures, uint16 indices and mip descriptors");
 }
 
+
+static void render_copy(Device &device)
+{
+    TargetInfo info{16,16,1}; info.guest_bottom_origin=true;info.final_layout=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    Target target(device,info);PipelineCache cache(device,"");Renderer renderer(device,target,cache);
+    RasterState raster;renderer.prepare(raster);
+    Texture color(device,{16,16}),depth(device,{16,16,1,1,Target::depth_format});
+    Readback output(device,16*16*4*3);FrameRing ring(device);
+    Matrices matrices{};for(auto &m:matrices.view_projection)for(unsigned i=0;i<4;++i)m[i*5]=1;
+    Vertex triangle[]={{{-1,-1,0,1},{1,0,0,1}},{{0,-1,0,1},{1,0,0,1}},{{-.5f,1,0,1},{1,0,0,1}}};
+    auto cmd=ring.begin();renderer.begin(cmd,{0,0,1,1});renderer.draw(ring,triangle,3,matrices,raster);renderer.end();
+    // Resuming a compatible pass must retain both color and depth. A triangle
+    // behind the previous one cannot overwrite its red pixels.
+    for(auto &v:triangle){v.position[2]=.8f;v.color[0]=0;v.color[1]=1;}
+    renderer.begin(cmd,{0,1,0,1},true);renderer.draw(ring,triangle,3,matrices,raster);renderer.end();
+    color.copy_from(cmd,target,0,0,0,0,0,16,16);depth.copy_from(cmd,target,0,0,0,0,0,16,16);
+    VkBufferImageCopy copy{};copy.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};copy.imageExtent={16,16,1};
+    vkCmdCopyImageToBuffer(cmd,target.color,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,output.buffer,1,&copy);
+    for(unsigned i=0;i<2;++i) {
+        VkImageMemoryBarrier image{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};image.srcAccessMask=VK_ACCESS_SHADER_READ_BIT;image.dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT;
+        image.oldLayout=VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;image.newLayout=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        image.srcQueueFamilyIndex=image.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;image.image=i?depth.image():color.image();
+        image.subresourceRange={VkImageAspectFlags(i?VK_IMAGE_ASPECT_DEPTH_BIT|VK_IMAGE_ASPECT_STENCIL_BIT:VK_IMAGE_ASPECT_COLOR_BIT),0,1,0,1};
+        vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,0,nullptr,1,&image);
+        copy.bufferOffset=(i+1)*16*16*4;copy.imageSubresource.aspectMask=i?VK_IMAGE_ASPECT_DEPTH_BIT:VK_IMAGE_ASPECT_COLOR_BIT;
+        vkCmdCopyImageToBuffer(cmd,image.image,image.newLayout,output.buffer,1,&copy);
+    }
+    VkBufferMemoryBarrier ready{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};ready.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;ready.dstAccessMask=VK_ACCESS_HOST_READ_BIT;
+    ready.srcQueueFamilyIndex=ready.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;ready.buffer=output.buffer;ready.size=VK_WHOLE_SIZE;
+    vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&ready,0,nullptr);
+    ring.wait(ring.submit());auto bytes=static_cast<const uint8_t *>(output.mapped);
+    require(!std::memcmp(bytes,bytes+16*16*4,16*16*4),"pbuffer color copy changed raster pixels");
+    auto pixel=bytes+(2*16+4)*4;require(pixel[0]==255&&pixel[1]==0&&pixel[2]==0,"preserved pbuffer color/depth or bottom-origin viewport changed");
+    pixel=bytes+(14*16+4)*4;require(pixel[0]==0&&pixel[2]==255,"guest pbuffer rows were flipped");
+    auto z=reinterpret_cast<const float *>(bytes+16*16*4*2);
+    require(z[2*16+4]==.5f&&z[14*16+4]==1,"GPU pbuffer depth copy changed retained depth");
+    std::puts("ok: preserving pbuffer passes, guest bottom-origin viewport and GPU color/depth copies");
+}
+
 int main(int argc, char **argv)
 try {
     require(hex(source_digest("")) == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
@@ -406,6 +456,7 @@ try {
     const auto &h = device->handles;
     require(device->capabilities.multiview, "stereo multiview not available");
     render_stereo(*device);
+    render_copy(*device);
     if (argc == 2) {
         ShaderPack game_pack(argv[1]);
         size_t fields = 0;

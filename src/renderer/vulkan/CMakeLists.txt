@@ -59,3 +59,14 @@ if(LINDBERGH_VULKAN_OPENXR)
     add_executable(lindbergh_vulkan_xr_probe ../../../tests/vulkan/openxr_probe.cpp)
     target_link_libraries(lindbergh_vulkan_xr_probe PRIVATE lindbergh_vulkan_openxr)
 endif()
+
+find_program(SPIRV_CROSS_BUILD spirv-cross REQUIRED)
+set(fixed_archive "${CMAKE_CURRENT_BINARY_DIR}/fixed-pack/fixed.lvsp")
+add_custom_command(OUTPUT "${fixed_archive}"
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../../../tools/vulkan/build_fixed.py"
+        "${CMAKE_CURRENT_BINARY_DIR}/fixed-pack" "${GLSLANG_VALIDATOR}" "${SPIRV_CROSS_BUILD}"
+    DEPENDS shaders/fixed.vert shaders/fixed.frag ../../../tools/vulkan/build_fixed.py
+        ../../../tools/vulkan/compile_shaders.py ../../../tools/vulkan/pack_shaders.py ../../../tools/vulkan/legacy.glsl VERBATIM)
+add_custom_target(vulkan_fixed_pack DEPENDS "${fixed_archive}")
+add_dependencies(lindbergh_vulkan vulkan_fixed_pack)
+set(LINDBERGH_VULKAN_FIXED_ARCHIVE "${fixed_archive}" CACHE INTERNAL "Fixed-function Vulkan shaders" FORCE)

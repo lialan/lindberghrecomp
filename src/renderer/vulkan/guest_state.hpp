@@ -43,6 +43,7 @@ public:
     void ortho(double left, double right, double bottom, double top, double near_z, double far_z);
     Matrix modelview_projection();
     const Matrix &current_matrix() const;
+    const Matrix &matrix(uint32_t mode, unsigned unit=0) const;
     void begin(uint32_t mode);
     void color(float r, float g, float b, float a);
     void vertex(float x, float y, float z = 0, float w = 1);

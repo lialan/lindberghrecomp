@@ -31,6 +31,7 @@ public:
     void enable(uint32_t location, bool enabled);
     void current(uint32_t location, const std::array<float, 4> &value);
     // Configure the active SPIR-V input locations only when the program changes.
+    const std::array<float,4> &current_value(uint32_t location) const { return arrays_.at(location).value; }
     void inputs(const std::vector<uint32_t> &locations);
     // Prepare before render-pass recording. Static VBOs bind directly. Dynamic
     // client arrays retain their original formats and need one bounded upload;

@@ -124,6 +124,21 @@ void main() {
     gl_Position = vec4(p.x, -p.y, (p.z + p.w) * 0.5, p.w);
 }
 """
+    if stage == "frag":
+        source, count = re.subn(r"\bvoid\s+main\s*\(\s*(?:void\s*)?\)", "void guest_main()", source)
+        if count != 1: raise ValueError("Expected exactly one fragment main function")
+        source += """
+layout(constant_id=1) const int legacy_alpha_func=0;
+void main() {
+    guest_main();
+    float a=legacy_frag_color.a, r=legacy.alpha_ref;
+    bool keep=legacy_alpha_func==0 || legacy_alpha_func==8 ||
+        (legacy_alpha_func==2 && a<r) || (legacy_alpha_func==3 && a==r) ||
+        (legacy_alpha_func==4 && a<=r) || (legacy_alpha_func==5 && a>r) ||
+        (legacy_alpha_func==6 && a!=r) || (legacy_alpha_func==7 && a>=r);
+    if(!keep) discard;
+}
+"""
     return "\n".join(prefix) + "\n" + legacy + "\n" + source
 
 
@@ -137,21 +152,30 @@ def program_key(row, root):
 
 
 def validate_uniform_layouts(reflection):
-    def shape(stage, type_id):
+    # Optimizers can remove unused members independently in each stage while
+    # preserving explicit offsets. Compare shared leaves, not whole type lists.
+    shared = {}
+    def walk(stage, type_id, offset, name, arrays=(), stride=0, matrix_stride=0, row_major=False):
         typ = reflection[stage].get("types", {}).get(type_id)
         if typ is None:
-            return type_id
-        return [(m["name"], m.get("offset"), m.get("array"), m.get("array_stride"),
-                 m.get("matrix_stride"), m.get("row_major", False), shape(stage, m["type"]))
-                for m in typ.get("members", [])]
-    bindings = {}
+            return {name: (offset, type_id, tuple(arrays), stride, matrix_stride, row_major)}
+        result = {}
+        for i in range(arrays[0] if arrays else 1):
+            prefix = f"{name}[{i}]" if arrays else name
+            for m in typ.get("members", []):
+                child = f"{prefix}.{m['name']}" if prefix else m["name"]
+                result.update(walk(stage,m["type"],offset+i*stride+m["offset"],child,
+                                   m.get("array",()),m.get("array_stride",0),m.get("matrix_stride",0),m.get("row_major",False)))
+        return result
     for stage in ("vert", "frag"):
         for block in reflection[stage].get("ubos", []):
             key = block["set"], block["binding"]
-            layout = block["block_size"], shape(stage, block["type"])
-            if key in bindings and bindings[key] != layout:
-                raise ValueError(f"Vertex/fragment uniform layout mismatch at set/binding {key}")
-            bindings[key] = layout
+            fields=walk(stage,block["type"],0,"")
+            previous=shared.setdefault(key,{})
+            for name, layout in fields.items():
+                if name in previous and previous[name] != layout:
+                    raise ValueError(f"Vertex/fragment uniform layout mismatch at {key}: {name}")
+                previous[name]=layout
 
 
 def compile_pair(row, root, output, validator, reflector):

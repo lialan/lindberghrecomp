@@ -20,20 +20,17 @@ result = converter.compile_pair({"program": 1, "vertex": str(patched), "fragment
                                 Path(__file__).parent, output, sys.argv[2], sys.argv[3])
 for stage in ("vert", "frag"):
     shutil.copy2(output / result["key"] / (stage + ".spv"), output / (stage + ".spv"))
-# Cross-stage descriptor layouts must agree, including scalar/array offsets.
-blocks = {}
-for stage in ("vert", "frag"):
-    reflect = result["reflection"][stage]
-    for block in reflect.get("ubos", []):
-        key = block["set"], block["binding"]
-        members = reflect["types"][block["type"]]["members"]
-        layout = [(m["name"], m.get("offset"), m.get("array_stride"), m.get("matrix_stride")) for m in members]
-        if key in blocks:
-            assert blocks[key] == (block["block_size"], layout)
-        blocks[key] = block["block_size"], layout
+# Stages may expose different optimized member subsets. Shared fields retain
+# identical offsets, and the archive merges them into one backing allocation.
+converter.validate_uniform_layouts(result["reflection"])
+blocks={}
+for stage in ("vert","frag"):
+    for block in result["reflection"][stage].get("ubos",[]):
+        key=block["set"],block["binding"]
+        blocks[key]=max(blocks.get(key,0),block["block_size"])
 (output / "program.json").write_text(json.dumps(result, indent=2) + "\n")
 
-assert blocks[(1, 0)][0] == 16, "guestTint uniform layout changed"
+assert blocks[(1, 0)] == 16, "guestTint uniform layout changed"
 
 spec = importlib.util.spec_from_file_location("shader_packer", root / "tools/vulkan/pack_shaders.py")
 packer = importlib.util.module_from_spec(spec)

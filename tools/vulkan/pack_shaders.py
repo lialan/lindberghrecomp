@@ -80,10 +80,14 @@ def pack(programs, root, output):
             reflect = meta["reflection"][stage]
             for block in reflect.get("ubos", []):
                 block_key = block["set"], block["binding"]
-                value = block["block_size"], uniform_fields(reflect, block)
-                if block_key in blocks and blocks[block_key] != value:
-                    raise ValueError(f"Uniform layout mismatch: {key}/{block_key}")
-                blocks[block_key] = value
+                fields = uniform_fields(reflect, block)
+                size, combined = blocks.get(block_key,(0,{}))
+                for field in fields:
+                    name=field[0]
+                    if name in combined and combined[name]!=field:
+                        raise ValueError(f"Uniform layout mismatch: {key}/{block_key}/{name}")
+                    combined[name]=field
+                blocks[block_key]=(max(size,block["block_size"]),combined)
             for sampler in reflect.get("textures", []):
                 if sampler["set"] != 2:
                     raise ValueError("Unexpected sampler descriptor set")
@@ -93,7 +97,7 @@ def pack(programs, root, output):
         u32(len(blocks))
         for (set_number, binding), (size, fields) in sorted(blocks.items()):
             u32(set_number); u32(binding); u32(size); u32(len(fields))
-            for name, *values in fields:
+            for name, *values in sorted(fields.values(), key=lambda f: (f[1],f[0])):
                 string(name)
                 for v in values: u32(v)
         u32(len(samplers))

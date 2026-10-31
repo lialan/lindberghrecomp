@@ -52,6 +52,7 @@ KEEP_ARB = re.compile(r"Program(String|Env|Local|sARB|ivARB)|BindProgramARB|GenP
 # Arguments that are a client pointer only while no buffer is bound to the
 # named target - with one bound they are byte offsets into it.
 OFFSET_ARGS = {
+    "glInterleavedArrays": (2, "GL_ARRAY_BUFFER"),
     "glVertexPointer": (3, "GL_ARRAY_BUFFER"),
     "glNormalPointer": (2, "GL_ARRAY_BUFFER"),
     "glColorPointer": (3, "GL_ARRAY_BUFFER"),

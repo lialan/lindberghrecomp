@@ -1,5 +1,6 @@
 #pragma once
 #include "frame_ring.hpp"
+#include "renderer.hpp"
 
 namespace lindbergh::vk {
 
@@ -26,6 +27,7 @@ struct TextureInfo {
     uint32_t width, height;
     uint32_t levels = 1, layers = 1;
     VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
+    VkComponentMapping components{};
 };
 
 class Texture {
@@ -36,6 +38,9 @@ public:
     Texture &operator=(const Texture &) = delete;
     void upload(VkCommandBuffer cmd, FrameRing &ring, uint32_t level, uint32_t layer,
                 const void *data, size_t bytes);
+    void copy_from(VkCommandBuffer cmd, Target &source, uint32_t level, int32_t dst_x, int32_t dst_y,
+                   int32_t src_x, int32_t src_y, uint32_t width, uint32_t height);
+    VkImage image() const { return image_; }
     VkImageView view() const { return view_; }
     const TextureInfo info;
 private:
@@ -53,6 +58,9 @@ struct SamplerInfo {
     VkSamplerMipmapMode mip_filter = VK_SAMPLER_MIPMAP_MODE_NEAREST;
     VkSamplerAddressMode u = VK_SAMPLER_ADDRESS_MODE_REPEAT, v = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     float min_lod = 0, max_lod = 0;
+    bool compare = false;
+    VkCompareOp compare_op = VK_COMPARE_OP_LESS_OR_EQUAL;
+    VkBorderColor border = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
 };
 
 class Sampler {

@@ -105,7 +105,7 @@ function(lindbergh_runtime target generated_dir)
         target_sources(${target} PRIVATE "${LINDBERGH_RUNTIME_DIR}/vulkan_guest.cpp"
             "${abi}/vulkan_missing.cpp" "${abi}/vulkan_desktop_stereo.c")
         target_include_directories(${target} PRIVATE "${abi}")
-        target_compile_definitions(${target} PRIVATE LINDBERGH_VULKAN=1)
+        target_compile_definitions(${target} PRIVATE LINDBERGH_VULKAN=1 LINDBERGH_VULKAN_FIXED_ARCHIVE="${LINDBERGH_VULKAN_FIXED_ARCHIVE}")
         target_link_libraries(${target} PRIVATE lindbergh_vulkan_sdl)
         set_target_properties(${target} PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
     endif()

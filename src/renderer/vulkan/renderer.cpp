@@ -2,6 +2,7 @@
 #include "colored_vert.hpp"
 #include "colored_frag.hpp"
 #include <cstddef>
+#include <algorithm>
 #include <stdexcept>
 
 namespace lindbergh::vk {
@@ -52,10 +53,10 @@ Target::Target(Device &device, TargetInfo target) : info(target), device_(device
         color = info.color;
         if (!color) image(device, create, color, color_memory_);
         color_view_ = view(device, color, info.color_format, info.layers, VK_IMAGE_ASPECT_COLOR_BIT);
-        create.format = VK_FORMAT_D32_SFLOAT;
-        create.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+        create.format = Target::depth_format;
+        create.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
         image(device, create, depth_, depth_memory_);
-        depth_view_ = view(device, depth_, create.format, info.layers, VK_IMAGE_ASPECT_DEPTH_BIT);
+        depth_view_ = view(device, depth_, create.format, info.layers, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
 
         VkAttachmentDescription attachments[3]{};
         attachments[0].format = info.color_format;
@@ -67,8 +68,10 @@ Target::Target(Device &device, TargetInfo target) : info(target), device_(device
         attachments[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         attachments[0].finalLayout = info.final_layout;
         attachments[1] = attachments[0];
-        attachments[1].format = VK_FORMAT_D32_SFLOAT;
-        attachments[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        attachments[1].format = Target::depth_format;
+        attachments[1].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        attachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        attachments[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
         attachments[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
         VkAttachmentReference col{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
         VkAttachmentReference depth{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
@@ -88,9 +91,9 @@ Target::Target(Device &device, TargetInfo target) : info(target), device_(device
         dependencies[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
         dependencies[1].srcSubpass = 0;
         dependencies[1].dstSubpass = VK_SUBPASS_EXTERNAL;
-        dependencies[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        dependencies[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
         dependencies[1].dstStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
-        dependencies[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        dependencies[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
         dependencies[1].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
         uint32_t mask = info.layers == 2 ? 3 : 1;
         VkRenderPassMultiviewCreateInfo multiview{VK_STRUCTURE_TYPE_RENDER_PASS_MULTIVIEW_CREATE_INFO};
@@ -123,6 +126,11 @@ Target::Target(Device &device, TargetInfo target) : info(target), device_(device
         pass.dependencyCount = 2;
         pass.pDependencies = dependencies;
         check(vkCreateRenderPass(device.handles.device, &pass, nullptr, &render_pass), "Vulkan world render pass");
+        attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        attachments[0].initialLayout = info.final_layout;
+        attachments[1].loadOp = attachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        attachments[1].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        check(vkCreateRenderPass(device.handles.device, &pass, nullptr, &load_pass), "Vulkan preserving render pass");
         VkImageView views[] = {color_view_, depth_view_, info.density_map};
         VkFramebufferCreateInfo framebuffer_info{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
         framebuffer_info.renderPass = render_pass;
@@ -139,6 +147,7 @@ void Target::release()
 {
     const auto d = device_.handles.device;
     if (framebuffer) vkDestroyFramebuffer(d, framebuffer, nullptr);
+    if (load_pass) vkDestroyRenderPass(d, load_pass, nullptr);
     if (render_pass) vkDestroyRenderPass(d, render_pass, nullptr);
     if (depth_view_) vkDestroyImageView(d, depth_view_, nullptr);
     if (color_view_) vkDestroyImageView(d, color_view_, nullptr);
@@ -149,13 +158,22 @@ void Target::release()
 }
 Target::~Target() { release(); }
 
-uint32_t RasterState::key() const
+RasterKey RasterState::key() const
 {
-    if (cull > VK_CULL_MODE_FRONT_AND_BACK || depth_compare > VK_COMPARE_OP_ALWAYS ||
-        (topology != VK_PRIMITIVE_TOPOLOGY_POINT_LIST && topology != VK_PRIMITIVE_TOPOLOGY_LINE_LIST &&
-         topology != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST))
+    if (cull>3 || depth_compare>7 || topology>VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN ||
+        src_rgb>VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA || dst_rgb>VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA ||
+        src_alpha>VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA || dst_alpha>VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA ||
+        blend_rgb>VK_BLEND_OP_MAX || blend_alpha>VK_BLEND_OP_MAX || color_mask>15 || alpha_func>8 || fixed_texture>255 || fog_mode>3)
         throw std::invalid_argument("Invalid Vulkan raster state");
-    return depth_test | (depth_write << 1) | (blend << 2) | (cull << 3) | (depth_compare << 5) | (topology << 8);
+    uint64_t a=depth_test | (uint64_t(depth_write)<<1) | (uint64_t(blend)<<2) | (uint64_t(cull)<<3) |
+        (uint64_t(depth_compare)<<5) | (uint64_t(topology)<<8) | (uint64_t(color_mask)<<12) |
+        (uint64_t(stencil)<<16) | (uint64_t(stencil_compare)<<17) | (uint64_t(stencil_fail)<<20) |
+        (uint64_t(stencil_depth_fail)<<23) | (uint64_t(stencil_pass)<<26) | (uint64_t(depth_bias)<<29) |
+        (uint64_t(clockwise)<<30);
+    uint64_t b=uint64_t(src_rgb) | (uint64_t(dst_rgb)<<5) | (uint64_t(src_alpha)<<10) | (uint64_t(dst_alpha)<<15) |
+        (uint64_t(blend_rgb)<<20) | (uint64_t(blend_alpha)<<23) | (uint64_t(alpha_func)<<26) |
+        (uint64_t(fixed_texture)<<30) | (uint64_t(fixed_env)<<38) | (uint64_t(fog_mode)<<62);
+    return {a,b};
 }
 
 static ProgramSource colored_program()
@@ -203,6 +221,10 @@ void Renderer::prepare(RasterState state)
     for (auto &s : stages) { s.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; s.pName = "main"; }
     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT; stages[0].module = vertex_;
     stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stages[1].module = fragment_;
+    const uint32_t constants[]={uint32_t(target_.info.guest_bottom_origin),state.alpha_func,state.fixed_texture,state.fixed_env,state.fog_mode};
+    const VkSpecializationMapEntry entries[]={{0,0,4},{1,4,4},{2,8,4},{3,12,4},{4,16,4}};
+    VkSpecializationInfo specialization{5,entries,sizeof constants,constants};
+    stages[0].pSpecializationInfo=stages[1].pSpecializationInfo=&specialization;
     VkPipelineVertexInputStateCreateInfo vertex{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     vertex.vertexBindingDescriptionCount = static_cast<uint32_t>(bindings_.size()); vertex.pVertexBindingDescriptions = bindings_.data();
     vertex.vertexAttributeDescriptionCount = static_cast<uint32_t>(attributes_.size()); vertex.pVertexAttributeDescriptions = attributes_.data();
@@ -212,23 +234,27 @@ void Renderer::prepare(RasterState state)
     viewport.viewportCount = viewport.scissorCount = 1;
     VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
     raster.polygonMode = VK_POLYGON_MODE_FILL;
-    raster.cullMode = state.cull; raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; raster.lineWidth = 1;
+    raster.cullMode = state.cull; raster.frontFace = (target_.info.guest_bottom_origin != state.clockwise) ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE; raster.lineWidth = 1;
+    raster.depthBiasEnable=state.depth_bias;
     VkPipelineMultisampleStateCreateInfo samples{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     samples.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     VkPipelineDepthStencilStateCreateInfo depth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     depth.depthTestEnable = state.depth_test; depth.depthWriteEnable = state.depth_write;
     depth.depthCompareOp = state.depth_compare;
+    depth.stencilTestEnable=state.stencil;
+    depth.front={state.stencil_fail,state.stencil_pass,state.stencil_depth_fail,state.stencil_compare,~0u,~0u,0};
+    depth.back=depth.front;
     VkPipelineColorBlendAttachmentState attachment{};
-    attachment.colorWriteMask = 15;
+    attachment.colorWriteMask = state.color_mask;
     attachment.blendEnable = state.blend;
-    attachment.srcColorBlendFactor = attachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
-    attachment.dstColorBlendFactor = attachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-    attachment.colorBlendOp = attachment.alphaBlendOp = VK_BLEND_OP_ADD;
+    attachment.srcColorBlendFactor = state.src_rgb; attachment.srcAlphaBlendFactor = state.src_alpha;
+    attachment.dstColorBlendFactor = state.dst_rgb; attachment.dstAlphaBlendFactor = state.dst_alpha;
+    attachment.colorBlendOp = state.blend_rgb; attachment.alphaBlendOp = state.blend_alpha;
     VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     blend.attachmentCount = 1; blend.pAttachments = &attachment;
-    VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_DEPTH_BIAS, VK_DYNAMIC_STATE_BLEND_CONSTANTS};
     VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-    dynamic.dynamicStateCount = 2; dynamic.pDynamicStates = dynamic_states;
+    dynamic.dynamicStateCount = uint32_t(sizeof dynamic_states / sizeof *dynamic_states); dynamic.pDynamicStates = dynamic_states;
     VkGraphicsPipelineCreateInfo pipeline{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
     pipeline.stageCount = 2; pipeline.pStages = stages;
     pipeline.pVertexInputState = &vertex; pipeline.pInputAssemblyState = &assembly;
@@ -241,21 +267,64 @@ void Renderer::prepare(RasterState state)
     pipelines_.emplace(key, result);
 }
 
-void Renderer::begin(VkCommandBuffer cmd, std::array<float, 4> color)
+void Renderer::begin(VkCommandBuffer cmd, std::array<float, 4> color, bool preserve)
 {
     if (cmd_ || !cmd) throw std::logic_error("Invalid Vulkan render pass begin");
     VkClearValue clear[2]{};
     for (unsigned i = 0; i < 4; i++) clear[0].color.float32[i] = color[i];
     clear[1].depthStencil = {1, 0};
     VkRenderPassBeginInfo pass{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
-    pass.renderPass = target_.render_pass; pass.framebuffer = target_.framebuffer;
+    pass.renderPass = preserve ? target_.load_pass : target_.render_pass; pass.framebuffer = target_.framebuffer;
     pass.renderArea.extent = {target_.info.width, target_.info.height};
     pass.clearValueCount = 2; pass.pClearValues = clear;
     vkCmdBeginRenderPass(cmd, &pass, VK_SUBPASS_CONTENTS_INLINE);
-    VkViewport viewport{0, 0, float(target_.info.width), float(target_.info.height), 0, 1};
+    VkViewport viewport{0, target_.info.guest_bottom_origin ? float(target_.info.height) : 0,
+                        float(target_.info.width), target_.info.guest_bottom_origin ? -float(target_.info.height) : float(target_.info.height), 0, 1};
     VkRect2D scissor{{0, 0}, pass.renderArea.extent};
     vkCmdSetViewport(cmd, 0, 1, &viewport); vkCmdSetScissor(cmd, 0, 1, &scissor);
     cmd_ = cmd; bound_ = VK_NULL_HANDLE;
+    const float blend_constants[4]{}; dynamic_state(0,~0u,~0u,0,0,blend_constants);
+}
+
+void Renderer::attach(VkCommandBuffer cmd)
+{
+    if (cmd_ || !cmd) throw std::logic_error("Invalid Vulkan pipeline attach");
+    cmd_ = cmd; bound_ = VK_NULL_HANDLE;
+}
+void Renderer::detach() { cmd_ = VK_NULL_HANDLE; bound_ = VK_NULL_HANDLE; }
+
+void Renderer::viewport(float x, float y, float width, float height, VkRect2D scissor)
+{
+    if (!cmd_) throw std::logic_error("Viewport outside render pass");
+    VkViewport vp{x, target_.info.guest_bottom_origin ? y + height : float(target_.info.height) - y - height,
+                  width, target_.info.guest_bottom_origin ? -height : height, 0, 1};
+    vkCmdSetViewport(cmd_, 0, 1, &vp);
+    vkCmdSetScissor(cmd_, 0, 1, &scissor);
+}
+
+void Renderer::dynamic_state(uint32_t ref, uint32_t compare_mask, uint32_t write_mask, float factor, float units, const float constants[4])
+{
+    if (!cmd_) throw std::logic_error("Dynamic state outside render pass");
+    vkCmdSetStencilReference(cmd_,VK_STENCIL_FACE_FRONT_AND_BACK,ref);
+    vkCmdSetStencilCompareMask(cmd_,VK_STENCIL_FACE_FRONT_AND_BACK,compare_mask);
+    vkCmdSetStencilWriteMask(cmd_,VK_STENCIL_FACE_FRONT_AND_BACK,write_mask);
+    vkCmdSetDepthBias(cmd_,units,0,factor); vkCmdSetBlendConstants(cmd_,constants);
+}
+
+void Renderer::clear(VkImageAspectFlags aspects, std::array<float,4> color, float depth, uint32_t stencil, VkRect2D rect)
+{
+    if (!cmd_) throw std::logic_error("Clear outside render pass");
+    VkClearAttachment attachments[2]{}; uint32_t count = 0;
+    if (aspects & VK_IMAGE_ASPECT_COLOR_BIT) {
+        auto &a = attachments[count++]; a.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        std::copy(color.begin(), color.end(), a.clearValue.color.float32);
+    }
+    if (aspects & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) {
+        auto &a = attachments[count++]; a.aspectMask = aspects & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
+        a.clearValue.depthStencil = {depth, stencil};
+    }
+    VkClearRect area{rect,0,1};
+    if (count && rect.extent.width && rect.extent.height) vkCmdClearAttachments(cmd_,count,attachments,1,&area);
 }
 
 void Renderer::bind_descriptors(uint32_t first_set, uint32_t count, const VkDescriptorSet *sets,

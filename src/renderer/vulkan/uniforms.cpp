@@ -10,7 +10,7 @@ UniformSet::UniformSet(Device &device, FrameRing &ring, std::vector<UniformBlock
 {
     const auto &limits = device.capabilities.properties.limits;
     alignment_ = std::max<VkDeviceSize>(1, limits.minUniformBufferOffsetAlignment);
-    if (blocks_.empty() || blocks_.size() > limits.maxDescriptorSetUniformBuffersDynamic ||
+    if (blocks_.size() > limits.maxDescriptorSetUniformBuffersDynamic ||
         ring.upload_capacity() > std::numeric_limits<uint32_t>::max())
         throw std::invalid_argument("Invalid Vulkan dynamic uniform set size");
     std::vector<VkDescriptorSetLayoutBinding> bindings;
@@ -27,6 +27,7 @@ UniformSet::UniformSet(Device &device, FrameRing &ring, std::vector<UniformBlock
         layout.bindingCount = static_cast<uint32_t>(bindings.size());
         layout.pBindings = bindings.data();
         check(vkCreateDescriptorSetLayout(d, &layout, nullptr, &layout_), "uniform descriptor layout");
+        if (blocks_.empty()) return;
         VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
             ring.slot_count() * static_cast<uint32_t>(blocks_.size())};
         VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};

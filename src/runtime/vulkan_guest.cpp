@@ -3,6 +3,8 @@
 #include "../renderer/vulkan/guest_state.hpp"
 #include "../renderer/vulkan/shader_pack.hpp"
 #include "../renderer/vulkan/window.hpp"
+#include "../renderer/vulkan/resources.hpp"
+#include "../renderer/vulkan/uniforms.hpp"
 #include "vulkan_abi.h"
 #include "vulkan_host.h"
 #include <algorithm>
@@ -14,6 +16,9 @@
 #include <map>
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
+#include <cmath>
+#include <sstream>
 
 using namespace lindbergh::vk;
 extern "C" unsigned char *g_guest_base;
@@ -38,12 +43,37 @@ struct TextureLevel {
   std::vector<uint8_t> bytes;
   bool compressed;
 };
+struct ImageVersion {
+  std::shared_ptr<Texture> image;
+  uint64_t revision = 0, use_frame = 0;
+};
+struct BufferVersion {
+  std::shared_ptr<GeometryBuffer> buffer;
+  size_t bytes = 0;
+  uint64_t revision = 0, use_frame = 0;
+};
 struct TextureObject {
+  uint64_t revision = 1;
+  bool dynamic = false;
+  ImageVersion stable;
+  std::array<ImageVersion,3> slots;
+
   std::map<int, TextureLevel> levels;
   std::unordered_map<GLenum, GLint> parameters;
   std::unordered_map<GLenum, std::array<float, 4>> float_parameters;
 };
+struct NativeProgram {
+  std::array<std::unique_ptr<UniformSet>,2> uniform_sets;
+  std::unique_ptr<SampledSet> empty_images;
+  std::vector<VkDescriptorSetLayout> layouts;
+  uint64_t legacy_version=0; uint32_t legacy_height=0;
+  std::array<uint64_t,2> uniform_version{}, uniform_frame{};
+  std::array<uint32_t,2> uniform_offset{};
+  std::map<std::string,std::unique_ptr<Renderer>> renderers;
+};
 struct Program {
+  std::shared_ptr<NativeProgram> native;
+
   std::vector<GLuint> shaders;
   std::vector<AttributeBinding> attributes;
   const ShaderRecord *record = nullptr;
@@ -53,6 +83,11 @@ struct Program {
   std::unordered_map<int, GLint> sampler_units;
 };
 struct Buffer {
+  uint64_t revision = 1;
+  bool dynamic = false;
+  BufferVersion stable;
+  std::array<BufferVersion,3> slots;
+
   std::vector<unsigned char> bytes;
   GLenum usage = GL_STATIC_DRAW;
 };
@@ -67,14 +102,49 @@ struct Attributes {
   GLenum matrix_mode, active_texture;
   std::array<GLuint, 8> textures;
 };
+struct DrawPacket {
+  Renderer *renderer;
+  Target *target;
+  std::vector<Upload> streams;
+  IndexStream index{};
+  uint32_t count = 0;
+  Matrices matrices{};
+  RasterState raster;
+  std::array<VkDescriptorSet,3> descriptors{};
+  std::array<std::vector<uint32_t>,2> offsets;
+  std::array<float,4> viewport;
+  VkRect2D scissor;
+  VkImageAspectFlags clear_aspects = 0;
+  std::array<float,4> color{};
+  float clear_depth = 1;
+  uint32_t clear_stencil = 0, stencil_ref=0, stencil_compare_mask=~0u, stencil_write_mask=~0u;
+  float depth_bias_factor=0, depth_bias_units=0;
+  std::array<float,4> blend_constants{};
+};
+struct Material {
+  std::shared_ptr<SampledSet> descriptors;
+  std::vector<std::shared_ptr<Texture>> images;
+  std::vector<std::shared_ptr<Sampler>> samplers;
+};
 struct State {
   std::unique_ptr<Device> device;
   std::unique_ptr<Window> window;
   std::unique_ptr<PipelineCache> cache;
   std::unique_ptr<FrameRing> ring;
-  std::unique_ptr<ShaderPack> pack;
+  std::unique_ptr<ShaderPack> pack, fixed_pack;
+  Program fixed_program;
+  std::array<bool,8> texture_enabled{};
+  std::array<GLenum,8> texture_env{GL_MODULATE,GL_MODULATE,GL_MODULATE,GL_MODULATE,GL_MODULATE,GL_MODULATE,GL_MODULATE,GL_MODULATE};
+  std::array<std::array<float,4>,8> env_color{};
   std::unordered_map<unsigned, std::unique_ptr<Target>> drawables;
   std::unordered_map<Target *, std::unique_ptr<Renderer>> renderers;
+  std::vector<DrawPacket> packets;
+  std::unordered_set<Target *> initialized;
+  std::array<std::unordered_map<std::string,std::shared_ptr<Material>>,3> materials;
+  std::unordered_map<std::string,std::shared_ptr<Sampler>> samplers;
+  std::shared_ptr<Texture> fallback;
+  Target *active_target = nullptr;
+  int game_width = 640, game_height = 480;
   GuestState matrices;
   GuestArrays arrays;
   VkCommandBuffer cmd = VK_NULL_HANDLE;
@@ -98,6 +168,9 @@ struct State {
   std::array<float, 4> clear{0, 0, 0, 0};
   RasterState raster;
   bool ready = false;
+  uint64_t legacy_version=1;
+  bool in_begin=false; GLenum immediate_mode=GL_TRIANGLES;
+  std::vector<std::array<float,64>> immediate;
   std::vector<Attributes> attributes;
   ~State() {
     ring.reset(); // completes buffered commands before referenced resources
@@ -109,13 +182,36 @@ struct State {
     if (!cmd) {
       cmd = ring->begin();
       screen = &window->acquire(*ring);
+      if (materials[ring->recording_slot()].size()>2048) materials[ring->recording_slot()].clear();
     }
   }
   void end_pass() {
     if (active) {
       active->end();
-      active = nullptr;
+      active = nullptr; active_target = nullptr;
     }
+  }
+  Target *target() { frame(); return drawable ? drawables.at(drawable).get() : screen; }
+  void flush() {
+    end_pass();
+    for (auto &p : packets) if (p.count) p.renderer->prepare(p.raster);
+    for (auto &p : packets) {
+      if (active_target != p.target) {
+        end_pass(); p.renderer->begin(cmd,p.color,initialized.count(p.target)!=0);
+        initialized.insert(p.target); active=p.renderer; active_target=p.target;
+      } else if (active != p.renderer) {
+        active->detach(); p.renderer->attach(cmd); active=p.renderer;
+      }
+      active->viewport(p.viewport[0],p.viewport[1],p.viewport[2],p.viewport[3],p.scissor);
+      if (p.clear_aspects) active->clear(p.clear_aspects,p.color,p.clear_depth,p.clear_stencil,p.scissor);
+      if (p.count) {
+        active->dynamic_state(p.stencil_ref,p.stencil_compare_mask,p.stencil_write_mask,p.depth_bias_factor,p.depth_bias_units,p.blend_constants.data());
+        for (unsigned set=0;set<3;++set) if (p.descriptors[set])
+          active->bind_descriptors(set,1,&p.descriptors[set],set<2?uint32_t(p.offsets[set].size()):0,set<2?p.offsets[set].data():nullptr);
+        active->draw_buffers(p.streams.data(),uint32_t(p.streams.size()),p.count,p.matrices,p.raster,p.index.buffer?&p.index:nullptr);
+      }
+    }
+    packets.clear(); end_pass();
   }
   Renderer &renderer() {
     frame();
@@ -126,8 +222,9 @@ struct State {
     if (active != renderer.get()) {
       end_pass();
       renderer->prepare(raster);
-      renderer->begin(cmd, clear);
-      active = renderer.get();
+      renderer->begin(cmd, clear, initialized.count(target)!=0);
+      initialized.insert(target);
+      active = renderer.get(); active_target = target;
     }
     return *renderer;
   }
@@ -147,6 +244,7 @@ struct State {
   }
 };
 State state;
+void queue_clear(GLbitfield mask);
 GLuint object() { return state.next_object++; }
 void check_range(size_t size, GLintptr offset, GLsizeiptr bytes) {
   if (offset < 0 || bytes < 0 || size_t(offset) > size ||
@@ -163,8 +261,10 @@ extern "C" int lvk_host_init(SDL_Window *window, int w, int h) {
     const char *cache = std::getenv("LINDBERGH_VULKAN_CACHE");
     state.cache =
         std::make_unique<PipelineCache>(*state.device, cache ? cache : "");
-    state.ring = std::make_unique<FrameRing>(*state.device, 3, 32u << 20);
+    state.ring = std::make_unique<FrameRing>(*state.device, 3, 64u << 20);
+    state.game_width=w; state.game_height=h;
     state.viewport = state.scissor = {0, 0, w, h};
+    state.arrays.current(3,{1,1,1,1});state.arrays.current(2,{0,0,1,0});
     state.raster.depth_test = false;
     state.raster.depth_write = true;
     state.ready = true;
@@ -176,21 +276,59 @@ extern "C" int lvk_host_init(SDL_Window *window, int w, int h) {
     return 0;
   }
 }
+
+namespace {
+struct FrameCapture {
+ Device &device;VkBuffer buffer=VK_NULL_HANDLE;VkDeviceMemory memory=VK_NULL_HANDLE;void *mapped=nullptr;
+ FrameCapture(Device &d,VkCommandBuffer cmd,Target &target):device(d) {
+  const auto bytes=VkDeviceSize(target.info.width)*target.info.height*4;
+  VkBufferCreateInfo create{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};create.size=bytes;create.usage=VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+  check(vkCreateBuffer(d.handles.device,&create,nullptr,&buffer),"capture buffer");
+  VkMemoryRequirements req;vkGetBufferMemoryRequirements(d.handles.device,buffer,&req);
+  VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};alloc.allocationSize=req.size;
+  alloc.memoryTypeIndex=d.memory_type(req.memoryTypeBits,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+  check(vkAllocateMemory(d.handles.device,&alloc,nullptr,&memory),"capture memory");check(vkBindBufferMemory(d.handles.device,buffer,memory,0),"bind capture");
+  check(vkMapMemory(d.handles.device,memory,0,bytes,0,&mapped),"map capture");
+  VkImageMemoryBarrier image{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};image.srcAccessMask=VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;image.dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT;
+  image.oldLayout=target.info.final_layout;image.newLayout=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+  image.srcQueueFamilyIndex=image.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;image.image=target.color;image.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
+  vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,0,nullptr,1,&image);
+  VkBufferImageCopy copy{};copy.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};copy.imageExtent={target.info.width,target.info.height,1};
+  vkCmdCopyImageToBuffer(cmd,target.color,image.newLayout,buffer,1,&copy);
+  image.oldLayout=image.newLayout;image.newLayout=target.info.final_layout;image.srcAccessMask=VK_ACCESS_TRANSFER_READ_BIT;image.dstAccessMask=0;
+  vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,0,0,nullptr,0,nullptr,1,&image);
+  VkBufferMemoryBarrier ready{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};ready.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;ready.dstAccessMask=VK_ACCESS_HOST_READ_BIT;
+  ready.srcQueueFamilyIndex=ready.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;ready.buffer=buffer;ready.size=VK_WHOLE_SIZE;
+  vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&ready,0,nullptr);
+ }
+ void write(const char *path,const Target &target) {
+  std::ofstream out(path,std::ios::binary);out<<"P6\n"<<target.info.width<<' '<<target.info.height<<"\n255\n";
+  const auto p=static_cast<const uint8_t *>(mapped);const bool bgra=target.info.color_format==VK_FORMAT_B8G8R8A8_UNORM||target.info.color_format==VK_FORMAT_B8G8R8A8_SRGB;
+  for(size_t i=0;i<size_t(target.info.width)*target.info.height;++i) {const char rgb[]={char(p[4*i+(bgra?2:0)]),char(p[4*i+1]),char(p[4*i+(bgra?0:2)])};out.write(rgb,3);}
+  std::fprintf(stderr,"[vulkan] frame capture %s\n",path);
+ }
+ ~FrameCapture() {if(mapped)vkUnmapMemory(device.handles.device,memory);if(buffer)vkDestroyBuffer(device.handles.device,buffer,nullptr);if(memory)vkFreeMemory(device.handles.device,memory,nullptr);}
+};
+}
+extern "C" unsigned g_frame;
 extern "C" void lvk_host_present(void) {
-  if (state.drawable)
-    gap("offscreen-to-window presentation requires render-target routing");
-  state.frame();
-  if (!state.active)
-    state.renderer();
-  state.end_pass();
-  state.window->present(*state.ring);
-  state.cmd = VK_NULL_HANDLE;
+  state.frame(); state.flush();
+  if (!state.initialized.count(state.screen)) {
+    const auto old=state.drawable;state.drawable=0;state.renderer();state.end_pass();state.drawable=old;
+  }
+  const char *shot=std::getenv("LINDBERGH_SHOT");const char *at=std::getenv("LINDBERGH_SHOT_FRAME");
+  std::unique_ptr<FrameCapture> capture;
+  if(shot && g_frame==unsigned(at?std::strtoul(at,nullptr,10):0)) capture=std::make_unique<FrameCapture>(*state.device,state.cmd,*state.screen);
+  auto submitted=state.window->present(*state.ring);
+  if(capture) {state.ring->wait(submitted);capture->write(shot,*state.screen);}
+  state.cmd=VK_NULL_HANDLE;
 }
 extern "C" unsigned lvk_create_drawable(int w, int h) {
   if (w <= 0 || h <= 0)
     gap("invalid guest drawable dimensions");
   const auto id = state.next_drawable++;
   TargetInfo info{uint32_t(w), uint32_t(h), 1};
+  info.guest_bottom_origin=true;
   state.drawables[id] = std::make_unique<Target>(*state.device, info);
   return id;
 }
@@ -202,8 +340,6 @@ extern "C" void lvk_destroy_drawable(unsigned id) {
 extern "C" void lvk_bind_drawable(unsigned id) {
   if (id && !state.drawables.count(id))
     gap("unknown guest Vulkan drawable");
-  if (state.drawable != id)
-    state.end_pass();
   state.drawable = id;
 }
 
@@ -374,23 +510,23 @@ extern "C" void lvk_glMatrixMode(GLenum mode) {
   state.matrices.matrix_mode(mode);
   state.matrix_mode = mode;
 }
-extern "C" void lvk_glLoadIdentity(void) { state.matrices.load_identity(); }
-extern "C" void lvk_glLoadMatrixf(const GLfloat *m) {
+extern "C" void lvk_glLoadIdentity(void) { ++state.legacy_version; state.matrices.load_identity(); }
+extern "C" void lvk_glLoadMatrixf(const GLfloat *m) { ++state.legacy_version;
   state.matrices.load_matrix(m);
 }
-extern "C" void lvk_glMultMatrixf(const GLfloat *m) {
+extern "C" void lvk_glMultMatrixf(const GLfloat *m) { ++state.legacy_version;
   state.matrices.mult_matrix(m);
 }
-extern "C" void lvk_glPushMatrix(void) { state.matrices.push_matrix(); }
-extern "C" void lvk_glPopMatrix(void) { state.matrices.pop_matrix(); }
-extern "C" void lvk_glTranslatef(GLfloat x, GLfloat y, GLfloat z) {
+extern "C" void lvk_glPushMatrix(void) { ++state.legacy_version; state.matrices.push_matrix(); }
+extern "C" void lvk_glPopMatrix(void) { ++state.legacy_version; state.matrices.pop_matrix(); }
+extern "C" void lvk_glTranslatef(GLfloat x, GLfloat y, GLfloat z) { ++state.legacy_version;
   state.matrices.translate(x, y, z);
 }
-extern "C" void lvk_glScalef(GLfloat x, GLfloat y, GLfloat z) {
+extern "C" void lvk_glScalef(GLfloat x, GLfloat y, GLfloat z) { ++state.legacy_version;
   state.matrices.scale(x, y, z);
 }
 extern "C" void lvk_glOrtho(GLdouble l, GLdouble r, GLdouble b, GLdouble t,
-                            GLdouble n, GLdouble f) {
+                            GLdouble n, GLdouble f) { ++state.legacy_version;
   state.matrices.ortho(l, r, b, t, n, f);
 }
 extern "C" void lvk_glViewport(GLint x, GLint y, GLsizei w, GLsizei h) {
@@ -409,15 +545,10 @@ extern "C" void lvk_glClearDepth(GLclampd d) {
 extern "C" void lvk_glClearStencil(GLint s) {
   state.integers[GL_STENCIL_CLEAR_VALUE] = s;
 }
-extern "C" void lvk_glClear(GLbitfield mask) {
-  if (mask &
-      ~(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT))
-    gap("unknown guest clear mask");
-  if (state.active)
-    gap("mid-pass guest clear is not implemented");
-}
+extern "C" void lvk_glClear(GLbitfield mask) { queue_clear(mask); }
 extern "C" void lvk_glEnable(GLenum cap) {
   state.enabled[cap] = true;
+  if(cap==GL_TEXTURE_2D)state.texture_enabled[state.active_texture-GL_TEXTURE0]=true;
   if (cap == GL_DEPTH_TEST)
     state.raster.depth_test = true;
   if (cap == GL_BLEND)
@@ -425,6 +556,7 @@ extern "C" void lvk_glEnable(GLenum cap) {
 }
 extern "C" void lvk_glDisable(GLenum cap) {
   state.enabled[cap] = false;
+  if(cap==GL_TEXTURE_2D)state.texture_enabled[state.active_texture-GL_TEXTURE0]=false;
   if (cap == GL_DEPTH_TEST)
     state.raster.depth_test = false;
   if (cap == GL_BLEND)
@@ -442,7 +574,7 @@ extern "C" void lvk_glDepthFunc(GLenum function) {
   state.integers[GL_DEPTH_FUNC] = function;
 }
 extern "C" void lvk_glPixelStorei(GLenum p, GLint v) { state.integers[p] = v; }
-extern "C" void lvk_glActiveTexture(GLenum unit) {
+extern "C" void lvk_glActiveTexture(GLenum unit) { ++state.legacy_version;
   if (unit < GL_TEXTURE0 || unit >= GL_TEXTURE0 + 8)
     gap("guest texture unit out of range");
   state.active_texture = unit;
@@ -469,6 +601,7 @@ extern "C" void lvk_glBufferData(GLenum target, GLsizeiptr n,
   if (n < 0)
     gap("negative guest buffer size");
   auto &b = state.buffers[state.binding(target)];
+  ++b.revision; b.dynamic=b.dynamic || bool(b.stable.buffer);
   b.bytes.resize(size_t(n));
   if (data && n)
     std::memcpy(b.bytes.data(), data, size_t(n));
@@ -478,6 +611,7 @@ extern "C" void lvk_glBufferSubData(GLenum target, GLintptr offset,
                                     GLsizeiptr n, const GLvoid *data) {
   auto &b = state.buffers.at(state.binding(target));
   check_range(b.bytes.size(), offset, n);
+  ++b.revision; b.dynamic=b.dynamic || bool(b.stable.buffer);
   if (n)
     std::memcpy(b.bytes.data() + offset, data, size_t(n));
 }
@@ -767,7 +901,8 @@ extern "C" void lvk_glTexImage2D(GLenum target, GLint level, GLint internal,
         internal, format, type, w, h);
     gap("guest texture format/dimensions need conversion support");
   }
-  auto &v = texture(target).levels[level];
+  auto &object=texture(target); ++object.revision; object.dynamic=object.dynamic || bool(object.stable.image);
+  auto &v = object.levels[level];
   v = {internal, w, h, format, type, {}, false};
   const auto pixel_bytes =
       components(format) * (type == GL_UNSIGNED_BYTE ? 1 : 4);
@@ -814,7 +949,8 @@ extern "C" void lvk_glCompressedTexImage2D(GLenum target, GLint level,
                                            GLsizei bytes, const GLvoid *data) {
   if (w < 0 || h < 0 || level < 0 || border || bytes < 0)
     gap("invalid guest compressed texture dimensions");
-  auto &v = texture(target).levels[level];
+  auto &object=texture(target); ++object.revision; object.dynamic=object.dynamic || bool(object.stable.image);
+  auto &v = object.levels[level];
   v = {GLint(internal), w, h, 0, 0, {}, true};
   v.bytes.resize(size_t(bytes));
   if (data || state.unpack_buffer)
@@ -826,6 +962,7 @@ extern "C" void lvk_glDeleteTextures(GLsizei n, const GLuint *ids) {
 }
 extern "C" void lvk_glTexEnvf(GLenum target, GLenum name, GLfloat value) {
   state.floats[(target << 16) | name] = {value, 0, 0, 0};
+  if(target==GL_TEXTURE_ENV&&name==GL_TEXTURE_ENV_MODE)state.texture_env[state.active_texture-GL_TEXTURE0]=GLenum(value);
 }
 extern "C" void lvk_glHint(GLenum target, GLenum mode) {
   state.integers[target] = mode;
@@ -847,10 +984,10 @@ extern "C" void lvk_glCullFace(GLenum face) {
 extern "C" void lvk_glFrontFace(GLenum face) {
   state.integers[GL_FRONT_FACE] = face;
 }
-extern "C" void lvk_glLightf(GLenum light, GLenum name, GLfloat v) {
+extern "C" void lvk_glLightf(GLenum light, GLenum name, GLfloat v) { ++state.legacy_version;
   state.floats[(light << 16) | name] = {v, 0, 0, 0};
 }
-extern "C" void lvk_glLightfv(GLenum light, GLenum name, const GLfloat *v) {
+extern "C" void lvk_glLightfv(GLenum light, GLenum name, const GLfloat *v) { ++state.legacy_version;
   auto &out = state.floats[(light << 16) | name];
   auto n = name == GL_SPOT_DIRECTION ? 3
            : name == GL_AMBIENT || name == GL_DIFFUSE || name == GL_SPECULAR ||
@@ -859,7 +996,7 @@ extern "C" void lvk_glLightfv(GLenum light, GLenum name, const GLfloat *v) {
                : 1;
   std::copy(v, v + n, out.begin());
 }
-extern "C" void lvk_glMaterialfv(GLenum face, GLenum name, const GLfloat *v) {
+extern "C" void lvk_glMaterialfv(GLenum face, GLenum name, const GLfloat *v) { ++state.legacy_version;
   if (face == GL_FRONT_AND_BACK) {
     auto n = name == GL_SHININESS ? 1 : 4;
     std::copy(v, v + n, state.floats[(GL_FRONT << 16) | name].begin());
@@ -868,13 +1005,13 @@ extern "C" void lvk_glMaterialfv(GLenum face, GLenum name, const GLfloat *v) {
     std::copy(v, v + (name == GL_SHININESS ? 1 : 4),
               state.floats[(face << 16) | name].begin());
 }
-extern "C" void lvk_glFogf(GLenum name, GLfloat value) {
+extern "C" void lvk_glFogf(GLenum name, GLfloat value) { ++state.legacy_version;
   state.floats[name] = {value, 0, 0, 0};
 }
-extern "C" void lvk_glFogi(GLenum name, GLint value) {
+extern "C" void lvk_glFogi(GLenum name, GLint value) { ++state.legacy_version;
   state.floats[name] = {float(value), 0, 0, 0};
 }
-extern "C" void lvk_glFogfv(GLenum name, const GLfloat *v) {
+extern "C" void lvk_glFogfv(GLenum name, const GLfloat *v) { ++state.legacy_version;
   std::copy(v, v + (name == GL_FOG_COLOR ? 4 : 1), state.floats[name].begin());
 }
 extern "C" void lvk_glVertexPointer(GLint size, GLenum type, GLsizei stride,
@@ -1104,7 +1241,7 @@ extern "C" void lvk_glTexParameterfv(GLenum target, GLenum name,
   if (name != GL_TEXTURE_BORDER_COLOR)
     t.parameters[name] = GLint(values[0]);
 }
-extern "C" void lvk_glAlphaFunc(GLenum compare, GLclampf reference) {
+extern "C" void lvk_glAlphaFunc(GLenum compare, GLclampf reference) { ++state.legacy_version;
   state.integers[GL_ALPHA_TEST_FUNC] = compare;
   state.floats[GL_ALPHA_TEST_REF] = {std::clamp(reference, 0.f, 1.f), 0, 0, 0};
 }
@@ -1131,4 +1268,451 @@ extern "C" void lvk_glStencilOp(GLenum fail, GLenum depth_fail, GLenum pass) {
   state.integers[GL_STENCIL_FAIL] = fail;
   state.integers[GL_STENCIL_PASS_DEPTH_FAIL] = depth_fail;
   state.integers[GL_STENCIL_PASS_DEPTH_PASS] = pass;
+}
+
+namespace {
+void key_word(std::string &key,uint64_t word) { key.append(reinterpret_cast<const char *>(&word),sizeof word); }
+void changed(TextureObject &o) { ++o.revision; o.dynamic=o.dynamic || bool(o.stable.image); }
+VkFormat texture_format(const TextureLevel &v) {
+  if(v.compressed) switch(v.internal) {
+    case 0x83f0:return VK_FORMAT_BC1_RGB_UNORM_BLOCK;
+    case 0x83f1:return VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+    case 0x83f2:return VK_FORMAT_BC2_UNORM_BLOCK;
+    case 0x83f3:return VK_FORMAT_BC3_UNORM_BLOCK;
+    default:gap("unknown guest compressed texture format");
+  }
+  switch(v.format) {
+    case GL_DEPTH_COMPONENT:return Target::depth_format;
+    case GL_LUMINANCE:case GL_ALPHA:case GL_RED:return VK_FORMAT_R8_UNORM;
+    case GL_LUMINANCE_ALPHA:return VK_FORMAT_R8G8_UNORM;
+    case GL_BGRA:return VK_FORMAT_B8G8R8A8_UNORM;
+    case GL_RGB:case GL_RGBA:return VK_FORMAT_R8G8B8A8_UNORM;
+    default:gap("native texture format not implemented");
+  }
+}
+std::shared_ptr<Texture> native_image(TextureObject &o) {
+  state.frame();state.end_pass();
+  if(o.levels.empty() || !o.levels.count(0)) {
+    if(!state.fallback) {
+      state.fallback=std::make_shared<Texture>(*state.device,TextureInfo{1,1});
+      const uint8_t black[]={0,0,0,255}; state.fallback->upload(state.cmd,*state.ring,0,0,black,4);
+    }
+    return state.fallback;
+  }
+  const auto &base=o.levels.at(0);
+  TextureInfo info{uint32_t(base.width),uint32_t(base.height),uint32_t(o.levels.rbegin()->first+1),1,texture_format(base)};
+  if(base.format==GL_LUMINANCE)info.components={VK_COMPONENT_SWIZZLE_R,VK_COMPONENT_SWIZZLE_R,VK_COMPONENT_SWIZZLE_R,VK_COMPONENT_SWIZZLE_ONE};
+  if(base.format==GL_LUMINANCE_ALPHA)info.components={VK_COMPONENT_SWIZZLE_R,VK_COMPONENT_SWIZZLE_R,VK_COMPONENT_SWIZZLE_R,VK_COMPONENT_SWIZZLE_G};
+  if(base.format==GL_ALPHA)info.components={VK_COMPONENT_SWIZZLE_ZERO,VK_COMPONENT_SWIZZLE_ZERO,VK_COMPONENT_SWIZZLE_ZERO,VK_COMPONENT_SWIZZLE_R};
+  auto &version=o.dynamic?o.slots[state.ring->recording_slot()]:o.stable;
+  const auto frame=state.ring->submissions()+1;
+  if(version.revision!=o.revision) {
+    if(!version.image || version.use_frame==frame || version.image->info.width!=info.width || version.image->info.height!=info.height ||
+        version.image->info.levels!=info.levels || version.image->info.format!=info.format ||
+        std::memcmp(&version.image->info.components,&info.components,sizeof info.components))
+      version.image=std::make_shared<Texture>(*state.device,info);
+    for(const auto &[level,v]:o.levels) {
+      if(texture_format(v)!=info.format)gap("mip texture formats disagree");
+      const void *data=v.bytes.data();size_t bytes=v.bytes.size();std::vector<uint8_t> expanded;
+      if(v.format==GL_RGB&&!v.compressed) {
+        expanded.resize(size_t(v.width)*v.height*4);
+        for(size_t i=0;i<size_t(v.width)*v.height;++i) {std::memcpy(expanded.data()+4*i,v.bytes.data()+3*i,3);expanded[4*i+3]=255;}
+        data=expanded.data();bytes=expanded.size();
+      } else if(v.format==GL_DEPTH_COMPONENT&&v.type==GL_UNSIGNED_INT) {
+        expanded.resize(bytes);
+        for(size_t i=0;i<bytes;i+=4) {uint32_t d;std::memcpy(&d,v.bytes.data()+i,4);const float f=float(double(d)/4294967295.0);std::memcpy(expanded.data()+i,&f,4);}
+        data=expanded.data();
+      }
+      version.image->upload(state.cmd,*state.ring,uint32_t(level),0,data,bytes);
+    }
+    version.revision=o.revision;
+  }
+  version.use_frame=frame;state.ring->keep_alive(version.image);return version.image;
+}
+std::shared_ptr<GeometryBuffer> native_buffer(GLuint id) {
+  auto &o=state.buffers.at(id);state.frame();state.end_pass();
+  auto &version=o.dynamic?o.slots[state.ring->recording_slot()]:o.stable;
+  const auto frame=state.ring->submissions()+1;
+  const auto bytes=(o.bytes.size()+3)&~size_t(3);
+  if(!bytes)gap("empty guest geometry buffer used for drawing");
+  if(version.revision!=o.revision) {
+    if(!version.buffer||version.use_frame==frame||version.bytes!=bytes) {
+      version.buffer=std::make_shared<GeometryBuffer>(*state.device,bytes);version.bytes=bytes;
+    }
+    if(bytes==o.bytes.size())version.buffer->upload(state.cmd,*state.ring,o.bytes.data(),bytes);
+    else {auto copy=o.bytes;copy.resize(bytes);version.buffer->upload(state.cmd,*state.ring,copy.data(),bytes);}
+    version.revision=o.revision;
+  }
+  version.use_frame=frame;state.ring->keep_alive(version.buffer);return version.buffer;
+}
+VkSamplerAddressMode wrap_mode(GLint value) {
+  switch(value) {case GL_REPEAT:return VK_SAMPLER_ADDRESS_MODE_REPEAT;case GL_MIRRORED_REPEAT:return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
+  case GL_CLAMP_TO_EDGE:return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;case GL_CLAMP:case GL_CLAMP_TO_BORDER:return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+  default:gap("guest texture wrap mode not implemented");}
+}
+std::shared_ptr<Sampler> native_sampler(TextureObject &o,uint32_t levels,bool shadow) {
+  auto param=[&](GLenum name,GLint fallback){const auto it=o.parameters.find(name);return it==o.parameters.end()?fallback:it->second;};
+  SamplerInfo info;
+  const auto min=param(GL_TEXTURE_MIN_FILTER,GL_NEAREST_MIPMAP_LINEAR),mag=param(GL_TEXTURE_MAG_FILTER,GL_LINEAR);
+  info.mag_filter=mag==GL_NEAREST?VK_FILTER_NEAREST:VK_FILTER_LINEAR;
+  info.min_filter=min==GL_NEAREST||min==GL_NEAREST_MIPMAP_NEAREST||min==GL_NEAREST_MIPMAP_LINEAR?VK_FILTER_NEAREST:VK_FILTER_LINEAR;
+  info.mip_filter=min==GL_NEAREST_MIPMAP_LINEAR||min==GL_LINEAR_MIPMAP_LINEAR?VK_SAMPLER_MIPMAP_MODE_LINEAR:VK_SAMPLER_MIPMAP_MODE_NEAREST;
+  info.max_lod=min==GL_NEAREST||min==GL_LINEAR?0:float(levels-1);
+  info.u=wrap_mode(param(GL_TEXTURE_WRAP_S,GL_REPEAT));info.v=wrap_mode(param(GL_TEXTURE_WRAP_T,GL_REPEAT));
+  info.compare=shadow;info.compare_op=VkCompareOp(param(GL_TEXTURE_COMPARE_FUNC,GL_LEQUAL)-GL_NEVER);
+  const auto color=o.float_parameters.find(GL_TEXTURE_BORDER_COLOR);
+  if(color!=o.float_parameters.end()) {
+    if(color->second==std::array<float,4>{1,1,1,1})info.border=VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
+    else if(color->second==std::array<float,4>{0,0,0,1})info.border=VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
+    else if(color->second!=std::array<float,4>{0,0,0,0})gap("custom sampler border color requires device feature support");
+  }
+  std::string key;
+  for(auto value:{int(info.min_filter),int(info.mag_filter),int(info.mip_filter),int(info.u),int(info.v),int(info.max_lod),int(info.compare),int(info.compare_op),int(info.border)})key_word(key,uint64_t(value));
+  auto &sampler=state.samplers[key];if(!sampler)sampler=std::make_shared<Sampler>(*state.device,info);return sampler;
+}
+DrawPacket packet_for(Target *target,Renderer *renderer) {
+  DrawPacket p{};p.target=target;p.renderer=renderer;p.color=state.clear;
+  const float sx=target==state.screen?float(target->info.width)/state.game_width:1;
+  const float sy=target==state.screen?float(target->info.height)/state.game_height:1;
+  p.viewport={state.viewport[0]*sx,state.viewport[1]*sy,state.viewport[2]*sx,state.viewport[3]*sy};
+  auto rect=state.enabled[GL_SCISSOR_TEST]?state.scissor:std::array<GLint,4>{0,0,int(target->info.width/sx),int(target->info.height/sy)};
+  int x0=std::clamp(int(std::floor(rect[0]*sx)),0,int(target->info.width));
+  int x1=std::clamp(int(std::ceil((rect[0]+rect[2])*sx)),x0,int(target->info.width));
+  int y0=std::clamp(int(std::floor(rect[1]*sy)),0,int(target->info.height));
+  int y1=std::clamp(int(std::ceil((rect[1]+rect[3])*sy)),y0,int(target->info.height));
+  p.scissor={{x0,target->info.guest_bottom_origin?y0:int(target->info.height)-y1},{uint32_t(x1-x0),uint32_t(y1-y0)}};
+  p.stencil_ref=uint32_t(integer(GL_STENCIL_REF,0));p.stencil_compare_mask=uint32_t(integer(GL_STENCIL_VALUE_MASK,~0));
+  p.stencil_write_mask=uint32_t(integer(GL_STENCIL_WRITEMASK,~0));
+  p.depth_bias_factor=state.floats[GL_POLYGON_OFFSET_FACTOR][0];p.depth_bias_units=state.floats[GL_POLYGON_OFFSET_UNITS][0];
+  p.blend_constants=state.floats[GL_BLEND_COLOR];
+  return p;
+}
+void queue_clear(GLbitfield mask) {
+  if(mask&~(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT|GL_STENCIL_BUFFER_BIT))gap("invalid guest clear mask");
+  auto *target=state.target();auto &renderer=state.renderers[target];
+  if(!renderer)renderer=std::make_unique<Renderer>(*state.device,*target,*state.cache);
+  auto p=packet_for(target,renderer.get());
+  const auto write=state.floats.find(GL_COLOR_WRITEMASK);
+  bool full=true,none=false;
+  if(write!=state.floats.end()) {full=std::all_of(write->second.begin(),write->second.end(),[](float v){return v!=0;});none=std::all_of(write->second.begin(),write->second.end(),[](float v){return v==0;});}
+  if(mask&GL_COLOR_BUFFER_BIT) {if(!none)p.clear_aspects|=VK_IMAGE_ASPECT_COLOR_BIT;}
+  if((mask&GL_DEPTH_BUFFER_BIT)&&state.raster.depth_write)p.clear_aspects|=VK_IMAGE_ASPECT_DEPTH_BIT;
+  if((mask&GL_STENCIL_BUFFER_BIT)&&(p.stencil_write_mask&255)) {p.clear_aspects|=VK_IMAGE_ASPECT_STENCIL_BIT;}
+  p.clear_depth=state.floats.count(GL_DEPTH_CLEAR_VALUE)?state.floats[GL_DEPTH_CLEAR_VALUE][0]:1;
+  p.clear_stencil=uint32_t(integer(GL_STENCIL_CLEAR_VALUE,0));
+  if(p.clear_aspects && ((!full&&!none) || ((p.clear_aspects&VK_IMAGE_ASPECT_STENCIL_BIT)&&((p.stencil_write_mask&255)!=255)))) {
+    p.count=6;p.clear_aspects=0;p.raster={};p.raster.depth_test=bool(mask&GL_DEPTH_BUFFER_BIT)&&state.raster.depth_write;
+    p.raster.depth_write=p.raster.depth_test;p.raster.depth_compare=VK_COMPARE_OP_ALWAYS;
+    p.raster.color_mask=0;if(mask&GL_COLOR_BUFFER_BIT)for(unsigned i=0;i<4;++i)if(write==state.floats.end()||write->second[i])p.raster.color_mask|=1u<<i;
+    p.raster.stencil=(mask&GL_STENCIL_BUFFER_BIT)&&(p.stencil_write_mask&255);p.raster.stencil_compare=VK_COMPARE_OP_ALWAYS;
+    p.raster.stencil_pass=VK_STENCIL_OP_REPLACE;p.stencil_ref=p.clear_stencil;
+    const auto z=std::clamp(p.clear_depth,0.f,1.f)*2-1;
+    Vertex quad[]={{{-1,-1,z,1},{}},{{1,-1,z,1},{}},{{1,1,z,1},{}},{{-1,-1,z,1},{}},{{1,1,z,1},{}},{{-1,1,z,1},{}}};
+    for(auto &v:quad)std::copy(p.color.begin(),p.color.end(),v.color);
+    p.streams.push_back(state.ring->upload(quad,sizeof quad));for(auto &m:p.matrices.view_projection)for(unsigned i=0;i<4;++i)m[i*5]=1;
+    p.viewport={0,0,float(target->info.width),float(target->info.height)};
+  }
+  if(p.clear_aspects||p.count)state.packets.push_back(std::move(p));
+}
+}
+extern "C" void lvk_glCopyTexSubImage2D(GLenum target,GLint level,GLint dx,GLint dy,GLint x,GLint y,GLsizei w,GLsizei h) {
+  auto &o=texture(target);if(!o.levels.count(level)||w<0||h<0)gap("invalid guest texture copy");
+  auto *source=state.target();state.flush();
+  if(!state.initialized.count(source)) {state.renderer();state.end_pass();}
+  changed(o);auto gpu=native_image(o);
+  gpu->copy_from(state.cmd,*source,uint32_t(level),dx,dy,x,y,uint32_t(w),uint32_t(h));
+}
+
+namespace {
+std::array<float,4> value(GLenum name,std::array<float,4> fallback={}) {
+  const auto it=state.floats.find(name);return it==state.floats.end()?fallback:it->second;
+}
+VkBlendFactor blend_factor(GLenum v) {
+  switch(v) {
+  case GL_ZERO:return VK_BLEND_FACTOR_ZERO;case GL_ONE:return VK_BLEND_FACTOR_ONE;
+  case GL_SRC_COLOR:return VK_BLEND_FACTOR_SRC_COLOR;case GL_ONE_MINUS_SRC_COLOR:return VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR;
+  case GL_DST_COLOR:return VK_BLEND_FACTOR_DST_COLOR;case GL_ONE_MINUS_DST_COLOR:return VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR;
+  case GL_SRC_ALPHA:return VK_BLEND_FACTOR_SRC_ALPHA;case GL_ONE_MINUS_SRC_ALPHA:return VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+  case GL_DST_ALPHA:return VK_BLEND_FACTOR_DST_ALPHA;case GL_ONE_MINUS_DST_ALPHA:return VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA;
+  case GL_CONSTANT_COLOR:return VK_BLEND_FACTOR_CONSTANT_COLOR;case GL_ONE_MINUS_CONSTANT_COLOR:return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR;
+  case GL_CONSTANT_ALPHA:return VK_BLEND_FACTOR_CONSTANT_ALPHA;case GL_ONE_MINUS_CONSTANT_ALPHA:return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA;
+  case GL_SRC_ALPHA_SATURATE:return VK_BLEND_FACTOR_SRC_ALPHA_SATURATE;default:gap("unsupported guest blend factor");
+  }
+}
+VkStencilOp stencil_op(GLenum v) {
+  switch(v) {case GL_KEEP:return VK_STENCIL_OP_KEEP;case GL_ZERO:return VK_STENCIL_OP_ZERO;case GL_REPLACE:return VK_STENCIL_OP_REPLACE;
+  case GL_INCR:return VK_STENCIL_OP_INCREMENT_AND_CLAMP;case GL_DECR:return VK_STENCIL_OP_DECREMENT_AND_CLAMP;
+  case GL_INVERT:return VK_STENCIL_OP_INVERT;case GL_INCR_WRAP:return VK_STENCIL_OP_INCREMENT_AND_WRAP;case GL_DECR_WRAP:return VK_STENCIL_OP_DECREMENT_AND_WRAP;
+  default:gap("unsupported guest stencil operation");}
+}
+VkBlendOp blend_op(GLenum v) {
+  switch(v) {case GL_FUNC_ADD:return VK_BLEND_OP_ADD;case GL_FUNC_SUBTRACT:return VK_BLEND_OP_SUBTRACT;
+  case GL_FUNC_REVERSE_SUBTRACT:return VK_BLEND_OP_REVERSE_SUBTRACT;case GL_MIN:return VK_BLEND_OP_MIN;case GL_MAX:return VK_BLEND_OP_MAX;
+  default:gap("unsupported guest blend equation");}
+}
+RasterState raster_state(bool fixed) {
+  auto r=state.raster;
+  if(state.enabled[GL_CULL_FACE]) {
+    auto face=integer(GL_CULL_FACE_MODE,GL_BACK);r.cull=face==GL_FRONT?VK_CULL_MODE_FRONT_BIT:face==GL_BACK?VK_CULL_MODE_BACK_BIT:VK_CULL_MODE_FRONT_AND_BACK;
+  }else r.cull=VK_CULL_MODE_NONE;
+  r.clockwise=integer(GL_FRONT_FACE,GL_CCW)==GL_CW;
+  r.src_rgb=blend_factor(integer(GL_BLEND_SRC,GL_ONE));r.dst_rgb=blend_factor(integer(GL_BLEND_DST,GL_ZERO));
+  r.src_alpha=blend_factor(integer(GL_BLEND_SRC_ALPHA,integer(GL_BLEND_SRC,GL_ONE)));
+  r.dst_alpha=blend_factor(integer(GL_BLEND_DST_ALPHA,integer(GL_BLEND_DST,GL_ZERO)));
+  r.blend_rgb=blend_op(integer(GL_BLEND_EQUATION_RGB,GL_FUNC_ADD));r.blend_alpha=blend_op(integer(GL_BLEND_EQUATION_ALPHA,GL_FUNC_ADD));
+  auto mask=value(GL_COLOR_WRITEMASK,{1,1,1,1});r.color_mask=0;for(unsigned i=0;i<4;++i)if(mask[i])r.color_mask|=1u<<i;
+  r.alpha_func=state.enabled[GL_ALPHA_TEST]?uint32_t(integer(GL_ALPHA_TEST_FUNC,GL_ALWAYS)-GL_NEVER+1):0;
+  r.stencil=state.enabled[GL_STENCIL_TEST];r.stencil_compare=VkCompareOp(integer(GL_STENCIL_FUNC,GL_ALWAYS)-GL_NEVER);
+  r.stencil_fail=stencil_op(integer(GL_STENCIL_FAIL,GL_KEEP));r.stencil_depth_fail=stencil_op(integer(GL_STENCIL_PASS_DEPTH_FAIL,GL_KEEP));r.stencil_pass=stencil_op(integer(GL_STENCIL_PASS_DEPTH_PASS,GL_KEEP));
+  r.depth_bias=state.enabled[GL_POLYGON_OFFSET_FILL];
+  if(fixed) {
+    if(state.enabled[GL_LIGHTING])gap("fixed-function lighting draw needs implementation");
+    for(unsigned i=0;i<8;++i) {
+      if(state.texture_enabled[i])r.fixed_texture|=1u<<i;
+      unsigned mode=0;switch(state.texture_env[i]) {case GL_MODULATE:break;case GL_REPLACE:mode=1;break;case GL_ADD:mode=2;break;case GL_DECAL:mode=3;break;case GL_BLEND:mode=4;break;default:gap("fixed-function texture combine mode needs implementation");}
+      r.fixed_env|=mode<<(3*i);
+    }
+    if(state.enabled[GL_FOG]) {auto mode=GLenum(value(GL_FOG_MODE,{GL_EXP,0,0,0})[0]);r.fog_mode=mode==GL_LINEAR?1:mode==GL_EXP?2:3;}
+  }
+  return r;
+}
+Program &current_program() {
+  if(state.program)return state.programs.at(state.program);
+  if(!state.fixed_pack) {
+    state.fixed_pack=std::make_unique<ShaderPack>(LINDBERGH_VULKAN_FIXED_ARCHIVE);
+    auto &p=state.fixed_program;p.record=&state.fixed_pack->programs().at(0);
+    for(const auto &u:p.record->uniforms)p.uniforms.push_back(std::make_unique<UniformData>(u));
+    for(const auto &s:p.record->samplers) {
+      const auto unit=std::strtoul(s.name.c_str()+std::strlen("fixed_texture"),nullptr,10);p.sampler_units[int(s.binding)]=GLint(unit);
+    }
+  }
+  return state.fixed_program;
+}
+void legacy_uniforms(Program &p,Target &target) {
+  if(p.native->legacy_version==state.legacy_version&&p.native->legacy_height==target.info.height)return;
+  const auto &mv=state.matrices.matrix(GL_MODELVIEW),&projection=state.matrices.matrix(GL_PROJECTION);
+  float normal[9]{};
+  const float a=mv[0],b=mv[4],c=mv[8],d=mv[1],e=mv[5],f=mv[9],g=mv[2],h=mv[6],i=mv[10];
+  const float det=a*(e*i-f*h)-b*(d*i-f*g)+c*(d*h-e*g);
+  if(det) {float cofactors[]={e*i-f*h,c*h-b*i,b*f-c*e,f*g-d*i,a*i-c*g,c*d-a*f,d*h-e*g,b*g-a*h,a*e-b*d};for(unsigned j=0;j<9;++j)normal[j]=cofactors[j]/det;}
+  for(size_t block=0;block<p.record->uniforms.size();++block) {
+    const auto &layout=p.record->uniforms[block];if(layout.set!=0)continue;
+    for(uint32_t field=0;field<layout.fields.size();++field) {
+      const auto &schema=layout.fields[field];const auto &name=schema.name;
+      std::array<float,4> v{};
+      auto write=[&](const float *data,size_t size,uint32_t count=1){p.uniforms[block]->write(field,data,size,0,count);};
+      if(name=="modelview") {write(mv.data(),64);continue;}
+      if(name=="projection") {write(projection.data(),64);continue;}
+      if(name=="normal_matrix") {write(normal,sizeof normal);continue;}
+      if(name=="texture_matrix") {float matrices[8][16];for(unsigned t=0;t<8;++t)std::copy(state.matrices.matrix(GL_TEXTURE,t).begin(),state.matrices.matrix(GL_TEXTURE,t).end(),matrices[t]);write(&matrices[0][0],schema.count*64,schema.count);continue;}
+      if(name=="normal_scale") {const auto length=std::sqrt(normal[2]*normal[2]+normal[5]*normal[5]+normal[8]*normal[8]);v[0]=length?1/length:1;}
+      else if(name=="viewport_height")v[0]=float(target.info.height);
+      else if(name=="alpha_ref")v=value(GL_ALPHA_TEST_REF);
+      else if(name=="fog.color")v=value(GL_FOG_COLOR);
+      else if(name=="fog.start")v=value(GL_FOG_START);
+      else if(name=="fog.end")v=value(GL_FOG_END,{1,0,0,0});
+      else if(name=="fog.density")v=value(GL_FOG_DENSITY,{1,0,0,0});
+      else if(name=="fog.scale") {auto range=value(GL_FOG_END,{1,0,0,0})[0]-value(GL_FOG_START)[0];v[0]=range?1/range:0;}
+      else if(name=="depth_range.near")v[0]=value(GL_DEPTH_RANGE,{0,1,0,0})[0];
+      else if(name=="depth_range.far")v[0]=value(GL_DEPTH_RANGE,{0,1,0,0})[1];
+      else if(name=="depth_range.diff") {auto range=value(GL_DEPTH_RANGE,{0,1,0,0});v[0]=range[1]-range[0];}
+      else if(name=="front_light_model.sceneColor") {
+        auto emission=value((GL_FRONT<<16)|GL_EMISSION,{0,0,0,1}),ambient=value((GL_FRONT<<16)|GL_AMBIENT,{.2f,.2f,.2f,1});
+        auto global=value(GL_LIGHT_MODEL_AMBIENT,{.2f,.2f,.2f,1});for(unsigned j=0;j<3;++j)v[j]=emission[j]+ambient[j]*global[j];v[3]=value((GL_FRONT<<16)|GL_DIFFUSE,{.8f,.8f,.8f,1})[3];
+      } else if(name.rfind("front_material.",0)==0) {
+        const auto leaf=name.substr(15);
+        if(leaf=="emission")v=value((GL_FRONT<<16)|GL_EMISSION,{0,0,0,1});
+        else if(leaf=="ambient")v=value((GL_FRONT<<16)|GL_AMBIENT,{.2f,.2f,.2f,1});
+        else if(leaf=="diffuse")v=value((GL_FRONT<<16)|GL_DIFFUSE,{.8f,.8f,.8f,1});
+        else if(leaf=="specular")v=value((GL_FRONT<<16)|GL_SPECULAR,{0,0,0,1});
+        else if(leaf=="shininess")v=value((GL_FRONT<<16)|GL_SHININESS);
+        else gap("unknown legacy material uniform");
+      } else if(name.rfind("light_source[",0)==0) {
+        const auto at=name.find(']');const unsigned light=unsigned(std::strtoul(name.c_str()+13,nullptr,10));const auto leaf=name.substr(at+2);
+        const GLenum key=(GL_LIGHT0+light)<<16;
+        if(leaf=="ambient")v=value(key|GL_AMBIENT,{0,0,0,1});
+        else if(leaf=="diffuse")v=value(key|GL_DIFFUSE,light?std::array<float,4>{0,0,0,1}:std::array<float,4>{1,1,1,1});
+        else if(leaf=="specular")v=value(key|GL_SPECULAR,light?std::array<float,4>{0,0,0,1}:std::array<float,4>{1,1,1,1});
+        else if(leaf=="position")v=value(key|GL_POSITION,{0,0,1,0});
+        else if(leaf=="spotDirection")v=value(key|GL_SPOT_DIRECTION,{0,0,-1,0});
+        else if(leaf=="spotExponent")v=value(key|GL_SPOT_EXPONENT);
+        else if(leaf=="spotCutoff")v=value(key|GL_SPOT_CUTOFF,{180,0,0,0});
+        else if(leaf=="spotCosCutoff")v[0]=std::cos(value(key|GL_SPOT_CUTOFF,{180,0,0,0})[0]*3.14159265358979323846f/180);
+        else if(leaf=="constantAttenuation")v=value(key|GL_CONSTANT_ATTENUATION,{1,0,0,0});
+        else if(leaf=="linearAttenuation")v=value(key|GL_LINEAR_ATTENUATION);
+        else if(leaf=="quadraticAttenuation")v=value(key|GL_QUADRATIC_ATTENUATION);
+        else if(leaf=="halfVector") {v=value(key|GL_POSITION,{0,0,1,0});float n=std::sqrt(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]);if(n)for(unsigned j=0;j<3;++j)v[j]/=n;v[2]+=1;n=std::sqrt(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]);if(n)for(unsigned j=0;j<3;++j)v[j]/=n;v[3]=0;}
+        else gap("unknown legacy light uniform");
+      } else gap("unknown legacy uniform");
+      write(v.data(),schema.rows*schema.columns*4);
+    }
+  }
+  p.native->legacy_version=state.legacy_version;p.native->legacy_height=target.info.height;
+}
+void native_program(Program &p) {
+  if(p.native)return;
+  p.native=std::make_shared<NativeProgram>();
+  for(unsigned set=0;set<2;++set) {
+    std::vector<UniformBlock> blocks;for(const auto &u:p.record->uniforms)if(u.set==set)blocks.push_back({u.binding,u.bytes});
+    if(blocks.size()>1)gap("multiple UBOs per guest descriptor set not implemented");
+    p.native->uniform_sets[set]=std::make_unique<UniformSet>(*state.device,*state.ring,blocks);
+    p.native->layouts.push_back(p.native->uniform_sets[set]->layout());
+  }
+  p.native->empty_images=std::make_unique<SampledSet>(*state.device,std::vector<SampledImage>{});
+  p.native->layouts.push_back(p.native->empty_images->layout());
+}
+std::shared_ptr<Material> material(Program &p) {
+  std::vector<std::shared_ptr<Texture>> images;std::vector<std::shared_ptr<Sampler>> samplers;std::vector<SampledImage> bindings;
+  std::string key(reinterpret_cast<const char *>(p.record->key.data()),p.record->key.size());
+  for(const auto &s:p.record->samplers) {
+    if(s.count!=1)gap("sampler arrays need descriptor-array binding");
+    const auto unit=p.sampler_units[int(s.binding)];if(unit<0||unit>=8)gap("guest sampler texture unit outside supported range");
+    auto &object=state.texture_objects[state.textures[unsigned(unit)]];
+    auto image=native_image(object);auto sampler=native_sampler(object,image->info.levels,s.type.find("Shadow")!=std::string::npos);
+    bindings.push_back({s.binding,image->view(),sampler->handle()});key_word(key,(uint64_t)(uintptr_t)image->view());key_word(key,(uint64_t)(uintptr_t)sampler->handle());
+    images.push_back(image);samplers.push_back(sampler);
+  }
+  auto &entry=state.materials[state.ring->recording_slot()][key];
+  if(!entry) {entry=std::make_shared<Material>();entry->descriptors=std::make_shared<SampledSet>(*state.device,bindings);entry->images=std::move(images);entry->samplers=std::move(samplers);}
+  state.ring->keep_alive(entry);return entry;
+}
+void draw_geometry(GLenum mode,GLint first,GLsizei count,const void *indices,GLenum index_type,bool indexed,
+                   const void *immediate=nullptr,uint32_t immediate_stride=0) {
+  if(count<=0)return;if(first<0)gap("negative guest first vertex");
+  auto *target=state.target();auto &p=current_program();native_program(p);legacy_uniforms(p,*target);
+  const bool fixed=!state.program;
+  if(fixed)for(size_t block=0;block<p.record->uniforms.size();++block) {
+    auto field=p.uniforms[block]->find("fixed_env_color");if(field>=0)p.uniforms[block]->write(uint32_t(field),state.env_color.data(),sizeof state.env_color,0,8);
+  }
+  auto images=material(p);p.native->layouts[2]=images->descriptors->layout();
+  std::vector<uint32_t> locations;for(const auto &input:p.record->inputs)locations.push_back(input.location);
+  uint32_t vertices=uint32_t(count);std::vector<uint32_t> elements;
+  if(indexed) {
+    const size_t bytes=index_type==GL_UNSIGNED_BYTE?1:index_type==GL_UNSIGNED_SHORT?2:index_type==GL_UNSIGNED_INT?4:0;
+    if(!bytes)gap("unsupported guest index type");
+    const uint8_t *data=static_cast<const uint8_t *>(indices);
+    if(state.element_buffer) {auto &b=state.buffers.at(state.element_buffer);const auto offset=(uintptr_t)indices;check_range(b.bytes.size(),GLintptr(offset),GLsizeiptr(size_t(count)*bytes));data=b.bytes.data()+offset;}
+    elements.resize(size_t(count));vertices=0;
+    for(size_t i=0;i<size_t(count);++i) {uint32_t v=0;std::memcpy(&v,data+i*bytes,bytes);elements[i]=v;if(v==UINT32_MAX)gap("guest index range overflow");vertices=std::max(vertices,v+1);}
+  }
+  auto raster=raster_state(fixed);raster.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+  if(mode==GL_TRIANGLE_STRIP)raster.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+  else if(mode==GL_TRIANGLE_FAN)raster.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
+  else if(mode==GL_POINTS)raster.topology=VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+  else if(mode==GL_LINES) {raster.topology=VK_PRIMITIVE_TOPOLOGY_LINE_LIST;count-=count%2;}
+  else if(mode==GL_LINE_STRIP)raster.topology=VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
+  else if(mode==GL_TRIANGLES)count-=count%3;
+  else if(mode==GL_QUADS||mode==GL_QUAD_STRIP||mode==GL_POLYGON||mode==GL_LINE_LOOP) {
+    auto original=std::move(elements);auto at=[&](uint32_t i){return original.empty()?i:original[i];};
+    auto tri=[&](uint32_t a,uint32_t b,uint32_t c){elements.push_back(at(a));elements.push_back(at(b));elements.push_back(at(c));};
+    if(mode==GL_QUADS)for(uint32_t i=0;i+3<uint32_t(count);i+=4){tri(i,i+1,i+2);tri(i,i+2,i+3);}
+    else if(mode==GL_QUAD_STRIP)for(uint32_t i=0;i+3<uint32_t(count);i+=2){tri(i,i+1,i+3);tri(i,i+3,i+2);}
+    else if(mode==GL_POLYGON)for(uint32_t i=2;i<uint32_t(count);++i)tri(0,i-1,i);
+    else {raster.topology=VK_PRIMITIVE_TOPOLOGY_LINE_LIST;for(uint32_t i=0;i<uint32_t(count);++i){elements.push_back(at(i));elements.push_back(at((i+1)%uint32_t(count)));}}
+    count=GLsizei(elements.size());indexed=true;
+  } else gap("unsupported guest primitive topology");
+  if(!count)return;
+  ArrayPlan plan;
+  if(immediate) {
+    auto stream=state.ring->upload(immediate,size_t(vertices)*immediate_stride);
+    for(uint32_t i=0;i<locations.size();++i) {plan.bindings.push_back({i,immediate_stride,VK_VERTEX_INPUT_RATE_VERTEX});plan.attributes.push_back({locations[i],i,VK_FORMAT_R32G32B32A32_SFLOAT,locations[i]*16});plan.streams.push_back(stream);}
+  } else {
+    state.arrays.inputs(locations);
+    const auto &prepared=state.arrays.prepare(*state.device,*state.ring,uint32_t(first),vertices,{g_guest_base,uint64_t(1)<<32},
+      [&](uint32_t id){auto gpu=native_buffer(id);return GuestBufferView{gpu->handle(),state.buffers.at(id).bytes.size()};});
+    plan=prepared;
+  }
+  std::string key;key_word(key,(uint64_t)(uintptr_t)target);
+  for(const auto &b:plan.bindings){key_word(key,b.binding);key_word(key,b.stride);}
+  for(const auto &a:plan.attributes){key_word(key,a.location);key_word(key,a.binding);key_word(key,a.format);key_word(key,a.offset);}
+  auto &renderer=p.native->renderers[key];
+  if(!renderer) {
+    ProgramSource source{p.record->vertex.data(),p.record->fragment.data(),p.record->vertex.size()*4,p.record->fragment.size()*4,plan.bindings,plan.attributes,p.native->layouts};
+    renderer=std::make_unique<Renderer>(*state.device,*target,*state.cache,source);
+  }
+  auto packet=packet_for(target,renderer.get());packet.raster=raster;packet.streams=std::move(plan.streams);packet.count=uint32_t(count);
+  for(auto &matrix:packet.matrices.view_projection)for(unsigned i=0;i<4;++i)matrix[i*5]=1;
+  if(indexed) {auto upload=state.ring->upload(elements.data(),size_t(count)*4,4);packet.index={upload.buffer,upload.offset,VK_INDEX_TYPE_UINT32};}
+  for(size_t block=0;block<p.record->uniforms.size();++block) {
+    const auto set=p.record->uniforms[block].set;if(set>=2)gap("unexpected uniform descriptor set");
+    const auto version=p.uniforms[block]->version(),frame=state.ring->submissions()+1;
+    if(p.native->uniform_frame[set]!=frame||p.native->uniform_version[set]!=version) {
+      const auto &bytes=p.uniforms[block]->bytes();p.native->uniform_offset[set]=p.native->uniform_sets[set]->upload(0,bytes.data(),bytes.size());
+      p.native->uniform_version[set]=version;p.native->uniform_frame[set]=frame;
+    }
+    packet.descriptors[set]=p.native->uniform_sets[set]->current_set();packet.offsets[set].push_back(p.native->uniform_offset[set]);
+  }
+  if(!p.record->samplers.empty())packet.descriptors[2]=images->descriptors->handle();
+  state.ring->keep_alive(p.native);state.packets.push_back(std::move(packet));
+}
+}
+extern "C" void lvk_glDrawArrays(GLenum mode,GLint first,GLsizei count) {draw_geometry(mode,first,count,nullptr,0,false);}
+extern "C" void lvk_glDrawElements(GLenum mode,GLsizei count,GLenum type,const GLvoid *indices) {draw_geometry(mode,0,count,indices,type,true);}
+extern "C" void lvk_glDrawRangeElements(GLenum mode,GLuint,GLuint,GLsizei count,GLenum type,const GLvoid *indices) {draw_geometry(mode,0,count,indices,type,true);}
+
+extern "C" void lvk_glLightModeli(GLenum name,GLint v) {++state.legacy_version;state.integers[name]=v;}
+extern "C" void lvk_glLightModelf(GLenum name,GLfloat v) {++state.legacy_version;state.floats[name]={v,0,0,0};}
+extern "C" void lvk_glLightModelfv(GLenum name,const GLfloat *v) {++state.legacy_version;std::copy(v,v+(name==GL_LIGHT_MODEL_AMBIENT?4:1),state.floats[name].begin());}
+extern "C" void lvk_glMaterialf(GLenum face,GLenum name,GLfloat v) {++state.legacy_version;if(name!=GL_SHININESS)gap("scalar material parameter is not shininess");state.floats[(face<<16)|name]={v,0,0,0};if(face==GL_FRONT_AND_BACK)state.floats[(GL_FRONT<<16)|name]=state.floats[(GL_BACK<<16)|name]={v,0,0,0};}
+extern "C" void lvk_glColorMaterial(GLenum face,GLenum mode) {state.integers[GL_COLOR_MATERIAL_FACE]=face;state.integers[GL_COLOR_MATERIAL_PARAMETER]=mode;}
+extern "C" void lvk_glBlendFuncSeparate(GLenum sr,GLenum dr,GLenum sa,GLenum da) {state.integers[GL_BLEND_SRC]=sr;state.integers[GL_BLEND_DST]=dr;state.integers[GL_BLEND_SRC_ALPHA]=sa;state.integers[GL_BLEND_DST_ALPHA]=da;}
+extern "C" void lvk_glBlendEquation(GLenum op) {state.integers[GL_BLEND_EQUATION_RGB]=state.integers[GL_BLEND_EQUATION_ALPHA]=op;}
+extern "C" void lvk_glBlendEquationSeparate(GLenum rgb,GLenum alpha) {state.integers[GL_BLEND_EQUATION_RGB]=rgb;state.integers[GL_BLEND_EQUATION_ALPHA]=alpha;}
+extern "C" void lvk_glBlendColor(GLclampf r,GLclampf g,GLclampf b,GLclampf a) {state.floats[GL_BLEND_COLOR]={r,g,b,a};}
+extern "C" void lvk_glTexEnvi(GLenum target,GLenum name,GLint v) {glTexEnvf(target,name,GLfloat(v));}
+extern "C" void lvk_glTexEnvfv(GLenum target,GLenum name,const GLfloat *v) {if(target!=GL_TEXTURE_ENV||name!=GL_TEXTURE_ENV_COLOR)gap("unsupported texture environment vector");state.env_color[state.active_texture-GL_TEXTURE0]={v[0],v[1],v[2],v[3]};}
+extern "C" void lvk_glDepthRange(GLclampd n,GLclampd f) {++state.legacy_version;state.floats[GL_DEPTH_RANGE]={float(std::clamp(n,0.,1.)),float(std::clamp(f,0.,1.)),0,0};}
+extern "C" void lvk_glPolygonMode(GLenum face,GLenum mode) {if(mode!=GL_FILL)gap("non-solid polygon mode requires Vulkan non-solid fill support");state.integers[(face<<16)|GL_POLYGON_MODE]=mode;}
+extern "C" void lvk_glColor4f(GLfloat r,GLfloat g,GLfloat b,GLfloat a) {state.arrays.current(3,{r,g,b,a});state.matrices.color(r,g,b,a);state.floats[GL_CURRENT_COLOR]={r,g,b,a};}
+extern "C" void lvk_glColor3f(GLfloat r,GLfloat g,GLfloat b) {glColor4f(r,g,b,1);}
+extern "C" void lvk_glColor4ub(GLubyte r,GLubyte g,GLubyte b,GLubyte a) {glColor4f(r/255.f,g/255.f,b/255.f,a/255.f);}
+extern "C" void lvk_glColor3ub(GLubyte r,GLubyte g,GLubyte b) {glColor4f(r/255.f,g/255.f,b/255.f,1);}
+extern "C" void lvk_glNormal3f(GLfloat x,GLfloat y,GLfloat z) {state.arrays.current(2,{x,y,z,0});}
+extern "C" void lvk_glTexCoord2f(GLfloat u,GLfloat v) {state.arrays.current(8,{u,v,0,1});}
+extern "C" void lvk_glMultiTexCoord2f(GLenum unit,GLfloat u,GLfloat v) {state.arrays.current(8+unit-GL_TEXTURE0,{u,v,0,1});}
+extern "C" void lvk_glTexCoord4f(GLfloat x,GLfloat y,GLfloat z,GLfloat w) {state.arrays.current(8,{x,y,z,w});}
+extern "C" void lvk_glVertexAttrib4f(GLuint index,GLfloat x,GLfloat y,GLfloat z,GLfloat w) {state.arrays.current(index,{x,y,z,w});}
+extern "C" void lvk_glVertexAttrib3f(GLuint index,GLfloat x,GLfloat y,GLfloat z) {state.arrays.current(index,{x,y,z,1});}
+extern "C" void lvk_glVertexAttrib2f(GLuint index,GLfloat x,GLfloat y) {state.arrays.current(index,{x,y,0,1});}
+extern "C" void lvk_glVertexAttrib1f(GLuint index,GLfloat x) {state.arrays.current(index,{x,0,0,1});}
+extern "C" void lvk_glBegin(GLenum mode) {if(state.in_begin)gap("nested guest glBegin");state.in_begin=true;state.immediate_mode=mode;state.immediate.clear();state.matrices.begin(mode);}
+namespace {
+void immediate_vertex(float x,float y,float z,float w) {
+ if(!state.in_begin)gap("immediate vertex outside glBegin");
+ auto &v=state.immediate.emplace_back();for(unsigned a=0;a<16;++a)std::copy(state.arrays.current_value(a).begin(),state.arrays.current_value(a).end(),v.begin()+a*4);
+ v[0]=x;v[1]=y;v[2]=z;v[3]=w;state.matrices.vertex(x,y,z,w);
+}
+}
+extern "C" void lvk_glVertex4f(GLfloat x,GLfloat y,GLfloat z,GLfloat w) {immediate_vertex(x,y,z,w);}
+extern "C" void lvk_glVertex3f(GLfloat x,GLfloat y,GLfloat z) {immediate_vertex(x,y,z,1);}
+extern "C" void lvk_glVertex3fv(const GLfloat *v) {immediate_vertex(v[0],v[1],v[2],1);}
+extern "C" void lvk_glVertex2f(GLfloat x,GLfloat y) {immediate_vertex(x,y,0,1);}
+extern "C" void lvk_glVertex2i(GLint x,GLint y) {immediate_vertex(float(x),float(y),0,1);}
+extern "C" void lvk_glEnd(void) {if(!state.in_begin)gap("guest glEnd outside glBegin");state.in_begin=false;state.matrices.end();if(!state.immediate.empty())draw_geometry(state.immediate_mode,0,GLsizei(state.immediate.size()),nullptr,0,false,state.immediate.data(),sizeof(state.immediate[0]));}
+
+extern "C" void lvk_glInterleavedArrays(GLenum format,GLsizei stride,const GLvoid *pointer) {
+  struct Attribute {unsigned size=0,offset=0;GLenum type=GL_FLOAT;};Attribute position,color,normal,uv;unsigned packed=0;
+  switch(format) {
+  case GL_V2F:position={2,0};packed=8;break;
+  case GL_V3F:position={3,0};packed=12;break;
+  case GL_C4UB_V2F:color={4,0,GL_UNSIGNED_BYTE};position={2,4};packed=12;break;
+  case GL_C4UB_V3F:color={4,0,GL_UNSIGNED_BYTE};position={3,4};packed=16;break;
+  case GL_C3F_V3F:color={3,0};position={3,12};packed=24;break;
+  case GL_N3F_V3F:normal={3,0};position={3,12};packed=24;break;
+  case GL_C4F_N3F_V3F:color={4,0};normal={3,16};position={3,28};packed=40;break;
+  case GL_T2F_V3F:uv={2,0};position={3,8};packed=20;break;
+  case GL_T4F_V4F:uv={4,0};position={4,16};packed=32;break;
+  case GL_T2F_C4UB_V3F:uv={2,0};color={4,8,GL_UNSIGNED_BYTE};position={3,12};packed=24;break;
+  case GL_T2F_C3F_V3F:uv={2,0};color={3,8};position={3,20};packed=32;break;
+  case GL_T2F_N3F_V3F:uv={2,0};normal={3,8};position={3,20};packed=32;break;
+  case GL_T2F_C4F_N3F_V3F:uv={2,0};color={4,8};normal={3,24};position={3,36};packed=48;break;
+  case GL_T4F_C4F_N3F_V4F:uv={4,0};color={4,16};normal={3,32};position={4,44};packed=60;break;
+  default:gap("unknown guest interleaved array format");
+  }
+  if(stride<0)gap("negative interleaved array stride");if(!stride)stride=GLsizei(packed);
+  const auto address=guest_pointer(pointer);
+  auto set=[&](unsigned slot,Attribute a,bool normalized) {
+    state.arrays.enable(slot,a.size!=0);if(a.size)state.arrays.pointer(slot,a.size,a.type,normalized,uint32_t(stride),address+a.offset);
+  };
+  set(0,position,false);set(3,color,color.type!=GL_FLOAT);set(2,normal,false);set(8+state.client_texture-GL_TEXTURE0,uv,false);
 }
