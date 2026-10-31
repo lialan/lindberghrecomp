@@ -64,6 +64,8 @@ public:
     Renderer &operator=(const Renderer &) = delete;
     void prepare(RasterState state);
     void begin(VkCommandBuffer cmd, std::array<float, 4> clear);
+    void bind_descriptors(uint32_t first_set, uint32_t count, const VkDescriptorSet *sets,
+                          uint32_t offset_count = 0, const uint32_t *dynamic_offsets = nullptr);
     void draw(FrameRing &ring, const Vertex *vertices, uint32_t count,
               const Matrices &matrices, RasterState state);
     void draw_indexed(FrameRing &ring, const Vertex *vertices, uint32_t vertex_count,
@@ -85,6 +87,7 @@ private:
     uint64_t draws_ = 0;
     std::vector<VkVertexInputBindingDescription> bindings_;
     std::vector<VkVertexInputAttributeDescription> attributes_;
+    uint32_t descriptor_count_ = 0;
     void release();
 };
 

@@ -78,6 +78,18 @@ Upload FrameRing::upload(const void *data, size_t bytes, VkDeviceSize alignment)
     return {s.upload, offset};
 }
 
+uint32_t FrameRing::recording_slot() const
+{
+    if (!recording_) throw std::logic_error("No Vulkan frame recording");
+    return current_;
+}
+
+VkBuffer FrameRing::upload_buffer(uint32_t slot) const
+{
+    if (slot >= slots_.size()) throw std::out_of_range("Unknown Vulkan upload slot");
+    return slots_[slot].upload;
+}
+
 Submission FrameRing::submit()
 {
     if (!recording_) throw std::logic_error("Submit outside Vulkan frame");

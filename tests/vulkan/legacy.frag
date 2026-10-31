@@ -1,2 +1,3 @@
 #version 120
-void main() { gl_FragColor = gl_Color; }
+uniform vec4 guestTint;
+void main() { gl_FragColor = gl_Color * guestTint; }

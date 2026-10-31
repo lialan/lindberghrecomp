@@ -22,6 +22,10 @@ public:
     Submission submit();
     void wait(Submission submission);
     uint64_t submissions() const { return submissions_; }
+    uint32_t slot_count() const { return static_cast<uint32_t>(slots_.size()); }
+    uint32_t recording_slot() const;
+    VkBuffer upload_buffer(uint32_t slot) const;
+    VkDeviceSize upload_capacity() const { return capacity_; }
 
 private:
     struct Slot {

@@ -27,3 +27,5 @@ for stage in ("vert", "frag"):
             assert blocks[key] == (block["block_size"], layout)
         blocks[key] = block["block_size"], layout
 (output / "program.json").write_text(json.dumps(result, indent=2) + "\n")
+
+assert blocks[(1, 0)][0] == 16, "guestTint uniform layout changed"

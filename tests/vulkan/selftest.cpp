@@ -2,6 +2,7 @@
 #include "frame_ring.hpp"
 #include "renderer.hpp"
 #include "guest_state.hpp"
+#include "uniforms.hpp"
 #include <array>
 #include <chrono>
 #include <cstdio>
@@ -161,10 +162,11 @@ static void render_stereo(Device &device)
 
     const auto vs = shader(std::string(LV_TEST_SHADER_DIR) + "/vert.spv");
     const auto fs = shader(std::string(LV_TEST_SHADER_DIR) + "/frag.spv");
+    UniformSet uniforms(device, ring, {{0, 16}});
     ProgramSource legacy{vs.data(), fs.data(), vs.size() * 4, fs.size() * 4,
         {{0, sizeof(Vertex), VK_VERTEX_INPUT_RATE_VERTEX}},
         {{0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Vertex, position)},
-         {3, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Vertex, color)}}, {}};
+         {3, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Vertex, color)}}, {uniforms.layout(), uniforms.layout()}};
     Renderer converted(device, target, cache, legacy);
     converted.prepare(state);
     for (auto &m : matrices.view_projection) {
@@ -174,6 +176,10 @@ static void render_stereo(Device &device)
     matrices.view_projection[1][12] = 0.8f;
     cmd = ring.begin();
     converted.begin(cmd, {0, 0, 0, 1});
+    const float tint[] = {1, 1, 1, 1};
+    auto offset = uniforms.upload(0, tint, sizeof tint);
+    auto descriptors = uniforms.current_set();
+    converted.bind_descriptors(1, 1, &descriptors, 1, &offset);
     converted.draw(ring, triangle, 3, matrices, state);
     converted.end();
     vkCmdCopyImageToBuffer(cmd, target.color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, output.buffer, 1, &copy);
@@ -183,6 +189,45 @@ static void render_stereo(Device &device)
     pixel(0, 8, 16, 255); pixel(0, 24, 16, 0);
     pixel(1, 8, 16, 0); pixel(1, 24, 16, 255);
     std::puts("ok: converted GLSL 1.20 shaders preserve front-face color and multiview raster output");
+
+    // Different draws and frames must retain independent uniform snapshots even
+    // with several frames in flight and descriptor sets recycled by slot.
+    constexpr unsigned frames = 12, image_bytes = 32 * 32 * 4 * 2;
+    Readback history(device, frames * image_bytes);
+    rejected([&] { uniforms.current_set(); }, "uniform set accepted outside frame");
+    Submission last{};
+    for (unsigned frame = 0; frame < frames; ++frame) {
+        cmd = ring.begin();
+        converted.begin(cmd, {0, 0, 0, 1});
+        const float color[] = {float(frame & 1), 1, 1, 1};
+        rejected([&] { uniforms.upload(0, color, 12); }, "truncated uniform block accepted");
+        offset = uniforms.upload(0, color, sizeof color);
+        require(offset % device.capabilities.properties.limits.minUniformBufferOffsetAlignment == 0,
+                "uniform upload violates device alignment");
+        descriptors = uniforms.current_set();
+        converted.bind_descriptors(1, 1, &descriptors, 1, &offset);
+        converted.draw(ring, triangle, 3, matrices, state);
+        // Change the state after the draw: its previous snapshot must survive.
+        const float black[] = {0, 0, 0, 1};
+        uniforms.upload(0, black, sizeof black);
+        converted.end();
+        copy.bufferOffset = frame * image_bytes;
+        vkCmdCopyImageToBuffer(cmd, target.color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, history.buffer, 1, &copy);
+        barrier.buffer = history.buffer; barrier.offset = copy.bufferOffset; barrier.size = image_bytes;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                             0, 0, nullptr, 1, &barrier, 0, nullptr);
+        last = ring.submit();
+    }
+    ring.wait(last);
+    for (unsigned frame = 0; frame < frames; ++frame) {
+        const auto bytes = static_cast<const unsigned char *>(history.mapped) + frame * image_bytes;
+        const auto left = bytes + (16 * 32 + 8) * 4;
+        const auto right = bytes + ((32 + 16) * 32 + 24) * 4;
+        require(left[0] == (frame & 1) * 255 && right[0] == left[0] && left[3] == 255 && right[3] == 255,
+                "buffered guest uniform state corrupted across in-flight frames");
+    }
+    require(converted.pipeline_count() == 1, "uniform changes created new pipelines");
+    std::puts("ok: converted shader uniforms retain snapshots across 12 asynchronously submitted frames");
 }
 
 int main()

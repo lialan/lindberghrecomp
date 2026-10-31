@@ -168,7 +168,8 @@ Renderer::Renderer(Device &device, Target &target, PipelineCache &cache)
     : Renderer(device, target, cache, colored_program()) {}
 
 Renderer::Renderer(Device &device, Target &target, PipelineCache &cache, const ProgramSource &program)
-    : device_(device), target_(target), cache_(cache), bindings_(program.bindings), attributes_(program.attributes)
+    : device_(device), target_(target), cache_(cache), bindings_(program.bindings), attributes_(program.attributes),
+      descriptor_count_(static_cast<uint32_t>(program.descriptor_layouts.size()))
 {
     if (!program.vertex || !program.fragment || !program.vertex_bytes || !program.fragment_bytes ||
         program.vertex_bytes % 4 || program.fragment_bytes % 4)
@@ -253,6 +254,17 @@ void Renderer::begin(VkCommandBuffer cmd, std::array<float, 4> color)
     VkRect2D scissor{{0, 0}, pass.renderArea.extent};
     vkCmdSetViewport(cmd, 0, 1, &viewport); vkCmdSetScissor(cmd, 0, 1, &scissor);
     cmd_ = cmd; bound_ = VK_NULL_HANDLE;
+}
+
+void Renderer::bind_descriptors(uint32_t first_set, uint32_t count, const VkDescriptorSet *sets,
+                                uint32_t offset_count, const uint32_t *dynamic_offsets)
+{
+    if (!cmd_) throw std::logic_error("Descriptor binding outside Vulkan render pass");
+    if (!count || !sets || first_set > descriptor_count_ || count > descriptor_count_ - first_set ||
+        (offset_count && !dynamic_offsets))
+        throw std::invalid_argument("Invalid Vulkan descriptor binding");
+    vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, first_set, count, sets,
+                            offset_count, dynamic_offsets);
 }
 
 void Renderer::draw(FrameRing &ring, const Vertex *vertices, uint32_t count, const Matrices &matrices, RasterState state)
