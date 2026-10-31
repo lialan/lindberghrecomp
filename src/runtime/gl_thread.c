@@ -52,15 +52,20 @@ typedef struct {
 
 static uint8_t *g_ring;                /* host address */
 static uint32_t g_ring_va;             /* guest address */
-static _Atomic uint64_t g_head, g_tail; /* bytes written, bytes done */
-static _Atomic uint32_t g_done_seq;    /* the last sync record or job done */
+/* bytes published, bytes done - each on a cache line of its own: they are
+ * written by different threads, tens of thousands of times a frame */
+static _Alignas(128) _Atomic uint64_t g_head;
+static _Alignas(128) _Atomic uint64_t g_tail;
+static _Alignas(128) uint64_t g_head_mine;   /* bytes written: the game thread's, published as g_head */
+static _Alignas(128) _Atomic uint32_t g_done_seq;    /* the last sync record or job done */
 static uint32_t g_seq;                 /* the game thread's numbering */
 static GlHook g_prev;                  /* the hook the worker runs: stereo.c's, or none */
 static int g_on;
 static pthread_t g_thread;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
-static _Atomic int g_worker_sleeps, g_game_sleeps;
+static _Alignas(128) _Atomic int g_worker_sleeps;
+static _Alignas(128) _Atomic int g_game_sleeps;
 static void (*g_take_context)(void);   /* the worker's first act */
 
 int glq_active(void) { return g_on; }
@@ -220,34 +225,52 @@ static double now_ms(clockid_t k) { struct timespec t; clock_gettime(k, &t); ret
         atomic_store(&g_game_sleeps, 0); pthread_mutex_unlock(&g_mu); } \
     if (_w0) g_wait_ms += now_ms(CLOCK_MONOTONIC) - _w0; } while (0)
 
+/* Records are written at g_head_mine and published to the worker as g_head
+ * every 32 (ring_put), or at once before anything the game then waits for
+ * (ring_put_wake): a store the worker reads on every record, made for each of
+ * 40,000 calls a frame, cost more than the calls' own copying. Publishing
+ * looks whether the worker sleeps, which costs a full fence (wake_worker). */
+static unsigned g_unpublished;
+static void publish(void)
+{
+    atomic_store_explicit(&g_head, g_head_mine, memory_order_release);
+    g_unpublished = 0;
+    wake_worker();
+}
+
 /* Room for n bytes (header included) at the head: a record never wraps. */
 static Rec *ring_take(uint32_t n)
 {
     n = (n + 15u) & ~15u;
-    uint64_t h = atomic_load_explicit(&g_head, memory_order_relaxed);
+    uint64_t h = g_head_mine;
     uint32_t off = (uint32_t)(h % RING_SIZE);
     if (off + n > RING_SIZE) {         /* to the end, a marker the worker skips */
         uint32_t pad = RING_SIZE - off;
+        if (h + pad - atomic_load_explicit(&g_tail, memory_order_acquire) > RING_SIZE) publish();   /* about to wait for room */
         GAME_WAIT(h + pad - atomic_load_explicit(&g_tail, memory_order_acquire) <= RING_SIZE);
         Rec *w = (Rec *)(g_ring + off);
         w->size = pad; w->kind = R_WRAP;
         h += pad;
-        atomic_store_explicit(&g_head, h, memory_order_release);
+        g_head_mine = h;
         off = 0;
     }
+    if (h + n - atomic_load_explicit(&g_tail, memory_order_acquire) > RING_SIZE) publish();
     GAME_WAIT(h + n - atomic_load_explicit(&g_tail, memory_order_acquire) <= RING_SIZE);
     Rec *r = (Rec *)(g_ring + off);
     r->size = n;
     return r;
 }
 
+/* the record at the head is complete */
 static void ring_put(void)
 {
-    /* the record at the head is complete: publish it */
-    uint64_t h = atomic_load_explicit(&g_head, memory_order_relaxed);
-    Rec *r = (Rec *)(g_ring + (uint32_t)(h % RING_SIZE));
-    atomic_store_explicit(&g_head, h + r->size, memory_order_release);
-    wake_worker();
+    g_head_mine += ((Rec *)(g_ring + (uint32_t)(g_head_mine % RING_SIZE)))->size;
+    if (++g_unpublished >= 32) publish();
+}
+static void ring_put_wake(void)
+{
+    g_head_mine += ((Rec *)(g_ring + (uint32_t)(g_head_mine % RING_SIZE)))->size;
+    publish();
 }
 
 static uint32_t va_of(const void *p) { return g_ring_va + (uint32_t)((const uint8_t *)p - g_ring); }
@@ -309,7 +332,7 @@ static uint32_t put_sync(CPU *c, HleId id, HleHandler fn)
 {
     Rec *r = ring_take(HDR);
     r->kind = R_SYNC; r->id = (uint32_t)id; r->fn = fn; r->u.c = c; r->seq = ++g_seq;
-    ring_put();
+    ring_put_wake();
     return r->seq;
 }
 
@@ -588,7 +611,7 @@ uint32_t glq_job(void (*job)(void *), void *arg)
 {
     Rec *r = ring_take(HDR);
     r->kind = R_JOB; r->u.job = job; r->arg = arg; r->seq = ++g_seq;
-    ring_put();
+    ring_put_wake();
     return r->seq;
 }
 
