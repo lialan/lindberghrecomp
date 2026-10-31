@@ -13,6 +13,11 @@ dispatch, hle_call, ...) and read again after it, and written back before a
 return. push32/pop32 move the local esp. A helper that takes c and touches
 only flags, the FPU or SSE state is left alone (SAFE); any other call that
 takes c counts as a call, which is always correct, only slower.
+
+The SSE registers (c->xmm[n]) the same way: the float code of these games
+moves values through them every few instructions, each a load or store of
+the struct. No SAFE helper reads or writes c->xmm (fxsave and fxrstor do,
+and count as calls).
 """
 import re
 
@@ -29,6 +34,7 @@ SAFE = {
 _func = re.compile(r"^void (L_[0-9A-F]{8})\(CPU \*c\)\n\{\n(.*?)\n\}$", re.S | re.M)
 _call = re.compile(r"\b([A-Za-z_][A-Za-z_0-9]*)\(c(?=[,)])")
 _reg = re.compile(r"\bc->(eax|ebx|ecx|edx|esi|edi|ebp|esp)\b")
+_xmm = re.compile(r"\bc->xmm\[([0-7])\]")
 _ret = re.compile(r"\breturn;")
 
 
@@ -51,12 +57,13 @@ def _body(body):
     used = set(_reg.findall(body))
     if "push32(c," in body or "pop32(c)" in body:
         used.add("esp")
-    if not used:
+    xmms = sorted(set(_xmm.findall(body)))
+    if not used and not xmms:
         return body, 0
     regs = [r for r in GPRS if r in used]
     # "c@" until the body's own c->reg are renamed, then "c->"
-    spill = " ".join("c@%s = R_%s;" % (r, r) for r in regs)
-    fill = " ".join("R_%s = c@%s;" % (r, r) for r in regs)
+    spill = " ".join(["c@%s = R_%s;" % (r, r) for r in regs] + ["c@xmm[%s] = X_xmm%s;" % (x, x) for x in xmms])
+    fill = " ".join(["R_%s = c@%s;" % (r, r) for r in regs] + ["X_xmm%s = c@xmm[%s];" % (x, x) for x in xmms])
 
     out, i, n = [], 0, 0
     while True:
@@ -90,7 +97,12 @@ def _body(body):
     body = "".join(out)
     body = _ret.sub("{ %s return; }" % spill, body)
     body = _reg.sub(lambda m: "R_" + m.group(1), body)
-    decl = "    uint32_t " + ", ".join("R_%s = c->%s" % (r, r) for r in regs) + ";\n"
+    body = _xmm.sub(lambda m: "X_xmm" + m.group(1), body)
+    decl = ""
+    if regs:
+        decl += "    uint32_t " + ", ".join("R_%s = c->%s" % (r, r) for r in regs) + ";\n"
+    if xmms:
+        decl += "    XMM " + ", ".join("X_xmm%s = c->xmm[%s]" % (x, x) for x in xmms) + ";\n"
     return (decl + body + "\n    " + spill).replace("c@", "c->"), n
 
 
