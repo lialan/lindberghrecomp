@@ -879,7 +879,12 @@ static void input_frame(XrTime t)
         unsigned b = 0;
         if (pl ? firing2 : firing) b |= CAB_P1_TRIGGER;
         if (trig[h] && !on && !menu.open) b |= CAB_P1_RELOAD;  /* the arcade's reload: fire off the screen */
-        if (grip[h] && !menu.open) b |= CAB_P1_RELOAD;
+        /* the grip reloads with a tap: a few frames from its squeeze, not for
+         * as long as it is held - a hand holding the controller squeezes it,
+         * and a gun forever reloading neither fires nor reloads */
+        static XrTime grip_at[2];
+        if (grip[h] && !prev[h][1]) grip_at[h] = t;
+        if (grip[h] && !menu.open && t - grip_at[h] < 120000000) b |= CAB_P1_RELOAD;
         if (btn_a[h] && !menu.open) b |= CAB_P1_ACTION;
         if (btn_b[h] && !menu.open) b |= CAB_P1_FIREMODE;
         held |= pl ? b << CAB_P2_SHIFT : b;
@@ -894,6 +899,15 @@ static void input_frame(XrTime t)
     /* Start: either stick's click; with two guns each hand's is its player's */
     int start = (dual ? stick[g] : stick[0] || stick[1]) && !menu.open;
     int start2 = dual && stick[off] && !menu.open;
+    /* Player 2 joins with its first shot: a game hands an unjoined player 2's
+     * trigger to player 1 (The House of the Dead 4 does), so pulling it before
+     * Start made player 1 fire. A pull presses player 2's Start too, at most
+     * every three seconds - Start does nothing to a player already in. */
+    {   static XrTime joined_at;
+        if (dual && trig[off] && !prev[off][0] && !menu.open && (!joined_at || t - joined_at > 3000000000LL))
+            joined_at = t;
+        if (dual && joined_at && t - joined_at < 300000000) start2 = 1;   /* held a moment: the credit first */
+    }
     /* the stand-in gun presses Start for a moment every ten seconds too (its
      * second one, five seconds later) */
     if (fake_gun() && fmod((double)t / 1e9, 10.0) < 0.2) start = 1;

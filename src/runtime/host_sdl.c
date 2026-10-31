@@ -412,7 +412,7 @@ static void gun_reading(int px, int py, double w, double h, int *gx, int *gy)
 static void cabinet_p2_test(void)
 {
     static int on = -1;
-    if (on < 0) on = env_int("LINDBERGH_P2_TEST", 0) != 0;
+    if (on < 0) on = env_int("LINDBERGH_P2_TEST", 0);
     if (!on || g_frame < 600) return;
     g_gun2_on = 1;
     int w = g_win.w ? g_win.w : DEFAULT_W, h = g_win.h ? g_win.h : DEFAULT_H;
@@ -423,7 +423,7 @@ static void cabinet_p2_test(void)
     g_auto &= ~p2;
     static unsigned coined;
     if (g_frame % 480u == 0 && coined != g_frame) { coined = g_frame; g_cab.coins[0]++; fprintf(stderr, "[cab] p2 test: coin at frame %u\n", g_frame); }
-    if (g_frame % 480u >= 30u && g_frame % 480u < 50u) g_auto |= CAB_P2_START;
+    if (on == 1 && g_frame % 480u >= 30u && g_frame % 480u < 50u) g_auto |= CAB_P2_START;   /* =2: never joins */
     if (g_frame % 360u < 60u) {
         g_gun2_px = g_gun2_py = -100000;
         if (g_frame % 360u >= 20u && g_frame % 360u < 30u) g_auto |= CAB_P2_RELOAD;
