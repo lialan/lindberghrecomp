@@ -281,7 +281,7 @@ static void *worker(void *arg)
         case R_ASYNC:
             memset(&cpu, 0, sizeof cpu);
             cpu.esp = va_of((uint8_t *)r + HDR);
-            if (g_prev) g_prev(&cpu, (HleId)r->id, r->fn); else r->fn(&cpu);
+            if (g_prev && cls((HleId)r->id)->kind != C_RAW) g_prev(&cpu, (HleId)r->id, r->fn); else r->fn(&cpu);
             break;
         case R_SYNC:
             if (g_prev && cls((HleId)r->id)->kind != C_RAW) g_prev(r->u.c, (HleId)r->id, r->fn);
@@ -314,7 +314,7 @@ static uint32_t put_sync(CPU *c, HleId id, HleHandler fn)
 }
 
 /* the viewport and scissor box the game last set (shadow_state, below) */
-static HleId g_id_viewport, g_id_scissor, g_id_popattrib, g_id_getint;
+static HleId g_id_viewport, g_id_scissor, g_id_popattrib, g_id_getint, g_id_makecurrent;
 static int32_t g_vp_shadow[4], g_sc_shadow[4];
 static int g_vp_known, g_sc_known;
 extern unsigned g_frame;
@@ -360,6 +360,7 @@ static void shadow_ids(void)
         else if (!strcmp(n, "glScissor")) g_id_scissor = (HleId)i;
         else if (!strcmp(n, "glPopAttrib")) g_id_popattrib = (HleId)i;
         else if (!strcmp(n, "glGetIntegerv")) g_id_getint = (HleId)i;
+        else if (!strcmp(n, "glXMakeCurrent")) g_id_makecurrent = (HleId)i;
     }
 }
 /* 1: the call was a read answered here */
@@ -490,7 +491,14 @@ static void glq_hook(CPU *c, HleId id, HleHandler fn)
     int async = 1;
     uint32_t extra = 0;                /* bytes of arrays after the arguments */
     switch (k->kind) {
-    case C_SYNC: case C_RAW: async = 0; break;
+    case C_SYNC: async = 0; break;
+    case C_RAW:
+        /* glXMakeCurrent of a context: on the worker it picks the drawable's
+         * framebuffer and succeeds (the window is up by then) - queued, and
+         * answered here. Twice a frame in The House of the Dead 4, around a
+         * pass into a pbuffer; each made the game wait for the whole queue. */
+        if (id == g_id_makecurrent && g_id_makecurrent && A32(2) && copy_on()) { c->eax = 1; break; }
+        async = 0; break;
     case C_DIRECT: fn(c); return;
     case C_VAL: break;
     case C_BLOB: extra = k->b; if (!A32(k->a)) async = 0; break;
