@@ -119,7 +119,7 @@ static int      g_loaded_hud;           /* the projection GL has is the HUD's sc
 static int      g_hud_nowrite;          /* this 2D draw's depth writes are off, to be put back */
 static int      g_hud_offset;           /* this 2D draw is pulled nearer by a polygon offset, to be put back */
 static unsigned g_2d_seq;               /* 2D-camera draws so far this frame */
-static int near_sprite(void);
+static int dropped_sprite(void);
 static unsigned g_3d_draws;             /* 3D draws so far this frame, wherever they went (g_scene_draws leaves out
                                          * the HUD's target - the window, for a game that draws both there) */
 static GLuint   g_unit0_rect;           /* render target bound to texture unit 0 */
@@ -1644,7 +1644,7 @@ static int transform_call(CPU *c, HleId id, const char *n)
         if (persp && !g_flat && (g_game_fb == g_world_fb || g_game_fb == g_world_fb_next)) {
             if (!g_replaying) tally_lens(g_proj[g_proj_top]);
             if (is_draw(k) && weapon_draw()) return 1;
-            if (k == K_BEGIN && near_sprite()) { g_skip_begin = 1; return 1; }
+            if (k == K_BEGIN && dropped_sprite()) { g_skip_begin = 1; return 1; }
         }
         if (persp && !g_flat && !g_replaying && !offscreen_fb(g_game_fb)) g_3d_draws++;
         if (persp && g_game_fb != g_hud_fb && !g_replaying && !offscreen_fb(g_game_fb)) { g_scene_draws++; g_world_fb_next = g_game_fb; if (g_env_proj) arb_camera_count(); }
@@ -3065,21 +3065,29 @@ int stereo_ray_to_screen(const float o_[3], const float d_[3], float *x, float *
 
 void stereo_game_size(int *w, int *h) { *w = GAME_W; *h = GAME_H; }
 
-/* A sprite the game hangs just before its camera, in the world's lens - The
- * House of the Dead 4 Special's shot splash, 20-40 units out along the gun's
- * line from the head. In the headset it floats a few metres before the face,
- * off the laser and at the wrong depth for both eyes: left out
- * (vr.near_sprites, in game units; LINDBERGH_XR_NEAR_SPRITES=0 keeps them). */
-static float g_near_sprites = -1;
-void stereo_near_sprites(float units) { if (!getenv("LINDBERGH_XR_NEAR_SPRITES")) g_near_sprites = units; }
-static int near_sprite(void)
+/* Sprites left out in the headset, by texture: The House of the Dead 4
+ * Special's hit flash, put at the hit's distance on the line from the head
+ * through the gun's screen point - beside the laser whenever that point is
+ * not where the laser lands, and never quite on it in both eyes
+ * (vr.drop_sprite_tex; LINDBERGH_XR_DROP_TEX=<id,id,...> instead, =0 none). */
+static unsigned g_drop_tex[8], g_n_drop_tex;
+static int g_drop_tex_env = -1;
+void stereo_drop_sprite_tex(const unsigned *ids, unsigned n)
 {
-    if (g_near_sprites < 0) { const char *v = getenv("LINDBERGH_XR_NEAR_SPRITES"); g_near_sprites = v ? (float)atof(v) : 0; }
-    if (!(g_near_sprites > 0) || !g_mv || g_mv_ident) return 0;
-    float m[16];
-    glGetFloatv(GL_MODELVIEW_MATRIX, m);
-    float d = sqrtf(m[12] * m[12] + m[13] * m[13] + m[14] * m[14]);
-    return d > 1 && d < g_near_sprites;
+    if (getenv("LINDBERGH_XR_DROP_TEX")) return;
+    g_n_drop_tex = 0;
+    for (unsigned i = 0; i < n && i < 8; i++) if (ids[i]) g_drop_tex[g_n_drop_tex++] = ids[i];
+}
+static int dropped_sprite(void)
+{
+    if (g_drop_tex_env < 0) {
+        const char *v = getenv("LINDBERGH_XR_DROP_TEX");
+        g_drop_tex_env = v != NULL;
+        if (v) { g_n_drop_tex = 0; for (char *e; *v && g_n_drop_tex < 8; v = *e ? e + 1 : e) {
+            unsigned long t = strtoul(v, &e, 10); if (e == v) break; if (t) g_drop_tex[g_n_drop_tex++] = (unsigned)t; } }
+    }
+    for (unsigned i = 0; i < g_n_drop_tex; i++) if (g_tex2d_bound == g_drop_tex[i]) return 1;
+    return 0;
 }
 
 
