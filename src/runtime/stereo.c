@@ -114,6 +114,8 @@ static float    g_screen_lens[2] = { 1.732f, 2.309f };   /* the screen's lens: t
                                          * and the 2D shrank and grew with it */
 static int      g_loaded_hud;           /* the projection GL has is the HUD's screen */
 static int      g_hud_nowrite;          /* this 2D draw's depth writes are off, to be put back */
+static int      g_hud_offset;           /* this 2D draw is pulled nearer by a polygon offset, to be put back */
+static unsigned g_2d_seq;               /* 2D-camera draws so far this frame */
 static GLuint   g_unit0_rect;           /* render target bound to texture unit 0 */
 static GLenum   g_active_unit = GL_TEXTURE0;
 static GLuint   g_rect_bound[8];        /* rectangle texture bound to each unit */
@@ -1475,6 +1477,8 @@ static int transform_call(CPU *c, HleId id, const char *n)
          * sees, so outside it last frame's pixels stayed and dragged along
          * whenever the camera or the head moved. Clear the colour too. */
         GLbitfield mask = A32(0);
+        if ((long)g_frame == g_cap_frame || (long)g_frame + 1 == g_cap_frame)
+            fprintf(stderr, "[units] frame %u clear %#x fb %u vp %d,%d %dx%d side %d\n", g_frame, mask, (unsigned)g_game_fb, g_vp[0], g_vp[1], g_vp[2], g_vp[3], g_side);
         if (g_mv && g_pbuffers && (g_game_fb == 0 || g_side))
             side_pass(!(g_vp[0] <= 0 && g_vp[1] <= 0 && g_vp[0] + g_vp[2] >= GAME_W && g_vp[1] + g_vp[3] >= GAME_H));
         if (g_side) return 0;
@@ -1654,6 +1658,9 @@ static int transform_call(CPU *c, HleId id, const char *n)
                   GLboolean bl = glIsEnabled(GL_BLEND); GLint bs = 0, bd = 0; glGetIntegerv(GL_BLEND_SRC, &bs); glGetIntegerv(GL_BLEND_DST, &bd);
                   GLfloat col[4] = { -1, -1, -1, -1 }, mat[4] = { -1, -1, -1, -1 };
                   glGetFloatv(GL_CURRENT_COLOR, col); glGetMaterialfv(GL_FRONT, GL_DIFFUSE, mat);
+                  { GLint df = 0; GLboolean dm = 0, dt = glIsEnabled(GL_DEPTH_TEST); glGetIntegerv(GL_DEPTH_FUNC, &df); glGetBooleanv(GL_DEPTH_WRITEMASK, &dm);
+                    GLint db = 0; glGetIntegerv(GL_DEPTH_BITS, &db);
+                    fprintf(stderr, "[units] depth test %d func %#x write %d bits %d\n", dt, df, dm, db); }
                   fprintf(stderr, "[units]%s fp %d vp %d glsl %d blend %d %#x/%#x colour %.2f %.2f %.2f %.2f material %.2f %.2f %.2f %.2f\n",
                           u, fpon, vpon, prog, bl, bs, bd, col[0], col[1], col[2], col[3], mat[0], mat[1], mat[2], mat[3]);
                   static GLint told[8]; int seen = 0;
@@ -1705,6 +1712,16 @@ static int transform_call(CPU *c, HleId id, const char *n)
          * depths that matter - The House of the Dead 4 Special's loading screen
          * hides a black layer behind its movie by depth; without the movie's
          * depth the black covered it */
+        /* That 2D keeps the game's depth, but its quads at one depth come out
+         * a hair apart on the headset and fought in stripes (the ride's
+         * how-to-play screen lost its sprites). Each is pulled a little nearer
+         * than the one before - ties go to the later draw, as on the cabinet;
+         * the whole frame's pull is far under the gaps between its layers. */
+        if (hud == 1 && !persp && is_perspective(g_proj[g_proj_top]) && g_mv && !g_replaying) {
+            glEnable(GL_POLYGON_OFFSET_FILL);
+            glPolygonOffset(0, -4.0f * (float)(++g_2d_seq));
+            g_hud_offset = 1;
+        }
         if (hud == 1 && !persp && !is_perspective(g_proj[g_proj_top])) {
             GLboolean wm = GL_FALSE;
             glGetBooleanv(GL_DEPTH_WRITEMASK, &wm);
@@ -1757,6 +1774,7 @@ static void exec(CPU *c, HleId id, HleHandler fn)
     if (is_draw(k) || k == K_END) {
         fixed_function_rect_done(); clip_done();
         if (g_hud_nowrite) { glDepthMask(GL_TRUE); g_hud_nowrite = 0; }
+        if (g_hud_offset) { glDisable(GL_POLYGON_OFFSET_FILL); glPolygonOffset(0, 0); g_hud_offset = 0; }
     }
     if (!g_replaying && (k == K_GETINTEGERV || k == K_GETFLOATV)) fix_query(c, k);
 }
@@ -2798,6 +2816,7 @@ void stereo_frame_begin(void)
     g_lens_seen = 0;
     g_near_seen = 0;
     g_scene_draws = 0;
+    g_2d_seq = 0;
     {
         static int flat_env = -1;
         if (flat_env < 0) { const char *v = getenv("LINDBERGH_FLAT_MENUS"); flat_env = !v || *v != '0'; }
