@@ -12,9 +12,8 @@
  * switch to one, park the viewport. A cabinet needs that. A window does not -
  * ours is already the right size and nobody else is using the screen.
  *
- * These are overrides rather than imports because libXxf86vm is statically
- * linked into the game, so the XF86VidMode entry points are lifted code. Left
- * to run, they would marshal X protocol down a socket that does not exist.
+ * Some games link libXxf86vm statically, others import it. Bind both forms
+ * to the same handlers; neither should speak X protocol to a real display.
  */
 
 #include <stdio.h>
@@ -138,16 +137,21 @@ static void h_ok(CPU *c) { RET(1); }
 void hle_register_vidmode(void)
 {
     int n = 0;
-    n += guest_override("XF86VidModeQueryExtension", h_QueryExtension);
-    n += guest_override("XF86VidModeQueryVersion", h_QueryVersion);
-    n += guest_override("XF86VidModeSetClientVersion", h_ok);
-    n += guest_override("XF86VidModeGetModeLine", h_GetModeLine);
-    n += guest_override("XF86VidModeGetAllModeLines", h_GetAllModeLines);
-    n += guest_override("XF86VidModeSwitchToMode", h_ok);
-    n += guest_override("XF86VidModeSwitchMode", h_ok);
-    n += guest_override("XF86VidModeSetViewPort", h_ok);
-    n += guest_override("XF86VidModeGetViewPort", h_GetViewPort);
-    n += guest_override("XF86VidModeLockModeSwitch", h_ok);
-    n += guest_override("XF86VidModeGetPermissions", h_ok);
-    fprintf(stderr, "[vidmode] %d entry points overridden\n", n);
+#define BIND(name, handler) do { \
+    n += guest_override(name, handler); \
+    n += hle_bind(name, handler); \
+} while (0)
+    BIND("XF86VidModeQueryExtension", h_QueryExtension);
+    BIND("XF86VidModeQueryVersion", h_QueryVersion);
+    BIND("XF86VidModeSetClientVersion", h_ok);
+    BIND("XF86VidModeGetModeLine", h_GetModeLine);
+    BIND("XF86VidModeGetAllModeLines", h_GetAllModeLines);
+    BIND("XF86VidModeSwitchToMode", h_ok);
+    BIND("XF86VidModeSwitchMode", h_ok);
+    BIND("XF86VidModeSetViewPort", h_ok);
+    BIND("XF86VidModeGetViewPort", h_GetViewPort);
+    BIND("XF86VidModeLockModeSwitch", h_ok);
+    BIND("XF86VidModeGetPermissions", h_ok);
+#undef BIND
+    fprintf(stderr, "[vidmode] %d entry points bound\n", n);
 }
