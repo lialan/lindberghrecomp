@@ -110,7 +110,12 @@ function(lindbergh_runtime target generated_dir)
             -Wno-unused-label -Wno-unused-variable -Wno-unused-but-set-variable
             -Wno-parentheses-equality -Wno-deprecated-declarations
             -Wno-constant-conversion -Wno-tautological-constant-out-of-range-compare
-            -fno-strict-aliasing -fwrapv)
+            -fno-strict-aliasing -fwrapv
+            # Release builds leave out the toolchains' hardening defaults,
+            # which cost the hot paths: a stack canary in every function with
+            # a local array (each lifted one holding an XMM register) and
+            # checked memcpy/strcpy. Debug builds keep them.
+            "$<$<CONFIG:Release>:-fno-stack-protector;-U_FORTIFY_SOURCE>")
         find_package(SDL2 REQUIRED)
         target_link_libraries(${target} PRIVATE SDL2::SDL2 z)
         if(ANDROID)
