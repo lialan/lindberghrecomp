@@ -9,5 +9,6 @@ void main() {
     // Guest clip space is GL's: Y up and Z in [-W,W]. Vulkan's framebuffer
     // uses the opposite Y direction and Z in [0,W]. Do this exactly once.
     gl_Position = vec4(p.x, -p.y, (p.z + p.w) * 0.5, p.w);
+    gl_PointSize = 1.0;
     vertex_color = color;
 }

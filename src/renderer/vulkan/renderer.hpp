@@ -13,7 +13,16 @@ struct RasterState {
     bool blend = false;
     VkCullModeFlags cull = VK_CULL_MODE_NONE;
     VkCompareOp depth_compare = VK_COMPARE_OP_LESS_OR_EQUAL;
+    VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     uint32_t key() const;
+};
+
+struct ProgramSource {
+    const uint32_t *vertex = nullptr, *fragment = nullptr;
+    size_t vertex_bytes = 0, fragment_bytes = 0;
+    std::vector<VkVertexInputBindingDescription> bindings;
+    std::vector<VkVertexInputAttributeDescription> attributes;
+    std::vector<VkDescriptorSetLayout> descriptor_layouts;
 };
 
 struct TargetInfo {
@@ -49,6 +58,7 @@ private:
 class Renderer {
 public:
     Renderer(Device &device, Target &target, PipelineCache &cache);
+    Renderer(Device &device, Target &target, PipelineCache &cache, const ProgramSource &program);
     ~Renderer();
     Renderer(const Renderer &) = delete;
     Renderer &operator=(const Renderer &) = delete;
@@ -56,6 +66,9 @@ public:
     void begin(VkCommandBuffer cmd, std::array<float, 4> clear);
     void draw(FrameRing &ring, const Vertex *vertices, uint32_t count,
               const Matrices &matrices, RasterState state);
+    void draw_indexed(FrameRing &ring, const Vertex *vertices, uint32_t vertex_count,
+                      const uint32_t *indices, uint32_t index_count,
+                      const Matrices &matrices, RasterState state);
     void end();
     uint64_t draw_count() const { return draws_; }
     size_t pipeline_count() const { return pipelines_.size(); }
@@ -70,6 +83,8 @@ private:
     VkPipeline bound_ = VK_NULL_HANDLE;
     std::unordered_map<uint32_t, VkPipeline> pipelines_;
     uint64_t draws_ = 0;
+    std::vector<VkVertexInputBindingDescription> bindings_;
+    std::vector<VkVertexInputAttributeDescription> attributes_;
     void release();
 };
 

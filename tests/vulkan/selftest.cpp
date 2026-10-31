@@ -1,6 +1,7 @@
 #include "device.hpp"
 #include "frame_ring.hpp"
 #include "renderer.hpp"
+#include "guest_state.hpp"
 #include <array>
 #include <chrono>
 #include <cstdio>
@@ -13,6 +14,18 @@ using namespace lindbergh::vk;
 static void require(bool test, const char *what)
 {
     if (!test) throw std::runtime_error(what);
+}
+
+static std::vector<uint32_t> shader(const std::string &path)
+{
+    std::ifstream input(path, std::ios::binary | std::ios::ate);
+    require(bool(input), "missing compiled legacy shader fixture");
+    const auto n = input.tellg();
+    require(n >= 20 && n % 4 == 0, "invalid compiled legacy shader fixture");
+    std::vector<uint32_t> data(static_cast<size_t>(n) / 4);
+    input.seekg(0);
+    require(bool(input.read(reinterpret_cast<char *>(data.data()), n)), "could not read legacy shader fixture");
+    return data;
 }
 
 template<class F> static void rejected(F fn, const char *what)
@@ -100,6 +113,76 @@ static void render_stereo(Device &device)
     pixel(0, 8, 16, 255); pixel(0, 24, 16, 0);
     pixel(1, 8, 16, 0); pixel(1, 24, 16, 255);
     std::puts("ok: one Vulkan draw rendered distinct stereo views with build-time SPIR-V");
+
+    // Exercise guest fixed-function matrix semantics and GL_QUADS through the
+    // direct frontend, then verify actual raster output rather than GL calls.
+    GuestState guest_state;
+    guest_state.matrix_mode(guest::Projection);
+    guest_state.ortho(-1, 1, -1, 1, -1, 1);
+    guest_state.matrix_mode(guest::Modelview);
+    guest_state.translate(0.5f, 0, 0);
+    guest_state.push_matrix();
+    guest_state.scale(0.5f, 0.5f, 1);
+    guest_state.color(1, 0, 0, 1);
+    guest_state.begin(guest::Quads);
+    guest_state.vertex(-1, -1); guest_state.vertex(1, -1);
+    guest_state.vertex(1, 1); guest_state.vertex(-1, 1);
+    const auto batch = guest_state.end();
+    require(batch && batch->vertices.size() == 4 && batch->indices.size() == 6,
+            "guest quad was not lowered to indexed triangles");
+    auto mvp = guest_state.modelview_projection();
+    std::memcpy(matrices.view_projection[0], mvp.data(), sizeof mvp);
+    mvp[12] -= 0.5f;
+    std::memcpy(matrices.view_projection[1], mvp.data(), sizeof mvp);
+    cmd = ring.begin();
+    renderer.begin(cmd, {0, 0, 0, 1});
+    renderer.draw_indexed(ring, batch->vertices.data(), static_cast<uint32_t>(batch->vertices.size()),
+        batch->indices.data(), static_cast<uint32_t>(batch->indices.size()), matrices, state);
+    renderer.end();
+    vkCmdCopyImageToBuffer(cmd, target.color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, output.buffer, 1, &copy);
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                         0, 0, nullptr, 1, &barrier, 0, nullptr);
+    ring.wait(ring.submit());
+    pixel(0, 24, 16, 255); pixel(0, 8, 16, 0);
+    pixel(1, 16, 16, 255); pixel(1, 28, 16, 0);
+    guest_state.pop_matrix();
+    require(guest_state.current_matrix()[0] == 1 && guest_state.current_matrix()[12] == 0.5f,
+            "guest matrix stack did not restore modelview");
+    guest_state.pop_matrix();
+    require(guest_state.error() == guest::StackUnderflow && guest_state.error() == guest::NoError,
+            "guest matrix error state did not clear");
+    guest_state.begin(guest::TriangleStrip);
+    guest_state.vertex(-1, -1); guest_state.vertex(1, -1);
+    guest_state.vertex(-1, 1); guest_state.vertex(1, 1);
+    auto strip = guest_state.end();
+    require(strip->indices == std::vector<uint32_t>({0, 1, 2, 2, 1, 3}), "triangle strip winding changed");
+    require(renderer.pipeline_count() == 1, "guest state translation recompiled a cached pipeline");
+    std::puts("ok: guest matrices, quad/strip assembly and indexed Vulkan stereo rasterization");
+
+    const auto vs = shader(std::string(LV_TEST_SHADER_DIR) + "/vert.spv");
+    const auto fs = shader(std::string(LV_TEST_SHADER_DIR) + "/frag.spv");
+    ProgramSource legacy{vs.data(), fs.data(), vs.size() * 4, fs.size() * 4,
+        {{0, sizeof(Vertex), VK_VERTEX_INPUT_RATE_VERTEX}},
+        {{0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Vertex, position)},
+         {3, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Vertex, color)}}, {}};
+    Renderer converted(device, target, cache, legacy);
+    converted.prepare(state);
+    for (auto &m : matrices.view_projection) {
+        std::fill(m, m + 16, 0);
+        for (unsigned i = 0; i < 4; i++) m[i * 5] = 1;
+    }
+    matrices.view_projection[1][12] = 0.8f;
+    cmd = ring.begin();
+    converted.begin(cmd, {0, 0, 0, 1});
+    converted.draw(ring, triangle, 3, matrices, state);
+    converted.end();
+    vkCmdCopyImageToBuffer(cmd, target.color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, output.buffer, 1, &copy);
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                         0, 0, nullptr, 1, &barrier, 0, nullptr);
+    ring.wait(ring.submit());
+    pixel(0, 8, 16, 255); pixel(0, 24, 16, 0);
+    pixel(1, 8, 16, 0); pixel(1, 24, 16, 255);
+    std::puts("ok: converted GLSL 1.20 shaders preserve front-face color and multiview raster output");
 }
 
 int main()

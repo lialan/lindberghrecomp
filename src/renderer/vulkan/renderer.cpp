@@ -149,26 +149,44 @@ Target::~Target() { release(); }
 
 uint32_t RasterState::key() const
 {
-    if (cull > VK_CULL_MODE_FRONT_AND_BACK || depth_compare > VK_COMPARE_OP_ALWAYS)
+    if (cull > VK_CULL_MODE_FRONT_AND_BACK || depth_compare > VK_COMPARE_OP_ALWAYS ||
+        (topology != VK_PRIMITIVE_TOPOLOGY_POINT_LIST && topology != VK_PRIMITIVE_TOPOLOGY_LINE_LIST &&
+         topology != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST))
         throw std::invalid_argument("Invalid Vulkan raster state");
-    return depth_test | (depth_write << 1) | (blend << 2) | (cull << 3) | (depth_compare << 5);
+    return depth_test | (depth_write << 1) | (blend << 2) | (cull << 3) | (depth_compare << 5) | (topology << 8);
+}
+
+static ProgramSource colored_program()
+{
+    return {colored_vert, colored_frag, sizeof colored_vert, sizeof colored_frag,
+        {{0, sizeof(Vertex), VK_VERTEX_INPUT_RATE_VERTEX}},
+        {{0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Vertex, position)},
+         {1, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Vertex, color)}}, {}};
 }
 
 Renderer::Renderer(Device &device, Target &target, PipelineCache &cache)
-    : device_(device), target_(target), cache_(cache)
+    : Renderer(device, target, cache, colored_program()) {}
+
+Renderer::Renderer(Device &device, Target &target, PipelineCache &cache, const ProgramSource &program)
+    : device_(device), target_(target), cache_(cache), bindings_(program.bindings), attributes_(program.attributes)
 {
+    if (!program.vertex || !program.fragment || !program.vertex_bytes || !program.fragment_bytes ||
+        program.vertex_bytes % 4 || program.fragment_bytes % 4)
+        throw std::invalid_argument("Invalid precompiled Vulkan shader modules");
     try {
         VkShaderModuleCreateInfo module{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-        module.codeSize = sizeof colored_vert;
-        module.pCode = colored_vert;
+        module.codeSize = program.vertex_bytes;
+        module.pCode = program.vertex;
         check(vkCreateShaderModule(device.handles.device, &module, nullptr, &vertex_), "vertex SPIR-V module");
-        module.codeSize = sizeof colored_frag;
-        module.pCode = colored_frag;
+        module.codeSize = program.fragment_bytes;
+        module.pCode = program.fragment;
         check(vkCreateShaderModule(device.handles.device, &module, nullptr, &fragment_), "fragment SPIR-V module");
         VkPushConstantRange matrices{VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(Matrices)};
         VkPipelineLayoutCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         info.pushConstantRangeCount = 1;
         info.pPushConstantRanges = &matrices;
+        info.setLayoutCount = static_cast<uint32_t>(program.descriptor_layouts.size());
+        info.pSetLayouts = program.descriptor_layouts.data();
         check(vkCreatePipelineLayout(device.handles.device, &info, nullptr, &layout_), "draw pipeline layout");
     } catch (...) { release(); throw; }
 }
@@ -182,16 +200,11 @@ void Renderer::prepare(RasterState state)
     for (auto &s : stages) { s.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; s.pName = "main"; }
     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT; stages[0].module = vertex_;
     stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stages[1].module = fragment_;
-    VkVertexInputBindingDescription binding{0, sizeof(Vertex), VK_VERTEX_INPUT_RATE_VERTEX};
-    VkVertexInputAttributeDescription attrs[] = {
-        {0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Vertex, position)},
-        {1, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Vertex, color)}
-    };
     VkPipelineVertexInputStateCreateInfo vertex{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
-    vertex.vertexBindingDescriptionCount = 1; vertex.pVertexBindingDescriptions = &binding;
-    vertex.vertexAttributeDescriptionCount = 2; vertex.pVertexAttributeDescriptions = attrs;
+    vertex.vertexBindingDescriptionCount = static_cast<uint32_t>(bindings_.size()); vertex.pVertexBindingDescriptions = bindings_.data();
+    vertex.vertexAttributeDescriptionCount = static_cast<uint32_t>(attributes_.size()); vertex.pVertexAttributeDescriptions = attributes_.data();
     VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
-    assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    assembly.topology = state.topology;
     VkPipelineViewportStateCreateInfo viewport{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
     viewport.viewportCount = viewport.scissorCount = 1;
     VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
@@ -245,7 +258,9 @@ void Renderer::begin(VkCommandBuffer cmd, std::array<float, 4> color)
 void Renderer::draw(FrameRing &ring, const Vertex *vertices, uint32_t count, const Matrices &matrices, RasterState state)
 {
     if (!cmd_) throw std::logic_error("Vulkan draw outside render pass");
-    if (!vertices || !count || count % 3) throw std::invalid_argument("Invalid Vulkan triangle list");
+    if (!vertices || !count || (state.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST && count % 3) ||
+        (state.topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST && count % 2))
+        throw std::invalid_argument("Invalid Vulkan primitive list");
     auto p = pipelines_.find(state.key());
     if (p == pipelines_.end()) throw std::logic_error("Unprepared Vulkan pipeline encountered during drawing");
     auto data = ring.upload(vertices, size_t(count) * sizeof(Vertex));
@@ -253,6 +268,25 @@ void Renderer::draw(FrameRing &ring, const Vertex *vertices, uint32_t count, con
     vkCmdBindVertexBuffers(cmd_, 0, 1, &data.buffer, &data.offset);
     vkCmdPushConstants(cmd_, layout_, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof matrices, &matrices);
     vkCmdDraw(cmd_, count, 1, 0, 0);
+    ++draws_;
+}
+
+void Renderer::draw_indexed(FrameRing &ring, const Vertex *vertices, uint32_t vertex_count,
+                            const uint32_t *indices, uint32_t index_count,
+                            const Matrices &matrices, RasterState state)
+{
+    if (!cmd_) throw std::logic_error("Vulkan draw outside render pass");
+    if (!vertices || !vertex_count || !indices || !index_count)
+        throw std::invalid_argument("Invalid Vulkan indexed draw");
+    auto p = pipelines_.find(state.key());
+    if (p == pipelines_.end()) throw std::logic_error("Unprepared Vulkan pipeline encountered during drawing");
+    auto vertex = ring.upload(vertices, size_t(vertex_count) * sizeof(Vertex));
+    auto index = ring.upload(indices, size_t(index_count) * sizeof(uint32_t), 4);
+    if (bound_ != p->second) { vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, p->second); bound_ = p->second; }
+    vkCmdBindVertexBuffers(cmd_, 0, 1, &vertex.buffer, &vertex.offset);
+    vkCmdBindIndexBuffer(cmd_, index.buffer, index.offset, VK_INDEX_TYPE_UINT32);
+    vkCmdPushConstants(cmd_, layout_, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof matrices, &matrices);
+    vkCmdDrawIndexed(cmd_, index_count, 1, 0, 0, 0);
     ++draws_;
 }
 
