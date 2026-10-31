@@ -117,7 +117,7 @@ int g_dispatch_always;      /* a watch or trace is on: lifted code dispatches ev
  * above, below an index (+1, 0 empty) into the lifted table, or with the top
  * bit set into the overrides - so a slot read while another thread writes it
  * is old or new, never half of each. */
-#define DCACHE_N 8192
+#define DCACHE_N 32768     /* entries; 8192 let busy call targets evict each other */
 static uint64_t g_dcache[DCACHE_N];
 void dispatch_cache_clear(void) { memset(g_dcache, 0, sizeof g_dcache); }   /* an override added */
 
@@ -234,8 +234,11 @@ void dispatch(CPU *c, uint32_t va)
      * same way. */
     if (__builtin_expect(g_dispatch_fast, 1) && (va < stereo_state_lo || va > stereo_state_hi)) {
         uint64_t e = __atomic_load_n(&g_dcache[(va >> 2) & (DCACHE_N - 1)], __ATOMIC_RELAXED);
-        if ((uint32_t)(e >> 32) == va && (uint32_t)e && !((uint32_t)e & 0x80000000u)) {
-            g_table[(uint32_t)e - 1].fn(c);
+        if ((uint32_t)(e >> 32) == va && (uint32_t)e) {
+            uint32_t k = (uint32_t)e;
+            /* a host body standing in for the function (an override) too */
+            if (k & 0x80000000u) { (void)pop32(c); guest_override_at((int)(k & 0x7fffffffu) - 1)(c); }
+            else g_table[k - 1].fn(c);
             return;
         }
     }
