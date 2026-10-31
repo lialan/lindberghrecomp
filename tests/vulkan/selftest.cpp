@@ -5,7 +5,9 @@
 #include "guest_arrays.hpp"
 #include "uniforms.hpp"
 #include "resources.hpp"
+#include "shader_pack.hpp"
 #include <array>
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -19,16 +21,18 @@ static void require(bool test, const char *what)
     if (!test) throw std::runtime_error(what);
 }
 
-static std::vector<uint32_t> shader(const std::string &path)
+static std::string source(const std::string &path)
 {
-    std::ifstream input(path, std::ios::binary | std::ios::ate);
-    require(bool(input), "missing compiled legacy shader fixture");
-    const auto n = input.tellg();
-    require(n >= 20 && n % 4 == 0, "invalid compiled legacy shader fixture");
-    std::vector<uint32_t> data(static_cast<size_t>(n) / 4);
-    input.seekg(0);
-    require(bool(input.read(reinterpret_cast<char *>(data.data()), n)), "could not read legacy shader fixture");
-    return data;
+    std::ifstream input(path, std::ios::binary);
+    require(bool(input), "missing source-owned shader fixture");
+    return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+}
+static std::string hex(const SourceDigest &hash)
+{
+    static const char digits[] = "0123456789abcdef";
+    std::string out;
+    for (const auto byte : hash) { out += digits[byte >> 4]; out += digits[byte & 15]; }
+    return out;
 }
 
 template<class F> static void rejected(F fn, const char *what)
@@ -162,8 +166,20 @@ static void render_stereo(Device &device)
     require(renderer.pipeline_count() == 1, "guest state translation recompiled a cached pipeline");
     std::puts("ok: guest matrices, quad/strip assembly and indexed Vulkan stereo rasterization");
 
-    const auto vs = shader(std::string(LV_TEST_SHADER_DIR) + "/vert.spv");
-    const auto fs = shader(std::string(LV_TEST_SHADER_DIR) + "/frag.spv");
+    ShaderPack pack(std::string(LV_TEST_SHADER_DIR) + "/fixture.lvsp");
+    const auto vs_hash = source_digest(source(std::string(LV_TEST_SOURCE_DIR) + "/legacy.vert"));
+    const auto fs_hash = source_digest(source(std::string(LV_TEST_SOURCE_DIR) + "/legacy.frag"));
+    const auto record = pack.find(vs_hash, fs_hash, {});
+    require(record && pack.programs().size() == 1, "offline shader archive lookup failed");
+    require(!pack.find(SourceDigest{}, fs_hash, {}), "unknown shader source silently accepted");
+    const auto &vs = record->vertex, &fs = record->fragment;
+    const auto uniform_layout = std::find_if(record->uniforms.begin(), record->uniforms.end(),
+                                             [](const auto &b) { return b.set == 1 && b.binding == 0; });
+    require(uniform_layout != record->uniforms.end() && uniform_layout->bytes == 16,
+            "shader archive lost the reflected guest uniform layout");
+    UniformData guest_uniforms(*uniform_layout);
+    const auto tint_location = guest_uniforms.find("guestTint");
+    require(tint_location >= 0 && guest_uniforms.find("not_a_uniform") == -1, "uniform name lookup changed");
     UniformSet uniforms(device, ring, {{0, 16}});
     Texture texture(device, {2, 2, 2});
     Sampler sampler(device);
@@ -187,7 +203,11 @@ static void render_stereo(Device &device)
     auto sampled = material.handle();
     converted.bind_descriptors(2, 1, &sampled);
     const float tint[] = {1, 1, 1, 1};
-    auto offset = uniforms.upload(0, tint, sizeof tint);
+    guest_uniforms.write(static_cast<uint32_t>(tint_location), tint, sizeof tint);
+    const auto version = guest_uniforms.version();
+    guest_uniforms.write(static_cast<uint32_t>(tint_location), tint, sizeof tint);
+    require(guest_uniforms.version() == version, "unchanged uniform marked dirty");
+    auto offset = uniforms.upload(0, guest_uniforms.bytes().data(), guest_uniforms.bytes().size());
     auto descriptors = uniforms.current_set();
     converted.bind_descriptors(1, 1, &descriptors, 1, &offset);
     converted.draw(ring, triangle, 3, matrices, state);
@@ -212,7 +232,8 @@ static void render_stereo(Device &device)
         converted.bind_descriptors(2, 1, &sampled);
         const float color[] = {float(frame & 1), 1, 1, 1};
         rejected([&] { uniforms.upload(0, color, 12); }, "truncated uniform block accepted");
-        offset = uniforms.upload(0, color, sizeof color);
+        guest_uniforms.write(static_cast<uint32_t>(tint_location), color, sizeof color);
+        offset = uniforms.upload(0, guest_uniforms.bytes().data(), guest_uniforms.bytes().size());
         require(offset % device.capabilities.properties.limits.minUniformBufferOffsetAlignment == 0,
                 "uniform upload violates device alignment");
         descriptors = uniforms.current_set();
@@ -351,8 +372,33 @@ static void render_stereo(Device &device)
     std::puts("ok: guest VBO/client/current arrays render directly with textures, uint16 indices and mip descriptors");
 }
 
-int main()
+int main(int argc, char **argv)
 try {
+    require(hex(source_digest("")) == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "empty shader source hash mismatch");
+    require(hex(source_digest("abc")) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            "shader source SHA-256 mismatch");
+    for (const auto &test : std::vector<std::pair<unsigned, std::string>>{
+        {55, "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318"},
+        {56, "b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a"},
+        {64, "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb"},
+        {65, "635361c48bb9eab14198e76ea8ab7f1a41685d6ad62aa9146d301d4f17eb0ae0"}})
+        require(hex(source_digest(std::string(test.first, 'a'))) == test.second, "shader hash padding/block mismatch");
+    // Non-square matrices in arrays catch both std140 column padding and
+    // transpose bugs. These offsets model build-time reflection metadata.
+    UniformLayout matrix_layout{1, 0, 128, {{"matrix", 16, 0, 2, 3, 2, 48, 16}}};
+    UniformData matrix_data(matrix_layout);
+    const float row_major[] = {1,2, 3,4, 5,6};
+    matrix_data.write(0, row_major, sizeof row_major, 1, 1, true);
+    const float col0[] = {1,3,5}, col1[] = {2,4,6};
+    require(!std::memcmp(matrix_data.bytes().data()+64, col0, sizeof col0) &&
+            !std::memcmp(matrix_data.bytes().data()+80, col1, sizeof col1) && matrix_data.bytes()[76] == 0,
+            "std140 matrix/array stride or transpose mismatch");
+    matrix_data.write(0, row_major, sizeof row_major, 0, 1, false);
+    require(!std::memcmp(matrix_data.bytes().data()+16, row_major, 12) &&
+            !std::memcmp(matrix_data.bytes().data()+32, row_major+3, 12) && matrix_data.bytes()[28] == 0,
+            "column-major std140 padding mismatch");
+    rejected([&] { matrix_data.write(0, row_major, sizeof row_major, 2); }, "out-of-range uniform array accepted");
     DeviceOptions options;
     options.allow_software = true; // This test deliberately runs on lavapipe.
     options.require_foveation = false;
@@ -360,6 +406,24 @@ try {
     const auto &h = device->handles;
     require(device->capabilities.multiview, "stereo multiview not available");
     render_stereo(*device);
+    if (argc == 2) {
+        ShaderPack game_pack(argv[1]);
+        size_t fields = 0;
+        for (const auto &p : game_pack.programs()) {
+            require(game_pack.find(p.vertex_source, p.fragment_source, p.attributes) == &p,
+                    "shader archive source/binding selection changed");
+            for (const auto &block : p.uniforms) fields += block.fields.size();
+            for (const auto *module : {&p.vertex, &p.fragment}) {
+                VkShaderModuleCreateInfo create{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+                create.codeSize = module->size() * 4; create.pCode = module->data();
+                VkShaderModule handle;
+                check(vkCreateShaderModule(h.device, &create, nullptr, &handle), "archived game SPIR-V module");
+                vkDestroyShaderModule(h.device, handle, nullptr);
+            }
+        }
+        std::printf("ok: loaded %zu archived game shader pairs and %zu reflected fields without a runtime GLSL compiler\n",
+                    game_pack.programs().size(), fields);
+    }
     // Borrowing must not accidentally destroy a device owned by OpenXR.
     {
         auto borrowed = Device::borrow(h, device->capabilities);

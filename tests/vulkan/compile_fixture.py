@@ -29,3 +29,8 @@ for stage in ("vert", "frag"):
 (output / "program.json").write_text(json.dumps(result, indent=2) + "\n")
 
 assert blocks[(1, 0)][0] == 16, "guestTint uniform layout changed"
+
+spec = importlib.util.spec_from_file_location("shader_packer", root / "tools/vulkan/pack_shaders.py")
+packer = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(packer)
+packer.pack([result], output, output / "fixture.lvsp")
