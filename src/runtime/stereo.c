@@ -1286,6 +1286,10 @@ static int   g_n_view_tex;
 static void aim_box_track(CPU *c, int k)
 {
     if (g_replaying) return;
+    if (k == K_END && (long)g_frame == g_cap_frame) {   /* a capture: the colour the glBegin's vertices ended with */
+        GLfloat col[4] = { -1, -1, -1, -1 }; glGetFloatv(GL_CURRENT_COLOR, col);
+        fprintf(stderr, "[units] end colour %.2f %.2f %.2f %.2f (texture %u)\n", col[0], col[1], col[2], col[3], g_tex2d_bound);
+    }
     if (g_mode == GL_MODELVIEW) {
         if (k == K_LOADID) g_mv_ident = 1;
         else if (k == K_PUSHMATRIX) { if (g_mv_ident_top < 31) g_mv_ident_stack[g_mv_ident_top++] = g_mv_ident; }
@@ -1519,7 +1523,7 @@ static int transform_call(CPU *c, HleId id, const char *n)
         return 1;
     }
     if (k == K_TEXSUB) {                /* noted for a capture only */
-        if (A32(1) == 0) { GLint bt = 0; glGetIntegerv(GL_TEXTURE_BINDING_2D, &bt); tex_hist((GLuint)bt, "updated (glTexSubImage2D)", AI32(4), AI32(5));
+        if (A32(1) == 0) { GLint bt = 0; glGetIntegerv(GL_TEXTURE_BINDING_2D, &bt); { char how[32]; snprintf(how, sizeof how, "updated, format %#x", A32(6)); tex_hist((GLuint)bt, how, AI32(4), AI32(5)); }
             static int lg = -1;     /* LINDBERGH_TEXSUB_LOG=1: big updates, now and then, with how bright their pixels are */
             if (lg < 0) { const char *v = getenv("LINDBERGH_TEXSUB_LOG"); lg = v && *v == '1'; }
             if (lg && AI32(4) * AI32(5) >= 256 * 256 && g_frame % 60 == 0) {
@@ -1536,7 +1540,8 @@ static int transform_call(CPU *c, HleId id, const char *n)
         return 0;
     }
     if (k == K_TEXIMAGE) {
-        if (A32(1) == 0) { GLint bt = 0; glGetIntegerv(GL_TEXTURE_BINDING_2D, &bt); tex_hist((GLuint)bt, APTR(8) ? "uploaded" : "allocated", AI32(3), AI32(4)); }
+        if (A32(1) == 0) { GLint bt = 0; glGetIntegerv(GL_TEXTURE_BINDING_2D, &bt); char how[32];
+            snprintf(how, sizeof how, "%s, format %#x", APTR(8) ? "uploaded" : "allocated", A32(6)); tex_hist((GLuint)bt, how, AI32(3), AI32(4)); }
         GLenum ifmt = A32(2);
         int is_float = ifmt == 0x881A || ifmt == 0x881B || ifmt == 0x8814 || ifmt == 0x8815;   /* RGBA/RGB 16F, 32F */
         static int rt8 = -1;           /* LINDBERGH_RT_8BIT=1: not kept (a debugging aid) */
@@ -1591,6 +1596,12 @@ static int transform_call(CPU *c, HleId id, const char *n)
         static long skip = -2;
         if (skip == -2) { const char *v = getenv("LINDBERGH_SKIP_TEX"); skip = v ? atol(v) : -1; }
         if (skip > 0 && (is_draw(k) || k == K_BEGIN) && g_tex2d_bound == (GLuint)skip) { if (k == K_BEGIN) g_skip_begin = 1; return 1; }
+        static long skp = -2;   /* LINDBERGH_SKIP_PROG=<program>: draws with that GLSL program left out */
+        if (skp == -2) { const char *v = getenv("LINDBERGH_SKIP_PROG"); skp = v ? atol(v) : -1; }
+        if (skp > 0 && (is_draw(k) || k == K_BEGIN)) {
+            GLint pr = 0; glGetIntegerv(GL_CURRENT_PROGRAM, &pr);
+            if (pr == skp) { if (k == K_BEGIN) g_skip_begin = 1; return 1; }
+        }
     }
     if (g_on && (is_draw(k) || k == K_BEGIN)) {
         /* Screen content or not, decided per draw: 2D that is not a pass over
@@ -1641,7 +1652,10 @@ static int transform_call(CPU *c, HleId id, const char *n)
                   int fpon = 0, vpon = 0; arb_is_enabled(GL_FRAGMENT_PROGRAM_ARB, &fpon); arb_is_enabled(GL_VERTEX_PROGRAM_ARB, &vpon);
                   GLint prog = 0; glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
                   GLboolean bl = glIsEnabled(GL_BLEND); GLint bs = 0, bd = 0; glGetIntegerv(GL_BLEND_SRC, &bs); glGetIntegerv(GL_BLEND_DST, &bd);
-                  fprintf(stderr, "[units]%s fp %d vp %d glsl %d blend %d %#x/%#x\n", u, fpon, vpon, prog, bl, bs, bd);
+                  GLfloat col[4] = { -1, -1, -1, -1 }, mat[4] = { -1, -1, -1, -1 };
+                  glGetFloatv(GL_CURRENT_COLOR, col); glGetMaterialfv(GL_FRONT, GL_DIFFUSE, mat);
+                  fprintf(stderr, "[units]%s fp %d vp %d glsl %d blend %d %#x/%#x colour %.2f %.2f %.2f %.2f material %.2f %.2f %.2f %.2f\n",
+                          u, fpon, vpon, prog, bl, bs, bd, col[0], col[1], col[2], col[3], mat[0], mat[1], mat[2], mat[3]);
                   static GLint told[8]; int seen = 0;
                   for (int i = 0; i < 8; i++) if (told[i] == prog) seen = 1;
                   if (prog && !seen) {
@@ -1687,7 +1701,11 @@ static int transform_call(CPU *c, HleId id, const char *n)
          * round to slightly different depths and fight pixel by pixel - the
          * HUD's gauges and text flickered in stripes. They still test against
          * the world; they just stop writing depth for each other. */
-        if (hud == 1 && !persp) {
+        /* Only flat 2D: a game's own 2D camera (is_2d_lens) hangs its quads at
+         * depths that matter - The House of the Dead 4 Special's loading screen
+         * hides a black layer behind its movie by depth; without the movie's
+         * depth the black covered it */
+        if (hud == 1 && !persp && !is_perspective(g_proj[g_proj_top])) {
             GLboolean wm = GL_FALSE;
             glGetBooleanv(GL_DEPTH_WRITEMASK, &wm);
             if (wm) { glDepthMask(GL_FALSE); g_hud_nowrite = 1; }
@@ -2396,6 +2414,14 @@ static void cap_save_tex(GLuint t)
     glBindTexture(GL_TEXTURE_2D, t);
     glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
     glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &h);
+    {   /* whether sampling it is complete: a mipmapping filter needs the levels */
+        GLint minf = 0, magf = 0, w1 = 0, maxl = -1;
+        glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, &minf);
+        glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, &magf);
+        glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, &maxl);
+        glGetTexLevelParameteriv(GL_TEXTURE_2D, 1, GL_TEXTURE_WIDTH, &w1);
+        fprintf(stderr, "[capture] texture %u: min filter %#x, mag %#x, level 1 width %d, max level %d\n", t, minf, magf, w1, maxl);
+    }
     glBindTexture(GL_TEXTURE_2D, (GLuint)was_tex);
     if (w <= 0 || h <= 0 || w > 4096 || h > 4096) { fprintf(stderr, "[capture] texture %u: size %dx%d, not saved\n", t, w, h); return; }
     glGetIntegerv(GL_FRAMEBUFFER_BINDING, &was_fb);

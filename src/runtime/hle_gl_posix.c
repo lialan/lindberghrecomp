@@ -542,7 +542,9 @@ static void h_glTexImage2D(CPU *c)
     GLint ifmt = AI32(2);
     GLsizei w = AI32(3), h = AI32(4);
     const void *px = APTR(8);
-    if (is_lum(fmt) && type == GL_UNSIGNED_BYTE && is_lum_ifmt(ifmt)) {
+    if (is_lum(fmt) && type == GL_UNSIGNED_BYTE) {      /* whatever storage was asked for: gl4es keeps the data's layout */
+        static int told;
+        if (told < 4 && fmt == GL_LUMINANCE_ALPHA) { told++; fprintf(stderr, "[gl] greyscale+alpha texture %dx%d allocated as %#x%s\n", w, h, ifmt, is_lum_ifmt(ifmt) ? "" : " (not greyscale)"); }
         unsigned char *rgba = px ? lum_to_rgba(px, w, h, fmt == GL_LUMINANCE_ALPHA) : NULL;
         GLint was = 4; glGetIntegerv(GL_UNPACK_ALIGNMENT, &was); glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
         glTexImage2D(A32(0), AI32(1), GL_RGBA, w, h, AI32(5), GL_RGBA, GL_UNSIGNED_BYTE, rgba);
