@@ -68,36 +68,40 @@ static GLint u_gun_mvp, u_gun_model, u_beam_mvp, u_beam_color, u_beam_shape;
 static int gun_verts;
 
 /* ---- the gun ----
- * Quaternius' SubmachineGun_2 (CC0), made into xr_gun_model.h by
- * quest/tools/obj2gun.py: barrel along -Z on the aim ray, the rail on top.
- * A sight goes on the rail, built from boxes here: its glass is where the
- * reticle shows. */
+ * Two models, chosen by the game's profile: Quaternius' SubmachineGun_2 (CC0),
+ * made into xr_gun_model.h by quest/tools/obj2gun.py, and a B&T TP9 built by
+ * quest/tools/tp9gun.py into xr_gun_tp9.h. Both: barrel along -Z on the aim
+ * ray, the rail on top. A sight goes on the rail, built from boxes here: its
+ * glass is where the reticle shows. */
 #include "xr_gun_model.h"
+#include "xr_gun_tp9.h"
 
 /* a debug switch, looked up once */
 #define ENV_ON(name) ({ static int _on = -1; if (_on < 0) _on = getenv(name) != NULL; _on; })
 
+/* the sights' boxes, y measured up from the rail's top */
 typedef struct { float c[3], h[3], rgb[3]; } Box;
-#define OPTIC_Y (GUN_RAIL_Y + 0.030f)   /* the sight line, above the bore */
-static const Box RED_DOT[] = {          /* a tube sight, like an Aimpoint */
-    { { 0, GUN_RAIL_Y + 0.006f, 0.030f }, { 0.011f, 0.006f, 0.018f }, { 0.10f, 0.10f, 0.11f } },   /* mount */
-    { { 0, OPTIC_Y + 0.017f, 0.030f }, { 0.017f, 0.003f, 0.032f }, { 0.16f, 0.16f, 0.17f } },      /* tube: top */
-    { { 0, OPTIC_Y - 0.017f, 0.030f }, { 0.017f, 0.003f, 0.032f }, { 0.16f, 0.16f, 0.17f } },      /* bottom */
-    { { -0.017f, OPTIC_Y, 0.030f }, { 0.003f, 0.017f, 0.032f }, { 0.16f, 0.16f, 0.17f } },         /* sides */
-    { { 0.017f, OPTIC_Y, 0.030f }, { 0.003f, 0.017f, 0.032f }, { 0.16f, 0.16f, 0.17f } },
-    { { 0.020f, OPTIC_Y, 0.030f }, { 0.004f, 0.006f, 0.006f }, { 0.12f, 0.12f, 0.13f } },         /* turret */
+static const Box RED_DOT[] = {          /* a slim reflex sight, like a Trijicon RMR */
+    { { 0, 0.003f, 0.028f }, { 0.0125f, 0.003f, 0.020f }, { 0.12f, 0.12f, 0.13f } },          /* base */
+    { { 0, 0.008f, 0.040f }, { 0.0115f, 0.004f, 0.008f }, { 0.15f, 0.15f, 0.16f } },          /* emitter housing */
+    { { -0.0110f, 0.0155f, 0.018f }, { 0.0015f, 0.0095f, 0.004f }, { 0.15f, 0.15f, 0.16f } }, /* hood: sides */
+    { { 0.0110f, 0.0155f, 0.018f }, { 0.0015f, 0.0095f, 0.004f }, { 0.15f, 0.15f, 0.16f } },
+    { { 0, 0.0255f, 0.018f }, { 0.0125f, 0.0015f, 0.004f }, { 0.15f, 0.15f, 0.16f } },        /* hood: top */
 };
 static const Box HOLO[] = {             /* a window sight, like an EOTech */
-    { { 0, GUN_RAIL_Y + 0.008f, 0.032f }, { 0.017f, 0.008f, 0.048f }, { 0.12f, 0.12f, 0.13f } },   /* body */
-    { { -0.019f, OPTIC_Y + 0.002f, 0.018f }, { 0.003f, 0.020f, 0.022f }, { 0.15f, 0.15f, 0.16f } },/* hood: sides */
-    { { 0.019f, OPTIC_Y + 0.002f, 0.018f }, { 0.003f, 0.020f, 0.022f }, { 0.15f, 0.15f, 0.16f } },
-    { { 0, OPTIC_Y + 0.020f, 0.018f }, { 0.022f, 0.003f, 0.022f }, { 0.15f, 0.15f, 0.16f } },      /* hood: top */
-    { { 0.008f, GUN_RAIL_Y + 0.018f, 0.064f }, { 0.007f, 0.004f, 0.010f }, { 0.08f, 0.08f, 0.09f } },/* buttons */
+    { { 0, 0.008f, 0.032f }, { 0.017f, 0.008f, 0.048f }, { 0.12f, 0.12f, 0.13f } },           /* body */
+    { { -0.019f, 0.032f, 0.018f }, { 0.003f, 0.020f, 0.022f }, { 0.15f, 0.15f, 0.16f } },     /* hood: sides */
+    { { 0.019f, 0.032f, 0.018f }, { 0.003f, 0.020f, 0.022f }, { 0.15f, 0.15f, 0.16f } },
+    { { 0, 0.050f, 0.018f }, { 0.022f, 0.003f, 0.022f }, { 0.15f, 0.15f, 0.16f } },          /* hood: top */
+    { { 0.008f, 0.018f, 0.064f }, { 0.007f, 0.004f, 0.010f }, { 0.08f, 0.08f, 0.09f } },      /* buttons */
 };
-/* each sight's glass: centre z and half width, half height, around the sight line */
-static const float GLASS[3][3] = { { 0, 0, 0 }, { 0.010f, 0.014f, 0.014f }, { 0.004f, 0.016f, 0.017f } };
+/* each sight's glass: centre z, half width, half height, and the sight line's height above the rail */
+static const float GLASS[3][4] = { { 0, 0, 0, 0 }, { 0.018f, 0.0095f, 0.0085f, 0.0145f },
+                                   { 0.004f, 0.016f, 0.017f, 0.030f } };
 
-static float mesh[(GUN_VERTS + 8 * 36) * 9];
+#define MAX_VERTS (GUN_VERTS > TP9_VERTS ? GUN_VERTS : TP9_VERTS)
+static float mesh[(MAX_VERTS + 8 * 36) * 9];
+static float rail_y;                    /* the current gun's rail top */
 
 static void add_boxes(int *n, const Box *bx, int count)
 {
@@ -108,7 +112,7 @@ static void add_boxes(int *n, const Box *bx, int count)
         float v[8][3];
         for (int k = 0; k < 8; k++)
             for (int a = 0; a < 3; a++)
-                v[k][a] = bx[p].c[a] + ((k >> a) & 1 ? bx[p].h[a] : -bx[p].h[a]);
+                v[k][a] = bx[p].c[a] + (a == 1 ? rail_y : 0) + ((k >> a) & 1 ? bx[p].h[a] : -bx[p].h[a]);
         for (int f = 0; f < 6; f++) {
             static const int tri[6] = { 0, 1, 2, 0, 2, 3 };
             for (int t = 0; t < 6; t++) {
@@ -121,15 +125,17 @@ static void add_boxes(int *n, const Box *bx, int count)
     }
 }
 
-static int cur_sight = -1;
-static void build_gun(int sight)
+static int cur_sight = -1, cur_model = -1;
+static void build_gun(int sight, int model)
 {
-    memcpy(mesh, GUN_MESH, sizeof GUN_MESH);
-    int n = GUN_VERTS;
+    int n;
+    if (model == XO_GUN_TP9) { memcpy(mesh, TP9_MESH, sizeof TP9_MESH); n = TP9_VERTS; rail_y = TP9_RAIL_Y; }
+    else { memcpy(mesh, GUN_MESH, sizeof GUN_MESH); n = GUN_VERTS; rail_y = GUN_RAIL_Y; }
     if (sight == XO_SIGHT_RED_DOT) add_boxes(&n, RED_DOT, (int)(sizeof RED_DOT / sizeof *RED_DOT));
     if (sight == XO_SIGHT_HOLO) add_boxes(&n, HOLO, (int)(sizeof HOLO / sizeof *HOLO));
     gun_verts = n;
     cur_sight = sight;
+    cur_model = model;
 }
 
 static GLuint shader(GLenum type, const char *src)
@@ -228,7 +234,7 @@ int xo_init(void)
     gl.SamplerParameteri(smp_screen, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     gl.SamplerParameteri(smp_screen, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
-    build_gun(XO_SIGHT_NONE);
+    build_gun(XO_SIGHT_NONE, XO_GUN_SMG);
     gl.GenVertexArrays(1, &vao_gun);
     gl.GenBuffers(1, &vbo_gun);
     gl.BindVertexArray(vao_gun);
@@ -376,7 +382,7 @@ static void glass(const float *vp, const float *model, int sight, float r, float
     float q[6][5];
     static const float c[6][2] = { { -1, -1 }, { 1, -1 }, { 1, 1 }, { -1, -1 }, { 1, 1 }, { -1, 1 } };
     for (int k = 0; k < 6; k++) {
-        float lp[3] = { c[k][0] * gz[1], OPTIC_Y + c[k][1] * gz[2], gz[0] };
+        float lp[3] = { c[k][0] * gz[1], rail_y + gz[3] + c[k][1] * gz[2], gz[0] };
         for (int i = 0; i < 3; i++)
             q[k][i] = model[i] * lp[0] + model[4 + i] * lp[1] + model[8 + i] * lp[2] + model[12 + i];
         q[k][3] = 0; q[k][4] = 0;
@@ -399,8 +405,8 @@ void xo_draw(const XoFrame *f, const float viewproj[16], const float eye_pos[3],
 
     float model[16];
     int sight = f->sight;
-    if (f->gun_valid && sight != cur_sight) {
-        build_gun(sight);
+    if (f->gun_valid && (sight != cur_sight || f->gun_model != cur_model)) {
+        build_gun(sight, f->gun_model);
         gl.BindBuffer(GL_ARRAY_BUFFER, vbo_gun);
         gl.BufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(gun_verts * 9 * sizeof(float)), mesh, GL_DYNAMIC_DRAW);
     }

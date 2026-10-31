@@ -5,6 +5,7 @@
 #define XR_OVERLAY_H
 
 enum { XO_SIGHT_NONE, XO_SIGHT_RED_DOT, XO_SIGHT_HOLO };
+enum { XO_GUN_SMG, XO_GUN_TP9 };
 
 /* One headset frame's worth, in metres in the LOCAL space. */
 typedef struct {
@@ -16,6 +17,7 @@ typedef struct {
     int   beam, dot, flash;     /* what to draw */
     int   sight;                /* XO_SIGHT_*: the optic on the rail */
     int   show_gun;             /* 0: the controller shows only the laser */
+    int   gun_model;            /* XO_GUN_* */
 } XoFrame;
 
 int  xo_init(void);

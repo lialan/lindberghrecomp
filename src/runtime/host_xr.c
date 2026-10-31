@@ -733,6 +733,7 @@ static void input_frame(XrTime t)
     }
     xo.sight = cfg.show_gun ? cfg.sight : XO_SIGHT_NONE;
     xo.show_gun = cfg.show_gun;
+    xo.gun_model = game_profile()->vr.gun_model;
     if (menu.open && menu.dirty) menu_paint();
 
     /* firing: a kick, a flash and a pulse ten times a second while held on
