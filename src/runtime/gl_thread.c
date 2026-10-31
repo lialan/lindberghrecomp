@@ -88,9 +88,10 @@ enum {
     C_DIRECT,       /* glXSwapBuffers: here, on the game thread (host_swap queues its GL) */
     C_RAW,          /* the rest of GLX: on the worker, waited for, past stereo.c's hook */
 };
-typedef struct { uint8_t kind, a, b, c; } Cls;
+/* ok: classified; sh: a call the game thread keeps a shadow of (viewport,
+ * scissor) or may answer from it (glGetIntegerv), so the rest skip that check */
+typedef struct { uint8_t kind, a, b, c, ok, sh; } Cls;
 static Cls g_cls[HLE_ID_MAX];
-static uint8_t g_cls_ok[HLE_ID_MAX];
 
 /* the client arrays as the game set them: on, and whether in client memory */
 enum { S_VERTEX, S_NORMAL, S_COLOR, S_SECONDARY, S_FOG, S_TEX0, S_ATTR0 = S_TEX0 + 8, S_N = S_ATTR0 + 16 };
@@ -165,13 +166,18 @@ static const struct { const char *name; uint8_t kind, a, b, c; } T[] = {
 
 static const Cls *cls(HleId id)
 {
-    if (g_cls_ok[id]) return &g_cls[id];
+    if (g_cls[id].ok) return &g_cls[id];
     const char *n = hle_name(id);
-    Cls k = { C_SYNC, 0, 0, 0 };
+    Cls k = { C_SYNC, 0, 0, 0, 1, 0 };
     for (unsigned i = 0; i < sizeof T / sizeof T[0]; i++)
         if (!strcmp(n, T[i].name)) { k.kind = T[i].kind; k.a = T[i].a; k.b = T[i].b; k.c = T[i].c; break; }
     if (!strncmp(n, "glX", 3)) k.kind = strcmp(n, "glXSwapBuffers") ? C_RAW : C_DIRECT;
-    g_cls[id] = k; g_cls_ok[id] = 1;
+    {   /* LINDBERGH_GLQ_NOSHADOW=1: every read waits, as before */
+        const char *v = getenv("LINDBERGH_GLQ_NOSHADOW");
+        k.sh = !(v && *v == '1') && (!strcmp(n, "glViewport") || !strcmp(n, "glScissor") ||
+                                     !strcmp(n, "glPopAttrib") || !strcmp(n, "glGetIntegerv"));
+    }
+    g_cls[id] = k;
     return &g_cls[id];
 }
 
@@ -400,9 +406,7 @@ static void shadow_ids(void)
 /* 1: the call was a read answered here */
 static int shadow_state(CPU *c, HleId id)
 {
-    static int off = -1;        /* LINDBERGH_GLQ_NOSHADOW=1: every read waits, as before */
-    if (off < 0) { const char *v = getenv("LINDBERGH_GLQ_NOSHADOW"); off = v && *v == '1'; }
-    if (!id || off) return 0;
+    if (!id) return 0;
     if (id == g_id_viewport) { for (int i = 0; i < 4; i++) g_vp_shadow[i] = (int32_t)A32(i); g_vp_known = 1; return 0; }
     if (id == g_id_scissor)  { for (int i = 0; i < 4; i++) g_sc_shadow[i] = (int32_t)A32(i); g_sc_known = 1; return 0; }
     if (id == g_id_popattrib) { g_vp_known = g_sc_known = 0; return 0; }
@@ -521,7 +525,7 @@ static void glq_hook(CPU *c, HleId id, HleHandler fn)
 {
     const Cls *k = cls(id);
     uint32_t a0 = A32(0);
-    if (shadow_state(c, id)) return;
+    if (__builtin_expect(k->sh, 0) && shadow_state(c, id)) return;
     int async = 1;
     uint32_t extra = 0;                /* bytes of arrays after the arguments */
     switch (k->kind) {

@@ -221,6 +221,19 @@ static void range_trace(uint32_t va)
     if (ncur < 32) { int i = ncur++; while (i > 0 && cur[i - 1] > va) { cur[i] = cur[i - 1]; i--; } cur[i] = va; }
 }
 
+/* A cache entry's low word: an index into the lifted table (+1), an override
+ * (+1, DC_OVR set), or an import reached through a pointer (its id +1, DC_PLT
+ * set) - the last went through the override scan and two binary searches on
+ * every call before it was cached. */
+#define DC_OVR 0x80000000u
+#define DC_PLT 0x40000000u
+static inline void dcache_run(CPU *c, uint32_t k)
+{
+    if (k & DC_OVR) { (void)pop32(c); guest_override_at((int)(k & ~DC_OVR) - 1)(c); }
+    else if (k & DC_PLT) { (void)pop32(c); hle_call(c, (HleId)((k & ~DC_PLT) - 1)); }
+    else g_table[k - 1].fn(c);
+}
+
 static void dispatch_slow(CPU *c, uint32_t va);
 static int g_dispatch_fast;     /* the debug options are read and none is on */
 
@@ -234,13 +247,10 @@ void dispatch(CPU *c, uint32_t va)
      * same way. */
     if (__builtin_expect(g_dispatch_fast, 1) && (va < stereo_state_lo || va > stereo_state_hi)) {
         uint64_t e = __atomic_load_n(&g_dcache[(va >> 2) & (DCACHE_N - 1)], __ATOMIC_RELAXED);
-        if ((uint32_t)(e >> 32) == va && (uint32_t)e) {
-            uint32_t k = (uint32_t)e;
-            /* a host body standing in for the function (an override) too */
-            if (k & 0x80000000u) { (void)pop32(c); guest_override_at((int)(k & 0x7fffffffu) - 1)(c); }
-            else g_table[k - 1].fn(c);
-            return;
-        }
+        if ((uint32_t)(e >> 32) == va && (uint32_t)e) { dcache_run(c, (uint32_t)e); return; }
+        /* a GL entry point glXGetProcAddressARB handed out: the game calls
+         * these through pointers every frame (shader uniforms, buffers) */
+        if (va >= 0xF0000000u && gl_token_call_entry(c, va)) return;
     }
     dispatch_slow(c, va);
 }
@@ -289,9 +299,7 @@ static void dispatch_slow(CPU *c, uint32_t va)
     uint64_t *sl = &g_dcache[(va >> 2) & (DCACHE_N - 1)];
     uint64_t e = __atomic_load_n(sl, __ATOMIC_RELAXED);
     if ((uint32_t)(e >> 32) == va && (uint32_t)e) {
-        uint32_t k = (uint32_t)e;
-        if (k & 0x80000000u) { (void)pop32(c); guest_override_at((int)(k & 0x7fffffffu) - 1)(c); }
-        else g_table[k - 1].fn(c);
+        dcache_run(c, (uint32_t)e);
         g_depth--;
         if (watched) fprintf(stderr, "[watch] %#010x -> %#x\n", va, c->eax);
         return;
@@ -301,7 +309,7 @@ static void dispatch_slow(CPU *c, uint32_t va)
      * over the lifted version; the range test costs two compares. */
     int oi = guest_find_override_index(va);
     HleHandler ov = oi >= 0 ? guest_override_at(oi) : NULL;
-    if (ov) __atomic_store_n(sl, (uint64_t)va << 32 | 0x80000000u | (uint32_t)(oi + 1), __ATOMIC_RELAXED);
+    if (ov) __atomic_store_n(sl, (uint64_t)va << 32 | DC_OVR | (uint32_t)(oi + 1), __ATOMIC_RELAXED);
     if (ov) { (void)pop32(c); ov(c); g_depth--;
               if (watched) fprintf(stderr, "[watch] %#010x -> %#x\n", va, c->eax);
               return; }
@@ -321,6 +329,7 @@ static void dispatch_slow(CPU *c, uint32_t va)
      * wrong reads every argument shifted by four bytes. */
     HleId id;
     if (find_plt(va, &id)) {
+        __atomic_store_n(sl, (uint64_t)va << 32 | DC_PLT | (uint32_t)(id + 1), __ATOMIC_RELAXED);
         (void)pop32(c);
         hle_call(c, id);
         g_depth--;
