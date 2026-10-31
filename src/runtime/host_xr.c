@@ -903,11 +903,13 @@ static void input_frame(XrTime t)
      * trigger to player 1 (The House of the Dead 4 does), so pulling it before
      * Start made player 1 fire. A pull presses player 2's Start too, at most
      * every three seconds - Start does nothing to a player already in. */
-    {   static XrTime joined_at;
-        if (dual && trig[off] && !prev[off][0] && !menu.open && (!joined_at || t - joined_at > 3000000000LL))
-            joined_at = t;
-        if (dual && joined_at && t - joined_at < 300000000) start2 = 1;   /* held a moment: the credit first */
-    }
+    static XrTime joined_at;
+    int join_coin = 0;
+    if (dual && trig[off] && !prev[off][0] && !menu.open && (!joined_at || t - joined_at > 3000000000LL)) {
+        joined_at = t;
+        join_coin = cfg.auto_coins;     /* the credit now, Start after it: a Start the game sees */
+    }                                   /* before the credit is refused, and held it is not pressed again */
+    int join_start = dual && joined_at && t - joined_at >= 150000000 && t - joined_at < 450000000;
     /* the stand-in gun presses Start for a moment every ten seconds too (its
      * second one, five seconds later) */
     if (fake_gun() && fmod((double)t / 1e9, 10.0) < 0.2) start = 1;
@@ -924,6 +926,8 @@ static void input_frame(XrTime t)
         if (start && !prev[HAND_L][7]) coin++;
         if (start2 && !prev[HAND_R][7]) coin++;
     }
+    coin += join_coin;
+    if (join_start) held |= CAB_P2_START;
     prev[HAND_L][7] = start; prev[HAND_R][7] = start2;
     stereo_set_gun((int)gx, (int)gy);
     stereo_set_gun2((int)g2x, (int)g2y);

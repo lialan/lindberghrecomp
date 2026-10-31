@@ -170,6 +170,14 @@ static unsigned g_auto;       /* buttons driven by LINDBERGH_AUTOSTART/AUTOGUN *
 static int      g_scripted;   /* the gun is scripted: real input is ignored */
 static int      g_gun2_on, g_gun2_px = -100000, g_gun2_py = -100000;   /* the second gun (host_vr_input2, LINDBERGH_P2_TEST) */
 
+int host_gun2_state(int *x, int *y)
+{
+    if (x) *x = g_gun2_px;
+    if (y) *y = g_gun2_py;
+    return g_gun2_on;
+}
+
+
 static int g_capture = -1;    /* binding the next key or click, for this action */
 static int g_calib;           /* aim calibration step, 0 = off */
 static double g_calib_sx, g_calib_sy;     /* where the sight was clicked, step 1 */
@@ -422,8 +430,9 @@ static void cabinet_p2_test(void)
     unsigned p2 = CAB_P2_TRIGGER | CAB_P2_RELOAD | CAB_P2_START;
     g_auto &= ~p2;
     static unsigned coined;
-    if (g_frame % 480u == 0 && coined != g_frame) { coined = g_frame; g_cab.coins[0]++; fprintf(stderr, "[cab] p2 test: coin at frame %u\n", g_frame); }
-    if (on == 1 && g_frame % 480u >= 30u && g_frame % 480u < 50u) g_auto |= CAB_P2_START;   /* =2: never joins */
+    unsigned coin_at = on == 3 ? 30u : 0u;   /* =3: the coin in the frame Start goes down */
+    if (g_frame % 480u == coin_at && coined != g_frame) { coined = g_frame; g_cab.coins[0]++; fprintf(stderr, "[cab] p2 test: coin at frame %u\n", g_frame); }
+    if (on != 2 && g_frame % 480u >= 30u && g_frame % 480u < 50u) g_auto |= CAB_P2_START;   /* =2: never joins */
     if (g_frame % 360u < 60u) {
         g_gun2_px = g_gun2_py = -100000;
         if (g_frame % 360u >= 20u && g_frame % 360u < 30u) g_auto |= CAB_P2_RELOAD;

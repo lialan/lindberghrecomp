@@ -291,6 +291,8 @@ void       host_cabinet_switches_read(void);
 void       host_audio_toggle_mute(void);
 int        host_input_pop(HostInput *out);
 void       host_mouse_state(int *x, int *y, int *buttons);
+/* The second gun's pointer, as host_mouse_state the first's; 0 when there is none. */
+int        host_gun2_state(int *x, int *y);
 
 /* The host window and its GL context, shared by the GLX and GLUT seams. */
 void       host_window_hint(int w, int h);
