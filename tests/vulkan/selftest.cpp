@@ -2,6 +2,7 @@
 #include "frame_ring.hpp"
 #include "renderer.hpp"
 #include "guest_state.hpp"
+#include "guest_arrays.hpp"
 #include "uniforms.hpp"
 #include "resources.hpp"
 #include <array>
@@ -244,13 +245,29 @@ static void render_stereo(Device &device)
     ProgramSource separate = legacy;
     separate.bindings = {{0, 16, VK_VERTEX_INPUT_RATE_VERTEX}, {1, 4, VK_VERTEX_INPUT_RATE_VERTEX}};
     separate.attributes = {{0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0}, {3, 1, VK_FORMAT_R8G8B8A8_UNORM, 0}};
-    Renderer textured(device, target, cache, separate);
-    textured.prepare(state);
+    std::unique_ptr<Renderer> textured, constant_color;
     const float positions[][4] = {{-1, -1, 0, 1}, {1, -1, 0, 1}, {1, 1, 0, 1}, {-1, 1, 0, 1}};
-    const uint32_t colors[] = {0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff};
+    const uint32_t colors[] = {0xff808080, 0xff808080, 0xff808080, 0xff808080};
     const uint16_t elements[] = {0, 1, 2, 0, 2, 3};
     GeometryBuffer positions_gpu(device, sizeof positions), colors_gpu(device, sizeof colors), indices_gpu(device, sizeof elements);
-    Upload streams[] = {{positions_gpu.handle(), 0}, {colors_gpu.handle(), 0}};
+    GuestArrays arrays;
+    arrays.inputs({0, 3});
+    arrays.bind_array_buffer(7);
+    arrays.pointer(0, 4, 0x1406, false, 0, 0);
+    arrays.enable(0, true);
+    arrays.bind_array_buffer(8);
+    arrays.pointer(3, 4, 0x1401, true, 0, 0);
+    arrays.enable(3, true);
+    arrays.current(3, {128.0f / 255, 128.0f / 255, 128.0f / 255, 1});
+    arrays.bind_array_buffer(9); // cannot change the buffer captured by pointer()
+    const GuestMemoryView memory{colors, sizeof colors, 0xfffffff0};
+    require(memory.read(0xfffffff0, 16) == colors, "high guest client address was truncated");
+    rejected([&] { memory.read(0xfffffffc, 8); }, "client array crossed the 32-bit address limit");
+    const BufferLookup buffers = [&](uint32_t name) -> GuestBufferView {
+        if (name == 7) return {positions_gpu.handle(), sizeof positions};
+        if (name == 8) return {colors_gpu.handle(), sizeof colors};
+        throw std::runtime_error("vertex pointer did not capture its array-buffer binding");
+    };
     IndexStream elements_gpu{indices_gpu.handle(), 0, VK_INDEX_TYPE_UINT16};
     SamplerInfo mip_info;
     mip_info.min_lod = mip_info.max_lod = 1;
@@ -268,14 +285,42 @@ static void render_stereo(Device &device)
             texture.upload(cmd, ring, 0, 0, texels, sizeof texels);
             texture.upload(cmd, ring, 1, 0, mip, sizeof mip);
         }
-        textured.begin(cmd, {0, 0, 0, 1});
+        if (!frame) {
+            const auto &offset_plan = arrays.prepare(device, ring, 1, 3, memory, buffers);
+            require(offset_plan.streams[0].offset == 16 && offset_plan.streams[1].offset == 4,
+                    "guest DrawArrays first vertex offset changed");
+        }
+        arrays.enable(3, frame % 3 != 2);
+        if (frame % 3 == 1) {
+            arrays.bind_array_buffer(0);
+            arrays.pointer(3, 4, 0x1401, true, 0, 0xfffffff0);
+            rejected([&] { arrays.prepare(device, ring, 1, 4, memory, buffers); },
+                     "client array overflow across the 32-bit window accepted");
+        } else {
+            arrays.bind_array_buffer(8);
+            arrays.pointer(3, 4, 0x1401, true, 0, 0);
+        }
+        const auto &plan = arrays.prepare(device, ring, 0, 4, memory, buffers);
+        require(plan.streams[0].buffer == positions_gpu.handle() && plan.streams[0].offset == 0,
+                "guest static geometry was copied instead of bound directly");
+        if (!frame) {
+            separate.bindings = plan.bindings; separate.attributes = plan.attributes;
+            textured = std::make_unique<Renderer>(device, target, cache, separate);
+            textured->prepare(state);
+            separate.bindings[1].stride = 0;
+            separate.attributes[1].format = VK_FORMAT_R32G32B32A32_SFLOAT;
+            constant_color = std::make_unique<Renderer>(device, target, cache, separate);
+            constant_color->prepare(state);
+        }
+        auto &draw = frame % 3 == 2 ? *constant_color : *textured;
+        draw.begin(cmd, {0, 0, 0, 1});
         offset = uniforms.upload(0, tint, sizeof tint);
         descriptors = uniforms.current_set();
-        textured.bind_descriptors(1, 1, &descriptors, 1, &offset);
+        draw.bind_descriptors(1, 1, &descriptors, 1, &offset);
         sampled = (frame & 1) ? mip_material.handle() : material.handle();
-        textured.bind_descriptors(2, 1, &sampled);
-        textured.draw_buffers(streams, 2, 6, matrices, state, &elements_gpu);
-        textured.end();
+        draw.bind_descriptors(2, 1, &sampled);
+        draw.draw_buffers(plan.streams.data(), static_cast<uint32_t>(plan.streams.size()), 6, matrices, state, &elements_gpu);
+        draw.end();
         copy.bufferOffset = frame * image_bytes;
         vkCmdCopyImageToBuffer(cmd, target.color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, history.buffer, 1, &copy);
         barrier.offset = copy.bufferOffset;
@@ -290,16 +335,20 @@ static void render_stereo(Device &device)
             const auto base = bytes + eye * image_bytes / 2;
             auto sample = [&](unsigned x, unsigned y, const uint8_t *expected) {
                 const auto p = base + (y * 32 + x) * 4;
-                require(std::memcmp(p, (frame & 1) ? mip : expected, 4) == 0,
-                        "texture orientation/mip or GPU vertex/index buffer raster output changed");
+                const auto source = (frame & 1) ? mip : expected;
+                const uint8_t modulated[] = {uint8_t(source[0] ? 128 : 0), uint8_t(source[1] ? 128 : 0),
+                                             uint8_t(source[2] ? 128 : 0), 255};
+                require(std::memcmp(p, modulated, 4) == 0,
+                        "texture orientation/mip, normalized colors or GPU vertex/index buffer raster output changed");
             };
             sample(8, 8, texels + 8); sample(24, 8, texels + 12);
             sample(8, 24, texels); sample(24, 24, texels + 4);
         }
     }
-    require(textured.draw_count() == frames && textured.pipeline_count() == 1,
+    require(textured->draw_count() + constant_color->draw_count() == frames &&
+            textured->pipeline_count() == 1 && constant_color->pipeline_count() == 1,
             "static textured stereo geometry was replayed or recompiled");
-    std::puts("ok: direct textured multiview draws reuse GPU geometry, normalized colors, uint16 indices and mip descriptors");
+    std::puts("ok: guest VBO/client/current arrays render directly with textures, uint16 indices and mip descriptors");
 }
 
 int main()
