@@ -597,6 +597,15 @@ extern "C" int lvk_host_init(SDL_Window *window, int w, int h) {
     state.activity=std::make_unique<ActivityRef>();
     state.activity->shader_defaults();
     xr_settings_load(&state.settings);
+    {
+      // Same vr.cfg lookup (and LINDBERGH_XR_SET override) as the GL host.
+      std::error_code ignored;
+      const char *source=std::filesystem::exists("vr.cfg",ignored)?"vr.cfg":std::filesystem::exists("../vr.cfg",ignored)?"../vr.cfg":"defaults";
+      const auto &c=state.settings;
+      std::fprintf(stderr,"[vulkan-xr] settings from %s%s (cwd %s): %.2f game units/m, HUD screen %.1f m, hud pitch %d, aim %.0f m, %dx%d @ %d Hz\n",
+        source,std::getenv("LINDBERGH_XR_SET")?" + LINDBERGH_XR_SET":"",std::filesystem::current_path(ignored).string().c_str(),
+        c.scale,c.screen,c.hud_pitch,c.aim,c.width,c.resolution,c.refresh);
+    }
     const auto *profile=game_profile();
     bool hud_lock=profile->vr.hud_head_locked;
     if(const auto *v=std::getenv("LINDBERGH_XR_HUD_LOCK"))hud_lock=*v=='1';
@@ -2414,10 +2423,14 @@ bool stereo_packet(DrawPacket &packet,GLint first,GLsizei count,const std::vecto
   const int kind=composite?LG_STEREO_PASS:lg_stereo_classify_draw(&facts);
   const bool raw_perspective=lg_stereo_is_perspective(p.data());
   const bool movie=texture!=state.texture_objects.end()&&texture->second.movie;
-  // Movie/HUD layers hide their black backing with depth. Keep HUD Z/W,
-  // while the specialized vertex wrapper restores full-eye clip XY.
+  // Movie/HUD layers hide their black backing with depth, so they take the
+  // HUD transform (Z/W and XY): the 4:3 picture sits on the virtual screen at
+  // the same size as the HUD drawn over it. Stretching it across the whole eye
+  // magnified it about twice. LINDBERGH_VULKAN_FULL_EYE_MOVIE=1 restores that
+  // full-eye XY (vertex specialization 5) for comparison.
   const bool full_hud=kind==LG_STEREO_FILL&&raw_perspective&&(!state.world_draws||movie);
-  packet.raster.full_hud=full_hud;
+  static const bool full_eye=[]{const auto *v=std::getenv("LINDBERGH_VULKAN_FULL_EYE_MOVIE");return v&&*v=='1';}();
+  packet.raster.full_hud=full_hud&&full_eye;
   packet.matrices=state.stereo->transforms(p,full_hud?LG_STEREO_HUD:kind);
   state.stereo->observe(p,kind);
   if(kind==LG_STEREO_WORLD && facts.perspective)++state.world_draws;

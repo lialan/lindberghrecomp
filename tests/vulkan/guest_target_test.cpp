@@ -1,3 +1,4 @@
+#include <array>
 // Drive the real guest ABI without a game ELF, SDL surface, or OpenXR runtime.
 // Only cabinet/profile/settings producers are replaced by inert test inputs.
 #define SDL_MAIN_HANDLED
@@ -54,11 +55,15 @@ static void layered_pixels(const std::string &path) {
     require(in&&magic=="P6"&&w==64&&h==64&&maximum==255,"missing full-screen HUD readback");
     std::vector<unsigned char> rgb(size_t(w)*h*3);in.read(reinterpret_cast<char *>(rgb.data()),rgb.size());
     require(bool(in),"truncated full-screen HUD readback");
-    for(unsigned i:{2u*64+2,2u*64+61,61u*64+2,61u*64+61,32u*64+32}) {
-        const unsigned white=i==32u*64+32?255:0;
-        require(rgb[3*i]==white&&rgb[3*i+1]==255&&rgb[3*i+2]==white,
-                "full-screen movie lost eye coverage, layer depth or foreground text");
-    }
+    // The movie sits on the virtual screen like the HUD, not stretched over
+    // the eye: eye corners stay clear, the screen shows the movie in front of
+    // its later black backing, and the finite text stays in front of both.
+    auto pixel=[&](unsigned x,unsigned y){const auto *p=&rgb[3*(y*64+x)];return std::array<unsigned,3>{p[0],p[1],p[2]};};
+    for(auto [x,y]:{std::pair{2u,2u},{61u,2u},{2u,61u},{61u,61u}})
+        require(pixel(x,y)==std::array<unsigned,3>{0,0,0},"full-screen movie was stretched past its screen");
+    for(auto [x,y]:{std::pair{32u,24u},{24u,32u},{40u,32u},{32u,40u}})
+        require(pixel(x,y)==std::array<unsigned,3>{0,255,0},"full-screen movie lost its screen or layer depth");
+    require(pixel(32,32)==std::array<unsigned,3>{255,255,255},"foreground HUD text fell behind the movie");
 }
 static void triangle(unsigned size) {
     glViewport(0,0,size,size);glClearColor(0,0,0,1);glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
@@ -139,7 +144,7 @@ int main() {
         glMatrixMode(GL_PROJECTION);glLoadIdentity();
         const auto unfinished=lvk_create_drawable(32,32);lvk_bind_drawable(unfinished);
         triangle(32);lvk_destroy_drawable(unfinished);lvk_bind_drawable(0);
-        std::puts("ok: real guest ABI pbuffer lifetime, perspective HUD bounds, full-screen layered movie/text depth, stereo readback and unfinished shutdown");
+        std::puts("ok: real guest ABI pbuffer lifetime, perspective HUD bounds, on-screen layered movie/text depth, stereo readback and unfinished shutdown");
         return 0; // production atexit drain runs before fixture cleanup
     } catch(const std::exception &error) {std::cerr<<error.what()<<'\n';return 1;}
 }
