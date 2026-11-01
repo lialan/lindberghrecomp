@@ -2,6 +2,7 @@
 // Guest GL ABI -> shared Vulkan state. No host GL entry is resolved or called.
 #include "../renderer/vulkan/guest_arrays.hpp"
 #include "../renderer/vulkan/guest_state.hpp"
+#include "../renderer/vulkan/stereo_scene.hpp"
 #include "../renderer/vulkan/shader_pack.hpp"
 #include "../renderer/vulkan/window.hpp"
 #include "../renderer/vulkan/resources.hpp"
@@ -17,6 +18,7 @@
 extern "C" {
 #include "game_profile.h"
 #include "display_cadence.h"
+#include "xr_settings.h"
 }
 #include <algorithm>
 #include <cstdio>
@@ -67,7 +69,8 @@ struct BufferVersion {
   uint64_t revision = 0, use_frame = 0;
 };
 struct TextureObject {
-  uint32_t layers = 1;
+  uint32_t layers = 1,render_width=0,render_height=0;
+  bool picture_view=false,movie=false,gpu_target=false;
   uint64_t revision = 1;
   bool dynamic = false;
   ImageVersion stable;
@@ -199,6 +202,21 @@ struct ActivityRef {
 struct State {
   std::unique_ptr<Device> device;
   std::unique_ptr<Window> window;
+  std::unique_ptr<StereoScene> stereo;
+  LgXrSettings settings=LG_XR_SETTINGS_DEFAULT;
+  std::array<StereoPose,2> fake_eyes;
+  std::unordered_map<unsigned,std::array<int,2>> drawable_sizes;
+  unsigned world_draws=0,hud_sequence=0;
+  unsigned hud_target=~0u,hud_target_next=~0u;
+  bool picture_size(int w,int h) const {
+    const auto *p=game_profile();
+    return (w==game_width&&h==game_height) || (p->vr.world_w>0&&w==p->vr.world_w&&h==p->vr.world_h);
+  }
+  std::array<int,2> logical_size() const {return drawable?drawable_sizes.at(drawable):std::array<int,2>{game_width,game_height};}
+  void scene_end() {
+    if(stereo)stereo->finish_frame();
+    world_draws=hud_sequence=0;hud_target=hud_target_next;hud_target_next=~0u;
+  }
 #ifdef LINDBERGH_VULKAN_XR
   std::unique_ptr<ActivityRef> activity;
   std::unique_ptr<OpenXR> xr;
@@ -222,7 +240,7 @@ struct State {
   Target *active_target = nullptr;
   int game_width = 640, game_height = 480;
   GuestState matrices;
-  GuestArrays arrays;
+  GuestArrays arrays,legacy_bounds_arrays;
   VkCommandBuffer cmd = VK_NULL_HANDLE;
   std::optional<Submission> last_submission;
   Target *screen = nullptr;
@@ -269,7 +287,7 @@ struct State {
     buffers.clear();
     samplers.clear();
     fallback.reset();
-    drawables.clear();
+    drawables.clear();drawable_sizes.clear();stereo.reset();
     initialized.clear();
     window.reset();
 #ifdef LINDBERGH_VULKAN_XR
@@ -295,6 +313,16 @@ struct State {
         screen = xr->begin_frame();
         host_display_timing(xr->display_time(),xr->display_period());
         xr_rendering = screen != nullptr;
+        if(screen) {
+          std::array<StereoPose,2> eyes;
+          for(unsigned i=0;i<2;++i) {
+            const auto &v=xr->views()[i];
+            eyes[i].orientation={v.pose.orientation.x,v.pose.orientation.y,v.pose.orientation.z,v.pose.orientation.w};
+            eyes[i].position={v.pose.position.x,v.pose.position.y,v.pose.position.z};
+            eyes[i].tangents={-std::tan(v.fov.angleLeft),std::tan(v.fov.angleRight),-std::tan(v.fov.angleDown),std::tan(v.fov.angleUp)};
+          }
+          stereo->publish(eyes);
+        } else stereo->invalidate();
         if (screen) {
           static bool first=true;
           if (first) {first=false;std::fprintf(stderr,"[vulkan-xr] first game target %ux%u, %u layers; foveation %s; session %d\n",screen->info.width,screen->info.height,screen->info.layers,xr->foveation_active()?"active":"disabled",int(xr->session_state()));}
@@ -307,6 +335,7 @@ struct State {
         }
 #else
         screen = &window->acquire(*ring);
+        if(stereo)stereo->publish(fake_eyes);
 #endif
       }
       if (materials[ring->recording_slot()].size()>2048) materials[ring->recording_slot()].clear();
@@ -395,7 +424,9 @@ extern "C" int lvk_host_can_thread(void) { return state.ready; }
 extern "C" int lvk_host_thread_enter(void) {
 #ifdef LINDBERGH_VULKAN_XR
   // SDL attaches this pthread once and detaches it through its TLS destructor.
-  return SDL_AndroidGetJNIEnv() != nullptr;
+  if(!SDL_AndroidGetJNIEnv())return 0;
+  if(state.xr)state.xr->renderer_thread();
+  return 1;
 #else
   return 1;
 #endif
@@ -407,7 +438,16 @@ extern "C" int lvk_host_init(SDL_Window *window, int w, int h) {
 #ifdef LINDBERGH_VULKAN_XR
     state.activity=std::make_unique<ActivityRef>();
     state.activity->shader_defaults();
-    state.xr=std::make_unique<OpenXR>(true,state.activity->platform(),true);
+    xr_settings_load(&state.settings);
+    const auto *profile=game_profile();
+    bool hud_lock=profile->vr.hud_head_locked;
+    if(const auto *v=std::getenv("LINDBERGH_XR_HUD_LOCK"))hud_lock=*v=='1';
+    StereoSettings stereo{state.settings.scale,state.settings.screen,profile->vr.hud_lens,float(state.settings.hud_pitch),8,hud_lock};
+    if(const auto *v=std::getenv("LINDBERGH_STEREO_2D_LENS"))stereo.hud_lens=std::atof(v);
+    state.stereo=std::make_unique<StereoScene>(stereo);
+    OpenXRConfig config{true,true,true,true,uint32_t(state.settings.width),uint32_t(state.settings.resolution),float(state.settings.refresh)};
+    if(const auto *v=std::getenv("LINDBERGH_CPU_BOOST"))config.cpu_boost=*v=='1';
+    state.xr=std::make_unique<OpenXR>(config,state.activity->platform());
     state.device=Device::create(state.xr->device_options());
 #else
     state.device = Device::create(desktop_options(window));
@@ -422,6 +462,19 @@ extern "C" int lvk_host_init(SDL_Window *window, int w, int h) {
     state.xr->attach(*state.device);
 #else
     state.window = std::make_unique<Window>(*state.device, window, 3);
+    if(const auto *yaw=std::getenv("LINDBERGH_VULKAN_FAKE_YAW")) {
+      const auto *profile=game_profile();
+      StereoSettings settings;settings.scale=profile->vr.scale>0?profile->vr.scale:1;settings.hud_lens=profile->vr.hud_lens;settings.head_locked=profile->vr.hud_head_locked;
+      state.stereo=std::make_unique<StereoScene>(settings);
+      const float angle=std::atof(yaw)*.017453292519943295f;
+      const std::array<float,4> q{0,std::sin(angle/2),0,std::cos(angle/2)};
+      for(unsigned eye=0;eye<2;++eye) {
+        state.fake_eyes[eye].orientation=q;
+        const float offset[]={eye?.032f:-.032f,0,0};
+        lg_stereo_rotate(q.data(),offset,state.fake_eyes[eye].position.data());
+      }
+      std::fprintf(stderr,"[vulkan] simulated eye poses at yaw %.1f degrees; no headset/display proof\n",std::atof(yaw));
+    }
 #endif
     const char *cache = std::getenv("LINDBERGH_VULKAN_CACHE");
     std::string cache_path;
@@ -512,7 +565,18 @@ extern "C" void lvk_host_present(void) {
 #ifdef LINDBERGH_VULKAN_XR
   if (!state.xr_rendering) capture_path.clear(); // never report a scratch frame as XR output
 #endif
-  if(!capture_path.empty()) capture=std::make_unique<FrameCapture>(*state.device,state.cmd,*state.screen);
+  Target *capture_target=state.screen;
+  if(!capture_path.empty()) {
+    if(const auto *v=std::getenv("LINDBERGH_VULKAN_SHOT_DRAWABLE")) {
+      const auto id=unsigned(std::strtoul(v,nullptr,10));
+      if(id) {
+        capture_target=state.drawables.at(id).get();
+        if(!state.initialized.count(capture_target))gap("capture drawable has not been initialized");
+        std::fprintf(stderr,"[vulkan] diagnostic capture of guest drawable %u; not final display output\n",id);
+      }
+    }
+    capture=std::make_unique<FrameCapture>(*state.device,state.cmd,*capture_target);
+  }
 #ifdef LINDBERGH_VULKAN_XR
   auto submitted=state.ring->submit();
   state.xr->end_frame(state.xr_rendering);
@@ -521,9 +585,10 @@ extern "C" void lvk_host_present(void) {
   auto submitted=state.window->present(*state.ring);
 #endif
   state.last_submission=submitted;
-  if(capture) {state.ring->wait(submitted);capture->write(capture_path.c_str(),*state.screen);}
+  if(capture) {state.ring->wait(submitted);capture->write(capture_path.c_str(),*capture_target);}
   state.cmd=VK_NULL_HANDLE;
   state.screen=nullptr;
+  state.scene_end();
 }
 extern "C" void lvk_glFlush(void) {
   if (!state.cmd) return;
@@ -543,13 +608,15 @@ extern "C" unsigned lvk_create_drawable(int w, int h) {
   if (w <= 0 || h <= 0)
     gap("invalid guest drawable dimensions");
   const auto id = state.next_drawable++;
-  TargetInfo info{uint32_t(w), uint32_t(h),
+  TargetInfo info{uint32_t(w),uint32_t(h),state.stereo?2u:1u};
 #ifdef LINDBERGH_VULKAN_XR
-                  2
-#else
-                  1
+  const auto *profile=game_profile();
+  const LgStereoTargetSize sizes={state.game_width,state.game_height,profile->vr.world_w,profile->vr.world_h,int(state.xr->width()),int(state.xr->height())};
+  float sx,sy;lg_stereo_target_scale(&sizes,w,h,0,&sx,&sy);
+  info.width=uint32_t(std::lround(w*sx));info.height=uint32_t(std::lround(h*sy));
+  std::fprintf(stderr,"[vulkan-xr] pbuffer %u: %dx%d -> %ux%u, %u layers\n",id,w,h,info.width,info.height,info.layers);
 #endif
-  };
+  state.drawable_sizes[id]={w,h};
   info.guest_bottom_origin=true;
   state.drawables[id] = std::make_unique<Target>(*state.device, info);
   return id;
@@ -815,8 +882,10 @@ extern "C" void lvk_glGenBuffers(GLsizei n, GLuint *out) {
 }
 extern "C" void lvk_glBindBuffer(GLenum target, GLuint name) {
   state.binding(target) = name;
-  if (target == GL_ARRAY_BUFFER)
+  if (target == GL_ARRAY_BUFFER) {
     state.arrays.bind_array_buffer(name);
+    state.legacy_bounds_arrays.bind_array_buffer(name);
+  }
 }
 extern "C" void lvk_glBufferData(GLenum target, GLsizeiptr n,
                                  const GLvoid *data, GLenum usage) {
@@ -1191,6 +1260,7 @@ extern "C" void lvk_glTexImage2D(GLenum target, GLint level, GLint internal,
     gap("guest texture format/dimensions need conversion support");
   }
   auto &object=texture(target); ++object.revision; object.dynamic=object.dynamic || bool(object.stable.image);
+  if(level==0) {object.gpu_target=false;object.layers=1;object.render_width=object.render_height=0;object.picture_view=false;}
   auto &v = object.levels[level];
   v = {internal, w, h, format, type, {}, false};
   const auto row = size_t(w) * pixel_bytes;
@@ -1230,6 +1300,7 @@ extern "C" void lvk_glTexSubImage2D(GLenum target, GLint level, GLint x, GLint y
                                     GLsizei w, GLsizei h, GLenum format, GLenum type,
                                     const GLvoid *pointer) {
   auto &object = texture(target);
+  if(format==GL_LUMINANCE && int64_t(w)*h>=256*256)object.movie=true;
   const auto it = object.levels.find(level);
   if (it == object.levels.end()) gap("guest texture subimage has no allocated level");
   auto &v = it->second;
@@ -1325,6 +1396,7 @@ extern "C" void lvk_glVertexPointer(GLint size, GLenum type, GLsizei stride,
   if (stride < 0)
     gap("negative guest vertex stride");
   state.arrays.pointer(0, size, type, false, stride, guest_pointer(pointer));
+  state.legacy_bounds_arrays.pointer(0,size,type,false,stride,guest_pointer(pointer));
 }
 extern "C" void lvk_glNormalPointer(GLenum type, GLsizei stride,
                                     const GLvoid *pointer) {
@@ -1366,6 +1438,7 @@ extern "C" void lvk_glDisableVertexAttribArray(GLuint index) {
   state.arrays.enable(index, false);
 }
 extern "C" void lvk_glEnableClientState(GLenum cap) {
+  if(cap==GL_VERTEX_ARRAY)state.legacy_bounds_arrays.enable(0,true);
   unsigned index;
   if (cap == GL_VERTEX_ARRAY)
     index = 0;
@@ -1385,6 +1458,7 @@ extern "C" void lvk_glEnableClientState(GLenum cap) {
   state.enabled[cap] = true;
 }
 extern "C" void lvk_glDisableClientState(GLenum cap) {
+  if(cap==GL_VERTEX_ARRAY)state.legacy_bounds_arrays.enable(0,false);
   unsigned index;
   if (cap == GL_VERTEX_ARRAY)
     index = 0;
@@ -1619,7 +1693,7 @@ VkFormat texture_format(const TextureLevel &v) {
     default:gap("native texture format not implemented");
   }
 }
-std::shared_ptr<Texture> native_image(TextureObject &o, int overwritten_level = -1) {
+std::shared_ptr<Texture> native_image(TextureObject &o, int overwritten_level = -1, bool gpu_copy = false) {
   state.frame();state.end_pass();
   if(o.levels.empty() || !o.levels.count(0)) {
     if(!state.fallback) {
@@ -1629,24 +1703,31 @@ std::shared_ptr<Texture> native_image(TextureObject &o, int overwritten_level = 
     return state.fallback;
   }
   const auto &base=o.levels.at(0);
-  TextureInfo info{uint32_t(base.width),uint32_t(base.height),uint32_t(o.levels.rbegin()->first+1),o.layers,texture_format(base)};
+  TextureInfo info{o.render_width?o.render_width:uint32_t(base.width),o.render_height?o.render_height:uint32_t(base.height),uint32_t(o.levels.rbegin()->first+1),o.layers,texture_format(base)};
   if(base.format==GL_BGRA && base.type==GL_UNSIGNED_SHORT_4_4_4_4_REV)
     info.components={VK_COMPONENT_SWIZZLE_G,VK_COMPONENT_SWIZZLE_B,VK_COMPONENT_SWIZZLE_A,VK_COMPONENT_SWIZZLE_R};
   if(base.format==GL_LUMINANCE)info.components={VK_COMPONENT_SWIZZLE_R,VK_COMPONENT_SWIZZLE_R,VK_COMPONENT_SWIZZLE_R,VK_COMPONENT_SWIZZLE_ONE};
   if(base.format==GL_LUMINANCE_ALPHA)info.components={VK_COMPONENT_SWIZZLE_R,VK_COMPONENT_SWIZZLE_R,VK_COMPONENT_SWIZZLE_R,VK_COMPONENT_SWIZZLE_G};
   if(base.format==GL_ALPHA)info.components={VK_COMPONENT_SWIZZLE_ZERO,VK_COMPONENT_SWIZZLE_ZERO,VK_COMPONENT_SWIZZLE_ZERO,VK_COMPONENT_SWIZZLE_R};
-  auto &version=o.dynamic?o.slots[state.ring->recording_slot()]:o.stable;
+  // A framebuffer copy drains preceding packets first. Its persistent image
+  // can be updated in queue order after prior shader reads, including reads
+  // from older in-flight frames. CPU uploads retain snapshot/version storage.
+  auto &version=o.dynamic && !o.gpu_target?o.slots[state.ring->recording_slot()]:o.stable;
   const auto frame=state.ring->submissions()+1;
   if(version.revision!=o.revision) {
-    if(!version.image || version.use_frame==frame || version.image->info.width!=info.width || version.image->info.height!=info.height ||
+    const bool allocate=!version.image || (version.use_frame==frame && !gpu_copy) || version.image->info.width!=info.width || version.image->info.height!=info.height ||
         version.image->info.levels!=info.levels || version.image->info.layers!=info.layers || version.image->info.format!=info.format ||
-        std::memcmp(&version.image->info.components,&info.components,sizeof info.components))
-      version.image=std::make_shared<Texture>(*state.device,info);
+        std::memcmp(&version.image->info.components,&info.components,sizeof info.components);
+    if(allocate)version.image=std::make_shared<Texture>(*state.device,info);
     for(const auto &[level,v]:o.levels) {
+      if(gpu_copy && !allocate)continue; // preserve the last GPU contents for partial copies
+
       if(texture_format(v)!=info.format)gap("mip texture formats disagree");
       // A full GPU color/depth copy initializes this level directly. Never
       // stage the obsolete CPU backing pixels before overwriting them.
       if (level == overwritten_level) continue;
+      if(info.width!=uint32_t(base.width) || info.height!=uint32_t(base.height))
+        gap("scaled partial/mip texture initialization needs a preserving GPU resample");
       const void *data=v.bytes.data();size_t bytes=v.bytes.size();std::vector<uint8_t> expanded;
       if(v.format==GL_RGB&&v.type==GL_UNSIGNED_BYTE&&!v.compressed) {
         expanded.resize(size_t(v.width)*v.height*4);
@@ -1707,8 +1788,8 @@ std::shared_ptr<Sampler> native_sampler(TextureObject &o,uint32_t levels,bool sh
 }
 DrawPacket packet_for(Target *target,Renderer *renderer) {
   DrawPacket p{};p.target=target;p.renderer=renderer;p.color=state.clear;
-  const float sx=target==state.screen?float(target->info.width)/state.game_width:1;
-  const float sy=target==state.screen?float(target->info.height)/state.game_height:1;
+  const auto logical=state.logical_size();
+  const float sx=float(target->info.width)/logical[0],sy=float(target->info.height)/logical[1];
   p.viewport={state.viewport[0]*sx,state.viewport[1]*sy,state.viewport[2]*sx,state.viewport[3]*sy};
   auto rect=state.enabled[GL_SCISSOR_TEST]?state.scissor:std::array<GLint,4>{0,0,int(target->info.width/sx),int(target->info.height/sy)};
   int x0=std::clamp(int(std::floor(rect[0]*sx)),0,int(target->info.width));
@@ -1755,10 +1836,17 @@ extern "C" void lvk_glCopyTexSubImage2D(GLenum target,GLint level,GLint dx,GLint
   auto *source=state.target();state.flush();
   if(!state.initialized.count(source)) {state.renderer();state.end_pass();}
   const auto &v=o.levels.at(level);
+  const auto logical=state.logical_size();
   const bool full_level=dx==0 && dy==0 && w==v.width && h==v.height;
-  o.layers=source->info.layers;
-  changed(o);auto gpu=native_image(o,full_level?level:-1);
-  gpu->copy_from(state.cmd,*source,uint32_t(level),dx,dy,x,y,uint32_t(w),uint32_t(h),0,0,o.layers);
+  o.layers=source->info.layers;o.gpu_target=true;
+  const double sx=double(source->info.width)/logical[0],sy=double(source->info.height)/logical[1];
+  const auto &base=o.levels.at(0);
+  o.render_width=uint32_t(std::lround(base.width*sx));o.render_height=uint32_t(std::lround(base.height*sy));
+  if(full_level)o.picture_view=true; // copied images play the role of legacy rectangle/view textures
+  changed(o);auto gpu=native_image(o,full_level?level:-1,true);
+  const auto px=int32_t(std::lround(x*sx)),py=int32_t(std::lround(y*sy));
+  const auto pw=uint32_t(std::lround((x+w)*sx)-px),ph=uint32_t(std::lround((y+h)*sy)-py);
+  gpu->copy_from(state.cmd,*source,uint32_t(level),int32_t(std::lround(dx*sx)),int32_t(std::lround(dy*sy)),px,py,pw,ph,0,0,o.layers);
 }
 
 namespace {
@@ -1918,9 +2006,108 @@ std::shared_ptr<Material> material(Program &p) {
   if(!entry) {entry=std::make_shared<Material>();entry->descriptors=std::make_shared<SampledSet>(*state.device,bindings);entry->images=std::move(images);entry->samplers=std::move(samplers);}
   state.ring->keep_alive(entry);return entry;
 }
+bool stereo_bounds(const Matrix &p,GLint first,GLsizei count,const std::vector<uint32_t> &elements,
+                   const void *immediate,uint32_t stride,bool guest_indexed,std::array<float,4> &box)
+{
+  if(count<=0 || count>64 || (!immediate&&guest_indexed&&state.element_buffer))return false;
+  box={1e9f,1e9f,-1e9f,-1e9f};
+  for(uint32_t i=0;i<uint32_t(count);++i) {
+    const auto index=uint32_t(first)+(elements.empty()?i:elements.at(i));
+    std::array<float,4> v;
+    if(immediate)std::memcpy(v.data(),static_cast<const uint8_t *>(immediate)+size_t(index)*stride,16);
+    else if(!state.legacy_bounds_arrays.position(index,{g_guest_base,uint64_t(1)<<32},[](uint32_t id){
+      const auto &b=state.buffers.at(id);return GuestMemoryView{b.bytes.data(),b.bytes.size()};},v))return false;
+    float x=p[0]*v[0]+p[4]*v[1]+p[12],y=p[1]*v[0]+p[5]*v[1]+p[13];
+    if(immediate) { // legacy glBegin fill tracking also includes clip W/Z
+      const float w=p[3]*v[0]+p[7]*v[1]+p[11]*v[2]+p[15];
+      if(w<=1e-6f)return false;
+      x=(x+p[8]*v[2])/w;y=(y+p[9]*v[2])/w;
+    }
+    box[0]=std::min(box[0],x);box[1]=std::min(box[1],y);box[2]=std::max(box[2],x);box[3]=std::max(box[3],y);
+  }
+  return true;
+}
+// A full-frame copied picture already contains each eye projection. Its
+// fullscreen composition keeps guest clip space, including its depth, instead
+// of projecting that rasterized image a second time as world geometry.
+bool picture_composite(GLint first,GLsizei count,const std::vector<uint32_t> &elements,
+                       const void *immediate,uint32_t stride)
+{
+  if(count<3 || count>6)return false;
+  const auto m=state.matrices.modelview_projection();
+  std::array<float,4> box{1e9f,1e9f,-1e9f,-1e9f};
+  for(uint32_t i=0;i<uint32_t(count);++i) {
+    const auto index=uint32_t(first)+(elements.empty()?i:elements.at(i));
+    std::array<float,4> v;
+    if(immediate)std::memcpy(v.data(),static_cast<const uint8_t *>(immediate)+size_t(index)*stride,16);
+    else if(!state.arrays.position(index,{g_guest_base,uint64_t(1)<<32},[](uint32_t id){
+      const auto &b=state.buffers.at(id);return GuestMemoryView{b.bytes.data(),b.bytes.size()};},v))return false;
+    const float w=m[3]*v[0]+m[7]*v[1]+m[11]*v[2]+m[15]*v[3];
+    if(!std::isfinite(w)||w<=1e-6f)return false;
+    const float x=(m[0]*v[0]+m[4]*v[1]+m[8]*v[2]+m[12]*v[3])/w;
+    const float y=(m[1]*v[0]+m[5]*v[1]+m[9]*v[2]+m[13]*v[3])/w;
+    if(!std::isfinite(x)||!std::isfinite(y))return false;
+    box[0]=std::min(box[0],x);box[1]=std::min(box[1],y);box[2]=std::max(box[2],x);box[3]=std::max(box[3],y);
+  }
+  return box[0]<=-.98f&&box[1]<=-.98f&&box[2]>=.98f&&box[3]>=.98f;
+}
+void stereo_packet(DrawPacket &packet,GLint first,GLsizei count,const std::vector<uint32_t> &elements,
+                   const void *immediate,uint32_t stride,bool guest_indexed)
+{
+  if(!state.stereo) {
+    for(auto &m:packet.matrices.view_projection)for(unsigned i=0;i<4;++i)m[i*5]=1;
+    return;
+  }
+  const auto &p=state.matrices.matrix(GL_PROJECTION);
+  LgStereoDrawFacts facts{};facts.perspective=state.stereo->world_camera(p);
+  const auto size=state.logical_size();
+  facts.offscreen=state.drawable && !state.picture_size(size[0],size[1]);
+  facts.hud_target=state.drawable==state.hud_target;facts.multiview=1;
+  facts.zoom=state.stereo->zoomed(p);
+  const auto texture=state.texture_objects.find(state.textures[0]);
+  if(texture!=state.texture_objects.end())facts.texture_view=texture->second.picture_view;
+  const auto *profile=game_profile();
+  facts.picture_target=profile->vr.world_w>0 && size[0]==profile->vr.world_w && size[1]==profile->vr.world_h;
+  facts.covers_viewport=1;
+  if(!facts.perspective) {
+    std::array<float,4> box;
+    if(stereo_bounds(p,first,count,elements,immediate,stride,guest_indexed,box)) {
+      facts.covers_viewport=box[0]<=-.95f&&box[1]<=-.95f&&box[2]>=.95f&&box[3]>=.95f;
+      facts.fills_screen=box[0]<=-.98f&&box[1]<=-.98f&&box[2]>=.98f&&box[3]>=.98f;
+    }
+  }
+  bool composite=false;
+  if(facts.texture_view && texture->second.gpu_target && !facts.offscreen) {
+    const auto &base=texture->second.levels.at(0);
+    composite=state.picture_size(base.width,base.height)&&picture_composite(first,count,elements,immediate,stride);
+  }
+  const int kind=composite?LG_STEREO_PASS:lg_stereo_classify_draw(&facts);
+  packet.matrices=state.stereo->transforms(p,kind);
+  state.stereo->observe(p,kind);
+  if(kind==LG_STEREO_WORLD && facts.perspective)++state.world_draws;
+  if(kind==LG_STEREO_HUD) {
+    const bool raw_perspective=lg_stereo_is_perspective(p.data());
+    if(!raw_perspective)state.hud_target_next=state.drawable;
+    const bool movie=texture!=state.texture_objects.end()&&texture->second.movie;
+    if(!raw_perspective || (state.world_draws && !movie))packet.raster.depth_write=false;
+    if(!facts.perspective && raw_perspective && (!state.world_draws || movie)) {
+      packet.raster.depth_bias=true;packet.depth_bias_factor=0;packet.depth_bias_units=-4.f*++state.hud_sequence;
+    }
+  }
+  static const auto log_range=[] {std::array<unsigned,2> r{};if(const auto *v=std::getenv("LINDBERGH_VULKAN_CLASSIFY")){r[0]=r[1]=unsigned(std::strtoul(v,nullptr,10));if(const auto *end=std::strchr(v,'-'))r[1]=unsigned(std::strtoul(end+1,nullptr,10));}return r;}();
+  if(log_range[1] && g_frame>=log_range[0] && g_frame<=log_range[1] && (state.world_draws==1 || facts.texture_view)) {
+    std::fprintf(stderr,"[vulkan-camera] P");for(float v:p)std::fprintf(stderr," %.6g",v);
+    std::fprintf(stderr," reprojection");for(float v:packet.matrices.view_projection[0])std::fprintf(stderr," %.6g",v);std::fputc(10,stderr);
+    std::fprintf(stderr,"[vulkan-camera] modelview");for(float v:state.matrices.matrix(GL_MODELVIEW))std::fprintf(stderr," %.6g",v);
+    std::fprintf(stderr,"; depth test %d write %d func %d\n",packet.raster.depth_test,packet.raster.depth_write,int(packet.raster.depth_compare));
+  }
+  if(log_range[1] && g_frame>=log_range[0] && g_frame<=log_range[1])
+    std::fprintf(stderr,"[vulkan-class] frame %u target %u %dx%d class %d lens %.4f %.4f texture-view %d offscreen %d; cache builds %zu; program %u texture %u gpu-target %d world draws %u\n",g_frame,state.drawable,size[0],size[1],kind,p[0],p[5],facts.texture_view,facts.offscreen,state.stereo->transform_builds(),state.program,state.textures[0],texture!=state.texture_objects.end()&&texture->second.gpu_target,state.world_draws);
+}
 void draw_geometry(GLenum mode,GLint first,GLsizei count,const void *indices,GLenum index_type,bool indexed,
                    const void *immediate=nullptr,uint32_t immediate_stride=0) {
   if(count<=0)return;if(first<0)gap("negative guest first vertex");
+  const bool guest_indexed=indexed;
   auto *target=state.target();auto &p=current_program();native_program(p);legacy_uniforms(p,*target);
   const bool fixed=!state.program;
   if(fixed)for(size_t block=0;block<p.record->uniforms.size();++block) {
@@ -1973,7 +2160,7 @@ void draw_geometry(GLenum mode,GLint first,GLsizei count,const void *indices,GLe
     renderer=std::make_unique<Renderer>(*state.device,*target,*state.cache,source);
   }
   auto packet=packet_for(target,renderer.get());packet.raster=raster;packet.streams=std::move(plan.streams);packet.count=uint32_t(count);
-  for(auto &matrix:packet.matrices.view_projection)for(unsigned i=0;i<4;++i)matrix[i*5]=1;
+  stereo_packet(packet,first,count,elements,immediate,immediate_stride,guest_indexed);
   if(indexed) {auto upload=state.ring->upload(elements.data(),size_t(count)*4,4);packet.index={upload.buffer,upload.offset,VK_INDEX_TYPE_UINT32};}
   for(size_t block=0;block<p.record->uniforms.size();++block) {
     const auto set=p.record->uniforms[block].set;if(set>=2)gap("unexpected uniform descriptor set");
