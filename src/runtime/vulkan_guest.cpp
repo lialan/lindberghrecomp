@@ -9,6 +9,9 @@
 #include "vulkan_abi.h"
 #include "vulkan_host.h"
 #include <SDL.h>
+extern "C" {
+#include "game_profile.h"
+}
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -294,9 +297,15 @@ extern "C" int lvk_host_init(SDL_Window *window, int w, int h) {
     const char *cache = std::getenv("LINDBERGH_VULKAN_CACHE");
     std::string cache_path;
     if (cache) cache_path=cache; // an explicitly empty override disables persistence
-    else if (auto *directory=SDL_GetPrefPath("lindberghrecomp",SDL_GetWindowTitle(window))) {
-      cache_path=std::string(directory)+"vulkan-pipelines.bin";
-      SDL_free(directory);
+    else {
+      // GLX games can create a generic-titled SDL window before naming it.
+      // The applied game profile is the stable per-title cache namespace.
+      const auto *profile=game_profile();
+      const char *title=profile->title && *profile->title ? profile->title : SDL_GetWindowTitle(window);
+      if (auto *directory=SDL_GetPrefPath("lindberghrecomp",title)) {
+        cache_path=std::string(directory)+"vulkan-pipelines.bin";
+        SDL_free(directory);
+      }
     }
     state.cache=std::make_unique<PipelineCache>(*state.device,cache_path);
     if (!cache_path.empty()) std::fprintf(stderr,"[vulkan] pipeline cache %s: %s\n",
