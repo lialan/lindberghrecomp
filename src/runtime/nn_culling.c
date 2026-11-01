@@ -20,7 +20,7 @@ static void side_planes(CPU *cpu)
 }
 float nn_culling_default_widen(void)
 {
-#ifdef LINDBERGH_OPENXR
+#if defined(LINDBERGH_OPENXR) || defined(LINDBERGH_VULKAN_OFFSCREEN)
     return 4;
 #else
     const char *stereo=getenv("LINDBERGH_STEREO"),*fake=getenv("LINDBERGH_VULKAN_FAKE_YAW");

@@ -6,7 +6,7 @@ namespace lindbergh::vk {
 SettingsPanel::SettingsPanel(int width,int height,const char *title,bool fake):width_(width),height_(height),fake_(fake),
     title_(std::string(title?title:"Lindbergh")+" - settings"),panel_pixels_(XM_W*XM_H*4),label_pixels_(XM_LABEL_W*XM_LABEL_H*4) {}
 unsigned SettingsPanel::update(LgXrSettings &cfg,StereoScene &scene,ControllerInput &input,ControllerSample sample,
-                              int64_t time,bool focused,const std::vector<float> &rates)
+                              int64_t time,bool focused,const std::vector<float> &rates,int64_t readout_time)
 {
     draws_={};guns_={};haptics_={};unsigned effects=0;
     focused=focused&&scene.tracking_valid();
@@ -62,8 +62,9 @@ unsigned SettingsPanel::update(LgXrSettings &cfg,StereoScene &scene,ControllerIn
             panel_.dirty=0;panel_dirty_=true;}
     }
     if(cfg.show_fps) {
-        if(!fps_since_)fps_since_=time;else ++fps_frames_;
-        if(time-fps_since_>=500000000){const int fps=int(double(fps_frames_)*1e9/double(time-fps_since_)+.5);fps_since_=time;fps_frames_=0;
+        const int64_t now=readout_time?readout_time:time;
+        if(!fps_since_)fps_since_=now;else ++fps_frames_;
+        if(now-fps_since_>=500000000){const int fps=int(double(fps_frames_)*1e9/double(now-fps_since_)+.5);fps_since_=now;fps_frames_=0;
             if(fps!=fps_){char text[32];std::snprintf(text,sizeof text,"%d FPS",fps);xm_paint_label(label_pixels_.data(),text);label_dirty_=true;fps_=fps;}}
         if(fps_>=0){XpPanel label{};label.hw=.07f;label.hh=label.hw*XM_LABEL_H/XM_LABEL_W;
             const float x[]={1,0,0},y[]={0,1,0},z[]={0,0,1},at[]={-.3f,-.26f,-1};float offset[3];const auto &q=scene.head_orientation();

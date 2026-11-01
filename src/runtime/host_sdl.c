@@ -719,6 +719,9 @@ int host_window_open(const char *title)
         if (title && *title) SDL_SetWindowTitle(g_win.win, title);
         return 1;
     }
+#ifdef LINDBERGH_VULKAN_OFFSCREEN
+    SDL_SetMainReady();SDL_setenv("SDL_VIDEODRIVER","dummy",1);SDL_setenv("SDL_AUDIODRIVER","dummy",1);
+#endif
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0) {
         fprintf(stderr, "[window] SDL_Init: %s\n", SDL_GetError());
         return 0;
@@ -775,7 +778,9 @@ int host_window_open(const char *title)
     g_win.win = SDL_CreateWindow(title && *title ? title : "lindberghrecomp",
                                  SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                  dw, dh,
-#if defined(LINDBERGH_VULKAN_XR)
+#if defined(LINDBERGH_VULKAN_OFFSCREEN)
+                                 0 |
+#elif defined(LINDBERGH_VULKAN_XR)
                                  SDL_WINDOW_FULLSCREEN |
 #elif defined(LINDBERGH_VULKAN)
                                  SDL_WINDOW_VULKAN |
@@ -810,7 +815,9 @@ int host_window_open(const char *title)
             );
     // Register exit output before worker shutdown, so LIFO teardown drains
     // all renderer records before writing the capture. No per-frame file I/O.
-#if defined(LINDBERGH_VULKAN_XR)
+#if defined(LINDBERGH_VULKAN_OFFSCREEN)
+    frame_timing_init("vulkan-offscreen-diagnostic");
+#elif defined(LINDBERGH_VULKAN_XR)
     frame_timing_init("vulkan-openxr");
 #elif defined(LINDBERGH_VULKAN)
     frame_timing_init("vulkan");

@@ -9,7 +9,7 @@ class SettingsPanel {
 public:
     SettingsPanel(int width,int height,const char *title,bool fake=false);
     unsigned update(LgXrSettings &settings,StereoScene &scene,ControllerInput &input,
-                    ControllerSample sample,int64_t time,bool focused,const std::vector<float> &rates);
+                    ControllerSample sample,int64_t time,bool focused,const std::vector<float> &rates,int64_t readout_time=0);
     void upload(Overlay &overlay,VkCommandBuffer cmd);
     const std::array<PanelDraw,2> &draws() const {return draws_;}
     const std::array<XoFrame,2> &guns() const {return guns_;}

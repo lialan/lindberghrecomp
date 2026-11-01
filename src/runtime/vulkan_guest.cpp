@@ -211,7 +211,13 @@ struct ActivityRef {
 #endif
 struct State {
   std::unique_ptr<Device> device;
+#ifndef LINDBERGH_VULKAN_OFFSCREEN
   std::unique_ptr<Window> window;
+#endif
+#ifdef LINDBERGH_VULKAN_OFFSCREEN
+  std::unique_ptr<Target> offscreen;
+  std::unique_ptr<ConstantDensityMap> offscreen_density;
+#endif
   std::unique_ptr<StereoScene> stereo;
   std::unique_ptr<Overlay> overlay;
   std::unique_ptr<SettingsPanel> panel;
@@ -307,7 +313,12 @@ struct State {
     fallback.reset();
     drawables.clear();drawable_sizes.clear();stereo.reset();controllers.reset();game_input={};
     initialized.clear();
+#ifndef LINDBERGH_VULKAN_OFFSCREEN
     window.reset();
+#endif
+#ifdef LINDBERGH_VULKAN_OFFSCREEN
+    offscreen.reset();offscreen_density.reset();
+#endif
 #ifdef LINDBERGH_VULKAN_XR
     unfocused.reset();unfocused_density.reset();
     xr.reset();
@@ -371,7 +382,11 @@ struct State {
           screen=unfocused.get();
         }
 #else
+#ifdef LINDBERGH_VULKAN_OFFSCREEN
+        screen=offscreen.get();
+#else
         screen = &window->acquire(*ring);
+#endif
         if(stereo) {stereo->publish(fake_eyes);if(fake_guns)fake_controllers();}
 #endif
       }
@@ -480,7 +495,13 @@ void State::panel_input(ControllerSample sample,int64_t time,bool focused)
 #else
   const auto &rates=no_rates;
 #endif
-  const unsigned effects=panel->update(settings,*stereo,*controllers,sample,time,focused,rates);
+  // Fake input uses a deterministic simulation clock. Its FPS readout must
+  // measure elapsed host time rather than reporting that clock's fixed 60 Hz.
+  int64_t readout_time=0;
+#ifndef LINDBERGH_VULKAN_XR
+  if(settings.show_fps)readout_time=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+#endif
+  const unsigned effects=panel->update(settings,*stereo,*controllers,sample,time,focused,rates,readout_time);
   if(effects&XP_SAVE)xr_settings_save(&settings);
 #ifdef LINDBERGH_VULKAN_XR
   if(effects&XP_RATE_CHANGED)xr->request_refresh(float(settings.refresh));
@@ -554,7 +575,12 @@ extern "C" int lvk_host_init(SDL_Window *window, int w, int h) {
     state.xr=std::make_unique<OpenXR>(config,state.activity->platform());
     state.device=Device::create(state.xr->device_options());
 #else
+#ifdef LINDBERGH_VULKAN_OFFSCREEN
+    DeviceOptions options;options.require_foveation=std::getenv("LINDBERGH_VULKAN_OFFSCREEN_DENSITY")!=nullptr;
+    state.device=Device::create(options);
+#else
     state.device = Device::create(desktop_options(window));
+#endif
 #endif
     // The loader/layer C++ globals are initialized during device creation.
     // Retire our resources before their atexit destructors, not afterward
@@ -565,11 +591,18 @@ extern "C" int lvk_host_init(SDL_Window *window, int w, int h) {
     host_display_timing_reset();
     state.xr->attach(*state.device);
 #else
+#ifndef LINDBERGH_VULKAN_OFFSCREEN
     state.window = std::make_unique<Window>(*state.device, window, 3);
+#else
+    if(!std::getenv("LINDBERGH_VULKAN_FAKE_YAW"))SDL_setenv("LINDBERGH_VULKAN_FAKE_YAW","0",1);
+#endif
     if(const auto *yaw=std::getenv("LINDBERGH_VULKAN_FAKE_YAW")) {
       const auto *profile=game_profile();
       StereoSettings settings;settings.scale=profile->vr.scale>0?profile->vr.scale:1;settings.hud_lens=profile->vr.hud_lens;settings.head_locked=profile->vr.hud_head_locked;
       if(const auto *v=std::getenv("LINDBERGH_VULKAN_FAKE_GUN"))state.fake_guns=std::atoi(v);
+#ifdef LINDBERGH_VULKAN_OFFSCREEN
+      if(!state.fake_guns)state.fake_guns=1;
+#endif
       if(state.fake_guns) {
         xr_settings_load(&state.settings);state.settings.dual=state.fake_guns>1;
         settings.scale=state.settings.scale;settings.screen=state.settings.screen;settings.hud_pitch=float(state.settings.hud_pitch);
@@ -607,6 +640,26 @@ extern "C" int lvk_host_init(SDL_Window *window, int w, int h) {
     const auto density=state.xr->density_extent();
     state.unfocused_density=std::make_unique<ConstantDensityMap>(*state.device,*state.ring,density[0],density[1],2);
 #endif
+#ifdef LINDBERGH_VULKAN_OFFSCREEN
+    TargetInfo offscreen{uint32_t(state.settings.width),uint32_t(state.settings.resolution),2};
+    if(!offscreen.width)offscreen.width=offscreen.height; // no runtime recommendation in this diagnostic
+    if(const auto *value=std::getenv("LINDBERGH_VULKAN_OFFSCREEN_DENSITY")) {
+      const float density=std::strtof(value,nullptr);
+      if(!std::isfinite(density)||density<=0||density>1)throw std::runtime_error("Invalid diagnostic density");
+      if(!state.device->capabilities.density_map_non_subsampled)throw std::runtime_error("Offscreen density needs non-subsampled FDM");
+      VkPhysicalDeviceFragmentDensityMapPropertiesEXT density_properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_PROPERTIES_EXT};
+      VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};properties.pNext=&density_properties;
+      vkGetPhysicalDeviceProperties2(state.device->handles.physical,&properties);
+      const auto extent=density_properties.maxFragmentDensityTexelSize;
+      if(!extent.width||!extent.height)throw std::runtime_error("Invalid density-map texel extent");
+      state.offscreen_density=std::make_unique<ConstantDensityMap>(*state.device,*state.ring,
+          (offscreen.width+extent.width-1)/extent.width,(offscreen.height+extent.height-1)/extent.height,2,density);
+      offscreen.density_map=state.offscreen_density->view();
+    }
+    state.offscreen=std::make_unique<Target>(*state.device,offscreen);
+    std::fprintf(stderr,"[vulkan-offscreen] diagnostic %ux%u x2; constant density map %s; no OpenXR/compositor/display proof\n",
+      offscreen.width,offscreen.height,offscreen.density_map?"enabled":"disabled");
+#endif
     if(state.controllers) {
       const auto *fake=std::getenv("LINDBERGH_VULKAN_FAKE_MENU");
       state.panel=std::make_unique<SettingsPanel>(state.settings.width,state.settings.resolution,game_profile()->title,fake&&*fake=='1');
@@ -614,7 +667,11 @@ extern "C" int lvk_host_init(SDL_Window *window, int w, int h) {
 #ifdef LINDBERGH_VULKAN_XR
       for(const auto &target:state.xr->render_targets())state.overlay->prepare(*target);
 #else
+#ifdef LINDBERGH_VULKAN_OFFSCREEN
+      state.overlay->prepare(*state.offscreen);
+#else
       for(const auto &target:state.window->render_targets())state.overlay->prepare(*target);
+#endif
 #endif
     }
     state.game_width=w; state.game_height=h;
@@ -624,7 +681,9 @@ extern "C" int lvk_host_init(SDL_Window *window, int w, int h) {
     state.raster.depth_write = true;
     state.ready = true;
     std::fprintf(stderr, "[vulkan] guest graphics routed directly to Vulkan; "
-#ifdef LINDBERGH_VULKAN_XR
+#ifdef LINDBERGH_VULKAN_OFFSCREEN
+                         "offscreen diagnostic target ready; no OpenXR session\n");
+#elif defined(LINDBERGH_VULKAN_XR)
                          "foveated OpenXR swapchain ready; world/input integration in progress\n");
 #else
                          "desktop swapchain ready\n");
@@ -639,9 +698,12 @@ extern "C" int lvk_host_init(SDL_Window *window, int w, int h) {
 
 namespace {
 struct FrameCapture {
- Device &device;VkBuffer buffer=VK_NULL_HANDLE;VkDeviceMemory memory=VK_NULL_HANDLE;void *mapped=nullptr;
+ Device &device;VkBuffer buffer=VK_NULL_HANDLE;VkDeviceMemory memory=VK_NULL_HANDLE;void *mapped=nullptr;uint32_t layers=1;
  FrameCapture(Device &d,VkCommandBuffer cmd,Target &target):device(d) {
-  const auto bytes=VkDeviceSize(target.info.width)*target.info.height*4;
+#ifdef LINDBERGH_VULKAN_OFFSCREEN
+  layers=std::min(2u,target.info.layers);
+#endif
+  const auto bytes=VkDeviceSize(target.info.width)*target.info.height*4*layers;
   VkBufferCreateInfo create{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};create.size=bytes;create.usage=VK_BUFFER_USAGE_TRANSFER_DST_BIT;
   check(vkCreateBuffer(d.handles.device,&create,nullptr,&buffer),"capture buffer");
   VkMemoryRequirements req;vkGetBufferMemoryRequirements(d.handles.device,buffer,&req);
@@ -651,9 +713,9 @@ struct FrameCapture {
   check(vkMapMemory(d.handles.device,memory,0,bytes,0,&mapped),"map capture");
   VkImageMemoryBarrier image{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};image.srcAccessMask=VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;image.dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT;
   image.oldLayout=target.info.final_layout;image.newLayout=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-  image.srcQueueFamilyIndex=image.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;image.image=target.color;image.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
+  image.srcQueueFamilyIndex=image.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;image.image=target.color;image.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,layers};
   vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,0,nullptr,1,&image);
-  VkBufferImageCopy copy{};copy.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};copy.imageExtent={target.info.width,target.info.height,1};
+  VkBufferImageCopy copy{};copy.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,layers};copy.imageExtent={target.info.width,target.info.height,1};
   vkCmdCopyImageToBuffer(cmd,target.color,image.newLayout,buffer,1,&copy);
   image.oldLayout=image.newLayout;image.newLayout=target.info.final_layout;image.srcAccessMask=VK_ACCESS_TRANSFER_READ_BIT;image.dstAccessMask=0;
   vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,0,0,nullptr,0,nullptr,1,&image);
@@ -662,10 +724,16 @@ struct FrameCapture {
   vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&ready,0,nullptr);
  }
  void write(const char *path,const Target &target) {
-  std::ofstream out(path,std::ios::binary);out<<"P6\n"<<target.info.width<<' '<<target.info.height<<"\n255\n";
-  const auto p=static_cast<const uint8_t *>(mapped);const bool bgra=target.info.color_format==VK_FORMAT_B8G8R8A8_UNORM||target.info.color_format==VK_FORMAT_B8G8R8A8_SRGB;
-  for(size_t i=0;i<size_t(target.info.width)*target.info.height;++i) {const char rgb[]={char(p[4*i+(bgra?2:0)]),char(p[4*i+1]),char(p[4*i+(bgra?0:2)])};out.write(rgb,3);}
-  std::fprintf(stderr,"[vulkan] frame capture %s\n",path);
+  for(uint32_t layer=0;layer<layers;++layer) {
+    std::string name=path;if(layer){const auto suffix=name.rfind(".ppm");if(suffix!=std::string::npos&&suffix+4==name.size())name.insert(suffix,".right");else name+=".right.ppm";}
+    std::ofstream out(name,std::ios::binary);out<<"P6\n"<<target.info.width<<' '<<target.info.height<<"\n255\n";
+    const auto p=static_cast<const uint8_t *>(mapped)+size_t(layer)*target.info.width*target.info.height*4;
+    const bool bgra=target.info.color_format==VK_FORMAT_B8G8R8A8_UNORM||target.info.color_format==VK_FORMAT_B8G8R8A8_SRGB;
+    for(size_t i=0;i<size_t(target.info.width)*target.info.height;++i) {const char rgb[]={char(p[4*i+(bgra?2:0)]),char(p[4*i+1]),char(p[4*i+(bgra?0:2)])};out.write(rgb,3);}
+    if(!out)std::fprintf(stderr,"[vulkan] frame capture write failed: %s\n",name.c_str());
+    else if(layers==1)std::fprintf(stderr,"[vulkan] frame capture %s\n",name.c_str());
+    else std::fprintf(stderr,"[vulkan] frame capture eye %u %s\n",layer,name.c_str());
+  }
  }
  ~FrameCapture() {if(mapped)vkUnmapMemory(device.handles.device,memory);if(buffer)vkDestroyBuffer(device.handles.device,buffer,nullptr);if(memory)vkFreeMemory(device.handles.device,memory,nullptr);}
 };
@@ -720,7 +788,11 @@ extern "C" void lvk_host_present(void) {
   state.xr->end_frame(state.xr_rendering);
   if (state.xr->exiting()) {SDL_Event quit{};quit.type=SDL_QUIT;SDL_PushEvent(&quit);}
 #else
+#ifdef LINDBERGH_VULKAN_OFFSCREEN
+  auto submitted=state.ring->submit();
+#else
   auto submitted=state.window->present(*state.ring);
+#endif
 #endif
   state.last_submission=submitted;
   if(capture) {state.ring->wait(submitted);capture->write(capture_path.c_str(),*capture_target);}
@@ -734,7 +806,11 @@ extern "C" void lvk_glFlush(void) {
 #ifdef LINDBERGH_VULKAN_XR
   state.last_submission=state.ring->submit();
 #else
+#ifdef LINDBERGH_VULKAN_OFFSCREEN
+  state.last_submission=state.ring->submit();
+#else
   state.last_submission=state.window->flush(*state.ring);
+#endif
 #endif
   state.cmd=VK_NULL_HANDLE; // next draw continues on the same acquired image
 }
@@ -758,6 +834,17 @@ extern "C" unsigned lvk_create_drawable(int w, int h) {
     if(state.xr->density_maps().empty())gap("World pbuffer requires runtime density maps");
     info.density_map=state.unfocused_density->view();
   }
+#endif
+#ifdef LINDBERGH_VULKAN_OFFSCREEN
+  const auto *profile=game_profile();
+  const LgStereoTargetSize sizes={state.game_width,state.game_height,profile->vr.world_w,profile->vr.world_h,
+      int(state.offscreen->info.width),int(state.offscreen->info.height)};
+  float sx,sy;lg_stereo_target_scale(&sizes,w,h,0,&sx,&sy);
+  info.width=uint32_t(std::lround(w*sx));info.height=uint32_t(std::lround(h*sy));
+  if(state.picture_size(w,h)&&info.width==state.offscreen->info.width&&info.height==state.offscreen->info.height)
+    info.density_map=state.offscreen->info.density_map;
+  std::fprintf(stderr,"[vulkan-offscreen] pbuffer %u %dx%d -> %ux%u x%u, density map %s\n",
+      id,w,h,info.width,info.height,info.layers,info.density_map?"enabled":"disabled");
 #endif
   state.drawable_sizes[id]={w,h};
   info.guest_bottom_origin=true;

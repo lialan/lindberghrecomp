@@ -28,7 +28,7 @@ void game_profile_apply(const LgGameProfile *p)
     g_profile = *p;
     if (p->title) host_window_title(p->title);
     int w = p->width, h = p->height;
-#ifdef LINDBERGH_OPENXR
+#if defined(LINDBERGH_OPENXR) || defined(LINDBERGH_VULKAN_OFFSCREEN)
     if (p->vr.width) { w = p->vr.width; h = p->vr.height; }
 #endif
     if (w > 0 && h > 0) host_window_hint(w, h);
@@ -43,7 +43,7 @@ void game_profile_apply(const LgGameProfile *p)
         const unsigned char *s = p->action_switch[i];
         jvs_action_switch(i, s[2] ? s[0] : i, s[2] ? s[1] : 1, s[2] ? s[2] : 0x80);
     }
-#ifdef LINDBERGH_OPENXR
+#if defined(LINDBERGH_OPENXR) || defined(LINDBERGH_VULKAN_OFFSCREEN)
     if (p->vr.title) env_default("LINDBERGH_XR_TITLE", p->vr.title);
     if (p->vr.gl_thread) env_default("LINDBERGH_GL_THREAD", "1");
     if (p->vr.hud_head_locked) stereo_hud_head_locked(1);

@@ -285,6 +285,12 @@ static void test_settings_panel()
     require(click(XP_CLOSE)&XP_SAVE,"close missing");require(!panel.open(),"close did not hide native panel");
     sample.buttons={};step();require(!panel.draws()[0].visible,"closed panel retained draw");
     panel.update(settings,scene,input,sample,time,false,rates);require(!panel.draws()[0].visible&&!panel.guns()[0].gun_valid,"focus loss left UI visible");
+    SettingsPanel clocked(settings.width,settings.resolution,"Clock");ControllerInput timed_input(controls);
+    settings.show_fps=1;sample={};sample.valid={1,1};
+    for(int i=0;i<45;++i)clocked.update(settings,scene,timed_input,sample,1000000000+int64_t(i)*16666667,true,rates,1000000000+int64_t(i)*8333333);
+    require(!clocked.draws()[1].visible,"FPS label used simulated input time instead of elapsed readout time");
+    for(int i=45;i<80;++i)clocked.update(settings,scene,timed_input,sample,1000000000+int64_t(i)*16666667,true,rates,1000000000+int64_t(i)*8333333);
+    require(clocked.draws()[1].visible,"FPS label ignored its elapsed readout clock");
     std::puts("ok: native menu actions, live camera settings, blocked game input and cabinet actions");
 }
 

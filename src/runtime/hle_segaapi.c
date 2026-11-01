@@ -38,6 +38,11 @@
 #include <SDL.h>
 #include "host_settings.h"
 #define HAVE_MIXER 1
+#if defined(__ANDROID__) && defined(LINDBERGH_VULKAN_OFFSCREEN)
+#include <pthread.h>
+#include <stdatomic.h>
+#include <time.h>
+#endif
 #endif
 
 #define SEGA_OK 0
@@ -178,12 +183,44 @@ static void mix(void *ud, Uint8 *stream, int len)
     }
 }
 
+#if defined(__ANDROID__) && defined(LINDBERGH_VULKAN_OFFSCREEN)
+/* Even SDL's dummy audio driver calls Android_JNI_AudioSetThreadPriority
+ * from SDL_RunAudio. A CLI has no JavaVM. Keep the real mix/voice clock on
+ * an owned pthread with discarded output; this is diagnostic audio only. */
+static pthread_t diagnostic_audio;
+static atomic_int diagnostic_audio_running;
+static void *diagnostic_mix(void *unused)
+{
+    (void)unused;float discarded[1024*2];struct timespec next;
+    clock_gettime(CLOCK_MONOTONIC,&next);
+    while(atomic_load(&diagnostic_audio_running)) {
+        mix(NULL,(Uint8 *)discarded,sizeof discarded);
+        next.tv_nsec+=1000000000LL*1024/OUT_RATE;
+        if(next.tv_nsec>=1000000000){next.tv_nsec-=1000000000;++next.tv_sec;}
+        clock_nanosleep(CLOCK_MONOTONIC,TIMER_ABSTIME,&next,NULL);
+    }
+    return NULL;
+}
+static void close_diagnostic_audio(void)
+{
+    atomic_store(&diagnostic_audio_running,0);pthread_join(diagnostic_audio,NULL);
+}
+#endif
 static void open_output(void)
 {
     static int done;
     if (done) return;
     done = 1;
     g_lock = SDL_CreateMutex();
+#if defined(__ANDROID__) && defined(LINDBERGH_VULKAN_OFFSCREEN)
+    atomic_store(&diagnostic_audio_running,1);
+    if(pthread_create(&diagnostic_audio,NULL,diagnostic_mix,NULL)) {
+        atomic_store(&diagnostic_audio_running,0);fprintf(stderr,"[sega-api] diagnostic mixer thread failed\n");return;
+    }
+    if(atexit(close_diagnostic_audio)){close_diagnostic_audio();return;}
+    fprintf(stderr,"[sega-api] diagnostic mix at %d Hz; discarded output, no JavaVM\n",OUT_RATE);
+    return;
+#endif
     if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) {
         fprintf(stderr, "[sega-api] no audio: %s\n", SDL_GetError());
         return;

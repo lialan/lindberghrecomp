@@ -292,6 +292,11 @@ void guest_install_crash_handler(void)
 #include <ucontext.h>
 #endif
 
+#ifdef __ANDROID__
+#include <unwind.h>
+static _Unwind_Reason_Code unwind_one(struct _Unwind_Context *,void *);
+#endif
+
 /* Which host function faulted: a fault inside a handler is a runtime bug, one
  * inside L_xxxxxxxx is the guest. dladdr names it without a debugger. */
 static void host_report_pc(void *ucv)
@@ -309,10 +314,13 @@ static void host_report_pc(void *ucv)
     uintptr_t at[2] = { pc, lr };
     const char *what[2] = { "host pc", "host lr" };
     for (int i = 0; i < 2; i++) {
-        Dl_info di;
+        Dl_info di = {0};
         if (at[i] && dladdr((void *)at[i], &di) && di.dli_sname)
             fprintf(stderr, "%s %p = %s+%#lx\n", what[i], (void *)at[i], di.dli_sname,
                     (unsigned long)(at[i] - (uintptr_t)di.dli_saddr));
+        else if (at[i] && di.dli_fname)
+            fprintf(stderr, "%s %p = %s+%#lx\n",what[i],(void *)at[i],di.dli_fname,
+                    (unsigned long)(at[i]-(uintptr_t)di.dli_fbase));
         else if (at[i])
             fprintf(stderr, "%s %p\n", what[i], (void *)at[i]);
     }
@@ -320,6 +328,8 @@ static void host_report_pc(void *ucv)
     void *bt[24];
     int n = backtrace(bt, 24);
     backtrace_symbols_fd(bt, n, 2);
+#elif defined(__ANDROID__)
+    int n=0;_Unwind_Backtrace(unwind_one,&n);
 #endif
 }
 
