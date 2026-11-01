@@ -29,7 +29,8 @@
  *   screen 3.0          distance of the HUD's screen, in metres
  *   aim 15              how far along the laser the game's shot meets it, in
  *                       metres (the game fires from the head, the laser from the gun)
- *   resolution 2280     the longer side of each eye's image, in pixels
+ *   resolution 2208     each eye's image height, in pixels (default: the
+ *                       panel's - Quest 3 2064x2208, Steam Frame 2160x2160)
  *   width 2064          each eye's width; 0 keeps the headset's own proportions
  *   refresh 120         display rate to ask for (72, 80, 90, 120); the game
  *                       draws at 60, so 120 shows every frame twice - evenly

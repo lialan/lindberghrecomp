@@ -54,9 +54,10 @@ unsigned xp_choose(XpPanel *p,LgXrSettings *cfg,int *hand,int item,const float *
     case XP_SCREEN:{int k=0;while(k<5&&screens[k]<=cfg->screen+.01f)++k;cfg->screen=screens[k%5];effects|=XP_SCREEN_CHANGED;break;}
     case XP_HUD:{static const int pitches[]={0,-10,-20,-30,10};int k=0;while(k<5&&pitches[k]!=cfg->hud_pitch)++k;cfg->hud_pitch=pitches[(k+1)%5];effects|=XP_HUD_CHANGED;break;}
     case XP_RATE:if(nrates){int k=0;while(k<nrates&&rates[k]<=cfg->refresh+.5f)++k;cfg->refresh=(int)(rates[k%nrates]+.5f);effects|=XP_RATE_CHANGED;}break;
-    case XP_RES:{static const int sizes[][2]={{0,1216},{0,1440},{0,1680},{0,1920},{0,2208},{2064,2280}};int k=0;
-        while(k<6&&(sizes[k][1]<cfg->resolution||(sizes[k][1]==cfg->resolution&&sizes[k][0]<=cfg->width)))++k;
-        cfg->width=sizes[k%6][0];cfg->resolution=sizes[k%6][1];break;}
+    case XP_RES:{/* smaller sizes at the headset's proportions, then its panel */
+        static const int sizes[][2]={{0,1216},{0,1440},{0,1680},{0,1920},{LG_XR_NATIVE_WIDTH,LG_XR_NATIVE_HEIGHT}};int k=0;
+        while(k<5&&(sizes[k][1]<cfg->resolution||(sizes[k][1]==cfg->resolution&&sizes[k][0]<=cfg->width)))++k;
+        cfg->width=sizes[k%5][0];cfg->resolution=sizes[k%5][1];break;}
     case XP_FOVEATION:cfg->foveation=(cfg->foveation+1)%4;effects|=XP_FOVEATION_CHANGED;break;
     case XP_COINS:cfg->auto_coins=!cfg->auto_coins;break;
     case XP_COIN:p->coin=1;break;

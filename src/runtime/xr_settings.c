@@ -39,8 +39,14 @@ void xr_settings_load(LgXrSettings *c)
     if (c->scale <= 0) c->scale = 1;
     if (c->screen <= 0.2f) c->screen = 3;
     if (c->aim < 1.0f || c->aim > 200.0f) c->aim = 15.0f;
-    if (c->resolution < 512 || c->resolution > 4096) c->resolution = 2280;
-    if (c->width < 0 || c->width > 4096) c->width = 0;
+    if (c->resolution < 512 || c->resolution > 4096 || c->width < 0 || c->width > 4096) {
+        c->resolution = LG_XR_NATIVE_HEIGHT; c->width = LG_XR_NATIVE_WIDTH;
+    }
+    /* 2064x2280 was every build's default and is in every vr.cfg the panel
+     * ever saved: it meant "the default", which is now the panel's own */
+    if (c->width == 2064 && c->resolution == 2280) {
+        c->resolution = LG_XR_NATIVE_HEIGHT; c->width = LG_XR_NATIVE_WIDTH;
+    }
 }
 
 void xr_settings_set(LgXrSettings *c,const char *key,const char *val)
