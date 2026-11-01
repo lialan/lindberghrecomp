@@ -91,6 +91,8 @@ struct BufferVersion {
 struct TextureObject {
   uint32_t layers = 1,render_width=0,render_height=0;
   bool picture_view=false,movie=false,gpu_target=false;
+  // Sampling its framebuffer's drawable directly (render_to_texture()).
+  std::shared_ptr<Texture> alias; Target *alias_target=nullptr;
   uint64_t revision = 1;
   bool dynamic = false;
   ImageVersion stable;
@@ -431,6 +433,7 @@ struct State {
   std::array<std::unordered_map<std::string,std::shared_ptr<Material>>,3> materials;
   std::unordered_map<std::string,std::shared_ptr<Sampler>> samplers;
   std::shared_ptr<Texture> fallback, cube_fallback;
+  std::unordered_map<Target *,std::shared_ptr<Texture>> target_views; // a drawable's colour, as a texture
   Target *active_target = nullptr;
   int game_width = 640, game_height = 480;
   GuestState matrices;
@@ -510,7 +513,7 @@ struct State {
     bound_framebuffer=nullptr;framebuffer=0;
     buffers.clear();
     samplers.clear();
-    fallback.reset();cube_fallback.reset();
+    fallback.reset();cube_fallback.reset();target_views.clear();
     drawables.clear();drawable_sizes.clear();deleted_drawables.clear();stereo.reset();controllers.reset();game_input={};
     initialized.clear();
 #ifndef LINDBERGH_VULKAN_OFFSCREEN
@@ -1266,6 +1269,12 @@ extern "C" unsigned lvk_create_drawable(int w, int h) { return create_drawable(w
 namespace {
 // rect: a rectangle texture's target, sampled in pixels, keeps the eyes' scale.
 // depthless: a framebuffer object without depth or stencil attachments.
+// A framebuffer object's colour texture samples its drawable's own image (GL's
+// render-to-texture) instead of a copy. LINDBERGH_VULKAN_RENDER_TO_TEXTURE=0: copies.
+bool render_to_texture() {
+  static const bool on=[]{const auto *v=std::getenv("LINDBERGH_VULKAN_RENDER_TO_TEXTURE");return !v||*v!='0';}();
+  return on;
+}
 unsigned create_drawable(int w, int h, bool rect, bool depthless) {
   if (w <= 0 || h <= 0)
     gap("invalid guest drawable dimensions");
@@ -1305,6 +1314,9 @@ unsigned create_drawable(int w, int h, bool rect, bool depthless) {
 #endif
   state.drawable_sizes[id]={w,h};
   info.guest_bottom_origin=true;info.transient_depth=depthless;
+  // A drawable's colour is only ever read back (copied, or sampled by its
+  // framebuffer object's texture): its passes end ready to be sampled.
+  if(render_to_texture())info.final_layout=VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
   state.drawables[id] = std::make_unique<Target>(*state.device, info);
   if(state.recipes)state.recipes->prepare(*state.drawables[id]);
 #ifdef LINDBERGH_VULKAN_XR
@@ -1326,6 +1338,8 @@ void retire_drawable(unsigned id) {
   auto retired=std::make_shared<RetiredTarget>();
   retired->target=std::move(found->second);
   auto *target=retired->target.get();
+  state.target_views.erase(target);
+  for(auto &o:state.texture_objects)if(o.second.alias_target==target){o.second.alias.reset();o.second.alias_target=nullptr;}
   if(state.recipes)retired->renderers=state.recipes->retire(*target);
   auto detach=[&](Program &program) {
     if(!program.native)return;
@@ -1415,10 +1429,25 @@ void resolve_texture(GLuint id) {
   state.frame();state.flush(false,whole?SIZE_MAX:upto);
   state.pass_stamp("resolve texture "+std::to_string(id)+" from drawable "+std::to_string(drawable)+", "+std::to_string(upto)+" packets recorded");
   if(!state.initialized.count(source))return;
+  const bool depth=o->levels.at(0).format==GL_DEPTH_COMPONENT||o->levels.at(0).format==GL_DEPTH_STENCIL;
+  const VkRect2D all{{0,0},{source->info.width,source->info.height}};
+  // The drawing target cannot also be sampled: a draw into its own source copies.
+  Target *drawing=state.drawable?state.drawables.at(state.drawable).get():state.screen;
+  if(!depth&&source->info.final_layout==VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL&&source!=drawing) {
+    state.materialize(source,&all);state.end_pass();
+    auto &view=state.target_views[source];
+    if(!view)view=std::make_shared<Texture>(*state.device,TextureInfo{source->info.width,source->info.height,1,source->info.layers,source->info.color_format},source->color);
+    const bool first=o->alias_target!=source;
+    o->layers=source->info.layers;o->gpu_target=true;o->picture_view=true;
+    o->render_width=source->info.width;o->render_height=source->info.height;
+    if(first){changed(*o);o->alias=view;o->alias_target=source;}
+    state.pass_stamp("framebuffer texture "+std::to_string(source->info.width)+"x"+std::to_string(source->info.height)+" sampled in place");
+    return;
+  }
   o->layers=source->info.layers;o->gpu_target=true;o->picture_view=true;
   o->render_width=source->info.width;o->render_height=source->info.height;
   changed(*o);auto gpu=native_image(*o,0,true);
-  const VkRect2D all{{0,0},{source->info.width,source->info.height}};state.materialize(source,&all);
+  state.materialize(source,&all);
   gpu->copy_from(state.cmd,*source,0,0,0,0,0,source->info.width,source->info.height,0,0,o->layers);
   state.pass_stamp("framebuffer copy "+std::to_string(source->info.width)+"x"+std::to_string(source->info.height)+
                    (o->levels.at(0).format==GL_DEPTH_COMPONENT||o->levels.at(0).format==GL_DEPTH_STENCIL?" depth":" colour"));
@@ -2823,7 +2852,7 @@ extern "C" void lvk_glStencilOp(GLenum fail, GLenum depth_fail, GLenum pass) {
 
 namespace {
 void key_word(std::string &key,uint64_t word) { key.append(reinterpret_cast<const char *>(&word),sizeof word); }
-void changed(TextureObject &o) { ++o.revision; o.dynamic=o.dynamic || bool(o.stable.image); }
+void changed(TextureObject &o) { o.alias.reset();o.alias_target=nullptr;++o.revision; o.dynamic=o.dynamic || bool(o.stable.image); }
 VkFormat texture_format(const TextureLevel &v) {
   if(v.compressed) switch(v.internal) {
     case 0x83f0:return VK_FORMAT_BC1_RGB_UNORM_BLOCK;
@@ -3218,7 +3247,7 @@ std::shared_ptr<Material> material(Program &p) {
     const GLuint id=(cube?state.cube_textures:rect?state.rect_textures:state.textures)[unsigned(unit)];
     resolve_texture(id);
     auto &object=state.texture_objects[id];
-    auto image=native_image(object);
+    auto image=object.alias?object.alias:native_image(object);
     if(cube&&image==state.fallback) {
       if(!state.cube_fallback) {
         TextureInfo info{1,1,1,6};info.cube=true;state.cube_fallback=std::make_shared<Texture>(*state.device,info);

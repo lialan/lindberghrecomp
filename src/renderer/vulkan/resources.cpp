@@ -184,6 +184,19 @@ Texture::Texture(Device &device, TextureInfo texture) : info(texture), device_(d
     } catch (...) { release(); throw; }
 }
 
+Texture::Texture(Device &device, TextureInfo texture, VkImage borrowed) : info(texture), device_(device), borrowed_(true)
+{
+    if (!borrowed || info.levels != 1 || info.cube) throw std::invalid_argument("Invalid borrowed texture");
+    image_ = borrowed; block_width_ = 1; block_bytes_ = 4;
+    initialized_.assign(info.layers, true);
+    VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    view.image = image_; view.format = info.format; view.components = info.components;
+    view.viewType = info.layers == 1 ? VK_IMAGE_VIEW_TYPE_2D : VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+    view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, info.layers};
+    try { check(vkCreateImageView(device.handles.device, &view, nullptr, &view_), "borrowed texture view"); }
+    catch (...) { image_ = VK_NULL_HANDLE; throw; }
+}
+
 VkImageView Texture::array_view()
 {
     if (info.layers > 1) return view_;
@@ -291,7 +304,7 @@ void Texture::release()
 {
     if (array_view_) vkDestroyImageView(device_.handles.device, array_view_, nullptr);
     if (view_) vkDestroyImageView(device_.handles.device, view_, nullptr);
-    if (image_) vkDestroyImage(device_.handles.device, image_, nullptr);
+    if (image_ && !borrowed_) vkDestroyImage(device_.handles.device, image_, nullptr);
     if (memory_) vkFreeMemory(device_.handles.device, memory_, nullptr);
 }
 Texture::~Texture() { release(); }

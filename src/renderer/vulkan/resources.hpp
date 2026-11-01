@@ -50,6 +50,9 @@ struct TextureInfo {
 class Texture {
 public:
     Texture(Device &device, TextureInfo info);
+    // Views of a render target's colour image (one level), not owning it: the
+    // target ends its passes in SHADER_READ_ONLY_OPTIMAL and outlives its use.
+    Texture(Device &device, TextureInfo info, VkImage borrowed);
     ~Texture();
     Texture(const Texture &) = delete;
     Texture &operator=(const Texture &) = delete;
@@ -67,6 +70,7 @@ private:
     VkImage image_ = VK_NULL_HANDLE;
     VkImageView view_ = VK_NULL_HANDLE, array_view_ = VK_NULL_HANDLE;
     VkDeviceMemory memory_ = VK_NULL_HANDLE;
+    bool borrowed_ = false;
     std::vector<bool> initialized_;
     uint32_t block_width_, block_bytes_;
     void release();
