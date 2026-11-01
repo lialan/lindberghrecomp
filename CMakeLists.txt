@@ -143,6 +143,7 @@ function(lindbergh_runtime target generated_dir)
         "${LINDBERGH_RUNTIME_DIR}/hle_pthread.c"
         "${LINDBERGH_RUNTIME_DIR}/hle_vidmode.c"
         "${LINDBERGH_RUNTIME_DIR}/hle_matrix.c"
+        "${LINDBERGH_RUNTIME_DIR}/nn_culling.c"
         "${LINDBERGH_RUNTIME_DIR}/hle_sega.c"
         "${LINDBERGH_RUNTIME_DIR}/hle_rideboard.c"
         "${LINDBERGH_RUNTIME_DIR}/hle_glut.c"
