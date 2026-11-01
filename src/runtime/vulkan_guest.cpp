@@ -8,6 +8,7 @@
 #include "../renderer/vulkan/uniforms.hpp"
 #include "vulkan_abi.h"
 #include "vulkan_host.h"
+#include <SDL.h>
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -194,6 +195,10 @@ struct State {
     drawables.clear();
     initialized.clear();
     window.reset();
+    if (cache) {
+      try { cache->save(); }
+      catch (const std::exception &e) { std::fprintf(stderr,"[vulkan] pipeline cache save: %s\n",e.what()); }
+    }
     cache.reset();
     pack.reset(); fixed_pack.reset();
     device.reset();
@@ -287,8 +292,15 @@ extern "C" int lvk_host_init(SDL_Window *window, int w, int h) {
     if (!cleanup_registered) gap("cannot register Vulkan shutdown");
     state.window = std::make_unique<Window>(*state.device, window, 3);
     const char *cache = std::getenv("LINDBERGH_VULKAN_CACHE");
-    state.cache =
-        std::make_unique<PipelineCache>(*state.device, cache ? cache : "");
+    std::string cache_path;
+    if (cache) cache_path=cache; // an explicitly empty override disables persistence
+    else if (auto *directory=SDL_GetPrefPath("lindberghrecomp",SDL_GetWindowTitle(window))) {
+      cache_path=std::string(directory)+"vulkan-pipelines.bin";
+      SDL_free(directory);
+    }
+    state.cache=std::make_unique<PipelineCache>(*state.device,cache_path);
+    if (!cache_path.empty()) std::fprintf(stderr,"[vulkan] pipeline cache %s: %s\n",
+                                         state.cache->loaded()?"loaded":"cold",cache_path.c_str());
     state.ring = std::make_unique<FrameRing>(*state.device, 3, 64u << 20);
     state.game_width=w; state.game_height=h;
     state.viewport = state.scissor = {0, 0, w, h};
