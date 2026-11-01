@@ -1,14 +1,21 @@
 #pragma once
 #include "renderer.hpp"
+#ifdef __ANDROID__
+#include <jni.h>
+#define XR_USE_PLATFORM_ANDROID
+#endif
 #define XR_USE_GRAPHICS_API_VULKAN
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 
 namespace lindbergh::vk {
+// Android callers retain the Activity reference until OpenXR is destroyed.
+// Opaque fields keep JNI out of the desktop host interface.
+struct OpenXRPlatform { void *java_vm = nullptr; void *activity = nullptr; };
 // Common Vulkan/OpenXR host, independent of SDL and the guest's graphics ABI.
 class OpenXR {
 public:
-    explicit OpenXR(bool require_foveation = false);
+    explicit OpenXR(bool require_foveation = false, OpenXRPlatform platform = {});
     ~OpenXR();
     OpenXR(const OpenXR &) = delete;
     OpenXR &operator=(const OpenXR &) = delete;

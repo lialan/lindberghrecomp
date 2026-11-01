@@ -1,0 +1,22 @@
+buildscript {
+    repositories { google(); mavenCentral() }
+    dependencies { classpath 'com.android.tools.build:gradle:8.7.3' }
+}
+repositories { google(); mavenCentral() }
+apply plugin: 'com.android.application'
+android {
+    namespace 'org.lindbergh.vulkanprobe'
+    compileSdkVersion 35
+    defaultConfig {
+        applicationId 'org.lindbergh.vulkanprobe'
+        minSdkVersion 29
+        targetSdkVersion 32
+        versionCode 1
+        versionName '0.1'
+        ndk { abiFilters 'arm64-v8a' }
+    }
+    sourceSets.main {
+        jni.srcDirs = []
+        jniLibs.srcDirs = [project.findProperty('nativeDir') ?: 'src/main/jniLibs']
+    }
+}

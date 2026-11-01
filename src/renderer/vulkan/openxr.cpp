@@ -14,9 +14,21 @@ template<class T> static T function(XrInstance instance, const char *name)
     xr_check(xrGetInstanceProcAddr(instance, name, &result), name);
     return reinterpret_cast<T>(result);
 }
-OpenXR::OpenXR(bool required) : require_foveation_(required)
+OpenXR::OpenXR(bool required, OpenXRPlatform platform) : require_foveation_(required)
 {
     try {
+#ifdef __ANDROID__
+        if (!platform.java_vm || !platform.activity)
+            throw std::invalid_argument("Android OpenXR requires JavaVM and Activity");
+        const auto initialize = function<PFN_xrInitializeLoaderKHR>(XR_NULL_HANDLE, "xrInitializeLoaderKHR");
+        XrLoaderInitInfoAndroidKHR loader{XR_TYPE_LOADER_INIT_INFO_ANDROID_KHR};
+        loader.applicationVM = platform.java_vm;
+        loader.applicationContext = platform.activity;
+        xr_check(initialize(reinterpret_cast<const XrLoaderInitInfoBaseHeaderKHR *>(&loader)),
+                 "initialize Android OpenXR loader");
+#else
+        (void)platform;
+#endif
         uint32_t n = 0;
         xr_check(xrEnumerateInstanceExtensionProperties(nullptr, 0, &n, nullptr), "enumerate runtime extensions (install/select an OpenXR runtime)");
         std::vector<XrExtensionProperties> available(n, {XR_TYPE_EXTENSION_PROPERTIES});
@@ -24,6 +36,11 @@ OpenXR::OpenXR(bool required) : require_foveation_(required)
         auto has = [&](const char *name) { return std::any_of(available.begin(),available.end(),[&](const auto &v){return std::strcmp(v.extensionName,name)==0;}); };
         if (!has(XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME)) throw std::runtime_error("OpenXR runtime does not provide XR_KHR_vulkan_enable2");
         std::vector<const char *> extensions{XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME};
+#ifdef __ANDROID__
+        if (!has(XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME))
+            throw std::runtime_error("OpenXR runtime does not provide XR_KHR_android_create_instance");
+        extensions.push_back(XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME);
+#endif
         if (required) {
             for (const auto name : {XR_FB_FOVEATION_EXTENSION_NAME, XR_FB_FOVEATION_CONFIGURATION_EXTENSION_NAME,
                                   XR_FB_FOVEATION_VULKAN_EXTENSION_NAME, XR_FB_SWAPCHAIN_UPDATE_STATE_EXTENSION_NAME}) {
@@ -32,6 +49,12 @@ OpenXR::OpenXR(bool required) : require_foveation_(required)
             }
         }
         XrInstanceCreateInfo create{XR_TYPE_INSTANCE_CREATE_INFO};
+#ifdef __ANDROID__
+        XrInstanceCreateInfoAndroidKHR android{XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR};
+        android.applicationVM = platform.java_vm;
+        android.applicationActivity = platform.activity;
+        create.next = &android;
+#endif
         std::strcpy(create.applicationInfo.applicationName,"Lindbergh Vulkan");
         create.applicationInfo.apiVersion = XR_MAKE_VERSION(1,0,0);
         create.enabledExtensionCount=static_cast<uint32_t>(extensions.size()); create.enabledExtensionNames=extensions.data();
