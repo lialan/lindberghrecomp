@@ -595,7 +595,13 @@ struct State {
       if (materials[ring->recording_slot()].size()>2048) materials[ring->recording_slot()].clear();
     }
   }
+  bool active_color_only=false; // the open pass left depth/stencil untouched
+  static bool uses_depth(const DrawPacket &p) {
+    return (p.clear_aspects&(VK_IMAGE_ASPECT_DEPTH_BIT|VK_IMAGE_ASPECT_STENCIL_BIT))||
+           (p.count&&(p.raster.depth_test||p.raster.stencil));
+  }
   void end_pass() {
+    active_color_only=false;
     if (active) {
       active->end();
       if(pass_profile.active) {
@@ -656,6 +662,7 @@ struct State {
           index=end-1;continue;
         }
       }
+      if (active_target==p.target&&active_color_only&&uses_depth(p))end_pass(); // depth is needed after all
       if (active_target != p.target) {
         end_pass();
         bool preserve=initialized.count(p.target)!=0;
@@ -719,7 +726,14 @@ struct State {
         }
         if(!begun) {
           if(!preserve)stencil_bits[p.target]=stencil;
-          p.renderer->begin(cmd,p.color,preserve,depth,stencil);
+          // A preserving pass whose queued draws never touch depth or stencil
+          // leaves them in memory untouched (a full-target composite loads and
+          // stores only colour). A depth user arriving later restarts the pass.
+          static const bool color_only_passes=[]{const auto *v=std::getenv("LINDBERGH_VULKAN_COLOR_ONLY");return !v||*v!='0';}();
+          bool color_only=preserve&&color_only_passes&&p.target->color_pass;
+          for(size_t k=index;color_only&&k<n&&packets[k].target==p.target;++k)color_only=!uses_depth(packets[k]);
+          p.renderer->begin(cmd,p.color,preserve,depth,stencil,nullptr,color_only);
+          active_color_only=color_only;
         }
         initialized.insert(p.target); active=p.renderer; active_target=p.target;
       } else if (active != p.renderer) {

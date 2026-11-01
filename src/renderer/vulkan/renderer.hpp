@@ -65,6 +65,9 @@ public:
     const TargetInfo info;
     VkImage color = VK_NULL_HANDLE;
     VkRenderPass render_pass = VK_NULL_HANDLE, load_pass = VK_NULL_HANDLE;
+    // Loads and stores colour only: depth/stencil are left untouched (no memory
+    // traffic) for a pass none of whose draws use them. Null when unsupported.
+    VkRenderPass color_pass = VK_NULL_HANDLE;
     VkImage depth_image() const { return depth_; }
     static constexpr VkFormat depth_format = VK_FORMAT_D32_SFLOAT_S8_UINT;
     VkFramebuffer framebuffer = VK_NULL_HANDLE;
@@ -102,7 +105,7 @@ public:
     // Called only when a new variant is created, never for a cached draw.
     std::function<void(RasterState)> pipeline_created;
     void begin(VkCommandBuffer cmd, std::array<float, 4> clear, bool preserve = false, float depth = 1, uint32_t stencil = 0,
-               const VkRect2D *area = nullptr);
+               const VkRect2D *area = nullptr, bool color_only = false);
     void viewport(float x, float y, float width, float height, VkRect2D scissor,float min_depth=0,float max_depth=1);
     void dynamic_state(uint32_t stencil_ref, uint32_t stencil_compare_mask, uint32_t stencil_write_mask,
                        float depth_bias_factor, float depth_bias_units, const float blend_constants[4]);

@@ -18,6 +18,8 @@ struct Capabilities {
     bool density_map = false;
     bool density_map_non_subsampled = false;
     bool shading_rate = false;
+    // VK_EXT_load_store_op_none: a pass may leave an attachment untouched.
+    bool load_store_none = false;
 };
 
 Capabilities query_capabilities(VkPhysicalDevice physical);

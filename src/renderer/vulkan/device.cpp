@@ -63,6 +63,7 @@ Capabilities query_capabilities(VkPhysicalDevice physical)
     out.density_map_non_subsampled = density.fragmentDensityMapNonSubsampledImages;
     out.shading_rate = rate.attachmentFragmentShadingRate;
     out.texture_compression_bc = features.features.textureCompressionBC;
+    out.load_store_none = extension(ext, VK_EXT_LOAD_STORE_OP_NONE_EXTENSION_NAME);
     out.image_view_format_swizzle = !portable || portability.imageViewFormatSwizzle;
     return out;
 }
@@ -148,6 +149,7 @@ std::unique_ptr<Device> Device::create(const DeviceOptions &options)
     std::vector<VkExtensionProperties> available(extension_count);
     check(vkEnumerateDeviceExtensionProperties(out->handles.physical, nullptr, &extension_count, available.data()), "selected device extensions");
     if (extension(available, "VK_KHR_portability_subset")) extensions.push_back("VK_KHR_portability_subset");
+    if (out->capabilities.load_store_none) extensions.push_back(VK_EXT_LOAD_STORE_OP_NONE_EXTENSION_NAME);
     // Enable one mechanism, never both competing attachments in a render pass.
     if (out->capabilities.density_map) {
         extensions.push_back(VK_EXT_FRAGMENT_DENSITY_MAP_EXTENSION_NAME);

@@ -169,6 +169,11 @@ Target::Target(Device &device, TargetInfo target) : info(target), device_(device
             attachments[1].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
         }
         check(vkCreateRenderPass(device.handles.device, &pass, nullptr, &load_pass), "Vulkan preserving render pass");
+        if (device.capabilities.load_store_none && !info.transient_depth) {
+            attachments[1].loadOp = attachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_NONE_EXT;
+            attachments[1].storeOp = attachments[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_NONE_EXT;
+            check(vkCreateRenderPass(device.handles.device, &pass, nullptr, &color_pass), "Vulkan colour-only render pass");
+        }
         framebuffer=make_framebuffer(info.density_map);
         if(info.density_map)density_framebuffers_.push_back({info.density_map,framebuffer});
     } catch (...) { release(); throw; }
@@ -207,6 +212,7 @@ void Target::release()
     if(density_framebuffers_.empty()) {
         if(framebuffer)vkDestroyFramebuffer(d,framebuffer,nullptr);
     } else for(const auto &entry:density_framebuffers_)vkDestroyFramebuffer(d,entry.second,nullptr);
+    if (color_pass) vkDestroyRenderPass(d, color_pass, nullptr);
     if (load_pass) vkDestroyRenderPass(d, load_pass, nullptr);
     if (render_pass) vkDestroyRenderPass(d, render_pass, nullptr);
     if (depth_view_) vkDestroyImageView(d, depth_view_, nullptr);
@@ -365,14 +371,15 @@ void Renderer::prepare(RasterState state)
 }
 
 void Renderer::begin(VkCommandBuffer cmd, std::array<float, 4> color, bool preserve, float depth, uint32_t stencil,
-                     const VkRect2D *area)
+                     const VkRect2D *area, bool color_only)
 {
     if (cmd_ || !cmd) throw std::logic_error("Invalid Vulkan render pass begin");
     VkClearValue clear[2]{};
     for (unsigned i = 0; i < 4; i++) clear[0].color.float32[i] = color[i];
     clear[1].depthStencil = {depth, stencil};
     VkRenderPassBeginInfo pass{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
-    pass.renderPass = preserve ? target_.load_pass : target_.render_pass; pass.framebuffer = target_.framebuffer;
+    // color_only: the caller records no depth/stencil use in this pass.
+    pass.renderPass = preserve ? (color_only && target_.color_pass ? target_.color_pass : target_.load_pass) : target_.render_pass; pass.framebuffer = target_.framebuffer;
     pass.renderArea.extent = {target_.info.width, target_.info.height};
     if (area) pass.renderArea = *area; // the caller guarantees nothing is drawn outside it
     pass.clearValueCount = 2; pass.pClearValues = clear;
