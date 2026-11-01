@@ -217,13 +217,15 @@ struct ActivityRef {
     std::filesystem::create_directories(directory);
     for (auto entry : {std::pair{"LINDBERGH_VULKAN_SHADERS","game.lvsp"},
                        std::pair{"LINDBERGH_VULKAN_FIXED_SHADERS","fixed.lvsp"},
-                       std::pair{"LINDBERGH_VULKAN_RECIPES_SEED","pipelines.lvpr"}}) {
+                       std::pair{"LINDBERGH_VULKAN_RECIPES_SEED","pipelines.lvpr"},
+                       std::pair{"LINDBERGH_VULKAN_CACHE_SEED","pipelines.bin"}}) {
       const char *override=std::getenv(entry.first);
       if (override && *override) continue;
       const auto source=std::string("vulkan/")+entry.second;
       std::unique_ptr<AAsset,decltype(&AAsset_close)> asset(AAssetManager_open(manager,source.c_str(),AASSET_MODE_STREAMING),AAsset_close);
       if (!asset) {
-        if(std::strcmp(entry.first,"LINDBERGH_VULKAN_RECIPES_SEED")==0)continue;
+        if(std::strcmp(entry.first,"LINDBERGH_VULKAN_RECIPES_SEED")==0||
+           std::strcmp(entry.first,"LINDBERGH_VULKAN_CACHE_SEED")==0)continue;   // optional
         throw std::runtime_error("Missing packaged shader archive: "+source);
       }
       const auto path=directory/entry.second;
@@ -268,13 +270,15 @@ struct ActivityRef {
     else directory="vulkan";
     for (auto entry : {std::pair{"LINDBERGH_VULKAN_SHADERS","game.lvsp"},
                        std::pair{"LINDBERGH_VULKAN_FIXED_SHADERS","fixed.lvsp"},
-                       std::pair{"LINDBERGH_VULKAN_RECIPES_SEED","pipelines.lvpr"}}) {
+                       std::pair{"LINDBERGH_VULKAN_RECIPES_SEED","pipelines.lvpr"},
+                       std::pair{"LINDBERGH_VULKAN_CACHE_SEED","pipelines.bin"}}) {
       const char *override=std::getenv(entry.first);
       if (override && *override) continue;
       const auto path=directory/entry.second;
       std::error_code ignored;
       if(!std::filesystem::is_regular_file(path,ignored)) {
-        if(std::strcmp(entry.first,"LINDBERGH_VULKAN_RECIPES_SEED")==0)continue;
+        if(std::strcmp(entry.first,"LINDBERGH_VULKAN_RECIPES_SEED")==0||
+           std::strcmp(entry.first,"LINDBERGH_VULKAN_CACHE_SEED")==0)continue;   // optional
         throw std::runtime_error("Missing packaged shader archive: "+path.string());
       }
       SDL_setenv(entry.first,path.c_str(),1);
@@ -1018,6 +1022,16 @@ extern "C" int lvk_host_init(SDL_Window *window, int w, int h) {
         cache_path=std::string(directory)+"vulkan-pipelines.bin";
         SDL_free(directory);
       }
+    }
+    // A fresh install starts from the driver cache packaged for its headset
+    // (vulkan/pipelines.bin, harvested on that GPU and driver): the startup
+    // precompile then finds every pipeline already built. PipelineCache checks
+    // vendor, device and cache UUID, so on any other GPU or driver it is
+    // ignored and the precompile builds them as before.
+    if(const char *seed=std::getenv("LINDBERGH_VULKAN_CACHE_SEED");seed&&*seed&&!cache_path.empty()) {
+      std::error_code ec;
+      if(!std::filesystem::exists(cache_path,ec)&&std::filesystem::copy_file(seed,cache_path,ec))
+        std::fprintf(stderr,"[vulkan] pipeline cache started from the packaged one: %s\n",seed);
     }
     state.cache=std::make_unique<PipelineCache>(*state.device,cache_path);
     if (!cache_path.empty()) std::fprintf(stderr,"[vulkan] pipeline cache %s: %s\n",
