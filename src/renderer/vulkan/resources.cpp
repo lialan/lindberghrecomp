@@ -5,14 +5,10 @@
 
 namespace lindbergh::vk {
 
-ConstantDensityMap::ConstantDensityMap(Device &d,FrameRing &ring,uint32_t width,uint32_t height,uint32_t layers,float density)
-    :ConstantDensityMap(d,ring,width,height,layers,[&]{
-        if(!std::isfinite(density)||density<=0||density>1)throw std::invalid_argument("Invalid constant density map");
-        const auto v=uint8_t(std::lround(density*255));return std::vector<uint8_t>(size_t(width)*height*2,v);}()) {}
-ConstantDensityMap::ConstantDensityMap(Device &d,FrameRing &ring,uint32_t width,uint32_t height,uint32_t layers,const std::vector<uint8_t> &texels):device_(d)
+ConstantDensityMap::ConstantDensityMap(Device &d,FrameRing &ring,uint32_t width,uint32_t height,uint32_t layers,float density):device_(d)
 {
     if(!d.capabilities.density_map || !d.capabilities.density_map_non_subsampled || !width || !height || (layers!=1&&layers!=2) ||
-       texels.size()!=size_t(width)*height*2)throw std::invalid_argument("Invalid density map");
+       !std::isfinite(density)||density<=0||density>1)throw std::invalid_argument("Invalid constant density map");
     try {
         VkImageCreateInfo create{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};create.imageType=VK_IMAGE_TYPE_2D;
         create.format=VK_FORMAT_R8G8_UNORM;create.extent={width,height,1};create.mipLevels=1;create.arrayLayers=layers;
@@ -31,33 +27,18 @@ ConstantDensityMap::ConstantDensityMap(Device &d,FrameRing &ring,uint32_t width,
         b.image=image_;b.subresourceRange=v.subresourceRange;b.srcQueueFamilyIndex=b.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
         b.newLayout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;b.dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;
         vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,0,nullptr,1,&b);
-        // One-time upload through a temporary host-visible buffer.
-        VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};bi.size=texels.size();bi.usage=VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-        check(vkCreateBuffer(d.handles.device,&bi,nullptr,&staging_),"density staging buffer");
-        VkMemoryRequirements sr;vkGetBufferMemoryRequirements(d.handles.device,staging_,&sr);
-        VkMemoryAllocateInfo sa{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};sa.allocationSize=sr.size;
-        sa.memoryTypeIndex=d.memory_type(sr.memoryTypeBits,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        check(vkAllocateMemory(d.handles.device,&sa,nullptr,&staging_memory_),"density staging memory");
-        check(vkBindBufferMemory(d.handles.device,staging_,staging_memory_,0),"bind density staging memory");
-        void *mapped=nullptr;check(vkMapMemory(d.handles.device,staging_memory_,0,VK_WHOLE_SIZE,0,&mapped),"map density staging");
-        std::copy(texels.begin(),texels.end(),static_cast<uint8_t *>(mapped));vkUnmapMemory(d.handles.device,staging_memory_);
-        std::vector<VkBufferImageCopy> copies(layers);
-        for(uint32_t l=0;l<layers;++l){copies[l].imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,l,1};copies[l].imageExtent={width,height,1};}
-        vkCmdCopyBufferToImage(cmd,staging_,image_,b.newLayout,layers,copies.data());
+        VkClearColorValue color{{density,density,0,0}};
+        vkCmdClearColorImage(cmd,image_,b.newLayout,&color,1,&v.subresourceRange);
         b.oldLayout=b.newLayout;b.newLayout=VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT;
         b.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;b.dstAccessMask=VK_ACCESS_FRAGMENT_DENSITY_MAP_READ_BIT_EXT;
         vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_FRAGMENT_DENSITY_PROCESS_BIT_EXT,0,0,nullptr,0,nullptr,1,&b);
         // Static views can be read by the host at BeginRenderPass. Finish this
         // one-time initialization before publishing the view; never per frame.
         ring.wait(ring.submit());
-        vkDestroyBuffer(d.handles.device,staging_,nullptr);staging_=VK_NULL_HANDLE;
-        vkFreeMemory(d.handles.device,staging_memory_,nullptr);staging_memory_=VK_NULL_HANDLE;
     } catch(...) {release();throw;}
 }
 void ConstantDensityMap::release()
 {
-    if(staging_)vkDestroyBuffer(device_.handles.device,staging_,nullptr);
-    if(staging_memory_)vkFreeMemory(device_.handles.device,staging_memory_,nullptr);
     if(view_)vkDestroyImageView(device_.handles.device,view_,nullptr);
     if(image_)vkDestroyImage(device_.handles.device,image_,nullptr);
     if(memory_)vkFreeMemory(device_.handles.device,memory_,nullptr);

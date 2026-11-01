@@ -353,7 +353,8 @@ void Renderer::prepare(RasterState state)
     if (pipeline_created) pipeline_created(state);
 }
 
-void Renderer::begin(VkCommandBuffer cmd, std::array<float, 4> color, bool preserve, float depth, uint32_t stencil)
+void Renderer::begin(VkCommandBuffer cmd, std::array<float, 4> color, bool preserve, float depth, uint32_t stencil,
+                     const VkRect2D *area)
 {
     if (cmd_ || !cmd) throw std::logic_error("Invalid Vulkan render pass begin");
     VkClearValue clear[2]{};
@@ -362,11 +363,12 @@ void Renderer::begin(VkCommandBuffer cmd, std::array<float, 4> color, bool prese
     VkRenderPassBeginInfo pass{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     pass.renderPass = preserve ? target_.load_pass : target_.render_pass; pass.framebuffer = target_.framebuffer;
     pass.renderArea.extent = {target_.info.width, target_.info.height};
+    if (area) pass.renderArea = *area; // the caller guarantees nothing is drawn outside it
     pass.clearValueCount = 2; pass.pClearValues = clear;
     vkCmdBeginRenderPass(cmd, &pass, VK_SUBPASS_CONTENTS_INLINE);
     VkViewport viewport{0, target_.info.guest_bottom_origin ? float(target_.info.height) : 0,
                         float(target_.info.width), target_.info.guest_bottom_origin ? -float(target_.info.height) : float(target_.info.height), 0, 1};
-    VkRect2D scissor{{0, 0}, pass.renderArea.extent};
+    VkRect2D scissor = pass.renderArea;
     cmd_ = cmd;invalidate_state();
     if(emit(Command::Viewport,false))vkCmdSetViewport(cmd,0,1,&viewport);
     if(emit(Command::Scissor,false))vkCmdSetScissor(cmd,0,1,&scissor);

@@ -303,8 +303,6 @@ struct State {
   std::unique_ptr<OpenXR> xr;
   std::unique_ptr<Target> unfocused;
   std::unique_ptr<ConstantDensityMap> unfocused_density;
-  // Eye pbuffers larger than the swapchain image: their own fixed foveation.
-  std::unordered_map<unsigned,std::unique_ptr<ConstantDensityMap>> eye_density;
   bool xr_rendering = false;
 #endif
   std::unique_ptr<PipelineCache> cache;
@@ -328,6 +326,36 @@ struct State {
     auto it=stencil_bits.find(t);uint32_t bits=it==stencil_bits.end()?255u:it->second;
     for(const auto &q:packets)if(q.target==t&&q.count&&q.raster.stencil)bits|=q.stencil_write_mask&255;
     return bits;
+  }
+  // A pass that would only clear the whole target is deferred: the next pass
+  // on that target begins with this clear (or drops it, when it clears
+  // anyway). Anything that reads the target first applies it (materialize).
+  // done: the part already cleared (a pass limited to the region it drew);
+  // empty when nothing of the clear has been applied yet.
+  struct PendingClear {std::array<float,4> color;float depth;uint32_t stencil;VkRect2D done{};};
+  std::unordered_map<Target *,PendingClear> pending_clears;
+  static bool contains(const VkRect2D &outer,const VkRect2D &inner) {
+    return outer.extent.width&&inner.offset.x>=outer.offset.x&&inner.offset.y>=outer.offset.y&&
+           int64_t(inner.offset.x)+inner.extent.width<=int64_t(outer.offset.x)+outer.extent.width&&
+           int64_t(inner.offset.y)+inner.extent.height<=int64_t(outer.offset.y)+outer.extent.height;
+  }
+  // Begin a pass on t, applying its pending clear: a clear begin when none of
+  // it has been applied, else a load with the remaining area cleared.
+  void begin_pending(Renderer &r,Target *t,const PendingClear &c) {
+    if(!c.done.extent.width) {r.begin(cmd,c.color,false,c.depth,c.stencil);stencil_bits[t]=c.stencil;return;}
+    r.begin(cmd,c.color,true);
+    const int W=int(t->info.width),H=int(t->info.height),x0=c.done.offset.x,y0=c.done.offset.y;
+    const int x1=x0+int(c.done.extent.width),y1=y0+int(c.done.extent.height);
+    for(auto rect:{VkRect2D{{0,0},{uint32_t(W),uint32_t(y0)}},VkRect2D{{0,y1},{uint32_t(W),uint32_t(H-y1)}},
+                   VkRect2D{{0,y0},{uint32_t(x0),uint32_t(y1-y0)}},VkRect2D{{x1,y0},{uint32_t(W-x1),uint32_t(y1-y0)}}})
+      r.clear(VK_IMAGE_ASPECT_COLOR_BIT|VK_IMAGE_ASPECT_DEPTH_BIT|VK_IMAGE_ASPECT_STENCIL_BIT,c.color,c.depth,c.stencil,rect);
+  }
+  void materialize(Target *t,const VkRect2D *read=nullptr) {
+    auto it=pending_clears.find(t);if(it==pending_clears.end())return;
+    if(read&&contains(it->second.done,*read))return; // the part read is already cleared
+    const auto c=it->second;pending_clears.erase(it);
+    end_pass();auto &r=renderers[t];if(!r)r=std::make_unique<Renderer>(*device,*t,*cache);
+    begin_pending(*r,t,c);r->end();
   }
   static bool covers(const VkRect2D &r,const Target *t) {
     return r.offset.x<=0&&r.offset.y<=0&&int64_t(r.offset.x)+r.extent.width>=t->info.width&&int64_t(r.offset.y)+r.extent.height>=t->info.height;
@@ -415,7 +443,7 @@ struct State {
     offscreen.reset();offscreen_density.reset();
 #endif
 #ifdef LINDBERGH_VULKAN_XR
-    unfocused.reset();unfocused_density.reset();eye_density.clear();
+    unfocused.reset();unfocused_density.reset();
     xr.reset();
     activity.reset();
     host_display_timing_reset();
@@ -461,11 +489,11 @@ struct State {
           panel_input(sample,xr->display_time(),focused);
           const auto &haptics=panel->haptics();
           for(int h=0;h<2;++h)if(haptics[h].milliseconds)xr->rumble(h,haptics[h].amplitude,haptics[h].milliseconds);
-          for(auto &entry:drawables)if(entry.second->info.density_map&&!eye_density.count(entry.first))
+          for(auto &entry:drawables)if(entry.second->info.density_map)
             entry.second->select_density_map(screen->info.density_map);
         } else {
           stereo->invalidate();panel_input({},xr->display_time(),false);
-          for(auto &entry:drawables)if(entry.second->info.density_map&&!eye_density.count(entry.first))
+          for(auto &entry:drawables)if(entry.second->info.density_map)
             entry.second->select_density_map(unfocused_density->view());
         }
         if (screen) {
@@ -519,8 +547,27 @@ struct State {
       if (created || ms>2) std::fprintf(stderr,"[vulkan-prepare] frame %u: %zu packets, %zu new pipelines, %.3f ms\n",g_frame,packets.size(),created,ms);
     } else for (auto &p : packets) if (p.count) p.renderer->prepare(p.raster);
     constexpr VkImageAspectFlags color_depth=VK_IMAGE_ASPECT_COLOR_BIT|VK_IMAGE_ASPECT_DEPTH_BIT;
-    for (auto &p : packets) {
+    static const bool defer_clears=[]{const auto *v=std::getenv("LINDBERGH_VULKAN_DEFER_CLEAR");return !v||*v!='0';}();
+    static const bool limit_area=[]{const auto *v=std::getenv("LINDBERGH_VULKAN_LIMIT_AREA");return !v||*v!='0';}();
+    auto full_clear=[&](const DrawPacket &q) {
+      if(q.count||!covers(q.scissor,q.target)||(q.clear_aspects&color_depth)!=color_depth)return false;
+      return (q.clear_aspects&VK_IMAGE_ASPECT_STENCIL_BIT)||(stencil_bits.count(q.target)&&!stencil_bits[q.target]);
+    };
+    for (size_t index=0;index<packets.size();++index) {
+      auto &p=packets[index];
       bool cleared_on_begin=false;
+      if (active_target != p.target && defer_clears && full_clear(p)) {
+        // A run on this target of whole-target clears only: defer it.
+        size_t end=index;while(end<packets.size()&&packets[end].target==p.target&&full_clear(packets[end]))++end;
+        if(end==packets.size()?!keep_last:packets[end].target!=p.target) {
+          end_pass();
+          const auto &last=packets[end-1];
+          const uint32_t stencil=(last.clear_aspects&VK_IMAGE_ASPECT_STENCIL_BIT)?last.clear_stencil&255:0;
+          pending_clears[p.target]={last.color,last.clear_depth,stencil};
+          stencil_bits[p.target]=stencil;initialized.insert(p.target);
+          index=end-1;continue;
+        }
+      }
       if (active_target != p.target) {
         end_pass();
         bool preserve=initialized.count(p.target)!=0;
@@ -535,8 +582,57 @@ struct State {
           preserve=false;depth=p.clear_depth;cleared_on_begin=true;
           stencil=(p.clear_aspects&VK_IMAGE_ASPECT_STENCIL_BIT)?p.clear_stencil&255:0;
         }
-        if(!preserve)stencil_bits[p.target]=stencil;
-        p.renderer->begin(cmd,p.color,preserve,depth,stencil);
+        bool begun=false;
+        if(auto pending=pending_clears.find(p.target);pending!=pending_clears.end()) {
+          // This pass clears everything itself, or begins with the deferred clear.
+          const auto c=pending->second;pending_clears.erase(pending);
+          if(!cleared_on_begin) {
+            if(!c.done.extent.width) {depth=c.depth;stencil=c.stencil;stencil_bits[p.target]=stencil;p.renderer->begin(cmd,c.color,false,depth,stencil);}
+            else begin_pending(*p.renderer,p.target,c);
+            begun=true;
+          }
+        }
+        if(!begun&&cleared_on_begin&&limit_area) {
+          // Begins with a whole-target clear but draws only part of it: limit
+          // the pass to that part; the rest of the clear stays pending.
+          VkRect2D area{};
+          for(size_t k=index+1;k<packets.size()&&packets[k].target==p.target;++k) {
+            const auto &q=packets[k];VkRect2D r=q.scissor;
+            if(q.count) {
+              const int vx=int(std::floor(q.viewport[0])),vx1=int(std::ceil(q.viewport[0]+q.viewport[2]));
+              const float top=q.viewport[1]+q.viewport[3];
+              const int vy0=p.target->info.guest_bottom_origin?int(std::floor(q.viewport[1])):int(p.target->info.height)-int(std::ceil(top));
+              const int vy1=p.target->info.guest_bottom_origin?int(std::ceil(top)):int(p.target->info.height)-int(std::floor(q.viewport[1]));
+              const int x0=std::max(r.offset.x,vx),y0=std::max(r.offset.y,vy0);
+              const int x1=int(std::min<int64_t>(int64_t(r.offset.x)+r.extent.width,vx1)),y1=int(std::min<int64_t>(int64_t(r.offset.y)+r.extent.height,vy1));
+              if(x1<=x0||y1<=y0)continue;
+              r={{x0,y0},{uint32_t(x1-x0),uint32_t(y1-y0)}};
+            }
+            if(!r.extent.width||!r.extent.height)continue;
+            if(!area.extent.width)area=r;
+            else {
+              const int x0=std::min(area.offset.x,r.offset.x),y0=std::min(area.offset.y,r.offset.y);
+              const int x1=int(std::max<int64_t>(int64_t(area.offset.x)+area.extent.width,int64_t(r.offset.x)+r.extent.width));
+              const int y1=int(std::max<int64_t>(int64_t(area.offset.y)+area.extent.height,int64_t(r.offset.y)+r.extent.height));
+              area={{x0,y0},{uint32_t(x1-x0),uint32_t(y1-y0)}};
+            }
+          }
+          if(area.extent.width&&uint64_t(area.extent.width)*area.extent.height*4<=uint64_t(p.target->info.width)*p.target->info.height) {
+            // Pad to whole 32-pixel tiles, inside the target.
+            const int x0=std::max(0,area.offset.x/32*32-32),y0=std::max(0,area.offset.y/32*32-32);
+            const int x1=std::min<int>(int(p.target->info.width),(int(area.offset.x+area.extent.width)+63)/32*32);
+            const int y1=std::min<int>(int(p.target->info.height),(int(area.offset.y+area.extent.height)+63)/32*32);
+            area={{x0,y0},{uint32_t(x1-x0),uint32_t(y1-y0)}};
+            stencil_bits[p.target]=stencil;
+            p.renderer->begin(cmd,p.color,false,depth,stencil,&area);
+            pending_clears[p.target]={p.color,depth,stencil,area};
+            begun=true;
+          }
+        }
+        if(!begun) {
+          if(!preserve)stencil_bits[p.target]=stencil;
+          p.renderer->begin(cmd,p.color,preserve,depth,stencil);
+        }
         initialized.insert(p.target); active=p.renderer; active_target=p.target;
       } else if (active != p.renderer) {
         active->detach(); p.renderer->attach(cmd); active=p.renderer;
@@ -569,7 +665,9 @@ struct State {
     if (active != renderer.get()) {
       end_pass();
       renderer->prepare(raster);
-      renderer->begin(cmd, clear, initialized.count(target)!=0);
+      if(auto pending=pending_clears.find(target);pending!=pending_clears.end()) {
+        const auto c=pending->second;pending_clears.erase(pending);begin_pending(*renderer,target,c);
+      } else renderer->begin(cmd, clear, initialized.count(target)!=0);
       initialized.insert(target);
       active = renderer.get(); active_target = target;
     }
@@ -906,6 +1004,7 @@ extern "C" void lvk_host_present(void) {
   show_overlay=show_overlay&&state.xr_rendering;
 #endif
   state.flush(show_overlay);
+  if(state.active_target!=state.screen)state.materialize(state.screen);
   if (!state.initialized.count(state.screen)) {
     const auto old=state.drawable;state.drawable=0;state.renderer();state.end_pass();state.drawable=old;
   }
@@ -944,6 +1043,7 @@ extern "C" void lvk_host_present(void) {
         std::fprintf(stderr,"[vulkan] diagnostic capture of guest drawable %u; not final display output\n",id);
       }
     }
+    state.materialize(capture_target);
     capture=std::make_unique<FrameCapture>(*state.device,state.cmd,*capture_target);
   }
 #ifdef LINDBERGH_VULKAN_XR
@@ -986,42 +1086,26 @@ extern "C" unsigned lvk_create_drawable(int w, int h) {
   if (w <= 0 || h <= 0)
     gap("invalid guest drawable dimensions");
   const auto id = state.next_drawable++;
+  // A rounded-up eye pbuffer (HOTD4: 640x480 drawn in 640x512) becomes exactly
+  // the eye frame, like an exact one: the swapchain's size, so its foveation
+  // and copies match. What lies beyond the frame is clipped (GL also keeps
+  // side passes out of the eyes).
+  const bool clipped_eye=state.stereo&&state.eye_pbuffer(w,h)&&!state.picture_size(w,h);
+  if(clipped_eye) {
+    std::fprintf(stderr,"[vulkan] pbuffer %u: %dx%d holds the %dx%d frame; drawn as the eye frame, the rest clipped\n",id,w,h,state.game_width,state.game_height);
+    w=state.game_width;h=state.game_height;
+  }
   TargetInfo info{uint32_t(w),uint32_t(h),state.stereo?2u:1u};
 #ifdef LINDBERGH_VULKAN_XR
   const auto *profile=game_profile();
   const LgStereoTargetSize sizes={state.game_width,state.game_height,profile->vr.world_w,profile->vr.world_h,int(state.xr->width()),int(state.xr->height())};
   float sx,sy;lg_stereo_target_scale(&sizes,w,h,0,&sx,&sy);
-  // A rounded-up eye pbuffer keeps the game frame's eye scale, so that frame
-  // fills the eye and the extra rows/columns stay addressable.
-  if(state.eye_pbuffer(w,h)&&!state.picture_size(w,h)){sx=float(state.xr->width())/state.game_width;sy=float(state.xr->height())/state.game_height;}
   info.width=uint32_t(std::lround(w*sx));info.height=uint32_t(std::lround(h*sy));
   std::fprintf(stderr,"[vulkan-xr] pbuffer %u: %dx%d -> %ux%u, %u layers\n",id,w,h,info.width,info.height,info.layers);
   const bool foveated_world=state.picture_size(w,h) && info.width==state.xr->width() && info.height==state.xr->height();
   if(foveated_world) {
     if(state.xr->density_maps().empty())gap("World pbuffer requires runtime density maps");
     info.density_map=state.unfocused_density->view();
-  } else if(state.eye_pbuffer(w,h) && !state.xr->density_maps().empty() &&
-            // Opt-in: on Quest 3 this static map measured slower for HOTD4
-            // (20.6 vs 18.0 GPU ms/frame) than no foveation at all.
-            [] {const auto *v=std::getenv("LINDBERGH_VULKAN_EYE_FOVEATION");return v&&*v=='1';}()) {
-    // Larger than the eye image, so the runtime's maps do not fit. Give it a
-    // fixed foveation map at the runtime map's texel scale, centred on the eye
-    // picture (bottom-origin: it fills the target's last eye-height rows).
-    const auto extent=state.xr->density_extent();
-    const uint32_t tw=(state.xr->width()+extent[0]-1)/extent[0],th=(state.xr->height()+extent[1]-1)/extent[1];
-    const uint32_t mw=(info.width+tw-1)/tw,mh=(info.height+th-1)/th;
-    const float cx=info.width*.5f,cy=float(info.height)-state.xr->height()*.5f;
-    std::vector<uint8_t> texels(size_t(mw)*mh*2);
-    for(uint32_t y=0;y<mh;++y)for(uint32_t x=0;x<mw;++x) {
-      const float dx=((x+.5f)*tw-cx)/(state.xr->width()*.5f),dy=((y+.5f)*th-cy)/(state.xr->height()*.5f);
-      const float r=std::sqrt(dx*dx+dy*dy);
-      const uint8_t d=r<.5f?255:r<.8f?128:64; // full centre, then 1/2 and 1/4 shading rate
-      texels[2*(size_t(y)*mw+x)]=texels[2*(size_t(y)*mw+x)+1]=d;
-    }
-    auto map=std::make_unique<ConstantDensityMap>(*state.device,*state.ring,mw,mh,2,texels);
-    info.density_map=map->view();
-    state.eye_density[id]=std::move(map);
-    std::fprintf(stderr,"[vulkan-xr] eye pbuffer %u: fixed foveation %ux%u texels of %ux%u px\n",id,mw,mh,tw,th);
   }
 #endif
 #ifdef LINDBERGH_VULKAN_OFFSCREEN
@@ -1029,7 +1113,6 @@ extern "C" unsigned lvk_create_drawable(int w, int h) {
   const LgStereoTargetSize sizes={state.game_width,state.game_height,profile->vr.world_w,profile->vr.world_h,
       int(state.offscreen->info.width),int(state.offscreen->info.height)};
   float sx,sy;lg_stereo_target_scale(&sizes,w,h,0,&sx,&sy);
-  if(state.eye_pbuffer(w,h)&&!state.picture_size(w,h)){sx=float(state.offscreen->info.width)/state.game_width;sy=float(state.offscreen->info.height)/state.game_height;}
   info.width=uint32_t(std::lround(w*sx));info.height=uint32_t(std::lround(h*sy));
   if(state.picture_size(w,h)&&info.width==state.offscreen->info.width&&info.height==state.offscreen->info.height)
     info.density_map=state.offscreen->info.density_map;
@@ -1076,20 +1159,10 @@ void retire_drawable(unsigned id) {
   if(auto clear=state.renderers.find(target);clear!=state.renderers.end()) {
     retired->renderers.push_back(std::move(clear->second));state.renderers.erase(clear);
   }
-  state.initialized.erase(target);state.stencil_bits.erase(target);
+  state.initialized.erase(target);state.stencil_bits.erase(target);state.pending_clears.erase(target);
   state.drawables.erase(found);state.drawable_sizes.erase(id);state.deleted_drawables.erase(id);
   if(state.hud_target==id)state.hud_target=~0u;
   if(state.hud_target_next==id)state.hud_target_next=~0u;
-#ifdef LINDBERGH_VULKAN_XR
-  if(auto density=state.eye_density.find(id);density!=state.eye_density.end()) {
-    // The same fence: the target (and its framebuffers) go before their map.
-    struct WithDensity {std::unique_ptr<ConstantDensityMap> map;std::shared_ptr<RetiredTarget> target;};
-    auto bundle=std::make_shared<WithDensity>();bundle->map=std::move(density->second);bundle->target=std::move(retired);
-    state.eye_density.erase(density);
-    state.ring->retire(std::move(bundle));
-    return;
-  }
-#endif
   state.ring->retire(std::move(retired));
 }
 }
@@ -2329,6 +2402,10 @@ extern "C" void lvk_glCopyTexSubImage2D(GLenum target,GLint level,GLint dx,GLint
   const auto &v=o.levels.at(level);
   const auto logical=state.logical_size();
   const bool full_level=dx==0 && dy==0 && w==v.width && h==v.height;
+  // Clip the source to the drawable (a clipped eye pbuffer ends at the frame).
+  if(x<0){dx-=x;w+=x;x=0;} if(y<0){dy-=y;h+=y;y=0;}
+  w=std::min(w,logical[0]-x);h=std::min(h,logical[1]-y);
+  if(w<=0||h<=0)return;
   o.layers=source->info.layers;o.gpu_target=true;
   const double sx=double(source->info.width)/logical[0],sy=double(source->info.height)/logical[1];
   const auto &base=o.levels.at(0);
@@ -2337,11 +2414,12 @@ extern "C" void lvk_glCopyTexSubImage2D(GLenum target,GLint level,GLint dx,GLint
   changed(o);auto gpu=native_image(o,full_level?level:-1,true);
   const auto px=int32_t(std::lround(x*sx)),py=int32_t(std::lround(y*sy));
   const auto pw=uint32_t(std::lround((x+w)*sx)-px),ph=uint32_t(std::lround((y+h)*sy)-py);
+  const VkRect2D read{{px,py},{pw,ph}};state.materialize(source,&read);
   gpu->copy_from(state.cmd,*source,uint32_t(level),int32_t(std::lround(dx*sx)),int32_t(std::lround(dy*sy)),px,py,pw,ph,0,0,o.layers);
   state.pass_stamp("copy "+std::to_string(pw)+"x"+std::to_string(ph)+" x"+std::to_string(o.layers));
   static const auto copy_log=[] {std::array<unsigned,2> r{};if(const auto *v=std::getenv("LINDBERGH_VULKAN_CLASSIFY")){r[0]=r[1]=unsigned(std::strtoul(v,nullptr,10));if(const auto *end=std::strchr(v,'-'))r[1]=unsigned(std::strtoul(end+1,nullptr,10));}return r;}();
   if(copy_log[1]&&g_frame>=copy_log[0]&&g_frame<=copy_log[1])
-    std::fprintf(stderr,"[vulkan-copy] frame %u from target %u %ux%u region %d %d %d %d -> texture %dx%d level %d\n",g_frame,state.drawable,source->info.width,source->info.height,x,y,w,h,v.width,v.height,level);
+    std::fprintf(stderr,"[vulkan-copy] frame %u from target %u %ux%u region %d %d %d %d -> texture %u %dx%d level %d\n",g_frame,state.drawable,source->info.width,source->info.height,x,y,w,h,state.textures[state.active_texture-GL_TEXTURE0],v.width,v.height,level);
 }
 
 namespace {
