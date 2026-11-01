@@ -242,10 +242,56 @@ struct State {
   std::array<StereoPose,2> fake_eyes;
   std::unordered_map<unsigned,std::array<int,2>> drawable_sizes;
   unsigned world_draws=0,hud_sequence=0;
+  // LINDBERGH_VULKAN_PASS_TIMINGS=file and LINDBERGH_VULKAN_PASS_FRAMES=a-b:
+  // GPU time of each render pass and copy on those frames. Timestamps sit
+  // between passes only (inside a multiview pass one would take a query per
+  // view). Profiled frames wait for their own GPU work before reading it back.
+  struct {
+    VkQueryPool pool=VK_NULL_HANDLE;std::FILE *out=nullptr;unsigned from=1,to=0,n=0,draws=0;bool active=false;
+    std::vector<std::string> labels;
+  } pass_profile;
+  void pass_stamp(std::string label) {
+    if(!pass_profile.active||pass_profile.n>=1024)return;
+    vkCmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,pass_profile.pool,pass_profile.n++);
+    pass_profile.labels.push_back(std::move(label));
+  }
+  void pass_profile_begin() {
+    static const bool configured=[this] {
+      const auto *path=std::getenv("LINDBERGH_VULKAN_PASS_TIMINGS"),*frames=std::getenv("LINDBERGH_VULKAN_PASS_FRAMES");
+      if(!path||!frames)return false;
+      pass_profile.from=unsigned(std::strtoul(frames,nullptr,10));pass_profile.to=pass_profile.from;
+      if(const auto *end=std::strchr(frames,'-'))pass_profile.to=unsigned(std::strtoul(end+1,nullptr,10));
+      pass_profile.out=std::fopen(path,"w");if(!pass_profile.out)return false;
+      std::fprintf(pass_profile.out,"frame,index,gpu_ms,what\n");
+      VkQueryPoolCreateInfo q{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};q.queryType=VK_QUERY_TYPE_TIMESTAMP;q.queryCount=1024;
+      return vkCreateQueryPool(device->handles.device,&q,nullptr,&pass_profile.pool)==VK_SUCCESS;
+    }();
+    pass_profile.active=configured&&g_frame>=pass_profile.from&&g_frame<=pass_profile.to;
+    if(!pass_profile.active)return;
+    vkCmdResetQueryPool(cmd,pass_profile.pool,0,1024);pass_profile.n=0;pass_profile.labels.clear();pass_profile.draws=0;
+    pass_stamp("frame start");
+  }
+  void pass_profile_end(Submission submitted) {
+    if(!pass_profile.active)return;
+    pass_profile.active=false;ring->wait(submitted);
+    std::vector<uint64_t> t(pass_profile.n);
+    if(!pass_profile.n||vkGetQueryPoolResults(device->handles.device,pass_profile.pool,0,pass_profile.n,t.size()*8,t.data(),8,
+       VK_QUERY_RESULT_64_BIT|VK_QUERY_RESULT_WAIT_BIT)!=VK_SUCCESS)return;
+    const double period=device->capabilities.properties.limits.timestampPeriod;
+    for(unsigned i=1;i<pass_profile.n;++i)
+      std::fprintf(pass_profile.out,"%u,%u,%.3f,%s\n",g_frame,i,double(t[i]-t[i-1])*period/1e6,pass_profile.labels[i].c_str());
+    std::fflush(pass_profile.out);
+  }
   unsigned hud_target=~0u,hud_target_next=~0u;
   bool picture_size(int w,int h) const {
     const auto *p=game_profile();
     return (w==game_width&&h==game_height) || (p->vr.world_w>0&&w==p->vr.world_w&&h==p->vr.world_h);
+  }
+  // As in the GL host, where a pbuffer in the headset is drawn as the eyes:
+  // a pbuffer holding the game's frame - its size, or rounded up from it (The
+  // House of the Dead 4 draws 640x480 in a 640x512 one) - is the eye picture.
+  bool eye_pbuffer(int w,int h) const {
+    return picture_size(w,h) || (w>=game_width&&h>=game_height&&w<2*game_width&&h<2*game_height);
   }
   std::array<int,2> logical_size() const {return drawable?drawable_sizes.at(drawable):std::array<int,2>{game_width,game_height};}
   void scene_end() {
@@ -257,6 +303,8 @@ struct State {
   std::unique_ptr<OpenXR> xr;
   std::unique_ptr<Target> unfocused;
   std::unique_ptr<ConstantDensityMap> unfocused_density;
+  // Eye pbuffers larger than the swapchain image: their own fixed foveation.
+  std::unordered_map<unsigned,std::unique_ptr<ConstantDensityMap>> eye_density;
   bool xr_rendering = false;
 #endif
   std::unique_ptr<PipelineCache> cache;
@@ -272,6 +320,18 @@ struct State {
   std::unordered_map<Target *, std::unique_ptr<Renderer>> renderers;
   std::vector<DrawPacket> packets;
   std::unordered_set<Target *> initialized;
+  // Stencil bits that may be non-zero in each target (absent: unknown). A
+  // masked stencil clear is an ordinary full clear when the masked-out bits
+  // are known to be zero; on a tiler that also lets the pass begin cleared.
+  std::unordered_map<Target *,uint32_t> stencil_bits;
+  uint32_t stencil_known(Target *t) const {
+    auto it=stencil_bits.find(t);uint32_t bits=it==stencil_bits.end()?255u:it->second;
+    for(const auto &q:packets)if(q.target==t&&q.count&&q.raster.stencil)bits|=q.stencil_write_mask&255;
+    return bits;
+  }
+  static bool covers(const VkRect2D &r,const Target *t) {
+    return r.offset.x<=0&&r.offset.y<=0&&int64_t(r.offset.x)+r.extent.width>=t->info.width&&int64_t(r.offset.y)+r.extent.height>=t->info.height;
+  }
   std::array<std::unordered_map<std::string,std::shared_ptr<Material>>,3> materials;
   std::unordered_map<std::string,std::shared_ptr<Sampler>> samplers;
   std::shared_ptr<Texture> fallback;
@@ -355,7 +415,7 @@ struct State {
     offscreen.reset();offscreen_density.reset();
 #endif
 #ifdef LINDBERGH_VULKAN_XR
-    unfocused.reset();unfocused_density.reset();
+    unfocused.reset();unfocused_density.reset();eye_density.clear();
     xr.reset();
     activity.reset();
     host_display_timing_reset();
@@ -373,6 +433,7 @@ struct State {
     if (!cmd) {
       ring->frame_id(g_frame);
       cmd = ring->begin();
+      pass_profile_begin();
       if (!screen) {
 #ifdef LINDBERGH_VULKAN_XR
         screen = xr->begin_frame();
@@ -400,11 +461,11 @@ struct State {
           panel_input(sample,xr->display_time(),focused);
           const auto &haptics=panel->haptics();
           for(int h=0;h<2;++h)if(haptics[h].milliseconds)xr->rumble(h,haptics[h].amplitude,haptics[h].milliseconds);
-          for(auto &entry:drawables)if(entry.second->info.density_map)
+          for(auto &entry:drawables)if(entry.second->info.density_map&&!eye_density.count(entry.first))
             entry.second->select_density_map(screen->info.density_map);
         } else {
           stereo->invalidate();panel_input({},xr->display_time(),false);
-          for(auto &entry:drawables)if(entry.second->info.density_map)
+          for(auto &entry:drawables)if(entry.second->info.density_map&&!eye_density.count(entry.first))
             entry.second->select_density_map(unfocused_density->view());
         }
         if (screen) {
@@ -432,6 +493,13 @@ struct State {
   void end_pass() {
     if (active) {
       active->end();
+      if(pass_profile.active) {
+        unsigned id=0;for(const auto &d:drawables)if(d.second.get()==active_target)id=d.first;
+        pass_stamp("pass "+std::string(id?"pbuffer "+std::to_string(id):"eye")+" "+std::to_string(active_target->info.width)+"x"+
+                   std::to_string(active_target->info.height)+" draws "+std::to_string(pass_profile.draws)+
+                   (active_target->info.density_map?" foveated":""));
+        pass_profile.draws=0;
+      }
       active = nullptr; active_target = nullptr;
     }
   }
@@ -450,16 +518,40 @@ struct State {
       const auto ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
       if (created || ms>2) std::fprintf(stderr,"[vulkan-prepare] frame %u: %zu packets, %zu new pipelines, %.3f ms\n",g_frame,packets.size(),created,ms);
     } else for (auto &p : packets) if (p.count) p.renderer->prepare(p.raster);
+    constexpr VkImageAspectFlags color_depth=VK_IMAGE_ASPECT_COLOR_BIT|VK_IMAGE_ASPECT_DEPTH_BIT;
     for (auto &p : packets) {
+      bool cleared_on_begin=false;
       if (active_target != p.target) {
-        end_pass(); p.renderer->begin(cmd,p.color,initialized.count(p.target)!=0);
+        end_pass();
+        bool preserve=initialized.count(p.target)!=0;
+        float depth=1;uint32_t stencil=0;
+        // A pass that starts by clearing everything begins cleared instead of
+        // loading what it is about to overwrite. Without a stencil clear, the
+        // stencil must already be known to be all zero (the begin clear value).
+        const bool stencil_zero=stencil_bits.count(p.target)&&!stencil_bits[p.target];
+        static const bool begin_clears=[]{const auto *v=std::getenv("LINDBERGH_VULKAN_BEGIN_CLEAR");return !v||*v!='0';}();
+        if(begin_clears&&preserve&&covers(p.scissor,p.target)&&(p.clear_aspects&color_depth)==color_depth&&
+           ((p.clear_aspects&VK_IMAGE_ASPECT_STENCIL_BIT)||stencil_zero)) {
+          preserve=false;depth=p.clear_depth;cleared_on_begin=true;
+          stencil=(p.clear_aspects&VK_IMAGE_ASPECT_STENCIL_BIT)?p.clear_stencil&255:0;
+        }
+        if(!preserve)stencil_bits[p.target]=stencil;
+        p.renderer->begin(cmd,p.color,preserve,depth,stencil);
         initialized.insert(p.target); active=p.renderer; active_target=p.target;
       } else if (active != p.renderer) {
         active->detach(); p.renderer->attach(cmd); active=p.renderer;
       }
       active->viewport(p.viewport[0],p.viewport[1],p.viewport[2],p.viewport[3],p.scissor);
-      if (p.clear_aspects) active->clear(p.clear_aspects,p.color,p.clear_depth,p.clear_stencil,p.scissor);
+      if (p.clear_aspects&&!cleared_on_begin) {
+        active->clear(p.clear_aspects,p.color,p.clear_depth,p.clear_stencil,p.scissor);
+        if(p.clear_aspects&VK_IMAGE_ASPECT_STENCIL_BIT) {
+          auto &bits=stencil_bits[p.target];
+          bits=covers(p.scissor,p.target)&&(p.stencil_write_mask&255)==255?(p.clear_stencil&255):(bits|(p.clear_stencil&255));
+        }
+      }
+      if (p.count&&p.raster.stencil) stencil_bits[p.target]|=p.stencil_write_mask&255;
       if (p.count) {
+        ++pass_profile.draws;
         active->dynamic_state(p.stencil_ref,p.stencil_compare_mask,p.stencil_write_mask,p.depth_bias_factor,p.depth_bias_units,p.blend_constants.data());
         for (unsigned set=0;set<3;++set) if (p.descriptors[set])
           active->bind_descriptors(set,1,&p.descriptors[set],set<2?uint32_t(p.offsets[set].size()):0,set<2?p.offsets[set].data():nullptr);
@@ -821,6 +913,9 @@ extern "C" void lvk_host_present(void) {
     Renderer *previous=state.active_target==state.screen?state.active:nullptr;
     if(state.active&&!previous)state.end_pass();
     state.overlay->draw(state.cmd,*state.screen,state.stereo->overlay_matrices(),state.stereo->overlay_eyes(),state.panel->guns(),previous,true,state.panel->draws());
+    state.pass_stamp("pass eye "+std::to_string(state.screen->info.width)+"x"+std::to_string(state.screen->info.height)+
+                     " draws "+std::to_string(state.pass_profile.draws)+" + overlay");
+    state.pass_profile.draws=0;
     state.active=nullptr;state.active_target=nullptr;
     static const bool overlay_log=std::getenv("LINDBERGH_VULKAN_OVERLAY_LOG")!=nullptr;
     if(overlay_log&&g_frame%600==0)std::fprintf(stderr,"[vulkan-overlay] frame %u: %zu retained meshes, %zu prepared targets, %llu multiview draws, %llu additional passes\n",
@@ -863,6 +958,7 @@ extern "C" void lvk_host_present(void) {
 #endif
 #endif
   state.last_submission=submitted;
+  state.pass_profile_end(submitted);
   if(capture) {state.ring->wait(submitted);capture->write(capture_path.c_str(),*capture_target);}
   state.cmd=VK_NULL_HANDLE;
   state.screen=nullptr;
@@ -895,12 +991,37 @@ extern "C" unsigned lvk_create_drawable(int w, int h) {
   const auto *profile=game_profile();
   const LgStereoTargetSize sizes={state.game_width,state.game_height,profile->vr.world_w,profile->vr.world_h,int(state.xr->width()),int(state.xr->height())};
   float sx,sy;lg_stereo_target_scale(&sizes,w,h,0,&sx,&sy);
+  // A rounded-up eye pbuffer keeps the game frame's eye scale, so that frame
+  // fills the eye and the extra rows/columns stay addressable.
+  if(state.eye_pbuffer(w,h)&&!state.picture_size(w,h)){sx=float(state.xr->width())/state.game_width;sy=float(state.xr->height())/state.game_height;}
   info.width=uint32_t(std::lround(w*sx));info.height=uint32_t(std::lround(h*sy));
   std::fprintf(stderr,"[vulkan-xr] pbuffer %u: %dx%d -> %ux%u, %u layers\n",id,w,h,info.width,info.height,info.layers);
   const bool foveated_world=state.picture_size(w,h) && info.width==state.xr->width() && info.height==state.xr->height();
   if(foveated_world) {
     if(state.xr->density_maps().empty())gap("World pbuffer requires runtime density maps");
     info.density_map=state.unfocused_density->view();
+  } else if(state.eye_pbuffer(w,h) && !state.xr->density_maps().empty() &&
+            // Opt-in: on Quest 3 this static map measured slower for HOTD4
+            // (20.6 vs 18.0 GPU ms/frame) than no foveation at all.
+            [] {const auto *v=std::getenv("LINDBERGH_VULKAN_EYE_FOVEATION");return v&&*v=='1';}()) {
+    // Larger than the eye image, so the runtime's maps do not fit. Give it a
+    // fixed foveation map at the runtime map's texel scale, centred on the eye
+    // picture (bottom-origin: it fills the target's last eye-height rows).
+    const auto extent=state.xr->density_extent();
+    const uint32_t tw=(state.xr->width()+extent[0]-1)/extent[0],th=(state.xr->height()+extent[1]-1)/extent[1];
+    const uint32_t mw=(info.width+tw-1)/tw,mh=(info.height+th-1)/th;
+    const float cx=info.width*.5f,cy=float(info.height)-state.xr->height()*.5f;
+    std::vector<uint8_t> texels(size_t(mw)*mh*2);
+    for(uint32_t y=0;y<mh;++y)for(uint32_t x=0;x<mw;++x) {
+      const float dx=((x+.5f)*tw-cx)/(state.xr->width()*.5f),dy=((y+.5f)*th-cy)/(state.xr->height()*.5f);
+      const float r=std::sqrt(dx*dx+dy*dy);
+      const uint8_t d=r<.5f?255:r<.8f?128:64; // full centre, then 1/2 and 1/4 shading rate
+      texels[2*(size_t(y)*mw+x)]=texels[2*(size_t(y)*mw+x)+1]=d;
+    }
+    auto map=std::make_unique<ConstantDensityMap>(*state.device,*state.ring,mw,mh,2,texels);
+    info.density_map=map->view();
+    state.eye_density[id]=std::move(map);
+    std::fprintf(stderr,"[vulkan-xr] eye pbuffer %u: fixed foveation %ux%u texels of %ux%u px\n",id,mw,mh,tw,th);
   }
 #endif
 #ifdef LINDBERGH_VULKAN_OFFSCREEN
@@ -908,6 +1029,7 @@ extern "C" unsigned lvk_create_drawable(int w, int h) {
   const LgStereoTargetSize sizes={state.game_width,state.game_height,profile->vr.world_w,profile->vr.world_h,
       int(state.offscreen->info.width),int(state.offscreen->info.height)};
   float sx,sy;lg_stereo_target_scale(&sizes,w,h,0,&sx,&sy);
+  if(state.eye_pbuffer(w,h)&&!state.picture_size(w,h)){sx=float(state.offscreen->info.width)/state.game_width;sy=float(state.offscreen->info.height)/state.game_height;}
   info.width=uint32_t(std::lround(w*sx));info.height=uint32_t(std::lround(h*sy));
   if(state.picture_size(w,h)&&info.width==state.offscreen->info.width&&info.height==state.offscreen->info.height)
     info.density_map=state.offscreen->info.density_map;
@@ -954,10 +1076,20 @@ void retire_drawable(unsigned id) {
   if(auto clear=state.renderers.find(target);clear!=state.renderers.end()) {
     retired->renderers.push_back(std::move(clear->second));state.renderers.erase(clear);
   }
-  state.initialized.erase(target);
+  state.initialized.erase(target);state.stencil_bits.erase(target);
   state.drawables.erase(found);state.drawable_sizes.erase(id);state.deleted_drawables.erase(id);
   if(state.hud_target==id)state.hud_target=~0u;
   if(state.hud_target_next==id)state.hud_target_next=~0u;
+#ifdef LINDBERGH_VULKAN_XR
+  if(auto density=state.eye_density.find(id);density!=state.eye_density.end()) {
+    // The same fence: the target (and its framebuffers) go before their map.
+    struct WithDensity {std::unique_ptr<ConstantDensityMap> map;std::shared_ptr<RetiredTarget> target;};
+    auto bundle=std::make_shared<WithDensity>();bundle->map=std::move(density->second);bundle->target=std::move(retired);
+    state.eye_density.erase(density);
+    state.ring->retire(std::move(bundle));
+    return;
+  }
+#endif
   state.ring->retire(std::move(retired));
 }
 }
@@ -1172,7 +1304,8 @@ extern "C" void lvk_glClearColor(GLclampf r, GLclampf g, GLclampf b,
   state.clear = {r, g, b, a};
 }
 extern "C" void lvk_glClearDepth(GLclampd d) {
-  state.floats[GL_DEPTH_CLEAR_VALUE] = {float(d), 0, 0, 0};
+  // GLclampd: GL clamps the clear depth to [0,1] (HOTD4 passes 10000/32768).
+  state.floats[GL_DEPTH_CLEAR_VALUE] = {float(std::clamp(d,0.,1.)), 0, 0, 0};
 }
 extern "C" void lvk_glClearStencil(GLint s) {
   state.integers[GL_STENCIL_CLEAR_VALUE] = s;
@@ -2160,7 +2293,14 @@ void queue_clear(GLbitfield mask) {
   if(write!=state.floats.end()) {full=std::all_of(write->second.begin(),write->second.end(),[](float v){return v!=0;});none=std::all_of(write->second.begin(),write->second.end(),[](float v){return v==0;});}
   if(mask&GL_COLOR_BUFFER_BIT) {if(!none)p.clear_aspects|=VK_IMAGE_ASPECT_COLOR_BIT;}
   if((mask&GL_DEPTH_BUFFER_BIT)&&state.raster.depth_write)p.clear_aspects|=VK_IMAGE_ASPECT_DEPTH_BIT;
-  if((mask&GL_STENCIL_BUFFER_BIT)&&(p.stencil_write_mask&255)) {p.clear_aspects|=VK_IMAGE_ASPECT_STENCIL_BIT;}
+  if((mask&GL_STENCIL_BUFFER_BIT)&&(p.stencil_write_mask&255)) {
+    p.clear_aspects|=VK_IMAGE_ASPECT_STENCIL_BIT;
+    // Bits outside the write mask known to be zero and cleared to zero: the
+    // masked clear equals a full one, so no clear quad is needed.
+    const uint32_t masked=p.stencil_write_mask&255;
+    static const bool widen=[]{const auto *v=std::getenv("LINDBERGH_VULKAN_WIDEN_STENCIL_CLEAR");return !v||*v!='0';}();
+    if(widen&&masked!=255&&p.clear_stencil==(p.clear_stencil&masked)&&!(state.stencil_known(target)&~masked&255))p.stencil_write_mask|=255;
+  }
   p.clear_depth=state.floats.count(GL_DEPTH_CLEAR_VALUE)?state.floats[GL_DEPTH_CLEAR_VALUE][0]:1;
   p.clear_stencil=uint32_t(integer(GL_STENCIL_CLEAR_VALUE,0));
   if(p.clear_aspects && ((!full&&!none) || ((p.clear_aspects&VK_IMAGE_ASPECT_STENCIL_BIT)&&((p.stencil_write_mask&255)!=255)))) {
@@ -2175,6 +2315,10 @@ void queue_clear(GLbitfield mask) {
     p.streams.push_back(state.ring->upload(quad,sizeof quad));for(auto &m:p.matrices.view_projection)for(unsigned i=0;i<4;++i)m[i*5]=1;
     p.viewport={0,0,float(target->info.width),float(target->info.height)};
   }
+  static const auto clear_log=[] {std::array<unsigned,2> r{};if(const auto *v=std::getenv("LINDBERGH_VULKAN_CLASSIFY")){r[0]=r[1]=unsigned(std::strtoul(v,nullptr,10));if(const auto *end=std::strchr(v,'-'))r[1]=unsigned(std::strtoul(end+1,nullptr,10));}return r;}();
+  if(clear_log[1]&&g_frame>=clear_log[0]&&g_frame<=clear_log[1])
+    std::fprintf(stderr,"[vulkan-clear] frame %u target %u mask %#x color-mask full %d none %d depth-write %d -> aspects %#x quad %d stencil-write %#x clear-stencil %u depth %g color %g %g %g %g scissor %d %d %u %u\n",
+      g_frame,state.drawable,mask,full,none,state.raster.depth_write,p.clear_aspects,p.count!=0,p.stencil_write_mask,p.clear_stencil,p.clear_depth,p.color[0],p.color[1],p.color[2],p.color[3],p.scissor.offset.x,p.scissor.offset.y,p.scissor.extent.width,p.scissor.extent.height);
   if(p.clear_aspects||p.count)state.packets.push_back(std::move(p));
 }
 }
@@ -2194,6 +2338,10 @@ extern "C" void lvk_glCopyTexSubImage2D(GLenum target,GLint level,GLint dx,GLint
   const auto px=int32_t(std::lround(x*sx)),py=int32_t(std::lround(y*sy));
   const auto pw=uint32_t(std::lround((x+w)*sx)-px),ph=uint32_t(std::lround((y+h)*sy)-py);
   gpu->copy_from(state.cmd,*source,uint32_t(level),int32_t(std::lround(dx*sx)),int32_t(std::lround(dy*sy)),px,py,pw,ph,0,0,o.layers);
+  state.pass_stamp("copy "+std::to_string(pw)+"x"+std::to_string(ph)+" x"+std::to_string(o.layers));
+  static const auto copy_log=[] {std::array<unsigned,2> r{};if(const auto *v=std::getenv("LINDBERGH_VULKAN_CLASSIFY")){r[0]=r[1]=unsigned(std::strtoul(v,nullptr,10));if(const auto *end=std::strchr(v,'-'))r[1]=unsigned(std::strtoul(end+1,nullptr,10));}return r;}();
+  if(copy_log[1]&&g_frame>=copy_log[0]&&g_frame<=copy_log[1])
+    std::fprintf(stderr,"[vulkan-copy] frame %u from target %u %ux%u region %d %d %d %d -> texture %dx%d level %d\n",g_frame,state.drawable,source->info.width,source->info.height,x,y,w,h,v.width,v.height,level);
 }
 
 namespace {
@@ -2399,7 +2547,7 @@ bool stereo_packet(DrawPacket &packet,GLint first,GLsizei count,const std::vecto
   const auto &p=state.matrices.matrix(GL_PROJECTION);
   LgStereoDrawFacts facts{};facts.perspective=state.stereo->world_camera(p);
   const auto size=state.logical_size();
-  facts.offscreen=state.drawable && !state.picture_size(size[0],size[1]);
+  facts.offscreen=state.drawable && !state.eye_pbuffer(size[0],size[1]);
   facts.hud_target=state.drawable==state.hud_target;facts.multiview=1;
   facts.zoom=state.stereo->zoomed(p);
   const auto texture=state.texture_objects.find(state.textures[0]);
@@ -2486,7 +2634,7 @@ bool stereo_packet(DrawPacket &packet,GLint first,GLsizei count,const std::vecto
     }
   }
   if(log_range[1] && g_frame>=log_range[0] && g_frame<=log_range[1])
-    std::fprintf(stderr,"[vulkan-class] frame %u target %u %dx%d class %d lens %.4f %.4f texture-view %d offscreen %d; cache builds %zu; program %u texture %u gpu-target %d world draws %u\n",g_frame,state.drawable,size[0],size[1],kind,p[0],p[5],facts.texture_view,facts.offscreen,state.stereo->transform_builds(),state.program,state.textures[0],texture!=state.texture_objects.end()&&texture->second.gpu_target,state.world_draws);
+    std::fprintf(stderr,"[vulkan-class] frame %u target %u %dx%d class %d lens %.4f %.4f texture-view %d offscreen %d; cache builds %zu; program %u texture %u gpu-target %d world draws %u; viewport %d %d %d %d\n",g_frame,state.drawable,size[0],size[1],kind,p[0],p[5],facts.texture_view,facts.offscreen,state.stereo->transform_builds(),state.program,state.textures[0],texture!=state.texture_objects.end()&&texture->second.gpu_target,state.world_draws,state.viewport[0],state.viewport[1],state.viewport[2],state.viewport[3]);
   return false;
 }
 void draw_geometry(GLenum mode,GLint first,GLsizei count,const void *indices,GLenum index_type,bool indexed,

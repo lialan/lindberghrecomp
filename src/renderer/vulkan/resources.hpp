@@ -1,4 +1,5 @@
 #pragma once
+#include <vector>
 #include "frame_ring.hpp"
 #include "renderer.hpp"
 
@@ -29,6 +30,9 @@ private:
 class ConstantDensityMap {
 public:
     ConstantDensityMap(Device &device,FrameRing &ring,uint32_t width,uint32_t height,uint32_t layers,float density=1);
+    // Per-texel R8G8 densities (width*height*2 bytes, the same for every layer):
+    // a fixed foveation pattern for a target the runtime's maps do not fit.
+    ConstantDensityMap(Device &device,FrameRing &ring,uint32_t width,uint32_t height,uint32_t layers,const std::vector<uint8_t> &texels);
     ~ConstantDensityMap();
     ConstantDensityMap(const ConstantDensityMap &)=delete;
     ConstantDensityMap &operator=(const ConstantDensityMap &)=delete;
@@ -36,6 +40,7 @@ public:
 private:
     Device &device_;
     VkImage image_=VK_NULL_HANDLE;VkDeviceMemory memory_=VK_NULL_HANDLE;VkImageView view_=VK_NULL_HANDLE;
+    VkBuffer staging_=VK_NULL_HANDLE;VkDeviceMemory staging_memory_=VK_NULL_HANDLE;
     void release();
 };
 

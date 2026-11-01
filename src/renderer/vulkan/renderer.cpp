@@ -353,12 +353,12 @@ void Renderer::prepare(RasterState state)
     if (pipeline_created) pipeline_created(state);
 }
 
-void Renderer::begin(VkCommandBuffer cmd, std::array<float, 4> color, bool preserve)
+void Renderer::begin(VkCommandBuffer cmd, std::array<float, 4> color, bool preserve, float depth, uint32_t stencil)
 {
     if (cmd_ || !cmd) throw std::logic_error("Invalid Vulkan render pass begin");
     VkClearValue clear[2]{};
     for (unsigned i = 0; i < 4; i++) clear[0].color.float32[i] = color[i];
-    clear[1].depthStencil = {1, 0};
+    clear[1].depthStencil = {depth, stencil};
     VkRenderPassBeginInfo pass{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     pass.renderPass = preserve ? target_.load_pass : target_.render_pass; pass.framebuffer = target_.framebuffer;
     pass.renderArea.extent = {target_.info.width, target_.info.height};
@@ -417,7 +417,8 @@ void Renderer::clear(VkImageAspectFlags aspects, std::array<float,4> color, floa
         a.clearValue.depthStencil = {depth, stencil};
     }
     VkClearRect area{rect,0,1};
-    if (count && rect.extent.width && rect.extent.height) vkCmdClearAttachments(cmd_,count,attachments,1,&area);
+    if (!count || !rect.extent.width || !rect.extent.height) return;
+    vkCmdClearAttachments(cmd_,count,attachments,1,&area);
 }
 
 void Renderer::bind_descriptors(uint32_t first_set, uint32_t count, const VkDescriptorSet *sets,
