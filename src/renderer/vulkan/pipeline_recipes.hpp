@@ -16,6 +16,8 @@ class PipelineRecipes {
     ~PipelineRecipes();
     PipelineRecipes(const PipelineRecipes &) = delete;
     PipelineRecipes &operator=(const PipelineRecipes &) = delete;
+    // Portable RGBA8 descriptions can rebuild for sRGB/FDM target variants;
+    // every retained pipeline is created against the destination render pass.
     void prepare(Target &);
     std::shared_ptr<Renderer> renderer(Target &, const ShaderRecord &,
                                        const std::vector<VkVertexInputBindingDescription> &,

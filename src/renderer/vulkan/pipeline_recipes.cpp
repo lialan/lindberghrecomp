@@ -75,6 +75,18 @@ SourceDigest identity(const ShaderRecord &record) {
         word(bytes, v);
     return source_digest(bytes);
 }
+bool portable_color(uint32_t format) {
+    return format == VK_FORMAT_R8G8B8A8_UNORM || format == VK_FORMAT_R8G8B8A8_SRGB ||
+           format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB;
+}
+bool portable_target(const std::array<uint32_t,5> &source, const std::array<uint32_t,5> &destination) {
+    // These are pipeline descriptions, not VkPipeline handles. Rebuild against
+    // the destination's own render pass (including color conversion and FDM).
+    // Shader identity remains exact; retain view count and origin conventions.
+    return source == destination ||
+           (portable_color(source[0]) && portable_color(destination[0]) &&
+            source[1] == destination[1] && source[3] == destination[3]);
+}
 } // namespace
 std::array<uint32_t, 5> PipelineRecipes::target_class(const Target &target) {
     return {uint32_t(target.info.color_format), target.info.layers, uint32_t(target.info.final_layout),
@@ -274,12 +286,14 @@ void PipelineRecipes::prepare(Target &target) {
     const auto started = std::chrono::steady_clock::now();
     const auto compatible = target_class(target);
     const auto before = prepared_;
+    // Preparing a different target class records its concrete descriptions too.
+    // Snapshot the candidates so callback insertions cannot extend this traversal.
+    std::vector<Recipe> candidates;
+    for (const auto &entry : recipes_)
+        if (portable_target(entry.second.target, compatible)) candidates.push_back(entry.second);
     preparing_ = true;
     try {
-        for (auto &entry : recipes_) {
-            auto &r = entry.second;
-            if (r.target != compatible)
-                continue;
+        for (const auto &r : candidates) {
             renderer(target, *shaders_.at(r.shader), r.bindings, r.attributes)->prepare(r.raster);
         }
     } catch (...) {
@@ -289,8 +303,9 @@ void PipelineRecipes::prepare(Target &target) {
     preparing_ = false;
     if (prepared_ != before)
         std::fprintf(
-            stderr, "[vulkan-recipes] retained %zu pipelines before target use (%ux%u x%u), %.3f ms\n",
+            stderr, "[vulkan-recipes] retained %zu pipelines before target use (%ux%u x%u, format %u, density %u, origin %u), %.3f ms\n",
             prepared_ - before, target.info.width, target.info.height, target.info.layers,
+            compatible[0], compatible[4], compatible[3],
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
 }
 void PipelineRecipes::retire(Target &target) {

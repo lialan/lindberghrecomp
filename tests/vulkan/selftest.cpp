@@ -626,6 +626,56 @@ static void render_stereo(Device &device)
         loaded.retire(resized);
         other_info.guest_bottom_origin=!other_info.guest_bottom_origin;Target flipped(device,other_info);
         loaded.prepare(flipped);require(loaded.prepared_count()==2,"incompatible target origin reused a pipeline");
+        auto variant_draw = [&](PipelineRecipes &catalogue, TargetInfo variant_info, bool srgb) {
+            Target variant(device,variant_info);
+            const auto prepared_before=catalogue.prepared_count();
+            catalogue.prepare(variant);
+            require(catalogue.prepared_count()==prepared_before+1,"portable color/FDM target variant was not prepared");
+            auto pipeline=catalogue.renderer(variant,*record,legacy.bindings,legacy.attributes);
+            pipeline->prepare(state);
+            require(catalogue.first_use_count()==0,"target variant compiled on first draw");
+            const float half_tint[]={.5f,.5f,.5f,1};
+            guest_uniforms.write(uint32_t(tint_location),half_tint,sizeof half_tint);
+            cmd=ring.begin();pipeline->begin(cmd,{0,0,0,1});bind_legacy(*pipeline);
+            sampled=legacy_material.handle();pipeline->bind_descriptors(2,1,&sampled);
+            offset=uniforms.upload(0,guest_uniforms.bytes().data(),guest_uniforms.bytes().size());descriptors=uniforms.current_set();
+            pipeline->bind_descriptors(1,1,&descriptors,1,&offset);
+            pipeline->draw(ring,triangle,3,matrices,state);pipeline->end();
+            vkCmdCopyImageToBuffer(cmd,variant.color,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,output.buffer,1,&copy);
+            vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&barrier,0,nullptr);
+            ring.wait(ring.submit());
+            const auto pixels=static_cast<const unsigned char *>(output.mapped);
+            for(unsigned eye=0;eye<2;++eye) {
+                const auto at=((eye*32+16)*32+(eye?24:8))*4;
+                require(std::abs(int(pixels[at])-(srgb?188:128))<=1&&pixels[at+1]==0&&pixels[at+2]==0&&pixels[at+3]==255,
+                        "portable target recipe lost destination color encoding or stereo output");
+            }
+            guest_uniforms.write(uint32_t(tint_location),tint,sizeof tint);
+            catalogue.retire(variant);
+        };
+        auto variant_info=target.info;variant_info.color_format=VK_FORMAT_R8G8B8A8_SRGB;
+        variant_draw(loaded,variant_info,true);
+        if(device.capabilities.density_map&&device.capabilities.density_map_non_subsampled) {
+            ConstantDensityMap density(device,ring,32,32,2);
+            variant_info.density_map=density.view();variant_draw(loaded,variant_info,true);
+            // The APK's offscreen seed contains only FDM target classes. Its
+            // unfocused scratch target must also preload from that seed.
+            const auto fdm_path=path+"-fdm";
+            {
+                Target seeded_fdm(device,variant_info);
+                PipelineRecipes capture_fdm(device,no_disk,{&pack},fdm_path);
+                capture_fdm.renderer(seeded_fdm,*record,legacy.bindings,legacy.attributes)->prepare(state);
+                capture_fdm.save();
+            }
+            PipelineRecipes fallback(device,no_disk,{&pack},"",fdm_path);
+            require(fallback.recipe_count()==1,"FDM-only portable seed did not load");
+            variant_draw(fallback,target.info,false);
+            variant_info.density_map=VK_NULL_HANDLE;variant_draw(fallback,variant_info,true);
+            std::filesystem::remove(fdm_path);
+        }
+        auto mono_info=target.info;mono_info.layers=1;Target mono(device,mono_info);
+        const auto before_mono=loaded.prepared_count();loaded.prepare(mono);
+        require(loaded.prepared_count()==before_mono,"portable recipe ignored stereo layer count");
         std::ifstream input(path,std::ios::binary);std::string bytes{std::istreambuf_iterator<char>(input),{}};
         bytes[12]^=1;{std::ofstream out(path,std::ios::binary|std::ios::trunc);out.write(bytes.data(),bytes.size());}
         PipelineRecipes corrupt(device,no_disk,{&pack},path);
@@ -637,7 +687,7 @@ static void render_stereo(Device &device)
         require(foreign_shader.recipe_count()==0,"unknown compiled shader identity reused a pipeline recipe");
         std::filesystem::remove(path);
     }
-    std::puts("ok: portable pipeline seeds preload retained stereo pipelines; compatible descriptors, resolution reuse and stale/corrupt rejection");
+    std::puts("ok: portable pipeline seeds preload retained stereo pipelines; destination sRGB/FDM rendering, descriptors, resolution reuse and stale/corrupt rejection");
 
     // Game loading uses packed BGRA8888_REV and RGB565. Sample the original
     // guest byte order directly; checking channels catches a mistaken swizzle.

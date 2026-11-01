@@ -412,7 +412,6 @@ struct State {
         if (!screen) {
           // Keep guest simulation/resources valid while the headset is not
           // rendering. Never hand this scratch target to the compositor.
-          if (!unfocused) unfocused=std::make_unique<Target>(*device,TargetInfo{uint32_t(game_width),uint32_t(game_height),2});
           screen=unfocused.get();
         }
 #else
@@ -675,6 +674,7 @@ extern "C" int lvk_host_init(SDL_Window *window, int w, int h) {
 #ifdef LINDBERGH_VULKAN_XR
     const auto density=state.xr->density_extent();
     state.unfocused_density=std::make_unique<ConstantDensityMap>(*state.device,*state.ring,density[0],density[1],2);
+    state.unfocused=std::make_unique<Target>(*state.device,TargetInfo{uint32_t(w),uint32_t(h),2});
 #endif
 #ifdef LINDBERGH_VULKAN_OFFSCREEN
     TargetInfo offscreen{uint32_t(state.settings.width),uint32_t(state.settings.resolution),2};
@@ -709,6 +709,7 @@ extern "C" int lvk_host_init(SDL_Window *window, int w, int h) {
           std::vector<const ShaderPack *>{state.pack.get(),state.fixed_pack.get()},recipe_file,seed?seed:"");
 #ifdef LINDBERGH_VULKAN_XR
         for(const auto &target:state.xr->render_targets())state.recipes->prepare(*target);
+        state.recipes->prepare(*state.unfocused);
 #elif defined(LINDBERGH_VULKAN_OFFSCREEN)
         state.recipes->prepare(*state.offscreen);
 #else
