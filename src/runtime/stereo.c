@@ -860,6 +860,7 @@ static Cls g_cls[HLE_ID_MAX];
  * targets tell a menu from a quiet moment of play, but the game itself does:
  * in game mode it runs one state function a frame, GameLoop while playing,
  * GameInstruction, GameWeaponSelect and so on while a menu is up. */
+#include "game_states.h"
 uint32_t stereo_state_lo = ~0u, stereo_state_hi;
 static uint32_t g_state_va[48];
 static unsigned g_nstate, g_nmenu;      /* the first g_nmenu are menus */
@@ -869,19 +870,10 @@ static long g_rt_dump_at = -2;          /* LINDBERGH_RT_DUMP_MENU=N: dump N fram
 
 static void watch_states(void)
 {
-    static const char *menus[] = {
-        "Init", "Calibration", "Instruction", "Card", "Custom", "MatchUpSelect", "CharacterSelect", "WeaponSelect",
-        "Information", "Entry", "StartWait", "StageSelect", "WaitCard", "NameEntry", "Ranking", "Record",
-        "Password", "Result", "Start",
-    };
-    static const char *play[] = {   /* reported in LINDBERGH_HUD_LOG only */
-        "Opening", "RoundStart", "Loop", "RoundResult", "Replay", "SceneClear", "ChallengerComes",
-        "TimeUp", "Continue", "Close", "Ending", "CleanUp", "Pause", "Exit", "Over", "StageClear",
-    };
     if (g_nstate) return;
-    for (int pass = 0; pass < 2; pass++) {
-        const char **l = pass ? play : menus;
-        int n = pass ? (int)(sizeof play / sizeof *play) : (int)(sizeof menus / sizeof *menus);
+    for (int pass = 0; pass < 2; pass++) {   /* play states: reported in LINDBERGH_HUD_LOG only */
+        const char *const *l = pass ? lg_play_states : lg_menu_states;
+        int n = pass ? (int)(sizeof lg_play_states / sizeof *lg_play_states) : (int)(sizeof lg_menu_states / sizeof *lg_menu_states);
         for (int i = 0; i < n && g_nstate < 48; i++) {
             char name[64];
             snprintf(name, sizeof name, "_Z%zuGame%sP8GAMEWORK", strlen(l[i]) + 4, l[i]);

@@ -14,6 +14,7 @@
 #include "../renderer/vulkan/uniforms.hpp"
 #include "vulkan_abi.h"
 #include "fixed_fragment_source.h"
+#include "game_states.h"
 #include "vulkan_host.h"
 #include <SDL.h>
 #ifdef LINDBERGH_VULKAN_XR
@@ -771,6 +772,7 @@ struct State {
   }
 };
 State state;
+void watch_game_states(); // the menu-state watch (below)
 void State::fake_controllers()
 {
   // In the device-free panel demonstration, turn toward the placed panel after
@@ -1020,6 +1022,7 @@ extern "C" int lvk_host_init(SDL_Window *window, int w, int h) {
 #endif
     }
     state.game_width=w; state.game_height=h;
+    if(state.stereo)watch_game_states();
     state.viewport = state.scissor = {0, 0, w, h};
     state.arrays.current(3,{1,1,1,1});state.arrays.current(2,{0,0,1,0});
     state.raster.depth_test = false;
@@ -1401,6 +1404,35 @@ extern "C" void lvk_glDeleteRenderbuffers(GLsizei n, const GLuint *ids) {
 }
 extern "C" void lvk_glDrawBuffer(GLenum) {}
 extern "C" void lvk_glReadBuffer(GLenum) {}
+// Menus: the game's state functions (game_states.h), as in the GL host. The
+// dispatcher reports guest calls inside [stereo_state_lo, stereo_state_hi]
+// (globals of the generated stereo bridge); a menu state having run this
+// frame or the last makes the frame's 3D screen content (facts.menu).
+extern "C" uint32_t stereo_state_lo, stereo_state_hi;
+extern "C" uint32_t guest_symbol(const char *name);
+namespace {
+struct {std::vector<uint32_t> va;size_t menus=0;unsigned frame=~0u;} g_game_states;
+void watch_game_states() {
+  auto &g=g_game_states;if(!g.va.empty())return;
+  for(int pass=0;pass<2;++pass) {
+    const auto *names=pass?lg_play_states:lg_menu_states;
+    const size_t n=pass?sizeof lg_play_states/sizeof *lg_play_states:sizeof lg_menu_states/sizeof *lg_menu_states;
+    for(size_t i=0;i<n;++i) {
+      const std::string name="_Z"+std::to_string(std::strlen(names[i])+4)+"Game"+names[i]+"P8GAMEWORK";
+      if(const uint32_t va=guest_symbol(name.c_str())) {
+        g.va.push_back(va);stereo_state_lo=std::min(stereo_state_lo,va);stereo_state_hi=std::max(stereo_state_hi,va);
+      }
+    }
+    if(!pass)g.menus=g.va.size();
+  }
+  std::fprintf(stderr,"[vulkan] %zu menu states of %zu found\n",g.menus,g.va.size());
+}
+bool menu_state() {return g_game_states.frame!=~0u&&g_frame-g_game_states.frame<=1;}
+}
+extern "C" void stereo_guest_state(uint32_t va) {
+  auto &g=g_game_states;
+  for(size_t i=0;i<g.va.size();++i)if(g.va[i]==va){g.frame=i<g.menus?g_frame:~0u;return;}
+}
 // arbprog.c's rectangle lookups: render targets drawn larger are scaled to the
 // eyes' resolution (what a rectangle target keeps, lg_stereo_target_scale).
 // Vertex programs that do their own transform multiply by u_reproj (GL's
@@ -3170,6 +3202,7 @@ bool stereo_packet(DrawPacket &packet,GLint first,GLsizei count,const std::vecto
   facts.offscreen=state.drawable && !state.eye_pbuffer(size[0],size[1]);
   facts.hud_target=state.drawable==state.hud_target;facts.multiview=1;
   facts.zoom=state.stereo->zoomed(p);
+  facts.menu=facts.perspective&&menu_state();
   const auto texture=state.texture_objects.find(!state.program&&state.rect_enabled[0]?state.rect_textures[0]:state.textures[0]);
   if(texture!=state.texture_objects.end())facts.texture_view=texture->second.picture_view;
   const auto *profile=game_profile();
@@ -3188,7 +3221,12 @@ bool stereo_packet(DrawPacket &packet,GLint first,GLsizei count,const std::vecto
     const auto &base=texture->second.levels.at(0);
     composite=state.picture_size(base.width,base.height)&&picture_composite(first,count,elements,immediate,stride);
   }
-  const int kind=composite?LG_STEREO_PASS:lg_stereo_classify_draw(&facts);
+  int kind=composite?LG_STEREO_PASS:lg_stereo_classify_draw(&facts);
+  // Full-screen 2D into a framebuffer object with no world drawn yet this
+  // frame is a 2D screen (GSE's menus and briefings: a frame layer with
+  // windows over its panels): it goes on the HUD's screen with the rest of
+  // the 2D. Over a world it stays a full-eye fill (a fade, a flash).
+  if(kind==LG_STEREO_FILL&&!facts.perspective&&!state.world_draws&&state.bound_framebuffer)kind=LG_STEREO_HUD;
   const bool raw_perspective=lg_stereo_is_perspective(p.data());
   const bool movie=texture!=state.texture_objects.end()&&texture->second.movie;
   // Movie/HUD layers hide their black backing with depth, so they take the
