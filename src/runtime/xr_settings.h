@@ -8,7 +8,8 @@ typedef struct {
     int resolution,width,refresh,left_handed,laser,auto_coins;
     int sight,crosshair,show_gun,hud_pitch,dual,show_fps;
 } LgXrSettings;
-#define LG_XR_SETTINGS_DEFAULT {1.0f,3.0f,15.0f,2280,2064,120,0,LASER_ON,1,0,1,1,0,0,0}
+/* ... dual off, FPS readout on (vr.cfg "fps off" hides it) */
+#define LG_XR_SETTINGS_DEFAULT {1.0f,3.0f,15.0f,2280,2064,120,0,LASER_ON,1,0,1,1,0,0,1}
 void xr_settings_load(LgXrSettings *settings);
 void xr_settings_set(LgXrSettings *settings,const char *key,const char *value);
 void xr_settings_save(const LgXrSettings *settings);
