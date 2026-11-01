@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <cmath>
 #include <stdexcept>
 namespace lindbergh::vk {
 void xr_check(XrResult result, const char *what)
@@ -14,7 +15,8 @@ template<class T> static T function(XrInstance instance, const char *name)
     xr_check(xrGetInstanceProcAddr(instance, name, &result), name);
     return reinterpret_cast<T>(result);
 }
-OpenXR::OpenXR(bool required, OpenXRPlatform platform) : require_foveation_(required)
+OpenXR::OpenXR(bool required, OpenXRPlatform platform, bool transfer_source)
+    : require_foveation_(required), transfer_source_(transfer_source)
 {
     try {
 #ifdef __ANDROID__
@@ -48,6 +50,8 @@ OpenXR::OpenXR(bool required, OpenXRPlatform platform) : require_foveation_(requ
                 extensions.push_back(name);
             }
         }
+        refresh_control_=has(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
+        if (refresh_control_) extensions.push_back(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
         XrInstanceCreateInfo create{XR_TYPE_INSTANCE_CREATE_INFO};
 #ifdef __ANDROID__
         XrInstanceCreateInfoAndroidKHR android{XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR};
@@ -115,6 +119,22 @@ void OpenXR::attach(Device &device)
         binding.queueFamilyIndex=h.queue_family; binding.queueIndex=0;
         XrSessionCreateInfo create{XR_TYPE_SESSION_CREATE_INFO}; create.next=&binding; create.systemId=system_;
         xr_check(xrCreateSession(instance_,&create,&session_),"Vulkan OpenXR session");
+        if (refresh_control_) {
+            auto enumerate=function<PFN_xrEnumerateDisplayRefreshRatesFB>(instance_,"xrEnumerateDisplayRefreshRatesFB");
+            request_refresh_=function<PFN_xrRequestDisplayRefreshRateFB>(instance_,"xrRequestDisplayRefreshRateFB");
+            get_refresh_=function<PFN_xrGetDisplayRefreshRateFB>(instance_,"xrGetDisplayRefreshRateFB");
+            uint32_t count=0;
+            xr_check(enumerate(session_,0,&count,nullptr),"enumerate OpenXR display rates");
+            std::vector<float> rates(count);
+            xr_check(enumerate(session_,count,&count,rates.data()),"OpenXR display rates");
+            // Same 120 Hz / 60 game-frame policy as the established Quest
+            // port. Prefer a supported integer multiple; never claim that a
+            // successful request proves the actual runtime refresh.
+            for (float preferred : {120.f,60.f}) {
+                for (float rate : rates) if (std::fabs(rate-preferred)<0.01f) requested_refresh_=rate;
+                if (requested_refresh_>0) break;
+            }
+        }
         XrReferenceSpaceCreateInfo space{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
         space.referenceSpaceType=XR_REFERENCE_SPACE_TYPE_LOCAL; space.poseInReferenceSpace.orientation.w=1;
         xr_check(xrCreateReferenceSpace(session_,&space,&space_),"OpenXR local space");
@@ -135,7 +155,7 @@ void OpenXR::attach(Device &device)
         XrSwapchainCreateInfoFoveationFB fov{XR_TYPE_SWAPCHAIN_CREATE_INFO_FOVEATION_FB};
         fov.flags=XR_SWAPCHAIN_CREATE_FOVEATION_FRAGMENT_DENSITY_MAP_BIT_FB;
         XrSwapchainCreateInfo swap{XR_TYPE_SWAPCHAIN_CREATE_INFO}; swap.next=require_foveation_?&fov:nullptr;
-        swap.usageFlags=XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT; swap.format=format;
+        swap.usageFlags=XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | (transfer_source_ ? XR_SWAPCHAIN_USAGE_TRANSFER_SRC_BIT : 0); swap.format=format;
         swap.sampleCount=1; swap.width=width_; swap.height=height_; swap.faceCount=1; swap.arraySize=2; swap.mipCount=1;
         xr_check(xrCreateSwapchain(session_,&swap,&swapchain_),"OpenXR stereo array swapchain");
         if(require_foveation_) {
@@ -179,13 +199,24 @@ void OpenXR::poll()
         if(event.type==XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
             const auto &change=*reinterpret_cast<XrEventDataSessionStateChanged *>(&event);
             if(change.session==session_) {
+                session_state_=change.state;
+                std::fprintf(stderr,"[vulkan-xr] session state %d\n",int(change.state));
                 if(change.state==XR_SESSION_STATE_READY && !running_) {
                     XrSessionBeginInfo begin{XR_TYPE_SESSION_BEGIN_INFO}; begin.primaryViewConfigurationType=XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
                     xr_check(xrBeginSession(session_,&begin),"begin OpenXR session"); running_=true;
+                    if (request_refresh_ && requested_refresh_>0) {
+                        const auto result=request_refresh_(session_,requested_refresh_);
+                        float observed=0;
+                        const auto got=get_refresh_(session_,&observed);
+                        std::fprintf(stderr,"[vulkan-xr] requested %.2f Hz: %d; reported %.2f Hz: %d\n",requested_refresh_,int(result),observed,int(got));
+                    }
                 } else if(change.state==XR_SESSION_STATE_STOPPING) {
                     xr_check(xrEndSession(session_),"end OpenXR session"); running_=false;
                 } else if(change.state==XR_SESSION_STATE_EXITING||change.state==XR_SESSION_STATE_LOSS_PENDING) exiting_=true;
             }
+        } else if(event.type==XR_TYPE_EVENT_DATA_DISPLAY_REFRESH_RATE_CHANGED_FB) {
+            const auto &rate=*reinterpret_cast<const XrEventDataDisplayRefreshRateChangedFB *>(&event);
+            std::fprintf(stderr,"[vulkan-xr] runtime refresh changed %.2f -> %.2f Hz\n",rate.fromDisplayRefreshRate,rate.toDisplayRefreshRate);
         } else if(event.type==XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) exiting_=true;
         event={XR_TYPE_EVENT_DATA_BUFFER};
     }
@@ -235,6 +266,7 @@ void OpenXR::detach()
     if(swapchain_) xrDestroySwapchain(swapchain_); swapchain_=XR_NULL_HANDLE;
     if(space_) xrDestroySpace(space_); space_=XR_NULL_HANDLE;
     if(session_) xrDestroySession(session_); session_=XR_NULL_HANDLE;
+    requested_refresh_=0; session_state_=XR_SESSION_STATE_UNKNOWN;
     device_=nullptr; running_=false; frame_open_=false; acquired_=false; foveation_=false;
 }
 void OpenXR::release() { detach(); if(instance_) xrDestroyInstance(instance_); instance_=XR_NULL_HANDLE; }

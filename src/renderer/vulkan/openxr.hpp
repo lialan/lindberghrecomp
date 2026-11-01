@@ -15,7 +15,7 @@ struct OpenXRPlatform { void *java_vm = nullptr; void *activity = nullptr; };
 // Common Vulkan/OpenXR host, independent of SDL and the guest's graphics ABI.
 class OpenXR {
 public:
-    explicit OpenXR(bool require_foveation = false, OpenXRPlatform platform = {});
+    explicit OpenXR(bool require_foveation = false, OpenXRPlatform platform = {}, bool transfer_source = false);
     ~OpenXR();
     OpenXR(const OpenXR &) = delete;
     OpenXR &operator=(const OpenXR &) = delete;
@@ -29,7 +29,9 @@ public:
     // Submit Vulkan commands before calling this; no per-frame CPU GPU wait.
     void end_frame(bool rendered);
     const std::array<XrView, 2> &views() const { return views_; }
+    XrDuration display_period() const { return frame_.predictedDisplayPeriod; }
     XrTime display_time() const { return frame_.predictedDisplayTime; }
+    XrSessionState session_state() const { return session_state_; }
     bool exiting() const { return exiting_; }
     bool frame_open() const { return frame_open_; }
     bool foveation_active() const { return foveation_; }
@@ -41,8 +43,9 @@ private:
     XrSwapchain swapchain_ = XR_NULL_HANDLE;
     XrFoveationProfileFB profile_ = XR_NULL_HANDLE;
     Device *device_ = nullptr;
-    bool require_foveation_, foveation_ = false, running_ = false, exiting_ = false, frame_open_ = false, acquired_ = false;
+    bool require_foveation_, transfer_source_, foveation_ = false, running_ = false, exiting_ = false, frame_open_ = false, acquired_ = false;
     uint32_t width_ = 0, height_ = 0, image_ = 0;
+    XrSessionState session_state_ = XR_SESSION_STATE_UNKNOWN;
     XrFrameState frame_{XR_TYPE_FRAME_STATE};
     std::array<XrView,2> views_{{{XR_TYPE_VIEW},{XR_TYPE_VIEW}}};
     std::vector<std::unique_ptr<Target>> targets_;
@@ -50,6 +53,10 @@ private:
     PFN_xrCreateVulkanInstanceKHR create_instance_ = nullptr;
     PFN_xrCreateVulkanDeviceKHR create_device_ = nullptr;
     PFN_xrGetVulkanGraphicsDevice2KHR get_device_ = nullptr;
+    bool refresh_control_ = false;
+    float requested_refresh_ = 0;
+    PFN_xrRequestDisplayRefreshRateFB request_refresh_ = nullptr;
+    PFN_xrGetDisplayRefreshRateFB get_refresh_ = nullptr;
     PFN_xrDestroyFoveationProfileFB destroy_profile_ = nullptr;
     void poll();
     void release();

@@ -726,6 +726,9 @@ int host_window_open(const char *title)
     g_win.w = env_int("LINDBERGH_WIDTH", g_hint_w ? g_hint_w : DEFAULT_W);
     g_win.h = env_int("LINDBERGH_HEIGHT", g_hint_h ? g_hint_h : DEFAULT_H);
 
+#if defined(__ANDROID__)
+    SDL_SetHint(SDL_HINT_ANDROID_BLOCK_ON_PAUSE, "0");
+#endif
 #ifndef LINDBERGH_VULKAN
 #if defined(__ANDROID__)
     /* GLES 3 under gl4es, which plays the 2.1 context the game expects. The
@@ -772,7 +775,9 @@ int host_window_open(const char *title)
     g_win.win = SDL_CreateWindow(title && *title ? title : "lindberghrecomp",
                                  SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                  dw, dh,
-#ifdef LINDBERGH_VULKAN
+#if defined(LINDBERGH_VULKAN_XR)
+                                 SDL_WINDOW_FULLSCREEN |
+#elif defined(LINDBERGH_VULKAN)
                                  SDL_WINDOW_VULKAN |
 #else
                                  SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE |
@@ -805,7 +810,9 @@ int host_window_open(const char *title)
             );
     // Register exit output before worker shutdown, so LIFO teardown drains
     // all renderer records before writing the capture. No per-frame file I/O.
-#if defined(LINDBERGH_VULKAN)
+#if defined(LINDBERGH_VULKAN_XR)
+    frame_timing_init("vulkan-openxr");
+#elif defined(LINDBERGH_VULKAN)
     frame_timing_init("vulkan");
 #elif defined(LINDBERGH_OPENXR)
     frame_timing_init("opengl-openxr");
@@ -929,7 +936,7 @@ static void maybe_screenshot(void)
     free(px);
 }
 
-#if defined(LINDBERGH_OPENXR)
+#if defined(LINDBERGH_OPENXR) && !defined(LINDBERGH_VULKAN)
 /* Where a frame's time goes, summed over each [perf] period: the game's own
  * work (first eye included), the second eye's replay, handing both to the
  * headset, and waiting for its next frame. */
@@ -993,7 +1000,7 @@ void host_swap(void)
         if (want < 0) want = env_int("LINDBERGH_GL_THREAD", 0);   /* or the game's profile: vr.gl_thread */
         if (want == 1) {
 #ifdef LINDBERGH_VULKAN
-            if (lvk_host_can_thread()) { want = 2; glq_start(NULL, NULL); }
+            if (lvk_host_can_thread()) { want = 2; glq_start(NULL, lvk_host_thread_enter); }
 #else
             if (g_win.gl) { want = 2; glq_start(gl_release, gl_take); }
 #endif
@@ -1020,8 +1027,7 @@ static void frame_gl(void *arg)
     if (frame_timing_on) frame_timing_record(g_frame,SDL_GetPerformanceCounter(),SDL_GetPerformanceFrequency());
     maybe_peek();
     ++g_frame;
-    return;
-#endif
+#else
 #if defined(LINDBERGH_OPENXR)
     g_t_game += since_mark();
     stereo_frame_end();                 /* the second eye, then both to the headset */
@@ -1058,6 +1064,7 @@ static void frame_gl(void *arg)
     if (frame_timing_on) frame_timing_record(g_frame-1,SDL_GetPerformanceCounter(),SDL_GetPerformanceFrequency());
 #endif
     stereo_frame_begin();
+#endif
 }
 
 /* The game thread's end of a frame. */
@@ -1086,7 +1093,7 @@ static void host_frame_done(void)
         Uint32 now = SDL_GetTicks();
         if (!t0) { t0 = now; f0 = g_frame; }
         else if (now - t0 >= 5000) {
-#if defined(LINDBERGH_OPENXR)
+#if defined(LINDBERGH_OPENXR) && !defined(LINDBERGH_VULKAN)
             unsigned n = g_frame - f0 ? g_frame - f0 : 1;
             fprintf(stderr, "[perf] frame %u, %.1f fps; ms per frame: game %.1f, second eye %.1f, submit %.1f, headset wait %.1f;"
                             " late %u (over 25 ms %u), worst %.0f ms\n",

@@ -9,8 +9,14 @@
 #include "vulkan_abi.h"
 #include "vulkan_host.h"
 #include <SDL.h>
+#ifdef LINDBERGH_VULKAN_XR
+#include "../renderer/vulkan/openxr.hpp"
+#include <SDL_system.h>
+#include <android/asset_manager_jni.h>
+#endif
 extern "C" {
 #include "game_profile.h"
+#include "display_cadence.h"
 }
 #include <algorithm>
 #include <cstdio>
@@ -135,9 +141,69 @@ struct Material {
   std::vector<std::shared_ptr<Texture>> images;
   std::vector<std::shared_ptr<Sampler>> samplers;
 };
+#ifdef LINDBERGH_VULKAN_XR
+// SDL supplies a local Activity reference. Keep a global reference until the
+// XR session and instance have been destroyed, including failure teardown.
+struct ActivityRef {
+  JavaVM *vm = nullptr;
+  jobject activity = nullptr;
+  ActivityRef() {
+    auto *env = static_cast<JNIEnv *>(SDL_AndroidGetJNIEnv());
+    if (!env || env->GetJavaVM(&vm) != JNI_OK) throw std::runtime_error("SDL JavaVM unavailable");
+    auto local = static_cast<jobject>(SDL_AndroidGetActivity());
+    if (local) { activity=env->NewGlobalRef(local); env->DeleteLocalRef(local); }
+    if (!activity) throw std::runtime_error("SDL Activity unavailable");
+  }
+  ~ActivityRef() {
+    auto *env = static_cast<JNIEnv *>(SDL_AndroidGetJNIEnv());
+    if (env && activity) env->DeleteGlobalRef(activity);
+  }
+  void shader_defaults() {
+    auto *env=static_cast<JNIEnv *>(SDL_AndroidGetJNIEnv());
+    if (env->PushLocalFrame(8)<0) throw std::runtime_error("Cannot create shader asset JNI frame");
+    struct LocalFrame {JNIEnv *env; ~LocalFrame(){env->PopLocalFrame(nullptr);}} locals{env};
+    auto cls=env->GetObjectClass(activity);
+    auto get=env->GetMethodID(cls,"getAssets","()Landroid/content/res/AssetManager;");
+    auto assets=env->CallObjectMethod(activity,get);
+    auto *manager=assets?AAssetManager_fromJava(env,assets):nullptr;
+    if (env->ExceptionCheck()) {env->ExceptionClear();throw std::runtime_error("Cannot access Vulkan shader assets");}
+    const char *storage=SDL_AndroidGetInternalStoragePath();
+    if (!manager || !storage) throw std::runtime_error("Vulkan shader asset storage unavailable");
+    const auto directory=std::filesystem::path(storage)/"vulkan";
+    std::filesystem::create_directories(directory);
+    for (auto entry : {std::pair{"LINDBERGH_VULKAN_SHADERS","game.lvsp"},
+                       std::pair{"LINDBERGH_VULKAN_FIXED_SHADERS","fixed.lvsp"}}) {
+      const char *override=std::getenv(entry.first);
+      if (override && *override) continue;
+      const auto source=std::string("vulkan/")+entry.second;
+      std::unique_ptr<AAsset,decltype(&AAsset_close)> asset(AAssetManager_open(manager,source.c_str(),AASSET_MODE_STREAMING),AAsset_close);
+      if (!asset) throw std::runtime_error("Missing packaged shader archive: "+source);
+      const auto path=directory/entry.second;
+      const auto temporary=path.string()+".tmp";
+      try {
+        std::ofstream out(temporary,std::ios::binary|std::ios::trunc);
+        std::array<char,65536> bytes;
+        int n;
+        while ((n=AAsset_read(asset.get(),bytes.data(),bytes.size()))>0) out.write(bytes.data(),n);
+        out.close();
+        if (n<0 || !out || std::rename(temporary.c_str(),path.c_str()))
+          throw std::runtime_error("Cannot extract Vulkan shader archive: "+source);
+      } catch (...) {std::remove(temporary.c_str());throw;}
+      SDL_setenv(entry.first,path.c_str(),1);
+    }
+  }
+  OpenXRPlatform platform() const { return {vm,activity}; }
+};
+#endif
 struct State {
   std::unique_ptr<Device> device;
   std::unique_ptr<Window> window;
+#ifdef LINDBERGH_VULKAN_XR
+  std::unique_ptr<ActivityRef> activity;
+  std::unique_ptr<OpenXR> xr;
+  std::unique_ptr<Target> unfocused;
+  bool xr_rendering = false;
+#endif
   std::unique_ptr<PipelineCache> cache;
   std::unique_ptr<FrameRing> ring;
   std::unique_ptr<ShaderPack> pack, fixed_pack;
@@ -183,7 +249,12 @@ struct State {
   std::vector<std::array<float,64>> immediate;
   std::vector<Attributes> attributes;
   void shutdown() {
-    if (!device) return;
+    if (!device) {
+#ifdef LINDBERGH_VULKAN_XR
+      xr.reset(); activity.reset();
+#endif
+      return;
+    }
     ready = false;
     ring.reset(); // completes buffered commands before referenced resources
     cmd = VK_NULL_HANDLE;
@@ -200,6 +271,12 @@ struct State {
     drawables.clear();
     initialized.clear();
     window.reset();
+#ifdef LINDBERGH_VULKAN_XR
+    unfocused.reset();
+    xr.reset();
+    activity.reset();
+    host_display_timing_reset();
+#endif
     if (cache) {
       try { cache->save(); }
       catch (const std::exception &e) { std::fprintf(stderr,"[vulkan] pipeline cache save: %s\n",e.what()); }
@@ -212,7 +289,25 @@ struct State {
   void frame() {
     if (!cmd) {
       cmd = ring->begin();
-      if (!screen) screen = &window->acquire(*ring);
+      if (!screen) {
+#ifdef LINDBERGH_VULKAN_XR
+        screen = xr->begin_frame();
+        host_display_timing(xr->display_time(),xr->display_period());
+        xr_rendering = screen != nullptr;
+        if (screen) {
+          static bool first=true;
+          if (first) {first=false;std::fprintf(stderr,"[vulkan-xr] first game target %ux%u, %u layers; foveation %s; session %d\n",screen->info.width,screen->info.height,screen->info.layers,xr->foveation_active()?"active":"disabled",int(xr->session_state()));}
+        }
+        if (!screen) {
+          // Keep guest simulation/resources valid while the headset is not
+          // rendering. Never hand this scratch target to the compositor.
+          if (!unfocused) unfocused=std::make_unique<Target>(*device,TargetInfo{uint32_t(game_width),uint32_t(game_height),2});
+          screen=unfocused.get();
+        }
+#else
+        screen = &window->acquire(*ring);
+#endif
+      }
       if (materials[ring->recording_slot()].size()>2048) materials[ring->recording_slot()].clear();
     }
   }
@@ -296,17 +391,37 @@ void check_range(size_t size, GLintptr offset, GLsizeiptr bytes) {
 }
 } // namespace
 extern "C" int lvk_host_can_thread(void) { return state.ready; }
+extern "C" int lvk_host_thread_enter(void) {
+#ifdef LINDBERGH_VULKAN_XR
+  // SDL attaches this pthread once and detaches it through its TLS destructor.
+  return SDL_AndroidGetJNIEnv() != nullptr;
+#else
+  return 1;
+#endif
+}
 extern "C" int lvk_host_init(SDL_Window *window, int w, int h) {
   if (state.ready)
     return 1;
   try {
+#ifdef LINDBERGH_VULKAN_XR
+    state.activity=std::make_unique<ActivityRef>();
+    state.activity->shader_defaults();
+    state.xr=std::make_unique<OpenXR>(true,state.activity->platform(),true);
+    state.device=Device::create(state.xr->device_options());
+#else
     state.device = Device::create(desktop_options(window));
+#endif
     // The loader/layer C++ globals are initialized during device creation.
     // Retire our resources before their atexit destructors, not afterward
     // when the process-global guest state would normally be destroyed.
     static const bool cleanup_registered = std::atexit(shutdown_vulkan) == 0;
     if (!cleanup_registered) gap("cannot register Vulkan shutdown");
+#ifdef LINDBERGH_VULKAN_XR
+    host_display_timing_reset();
+    state.xr->attach(*state.device);
+#else
     state.window = std::make_unique<Window>(*state.device, window, 3);
+#endif
     const char *cache = std::getenv("LINDBERGH_VULKAN_CACHE");
     std::string cache_path;
     if (cache) cache_path=cache; // an explicitly empty override disables persistence
@@ -331,10 +446,15 @@ extern "C" int lvk_host_init(SDL_Window *window, int w, int h) {
     state.raster.depth_write = true;
     state.ready = true;
     std::fprintf(stderr, "[vulkan] guest graphics routed directly to Vulkan; "
+#ifdef LINDBERGH_VULKAN_XR
+                         "foveated OpenXR swapchain ready; world/input integration in progress\n");
+#else
                          "desktop swapchain ready\n");
+#endif
     return 1;
   } catch (const std::exception &e) {
     std::fprintf(stderr, "[vulkan] initialization: %s\n", e.what());
+    state.shutdown();
     return 0;
   }
 }
@@ -388,8 +508,17 @@ extern "C" void lvk_host_present(void) {
     if(every) { char suffix[32];std::snprintf(suffix,sizeof suffix,".%05u.ppm",g_frame);capture_path+=suffix; }
   }
   std::unique_ptr<FrameCapture> capture;
+#ifdef LINDBERGH_VULKAN_XR
+  if (!state.xr_rendering) capture_path.clear(); // never report a scratch frame as XR output
+#endif
   if(!capture_path.empty()) capture=std::make_unique<FrameCapture>(*state.device,state.cmd,*state.screen);
+#ifdef LINDBERGH_VULKAN_XR
+  auto submitted=state.ring->submit();
+  state.xr->end_frame(state.xr_rendering);
+  if (state.xr->exiting()) {SDL_Event quit{};quit.type=SDL_QUIT;SDL_PushEvent(&quit);}
+#else
   auto submitted=state.window->present(*state.ring);
+#endif
   state.last_submission=submitted;
   if(capture) {state.ring->wait(submitted);capture->write(capture_path.c_str(),*state.screen);}
   state.cmd=VK_NULL_HANDLE;
@@ -398,7 +527,11 @@ extern "C" void lvk_host_present(void) {
 extern "C" void lvk_glFlush(void) {
   if (!state.cmd) return;
   state.flush();
+#ifdef LINDBERGH_VULKAN_XR
+  state.last_submission=state.ring->submit();
+#else
   state.last_submission=state.window->flush(*state.ring);
+#endif
   state.cmd=VK_NULL_HANDLE; // next draw continues on the same acquired image
 }
 extern "C" void lvk_glFinish(void) {

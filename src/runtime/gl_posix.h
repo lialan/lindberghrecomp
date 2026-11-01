@@ -8,7 +8,10 @@
 #define GL_POSIX_H
 
 #define GL_SILENCE_DEPRECATION 1
-#if defined(__APPLE__)
+#if defined(LINDBERGH_VULKAN)
+/* Declaration-only guest ABI; no platform OpenGL headers or driver. */
+#include "vulkan_abi.h"
+#elif defined(__APPLE__)
 #include <OpenGL/gl.h>
 #include <OpenGL/glext.h>
 #elif defined(_WIN32)
@@ -19,9 +22,6 @@
 #include <GL/glext.h>
 #endif
 
-#ifdef LINDBERGH_VULKAN
-#include "vulkan_abi.h"
-#endif
 
 #include <string.h>
 #include "lindbergh_rt.h"
