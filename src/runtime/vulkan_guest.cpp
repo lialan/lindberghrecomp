@@ -38,6 +38,7 @@ extern "C" {
 #include <unordered_set>
 #include <cmath>
 #include <sstream>
+#include <set>
 #include <chrono>
 
 using namespace lindbergh::vk;
@@ -2411,11 +2412,16 @@ bool stereo_packet(DrawPacket &packet,GLint first,GLsizei count,const std::vecto
     composite=state.picture_size(base.width,base.height)&&picture_composite(first,count,elements,immediate,stride);
   }
   const int kind=composite?LG_STEREO_PASS:lg_stereo_classify_draw(&facts);
-  packet.matrices=state.stereo->transforms(p,kind);
+  const bool raw_perspective=lg_stereo_is_perspective(p.data());
+  const bool movie=texture!=state.texture_objects.end()&&texture->second.movie;
+  // Movie/HUD layers hide their black backing with depth. Keep HUD Z/W,
+  // while the specialized vertex wrapper restores full-eye clip XY.
+  const bool full_hud=kind==LG_STEREO_FILL&&raw_perspective&&(!state.world_draws||movie);
+  packet.raster.full_hud=full_hud;
+  packet.matrices=state.stereo->transforms(p,full_hud?LG_STEREO_HUD:kind);
   state.stereo->observe(p,kind);
   if(kind==LG_STEREO_WORLD && facts.perspective)++state.world_draws;
-  if(kind==LG_STEREO_HUD) {
-    const bool raw_perspective=lg_stereo_is_perspective(p.data());
+  if(kind==LG_STEREO_HUD||full_hud) {
     if(!raw_perspective)state.hud_target_next=state.drawable;
     if(!raw_perspective&&bounded&&state.controllers) {
       float gun[2][2]={{-100,-100},{-100,-100}};const auto &aim=state.controllers->aims();const auto &settings=state.controllers->settings();
@@ -2428,18 +2434,43 @@ bool stereo_packet(DrawPacket &packet,GLint first,GLsizei count,const std::vecto
         std::fprintf(stderr,"[vulkan-sight] frame %u learned primary %u secondary %u\n",g_frame,state.sight.primary,state.sight.secondary);
       if(hide)return true;
     }
-    const bool movie=texture!=state.texture_objects.end()&&texture->second.movie;
     if(!raw_perspective || (state.world_draws && !movie))packet.raster.depth_write=false;
     if(!facts.perspective && raw_perspective && (!state.world_draws || movie)) {
       packet.raster.depth_bias=true;packet.depth_bias_factor=0;packet.depth_bias_units=-4.f*++state.hud_sequence;
     }
   }
   static const auto log_range=[] {std::array<unsigned,2> r{};if(const auto *v=std::getenv("LINDBERGH_VULKAN_CLASSIFY")){r[0]=r[1]=unsigned(std::strtoul(v,nullptr,10));if(const auto *end=std::strchr(v,'-'))r[1]=unsigned(std::strtoul(end+1,nullptr,10));}return r;}();
-  if(log_range[1] && g_frame>=log_range[0] && g_frame<=log_range[1] && (state.world_draws==1 || facts.texture_view)) {
+  if(log_range[1] && g_frame>=log_range[0] && g_frame<=log_range[1] && (state.world_draws==1 || facts.texture_view || kind==LG_STEREO_FILL)) {
     std::fprintf(stderr,"[vulkan-camera] P");for(float v:p)std::fprintf(stderr," %.6g",v);
     std::fprintf(stderr," reprojection");for(float v:packet.matrices.view_projection[0])std::fprintf(stderr," %.6g",v);std::fputc(10,stderr);
     std::fprintf(stderr,"[vulkan-camera] modelview");for(float v:state.matrices.matrix(GL_MODELVIEW))std::fprintf(stderr," %.6g",v);
     std::fprintf(stderr,"; depth test %d write %d func %d\n",packet.raster.depth_test,packet.raster.depth_write,int(packet.raster.depth_compare));
+    if(kind==LG_STEREO_FILL) {
+      std::fprintf(stderr,"[vulkan-fill] frame %u program %u texture %u movie %d full-hud %d; depth bias %d %.3f %.3f blend %d src %u dst %u color-mask %u; bounds %d %.4f %.4f %.4f %.4f\n",
+        g_frame,state.program,state.textures[0],texture!=state.texture_objects.end()&&texture->second.movie,packet.raster.full_hud,
+        packet.raster.depth_bias,packet.depth_bias_factor,packet.depth_bias_units,packet.raster.blend,unsigned(packet.raster.src_rgb),unsigned(packet.raster.dst_rgb),packet.raster.color_mask,
+        bounded,box[0],box[1],box[2],box[3]);
+      auto &program=current_program();
+      for(const auto &sampler:program.record->samplers) {
+        const int unit=program.sampler_units[int(sampler.binding)];
+        if(unit<0||unit>=8)continue;
+        auto image=state.texture_objects.find(state.textures[unit]);
+        if(image==state.texture_objects.end()||!image->second.levels.count(0))continue;
+        const auto &level=image->second.levels.at(0);const auto &bytes=level.bytes;
+        const auto range=std::minmax_element(bytes.begin(),bytes.end());uint64_t sum=0;for(auto value:bytes)sum+=value;
+        std::fprintf(stderr,"[vulkan-fill-image] sampler %s binding %u unit %d texture %u %dx%d format %#x type %#x movie %d gpu-target %d; CPU shadow %zu bytes min %u max %u mean %.3f\n",
+          sampler.name.c_str(),sampler.binding,unit,state.textures[unit],level.width,level.height,level.format,level.type,image->second.movie,image->second.gpu_target,
+          bytes.size(),bytes.empty()?0u:unsigned(*range.first),bytes.empty()?0u:unsigned(*range.second),bytes.empty()?0:double(sum)/bytes.size());
+      }
+      if(const auto *directory=std::getenv("LINDBERGH_VULKAN_CLASSIFY_DIR");directory&&*directory) {
+        static std::set<std::pair<GLuint,GLuint>> dumped;
+        for(auto id:program.shaders)if(dumped.emplace(state.program,id).second) {
+          const auto path=std::filesystem::path(directory)/("program-"+std::to_string(state.program)+"-shader-"+std::to_string(id)+".glsl");
+          std::ofstream file(path);file<<state.shaders.at(id).source;
+          if(!file)std::fprintf(stderr,"[vulkan-fill] cannot write diagnostic shader %s\n",path.string().c_str());
+        }
+      }
+    }
   }
   if(log_range[1] && g_frame>=log_range[0] && g_frame<=log_range[1])
     std::fprintf(stderr,"[vulkan-class] frame %u target %u %dx%d class %d lens %.4f %.4f texture-view %d offscreen %d; cache builds %zu; program %u texture %u gpu-target %d world draws %u\n",g_frame,state.drawable,size[0],size[1],kind,p[0],p[5],facts.texture_view,facts.offscreen,state.stereo->transform_builds(),state.program,state.textures[0],texture!=state.texture_objects.end()&&texture->second.gpu_target,state.world_draws);

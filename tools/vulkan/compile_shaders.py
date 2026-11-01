@@ -118,11 +118,17 @@ def convert(source, stage, interface, attributes, samplers):
         if count != 1:
             raise ValueError("Expected exactly one vertex main function")
         source += """
+layout(constant_id=5) const bool legacy_full_hud=false;
 void main() {
     legacy_front_color = vec4(0); legacy_back_color = vec4(0);
     legacy_front_secondary = vec4(0); legacy_back_secondary = vec4(0);
     guest_main();
     vec4 p = eyes.reprojection[gl_ViewIndex] * gl_Position;
+    // Full-screen movie/fade layers retain HUD depth ordering. Their XY still
+    // covers the eye instead of shrinking onto the finite HUD screen plane.
+    // Specialization eliminates this work from ordinary world/HUD pipelines.
+    if (legacy_full_hud && gl_Position.w != 0.0)
+        p.xy = gl_Position.xy * (p.w / gl_Position.w);
     gl_Position = vec4(p.x, -p.y, (p.z + p.w) * 0.5, p.w);
 }
 """

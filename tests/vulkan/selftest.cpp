@@ -654,6 +654,31 @@ static void render_stereo(Device &device)
         require(loaded.prepared_count()==1&&loaded.first_use_count()==0,"pipeline was not prepared before target use");
         draw->prepare(state);
         require(loaded.first_use_count()==0,"cached draw created another pipeline");
+        auto full_state=state;full_state.full_hud=true;
+        require(!(full_state.key()==state.key()),"full-screen HUD mode was dropped from the pipeline key");
+        const auto full_path=path+"-full";
+        {
+            PipelineRecipes capture_full(device,no_disk,{&pack},full_path);
+            capture_full.renderer(target,*record,legacy.bindings,legacy.attributes)->prepare(full_state);
+            capture_full.save();
+        }
+        PipelineRecipes loaded_full(device,no_disk,{&pack},"",full_path);
+        require(loaded_full.recipe_count()==1,"full-screen HUD recipe lost its raster flag");
+        loaded_full.prepare(target);
+        loaded_full.renderer(target,*record,legacy.bindings,legacy.attributes)->prepare(full_state);
+        require(loaded_full.first_use_count()==0,"full-screen HUD variant did not preload");
+        std::filesystem::remove(full_path);
+        auto old_vertex=record->vertex;
+        for(size_t at=5;at<old_vertex.size();) {
+            const auto words=old_vertex[at]>>16,op=old_vertex[at]&0xffff;
+            if(op==71&&words==4&&old_vertex[at+2]==1&&old_vertex[at+3]==5) {
+                old_vertex.erase(old_vertex.begin()+at,old_vertex.begin()+at+words);break;
+            }
+            at+=words;
+        }
+        auto old_source=legacy;old_source.vertex=old_vertex.data();old_source.vertex_bytes=old_vertex.size()*4;
+        Renderer old_wrapper(device,target,no_disk,old_source);old_wrapper.prepare(state);
+        rejected([&]{old_wrapper.prepare(full_state);},"stale wrapper silently ignored full-screen HUD depth mode");
         draw->filter_state(true);
         cmd=ring.begin();draw->begin(cmd,{0,0,0,1});bind_legacy(*draw);
         sampled=legacy_material.handle();draw->bind_descriptors(2,1,&sampled);

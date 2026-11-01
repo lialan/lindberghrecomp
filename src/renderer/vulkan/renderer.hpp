@@ -23,7 +23,7 @@ struct RasterState {
     VkBlendFactor src_alpha=VK_BLEND_FACTOR_ONE, dst_alpha=VK_BLEND_FACTOR_ZERO;
     VkBlendOp blend_rgb=VK_BLEND_OP_ADD, blend_alpha=VK_BLEND_OP_ADD;
     uint32_t color_mask=15, alpha_func=0, fixed_texture=0, fixed_env=0, fog_mode=0;
-    bool stencil=false, depth_bias=false, clockwise=false;
+    bool stencil=false, depth_bias=false, clockwise=false, full_hud=false;
     VkCompareOp stencil_compare=VK_COMPARE_OP_ALWAYS;
     VkStencilOp stencil_fail=VK_STENCIL_OP_KEEP, stencil_depth_fail=VK_STENCIL_OP_KEEP, stencil_pass=VK_STENCIL_OP_KEEP;
     RasterKey key() const;
@@ -140,6 +140,7 @@ private:
     std::vector<VkVertexInputBindingDescription> bindings_;
     std::vector<VkVertexInputAttributeDescription> attributes_;
     uint32_t descriptor_count_ = 0;
+    bool full_hud_capable_=false;
     bool filter_=true, count_commands_=false, viewport_valid_=false, scissor_valid_=false;
     bool streams_valid_=false, index_valid_=false, matrices_valid_=false;
     uint32_t dynamic_valid_=0, stencil_ref_=0, stencil_compare_=0, stencil_write_=0;

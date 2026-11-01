@@ -50,6 +50,7 @@ RasterState raster(RasterKey k) {
     r.stencil_pass = VkStencilOp((a >> 26) & 7);
     r.depth_bias = (a >> 29) & 1;
     r.clockwise = (a >> 30) & 1;
+    r.full_hud = (a >> 31) & 1;
     r.src_rgb = VkBlendFactor(b & 31);
     r.dst_rgb = VkBlendFactor((b >> 5) & 31);
     r.src_alpha = VkBlendFactor((b >> 10) & 31);

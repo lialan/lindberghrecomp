@@ -231,7 +231,7 @@ RasterKey RasterState::key() const
     uint64_t a=depth_test | (uint64_t(depth_test && depth_write)<<1) | (uint64_t(blend)<<2) | (uint64_t(cull)<<3) |
         (uint64_t(compare)<<5) | (uint64_t(topology)<<8) | (uint64_t(color_mask)<<12) |
         stencil_bits | (uint64_t(depth_bias)<<29) |
-        (uint64_t(clockwise)<<30);
+        (uint64_t(clockwise)<<30) | (uint64_t(full_hud)<<31);
     uint64_t b=blend_bits | (uint64_t(alpha_func)<<26) |
         (uint64_t(fixed_texture)<<30) | (uint64_t(fixed_env)<<38) | (uint64_t(fog_mode)<<62);
     return {a,b};
@@ -245,6 +245,20 @@ static ProgramSource colored_program()
          {1, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Vertex, color)}}, {}};
 }
 
+static bool full_hud_capable(const ProgramSource &source)
+{
+    const auto count=source.vertex_bytes/4;
+    if(!source.vertex||count<5||source.vertex[0]!=0x07230203)return false;
+    for(size_t at=5;at<count;) {
+        const auto words=source.vertex[at]>>16,op=source.vertex[at]&0xffff;
+        if(!words||words>count-at)return false;
+        // OpDecorate <id> SpecId 5: shared offline wrapper's full-HUD switch.
+        if(op==71&&words==4&&source.vertex[at+2]==1&&source.vertex[at+3]==5)return true;
+        at+=words;
+    }
+    return false;
+}
+
 Renderer::Renderer(Device &device, Target &target, PipelineCache &cache)
     : Renderer(device, target, cache, colored_program()) {}
 
@@ -255,6 +269,7 @@ Renderer::Renderer(Device &device, Target &target, PipelineCache &cache, const P
     if (!program.vertex || !program.fragment || !program.vertex_bytes || !program.fragment_bytes ||
         program.vertex_bytes % 4 || program.fragment_bytes % 4)
         throw std::invalid_argument("Invalid precompiled Vulkan shader modules");
+    full_hud_capable_=full_hud_capable(program);
     static const bool filtering=[] {const auto *v=std::getenv("LINDBERGH_VULKAN_STATE_FILTER");return !v||*v!='0';}();
     filter_=filtering;count_commands_=command_stats_enabled();
     streams_.resize(bindings_.size());descriptors_.resize(descriptor_count_);
@@ -279,15 +294,17 @@ Renderer::Renderer(Device &device, Target &target, PipelineCache &cache, const P
 void Renderer::prepare(RasterState state)
 {
     if (cmd_) throw std::logic_error("Pipeline creation attempted during Vulkan draw recording");
+    if(state.full_hud&&!full_hud_capable_)
+        throw std::runtime_error("Offline vertex shader predates full-screen HUD depth support; rebuild the shader pack");
     const auto key = state.key();
     if (pipelines_.count(key)) return;
     VkPipelineShaderStageCreateInfo stages[2]{};
     for (auto &s : stages) { s.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; s.pName = "main"; }
     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT; stages[0].module = vertex_;
     stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stages[1].module = fragment_;
-    const uint32_t constants[]={uint32_t(target_.info.guest_bottom_origin),state.alpha_func,state.fixed_texture,state.fixed_env,state.fog_mode};
-    const VkSpecializationMapEntry entries[]={{0,0,4},{1,4,4},{2,8,4},{3,12,4},{4,16,4}};
-    VkSpecializationInfo specialization{5,entries,sizeof constants,constants};
+    const uint32_t constants[]={uint32_t(target_.info.guest_bottom_origin),state.alpha_func,state.fixed_texture,state.fixed_env,state.fog_mode,uint32_t(state.full_hud)};
+    const VkSpecializationMapEntry entries[]={{0,0,4},{1,4,4},{2,8,4},{3,12,4},{4,16,4},{5,20,4}};
+    VkSpecializationInfo specialization{6,entries,sizeof constants,constants};
     stages[0].pSpecializationInfo=stages[1].pSpecializationInfo=&specialization;
     VkPipelineVertexInputStateCreateInfo vertex{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     vertex.vertexBindingDescriptionCount = static_cast<uint32_t>(bindings_.size()); vertex.pVertexBindingDescriptions = bindings_.data();

@@ -48,6 +48,18 @@ static void hud_pixels(const std::string &path) {
                 "small perspective HUD array incorrectly classified as full-screen fill");
     }
 }
+static void layered_pixels(const std::string &path) {
+    std::ifstream in(path,std::ios::binary);std::string magic;unsigned w,h,maximum;
+    in>>magic>>w>>h>>maximum;in.get();
+    require(in&&magic=="P6"&&w==64&&h==64&&maximum==255,"missing full-screen HUD readback");
+    std::vector<unsigned char> rgb(size_t(w)*h*3);in.read(reinterpret_cast<char *>(rgb.data()),rgb.size());
+    require(bool(in),"truncated full-screen HUD readback");
+    for(unsigned i:{2u*64+2,2u*64+61,61u*64+2,61u*64+61,32u*64+32}) {
+        const unsigned white=i==32u*64+32?255:0;
+        require(rgb[3*i]==white&&rgb[3*i+1]==255&&rgb[3*i+2]==white,
+                "full-screen movie lost eye coverage, layer depth or foreground text");
+    }
+}
 static void triangle(unsigned size) {
     glViewport(0,0,size,size);glClearColor(0,0,0,1);glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
     glColor4f(0,1,0,1);glBegin(GL_TRIANGLES);
@@ -107,10 +119,27 @@ int main() {
         SDL_setenv("LINDBERGH_VULKAN_SHOT_DRAWABLE",std::to_string(hud).c_str(),1);
         lvk_host_present();hud_pixels(directory+"/frame.ppm");hud_pixels(directory+"/frame.right.ppm");
         lvk_bind_drawable(0);lvk_destroy_drawable(hud);++g_frame;
+        const auto movie=lvk_create_drawable(64,64);lvk_bind_drawable(movie);
+        glEnable(GL_DEPTH_TEST);glDepthFunc(GL_LEQUAL);glDepthMask(GL_TRUE);
+        glViewport(0,0,64,64);glClearColor(0,0,0,1);glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
+        auto layer=[](float depth,float span,float r,float g,float b) {
+            const float half=depth*span/1.8107f;
+            glColor4f(r,g,b,1);glBegin(GL_QUADS);
+            glVertex3f(-half,-half,-depth);glVertex3f(half,-half,-depth);
+            glVertex3f(half,half,-depth);glVertex3f(-half,half,-depth);glEnd();
+        };
+        layer(1.3f,1,0,1,0); // full movie: green through all eye corners
+        layer(1.7f,1,0,0,0); // later black backing must stay behind it
+        layer(1.1f,.25f,1,1,1); // finite HUD text must remain in front
+        std::filesystem::remove(directory+"/frame.ppm");std::filesystem::remove(directory+"/frame.right.ppm");
+        SDL_setenv("LINDBERGH_SHOT_FRAME",std::to_string(g_frame).c_str(),1);
+        SDL_setenv("LINDBERGH_VULKAN_SHOT_DRAWABLE",std::to_string(movie).c_str(),1);
+        lvk_host_present();layered_pixels(directory+"/frame.ppm");layered_pixels(directory+"/frame.right.ppm");
+        lvk_bind_drawable(0);lvk_destroy_drawable(movie);++g_frame;
         glMatrixMode(GL_PROJECTION);glLoadIdentity();
         const auto unfinished=lvk_create_drawable(32,32);lvk_bind_drawable(unfinished);
         triangle(32);lvk_destroy_drawable(unfinished);lvk_bind_drawable(0);
-        std::puts("ok: real guest ABI pbuffer lifetime/recreation, perspective HUD array bounds, stereo readback and unfinished shutdown");
+        std::puts("ok: real guest ABI pbuffer lifetime, perspective HUD bounds, full-screen layered movie/text depth, stereo readback and unfinished shutdown");
         return 0; // production atexit drain runs before fixture cleanup
     } catch(const std::exception &error) {std::cerr<<error.what()<<'\n';return 1;}
 }
