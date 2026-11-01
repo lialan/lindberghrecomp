@@ -189,9 +189,17 @@ static void render_stereo(Device &device)
         auto ds=legacy_uniforms.current_set();r.bind_descriptors(0,1,&ds,1,&offset);
     };
     UniformSet uniforms(device, ring, {{0, 16}});
+    TextureInfo texture_info{2, 2, 2};
+    if (device.capabilities.image_view_format_swizzle) {
+        texture_info.format = VK_FORMAT_R8_UNORM;
+        texture_info.components = {VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R,
+                                   VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_ONE};
+    }
+    Texture legacy_texture(device, texture_info);
     Texture texture(device, {2, 2, 2});
     Sampler sampler(device);
     SampledSet material(device, {{0, texture.view(), sampler.handle()}});
+    SampledSet legacy_material(device, {{0, legacy_texture.view(), sampler.handle()}});
     ProgramSource legacy{vs.data(), fs.data(), vs.size() * 4, fs.size() * 4,
         {{0, sizeof(Vertex), VK_VERTEX_INPUT_RATE_VERTEX}},
         {{0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Vertex, position)},
@@ -205,11 +213,12 @@ static void render_stereo(Device &device)
     matrices.view_projection[1][12] = 0.8f;
     cmd = ring.begin();
     const uint32_t white[] = {0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff};
-    texture.upload(cmd, ring, 0, 0, white, sizeof white);
-    texture.upload(cmd, ring, 1, 0, white, 4);
+    const bool luminance = texture_info.format == VK_FORMAT_R8_UNORM;
+    legacy_texture.upload(cmd, ring, 0, 0, white, luminance ? 4 : sizeof white);
+    legacy_texture.upload(cmd, ring, 1, 0, white, luminance ? 1 : 4);
     converted.begin(cmd, {0, 0, 0, 1});
     bind_legacy(converted);
-    auto sampled = material.handle();
+    auto sampled = legacy_material.handle();
     converted.bind_descriptors(2, 1, &sampled);
     const float tint[] = {1, 1, 1, 1};
     guest_uniforms.write(static_cast<uint32_t>(tint_location), tint, sizeof tint);
@@ -455,6 +464,14 @@ try {
     auto device = Device::create(options);
     const auto &h = device->handles;
     require(device->capabilities.multiview, "stereo multiview not available");
+    auto limited_caps = device->capabilities;
+    limited_caps.image_view_format_swizzle = false;
+    auto limited = Device::borrow(h, limited_caps);
+    TextureInfo luminance{1, 1};
+    luminance.components = {VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R,
+                            VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_ONE};
+    rejected([&] { Texture unsupported(*limited, luminance); },
+             "unsupported texture component swizzle accepted");
     render_stereo(*device);
     render_copy(*device);
     if (argc == 2) {

@@ -172,12 +172,29 @@ struct State {
   bool in_begin=false; GLenum immediate_mode=GL_TRIANGLES;
   std::vector<std::array<float,64>> immediate;
   std::vector<Attributes> attributes;
-  ~State() {
+  void shutdown() {
+    if (!device) return;
+    ready = false;
     ring.reset(); // completes buffered commands before referenced resources
+    cmd = VK_NULL_HANDLE;
+    active = nullptr; active_target = nullptr; screen = nullptr;
+    packets.clear();
+    for (auto &slot : materials) slot.clear();
+    programs.clear();
+    fixed_program.native.reset();
     renderers.clear();
+    texture_objects.clear();
+    buffers.clear();
+    samplers.clear();
+    fallback.reset();
     drawables.clear();
+    initialized.clear();
     window.reset();
+    cache.reset();
+    pack.reset(); fixed_pack.reset();
+    device.reset();
   }
+  ~State() { shutdown(); }
   void frame() {
     if (!cmd) {
       cmd = ring->begin();
@@ -244,6 +261,7 @@ struct State {
   }
 };
 State state;
+void shutdown_vulkan() { state.shutdown(); }
 void queue_clear(GLbitfield mask);
 GLuint object() { return state.next_object++; }
 void check_range(size_t size, GLintptr offset, GLsizeiptr bytes) {
@@ -252,11 +270,17 @@ void check_range(size_t size, GLintptr offset, GLsizeiptr bytes) {
     gap("guest buffer range exceeds storage");
 }
 } // namespace
+extern "C" int lvk_host_can_thread(void) { return state.ready; }
 extern "C" int lvk_host_init(SDL_Window *window, int w, int h) {
   if (state.ready)
     return 1;
   try {
     state.device = Device::create(desktop_options(window));
+    // The loader/layer C++ globals are initialized during device creation.
+    // Retire our resources before their atexit destructors, not afterward
+    // when the process-global guest state would normally be destroyed.
+    static const bool cleanup_registered = std::atexit(shutdown_vulkan) == 0;
+    if (!cleanup_registered) gap("cannot register Vulkan shutdown");
     state.window = std::make_unique<Window>(*state.device, window, 3);
     const char *cache = std::getenv("LINDBERGH_VULKAN_CACHE");
     state.cache =

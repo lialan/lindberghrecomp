@@ -14,6 +14,7 @@ struct Capabilities {
     VkPhysicalDeviceProperties properties{};
     bool multiview = false;
     bool texture_compression_bc = false;
+    bool image_view_format_swizzle = true; // core Vulkan; optional on portability devices
     bool density_map = false;
     bool density_map_non_subsampled = false;
     bool shading_rate = false;

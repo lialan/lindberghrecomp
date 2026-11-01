@@ -958,15 +958,12 @@ static void pace(void)
     next += period;
 }
 
-/* gl_thread.c: the GL on a worker thread */
-int glq_active(void);
-int glq_start(void (*release)(void), void (*take)(void));
-uint32_t glq_job(void (*job)(void *), void *arg);
-void glq_wait(uint32_t seq);
-void glq_drain(void);
-void glq_report(unsigned frames);
-static void gl_release(void) { SDL_GL_MakeCurrent(g_win.win, NULL); }
-static void gl_take(void) { SDL_GL_MakeCurrent(g_win.win, g_win.gl); }
+/* Shared worker: guest ABI snapshots, state filtering, one-frame overlap. */
+#include "render_queue.h"
+#ifndef LINDBERGH_VULKAN
+static int gl_release(void) { return SDL_GL_MakeCurrent(g_win.win, NULL) == 0; }
+static int gl_take(void) { return SDL_GL_MakeCurrent(g_win.win, g_win.gl) == 0; }
+#endif
 static void frame_gl(void *arg);
 static void host_frame_done(void);
 
@@ -983,7 +980,13 @@ void host_swap(void)
          * from this first swap on */
         static int want = -1;
         if (want < 0) want = env_int("LINDBERGH_GL_THREAD", 0);   /* or the game's profile: vr.gl_thread */
-        if (want == 1 && g_win.gl) { want = 2; glq_start(gl_release, gl_take); }
+        if (want == 1) {
+#ifdef LINDBERGH_VULKAN
+            if (lvk_host_can_thread()) { want = 2; glq_start(NULL, NULL); }
+#else
+            if (g_win.gl) { want = 2; glq_start(gl_release, gl_take); }
+#endif
+        }
     }
     if (glq_active()) {
         /* the end of this frame goes to the worker; the game waits only for

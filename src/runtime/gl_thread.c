@@ -25,6 +25,7 @@
  * LINDBERGH_GL_THREAD=1 turns it on (or a game's profile); =0 off. */
 #include "lindbergh_rt.h"
 #include "gl_posix.h"
+#include "render_queue.h"
 #include <pthread.h>
 #include <stdatomic.h>
 #include <string.h>
@@ -36,7 +37,7 @@
 #define RING_SIZE   (16u << 20)        /* bytes of guest memory: two busy frames */
 #define ARGS        16u                /* dwords of the guest stack copied per call */
 
-enum { R_ASYNC = 1, R_SYNC, R_JOB, R_WRAP };
+enum { R_ASYNC = 1, R_SYNC, R_JOB, R_WRAP, R_STOP };
 
 /* One record in the ring: this header, then the copied arguments, then any
  * arrays they point at - all in guest memory, so a handler reads them through
@@ -71,7 +72,9 @@ static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
 static _Alignas(128) _Atomic int g_worker_sleeps;
 static _Alignas(128) _Atomic int g_game_sleeps;
-static void (*g_take_context)(void);   /* the worker's first act */
+static int (*g_take_context)(void);   /* the worker's first act */
+static int (*g_release_context)(void);
+static _Atomic int g_context_ready;
 
 int glq_active(void) { return g_on; }
 
@@ -477,7 +480,10 @@ static uint32_t va_of(const void *p) { return g_ring_va + (uint32_t)((const uint
 static void *worker(void *arg)
 {
     (void)arg;
-    if (g_take_context) g_take_context();
+    int ready = !g_take_context || g_take_context();
+    atomic_store_explicit(&g_context_ready, ready, memory_order_release);
+    wake_game();
+    if (!ready) return NULL;
     CPU cpu;
     memset(&cpu, 0, sizeof cpu);
     for (;;) {
@@ -499,6 +505,10 @@ static void *worker(void *arg)
         Rec *r = (Rec *)(g_ring + (uint32_t)(t % RING_SIZE));
         uint32_t size = r->size;
         switch (r->kind) {
+        case R_STOP:
+            if (g_release_context) g_release_context();
+            atomic_store_explicit(&g_tail, t + size, memory_order_release);
+            return NULL;
         case R_ASYNC:
             /* a GL handler reads its arguments off esp and answers in eax:
              * the rest of the CPU is cleared once, not for every call (352
@@ -965,7 +975,23 @@ void glq_report(unsigned frames)
 
 /* Start, from the game thread at its first swap. release() lets go of the GL
  * context on this thread; take() makes it current on the worker. */
-int glq_start(void (*release)(void), void (*take)(void))
+static void glq_shutdown(void)
+{
+    if (!g_on) return;
+    /* exit() can originate in an XR callback on the worker itself. In that
+     * case subsequent XR/EGL atexit handlers already run on its owner. */
+    if (pthread_equal(pthread_self(), g_thread)) { g_on = 0; return; }
+    Rec *r = ring_take(HDR);
+    r->kind = R_STOP;
+    ring_put_wake();
+    pthread_join(g_thread, NULL);
+    g_on = 0;
+    g_gl_hook = g_prev;
+    if (g_take_context && !g_take_context())
+        fprintf(stderr, "[glq] could not reclaim the context for shutdown\n");
+}
+
+int glq_start(int (*release)(void), int (*take)(void))
 {
     if (g_on) return 1;
     void *p = guest_alloc(RING_SIZE, 64);
@@ -979,14 +1005,26 @@ int glq_start(void (*release)(void), void (*take)(void))
     g_prev = g_gl_hook;
     shadow_ids();
     g_take_context = take;
-    if (release) release();
+    g_release_context = release;
+    if (release && !release()) { guest_free(g_ring); g_ring = NULL; return 0; }
+    atomic_store(&g_context_ready, -1);
     if (pthread_create(&g_thread, NULL, worker, NULL)) {
         fprintf(stderr, "[glq] no worker thread\n");
-        if (take) take();
+        if (take && !take()) { fprintf(stderr, "[glq] could not recover the context\n"); exit(1); }
+        guest_free(g_ring); g_ring = NULL;
+        return 0;
+    }
+    GAME_WAIT(atomic_load_explicit(&g_context_ready, memory_order_acquire) != -1);
+    if (!atomic_load(&g_context_ready)) {
+        pthread_join(g_thread, NULL);
+        if (take && !take()) { fprintf(stderr, "[glq] could not recover the context\n"); exit(1); }
+        guest_free(g_ring); g_ring = NULL;
+        fprintf(stderr, "[glq] context transfer failed; keeping rendering on the game thread\n");
         return 0;
     }
     g_on = 1;
     g_gl_hook = glq_hook;
-    fprintf(stderr, "[glq] GL on its own thread\n");
+    atexit(glq_shutdown);       /* return ownership before XR/Mesa teardown */
+    fprintf(stderr, "[glq] guest graphics on its own thread\n");
     return 1;
 }

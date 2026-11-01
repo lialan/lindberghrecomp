@@ -61,6 +61,15 @@ Texture::Texture(Device &device, TextureInfo texture) : info(texture), device_(d
     uint32_t max_levels = 1;
     for (uint32_t side = std::max(info.width, info.height); side > 1; side >>= 1) ++max_levels;
     if (info.levels > max_levels) throw std::invalid_argument("Invalid Vulkan mip count");
+    const auto identity = [](VkComponentSwizzle value, VkComponentSwizzle channel) {
+        return value == VK_COMPONENT_SWIZZLE_IDENTITY || value == channel;
+    };
+    if (!device.capabilities.image_view_format_swizzle &&
+        (!identity(info.components.r, VK_COMPONENT_SWIZZLE_R) ||
+         !identity(info.components.g, VK_COMPONENT_SWIZZLE_G) ||
+         !identity(info.components.b, VK_COMPONENT_SWIZZLE_B) ||
+         !identity(info.components.a, VK_COMPONENT_SWIZZLE_A)))
+        throw std::runtime_error("Texture component swizzles were not enabled on this Vulkan device");
     block_width_ = 1;
     switch (info.format) {
     case VK_FORMAT_R8_UNORM: block_bytes_ = 1; break;

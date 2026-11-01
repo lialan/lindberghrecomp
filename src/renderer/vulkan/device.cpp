@@ -1,3 +1,7 @@
+// Portability-subset feature declarations remain guarded in Vulkan headers.
+#ifndef VK_ENABLE_BETA_EXTENSIONS
+#define VK_ENABLE_BETA_EXTENSIONS
+#endif
 #include "device.hpp"
 
 #include <algorithm>
@@ -34,7 +38,13 @@ Capabilities query_capabilities(VkPhysicalDevice physical)
     VkPhysicalDeviceMultiviewFeatures multiview{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES};
     VkPhysicalDeviceFragmentDensityMapFeaturesEXT density{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_FEATURES_EXT};
     VkPhysicalDeviceFragmentShadingRateFeaturesKHR rate{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR};
+    VkPhysicalDevicePortabilitySubsetFeaturesKHR portability{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_FEATURES_KHR};
     features.pNext = &multiview;
+    const bool portable = extension(ext, VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME);
+    if (portable) {
+        portability.pNext = multiview.pNext;
+        multiview.pNext = &portability;
+    }
     if (extension(ext, VK_EXT_FRAGMENT_DENSITY_MAP_EXTENSION_NAME)) {
         density.pNext = multiview.pNext;
         multiview.pNext = &density;
@@ -53,6 +63,7 @@ Capabilities query_capabilities(VkPhysicalDevice physical)
     out.density_map_non_subsampled = density.fragmentDensityMapNonSubsampledImages;
     out.shading_rate = rate.attachmentFragmentShadingRate;
     out.texture_compression_bc = features.features.textureCompressionBC;
+    out.image_view_format_swizzle = !portable || portability.imageViewFormatSwizzle;
     return out;
 }
 
@@ -152,6 +163,12 @@ std::unique_ptr<Device> Device::create(const DeviceOptions &options)
         views.pNext = &rate;
     }
     VkDeviceCreateInfo device{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+    VkPhysicalDevicePortabilitySubsetFeaturesKHR portability{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_FEATURES_KHR};
+    if (extension(available, VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME)) {
+        portability.imageViewFormatSwizzle = out->capabilities.image_view_format_swizzle;
+        portability.pNext = views.pNext;
+        views.pNext = &portability;
+    }
     VkPhysicalDeviceFeatures core{};
     core.textureCompressionBC = out->capabilities.texture_compression_bc;
     device.pEnabledFeatures = &core;
