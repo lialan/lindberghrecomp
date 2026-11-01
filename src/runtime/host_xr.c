@@ -1,4 +1,6 @@
 #include "display_cadence.h"
+#include "xr_settings.h"
+#include "stereo_projection.h"
 /*
  * host_xr.c - the headset, through OpenXR (Android and Windows PC VR).
  *
@@ -132,78 +134,13 @@ static int gl_load(void)
 #define GL_FRAMEBUFFER_SRGB_EXT 0x8DB9
 
 /* ---- settings ---- */
-enum { LASER_ON, LASER_DOT, LASER_OFF };
 static const char *const LASER_NAME[] = { "laser", "dot", "off" };
 
 static const char *const SIGHT_NAME[] = { "none", "reddot", "holo" };
 
-static struct {
-    float scale, screen, aim;            /* aim: where the laser and the game's shot meet, metres */
-    int   resolution, width, refresh, left_handed, laser, auto_coins;
-    int   sight, crosshair, show_gun;         /* XO_SIGHT_*; the game's own sight; the gun model */
-    int   hud_pitch;                          /* a head-locked HUD tilted up (+) or down, degrees */
-    int   dual;                               /* dual wielding: a gun in each hand, players 1 and 2 */
-    int   show_fps;                           /* the frame rate, shown low in the view */
-} cfg = { 1.0f, 3.0f, 15.0f, 2280, 2064, 120, 0, LASER_ON, 1, XO_SIGHT_NONE, 1, 1 };
-
-static void cfg_save(void)
-{
-    FILE *f = fopen("vr.cfg", "w");
-    if (!f) return;
-    fprintf(f, "scale %g\nscreen %g\naim %g\nresolution %d\nwidth %d\nrefresh %d\nhand %s\nlaser %s\ncoins %s\n"
-               "sight %s\ncrosshair %s\ngun %s\nhud_pitch %d\ndual %s\nfps %s\n",
-            cfg.scale, cfg.screen, cfg.aim, cfg.resolution, cfg.width, cfg.refresh, cfg.left_handed ? "left" : "right",
-            LASER_NAME[cfg.laser], cfg.auto_coins ? "auto" : "manual",
-            SIGHT_NAME[cfg.sight], cfg.crosshair ? "on" : "off", cfg.show_gun ? "on" : "off", cfg.hud_pitch, cfg.dual ? "on" : "off", cfg.show_fps ? "on" : "off");
-    fclose(f);
-}
-
-static void cfg_set(const char *key, const char *val);
-
-static void cfg_load(void)
-{
-    /* the game's own size of a metre, until vr.cfg says otherwise: set by
-     * its android_main (Let's Go Jungle's world is in about decimetres) */
-    { const char *v = getenv("LINDBERGH_XR_SCALE"); if (v && atof(v) > 0) cfg.scale = (float)atof(v); }
-    FILE *f = fopen("vr.cfg", "r");
-    if (!f) f = fopen("../vr.cfg", "r");    /* beside the game: where adb can put one */
-    char key[32], val[32];
-    while (f && fscanf(f, "%31s %31s", key, val) == 2) cfg_set(key, val);
-    if (f) fclose(f);
-    /* LINDBERGH_XR_SET="key=value,...": for this run only, not saved (testing) */
-    const char *e = getenv("LINDBERGH_XR_SET");
-    while (e && *e) {
-        if (sscanf(e, "%31[^=]=%31[^,]", key, val) == 2) cfg_set(key, val);
-        e = strchr(e, ',');
-        if (e) e++;
-    }
-    if (cfg.scale <= 0) cfg.scale = 1;
-    if (cfg.screen <= 0.2f) cfg.screen = 3;
-    if (cfg.aim < 1.0f || cfg.aim > 200.0f) cfg.aim = 15.0f;
-    if (cfg.resolution < 512 || cfg.resolution > 4096) cfg.resolution = 2280;
-    if (cfg.width < 0 || cfg.width > 4096) cfg.width = 0;
-}
-
-static void cfg_set(const char *key, const char *val)
-{
-    {
-        if (!strcmp(key, "scale")) cfg.scale = (float)atof(val);
-        else if (!strcmp(key, "screen")) cfg.screen = (float)atof(val);
-        else if (!strcmp(key, "hud_pitch")) cfg.hud_pitch = atoi(val);
-        else if (!strcmp(key, "aim")) cfg.aim = (float)atof(val);
-        else if (!strcmp(key, "resolution")) cfg.resolution = atoi(val);
-        else if (!strcmp(key, "width")) cfg.width = atoi(val);
-        else if (!strcmp(key, "refresh")) cfg.refresh = atoi(val);
-        else if (!strcmp(key, "hand")) cfg.left_handed = !strcmp(val, "left");
-        else if (!strcmp(key, "laser")) cfg.laser = !strcmp(val, "dot") ? LASER_DOT : !strcmp(val, "off") ? LASER_OFF : LASER_ON;
-        else if (!strcmp(key, "coins")) cfg.auto_coins = strcmp(val, "manual") != 0;
-        else if (!strcmp(key, "sight")) cfg.sight = !strcmp(val, "reddot") ? XO_SIGHT_RED_DOT : !strcmp(val, "holo") ? XO_SIGHT_HOLO : XO_SIGHT_NONE;
-        else if (!strcmp(key, "crosshair")) cfg.crosshair = strcmp(val, "off") != 0;
-        else if (!strcmp(key, "gun")) cfg.show_gun = strcmp(val, "off") != 0;
-        else if (!strcmp(key, "dual")) cfg.dual = !strcmp(val, "on");
-        else if (!strcmp(key, "fps")) cfg.show_fps = !strcmp(val, "on");
-    }
-}
+static LgXrSettings cfg = LG_XR_SETTINGS_DEFAULT;
+static void cfg_save(void) { xr_settings_save(&cfg); }
+static void cfg_load(void) { xr_settings_load(&cfg); }
 
 /* ---- the session ---- */
 static XrInstance  instance;
@@ -407,11 +344,8 @@ static void rumble(int h, float amp, int ms)
 /* Rotate v by quaternion q. */
 static void qrot(XrQuaternionf q, const float v[3], float out[3])
 {
-    float x = q.x, y = q.y, z = q.z, w = q.w;
-    float tx = 2 * (y * v[2] - z * v[1]), ty = 2 * (z * v[0] - x * v[2]), tz = 2 * (x * v[1] - y * v[0]);
-    out[0] = v[0] + w * tx + (y * tz - z * ty);
-    out[1] = v[1] + w * ty + (z * tx - x * tz);
-    out[2] = v[2] + w * tz + (x * ty - y * tx);
+    const float quaternion[]={q.x,q.y,q.z,q.w};
+    lg_stereo_rotate(quaternion,v,out);
 }
 
 /* Cabinet bits, as in lindbergh_rt.h */
@@ -1302,17 +1236,9 @@ static void pose_view(XrPosef p, float m[16])
 /* game camera space -> eye space, for a pose in LOCAL space (metres) */
 static void view_matrix(XrPosef p, float m[16])
 {
-    XrQuaternionf q = p.orientation, qi = { -q.x, -q.y, -q.z, q.w };
-    const float ex[3] = { 1, 0, 0 }, ey[3] = { 0, 1, 0 }, ez[3] = { 0, 0, 1 };
-    float c0[3], c1[3], c2[3];
-    qrot(qi, ex, c0); qrot(qi, ey, c1); qrot(qi, ez, c2);
-    float t[3] = { -p.position.x * cfg.scale, -p.position.y * cfg.scale, -p.position.z * cfg.scale }, rt[3];
-    qrot(qi, t, rt);
-    memset(m, 0, 64);
-    m[0] = c0[0]; m[1] = c0[1]; m[2] = c0[2];
-    m[4] = c1[0]; m[5] = c1[1]; m[6] = c1[2];
-    m[8] = c2[0]; m[9] = c2[1]; m[10] = c2[2];
-    m[12] = rt[0]; m[13] = rt[1]; m[14] = rt[2]; m[15] = 1;
+    const float q[]={p.orientation.x,p.orientation.y,p.orientation.z,p.orientation.w};
+    const float position[]={p.position.x,p.position.y,p.position.z};
+    lg_stereo_pose_view(q,position,cfg.scale,m);
 }
 
 /* LOCAL's origin is wherever the headset was last recentred, not where the

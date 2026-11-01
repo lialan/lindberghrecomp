@@ -12,10 +12,17 @@ namespace lindbergh::vk {
 // Android callers retain the Activity reference until OpenXR is destroyed.
 // Opaque fields keep JNI out of the desktop host interface.
 struct OpenXRPlatform { void *java_vm = nullptr; void *activity = nullptr; };
+struct OpenXRConfig {
+    bool require_foveation=false,transfer_source=false,anchor_head=false,symmetric_fov=false;
+    uint32_t width=0,height=0; // zero: runtime recommendation; width-only zero: preserve recommended aspect
+    float refresh=120; // request only; predicted runtime timing remains authoritative
+    bool sustained_cpu=true,cpu_boost=false;
+};
 // Common Vulkan/OpenXR host, independent of SDL and the guest's graphics ABI.
 class OpenXR {
 public:
     explicit OpenXR(bool require_foveation = false, OpenXRPlatform platform = {}, bool transfer_source = false);
+    explicit OpenXR(OpenXRConfig config,OpenXRPlatform platform = {});
     ~OpenXR();
     OpenXR(const OpenXR &) = delete;
     OpenXR &operator=(const OpenXR &) = delete;
@@ -23,6 +30,7 @@ public:
     // The device must outlive the attached session; detach before destroying it.
     void attach(Device &device);
     void detach();
+    void renderer_thread(); // call when the shared worker takes rendering ownership
     // A null target still requires end_frame(false): shouldRender can be false.
     // Returns null before READY without opening a frame.
     Target *begin_frame();
@@ -34,12 +42,16 @@ public:
     XrSessionState session_state() const { return session_state_; }
     bool exiting() const { return exiting_; }
     bool frame_open() const { return frame_open_; }
+    uint32_t width() const { return width_; }
+    uint32_t height() const { return height_; }
     bool foveation_active() const { return foveation_; }
 private:
     XrInstance instance_ = XR_NULL_HANDLE;
     XrSystemId system_ = XR_NULL_SYSTEM_ID;
     XrSession session_ = XR_NULL_HANDLE;
-    XrSpace space_ = XR_NULL_HANDLE;
+    XrSpace space_ = XR_NULL_HANDLE,base_space_ = XR_NULL_HANDLE;
+    OpenXRConfig config_;
+    bool anchor_pending_=true;
     XrSwapchain swapchain_ = XR_NULL_HANDLE;
     XrFoveationProfileFB profile_ = XR_NULL_HANDLE;
     Device *device_ = nullptr;
@@ -53,7 +65,11 @@ private:
     PFN_xrCreateVulkanInstanceKHR create_instance_ = nullptr;
     PFN_xrCreateVulkanDeviceKHR create_device_ = nullptr;
     PFN_xrGetVulkanGraphicsDevice2KHR get_device_ = nullptr;
-    bool refresh_control_ = false;
+    bool refresh_control_ = false,performance_control_=false,thread_control_=false;
+    uint32_t renderer_tid_=0;
+#ifdef __ANDROID__
+    PFN_xrSetAndroidApplicationThreadKHR set_thread_=nullptr;
+#endif
     float requested_refresh_ = 0;
     PFN_xrRequestDisplayRefreshRateFB request_refresh_ = nullptr;
     PFN_xrGetDisplayRefreshRateFB get_refresh_ = nullptr;

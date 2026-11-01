@@ -1,3 +1,4 @@
+#include "stereo_scene.hpp"
 #include "../../src/runtime/stereo_projection.h"
 #include "device.hpp"
 #include "frame_ring.hpp"
@@ -576,6 +577,63 @@ static void render_stereo_depth_copy(Device &device)
     std::puts("ok: stereo GPU depth copies preserve each eye, mixed layouts and explicit layer routing");
 }
 
+static void test_live_stereo_scene()
+{
+    StereoSettings settings;settings.head_locked=true;settings.hud_lens=1.8107f;
+    StereoScene scene(settings);
+    std::array<StereoPose,2> eyes;eyes[0].position={.032f,0,0};eyes[1].position={-.032f,0,0};
+    scene.publish(eyes);
+    auto camera=identity();camera[0]=1.954f;camera[5]=2.6053f;camera[10]=-2;camera[11]=-1;camera[14]=-3;camera[15]=0;
+    auto hud_camera=camera;hud_camera[0]=1.8107f;
+    require(scene.world_camera(camera)&&!scene.world_camera(hud_camera),"profile HUD lens was treated as world geometry");
+    const auto world=scene.transforms(camera,LG_STEREO_WORLD);
+    for(unsigned i=0;i<1000;++i) scene.transforms(camera,LG_STEREO_WORLD);
+    require(scene.transform_builds()==1,"unchanged draws rebuilt stereo camera transforms");
+    const auto hud=scene.transforms(hud_camera,LG_STEREO_HUD);
+    scene.transforms(camera,LG_STEREO_HUD);
+    require(scene.transform_builds()==2,"HUD transform unnecessarily depends on guest projection");
+    const float yaw=.4f;
+    const std::array<float,4> q{0,std::sin(yaw/2),0,std::cos(yaw/2)};
+    for(auto &eye:eyes) {auto old=eye.position;lg_stereo_rotate(q.data(),old.data(),eye.position.data());eye.orientation=q;}
+    scene.publish(eyes);
+    const auto turned_world=scene.transforms(camera,LG_STEREO_WORLD),turned_hud=scene.transforms(hud_camera,LG_STEREO_HUD);
+    require(std::fabs(turned_world.view_projection[0][0]-world.view_projection[0][0])>.01f,"head turn did not change the world projection");
+    for(unsigned eye=0;eye<2;++eye)for(unsigned i=0;i<16;++i)
+        require(std::fabs(turned_hud.view_projection[eye][i]-hud.view_projection[eye][i])<1e-5f,"head-locked HUD followed the world rotation");
+    auto another=camera;another[0]=2.3f;another[5]=3.0667f;
+    scene.observe(camera,LG_STEREO_WORLD);scene.observe(camera,LG_STEREO_WORLD);scene.observe(another,LG_STEREO_WORLD);scene.finish_frame();
+    require(scene.screen_lens()[0]==camera[0]&&scene.screen_lens()[1]==camera[5],"HUD screen did not use the dominant world camera");
+    auto zoom=camera;zoom[0]=9;
+    for(unsigned i=0;i<6;++i) {require(!scene.zoomed(zoom),"transient camera zoom was treated as a scope");scene.observe(zoom,LG_STEREO_WORLD);scene.finish_frame();}
+    require(scene.zoomed(zoom),"held scope lens was not recognized");
+    LgStereoDrawFacts f{};f.perspective=1;
+    require(lg_stereo_classify_draw(&f)==LG_STEREO_WORLD,"world class changed");
+    f.menu=1;require(lg_stereo_classify_draw(&f)==LG_STEREO_HUD,"menu model escaped HUD plane");
+    f.offscreen=1;require(lg_stereo_classify_draw(&f)==LG_STEREO_PASS,"offscreen sprite camera was reprojected");
+    f={};f.texture_view=1;f.covers_viewport=1;f.multiview=1;f.fills_screen=1;
+    require(lg_stereo_classify_draw(&f)==LG_STEREO_WORLD,"completed world pass was flattened onto HUD");
+    f.covers_viewport=0;f.fills_screen=0;
+    require(lg_stereo_classify_draw(&f)==LG_STEREO_HUD,"cropped view sprite escaped HUD plane");
+    f.texture_view=0;f.fills_screen=1;
+    require(lg_stereo_classify_draw(&f)==LG_STEREO_FILL,"full-screen fade was put on a floating plane");
+    LgStereoTargetSize size{1024,768,800,600,2064,2280};float sx,sy;
+    lg_stereo_target_scale(&size,1024,768,0,&sx,&sy);
+    require(sx==2064.f/1024 && sy==2280.f/768,"full picture did not use the configured eye size");
+    lg_stereo_target_scale(&size,1024,1024,0,&sx,&sy);
+    require(sx==1&&sy==1,"shadow map was expanded beyond the 1024-pixel cap");
+    lg_stereo_target_scale(&size,256,256,0,&sx,&sy);
+    require(sx==2&&sy==2,"small offscreen target did not retain bounded GL scaling");
+    lg_stereo_target_scale(&size,800,600,0,&sx,&sy);
+    require(sx==2064.f/800 && sy==2280.f/600,"separate world target was not eye-sized");
+    GuestArrays arrays;arrays.bind_array_buffer(7);arrays.pointer(0,3,0x1406,false,16,16);arrays.enable(0,true);arrays.bind_array_buffer(99);
+    const float positions[]={0,0,0,0, 1,2,3,1, 4,5,6,1};std::array<float,4> v;
+    require(arrays.position(1,{nullptr,0},[&](uint32_t id){require(id==7,"HUD bounds lost the pointer's captured VBO");return GuestMemoryView{positions,sizeof positions};},v) && v==std::array<float,4>{4,5,6,1},"HUD position shadow read changed stride/offset semantics");
+    rejected([&]{arrays.position(2,{nullptr,0},[&](uint32_t){return GuestMemoryView{positions,sizeof positions};},v);},"HUD bounds escaped the CPU buffer shadow");
+    scene.invalidate();const auto inactive=scene.transforms(camera,LG_STEREO_WORLD);
+    require(inactive.view_projection[0][0]==1 && inactive.view_projection[0][12]==0,"invalid tracking reused an old camera");
+    std::puts("ok: live stereo pose publication, HUD/world classification, dominant lens and cached transforms");
+}
+
 static void test_shared_projection()
 {
     auto p=identity(),view=identity(),head=identity();
@@ -614,6 +672,7 @@ static void test_shared_projection()
 int main(int argc, char **argv)
 try {
     test_shared_projection();
+    test_live_stereo_scene();
     require(shader_source_digest("a\r\n") == shader_source_digest("a \n"),
             "shader identity differs from guest CR normalization");
     require(shader_source_digest("a") == shader_source_digest("a\n"),

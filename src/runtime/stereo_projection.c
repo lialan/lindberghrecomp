@@ -16,6 +16,42 @@ static void frustum(float *m,double l,double r,double b,double t,double n,double
     m[8]=(float)((r+l)/(r-l));m[9]=(float)((t+b)/(t-b));
     m[10]=(float)(-(f+n)/(f-n));m[11]=-1;m[14]=(float)(-2*f*n/(f-n));
 }
+void lg_stereo_target_scale(const LgStereoTargetSize *s,int w,int h,int rectangle,float *x,float *y)
+{
+    float kx=(float)s->eye_w/s->game_w,ky=(float)s->eye_h/s->game_h;
+    if(w>0 && h>0 && w==s->world_w && h==s->world_h) {kx=(float)s->eye_w/w;ky=(float)s->eye_h/h;}
+    else if(!rectangle && !(w==s->game_w && h==s->game_h) && w>0 && h>0) {
+        float k=fminf(fminf(kx,ky),2.f);
+        k=fminf(k,1024.f/(w>h?w:h));kx=ky=k<1?1:k;
+    }
+    *x=kx;*y=ky;
+}
+int lg_stereo_classify_draw(const LgStereoDrawFacts *d)
+{
+    int hud=d->perspective ? d->hud_target || d->menu || d->zoom
+                          : !(d->texture_view || d->picture_target) || !d->covers_viewport;
+    if(d->offscreen || d->flat) return LG_STEREO_PASS;
+    if(hud && !d->perspective && d->multiview && d->fills_screen) return LG_STEREO_FILL;
+    return hud ? LG_STEREO_HUD : LG_STEREO_WORLD;
+}
+void lg_stereo_rotate(const float *q,const float *v,float *out)
+{
+    const float x=q[0],y=q[1],z=q[2],w=q[3];
+    const float tx=2*(y*v[2]-z*v[1]),ty=2*(z*v[0]-x*v[2]),tz=2*(x*v[1]-y*v[0]);
+    const float r[]={v[0]+w*tx+(y*tz-z*ty),v[1]+w*ty+(z*tx-x*tz),v[2]+w*tz+(x*ty-y*tx)};
+    memcpy(out,r,sizeof r);
+}
+void lg_stereo_pose_view(const float *q,const float *p,float scale,float *out)
+{
+    const float inverse[]={-q[0],-q[1],-q[2],q[3]};
+    const float ex[]={1,0,0},ey[]={0,1,0},ez[]={0,0,1};
+    const float translation[]={-p[0]*scale,-p[1]*scale,-p[2]*scale};
+    float c0[3],c1[3],c2[3],t[3];
+    lg_stereo_rotate(inverse,ex,c0);lg_stereo_rotate(inverse,ey,c1);lg_stereo_rotate(inverse,ez,c2);
+    lg_stereo_rotate(inverse,translation,t);
+    identity(out);
+    for(int i=0;i<3;++i) {out[i]=c0[i];out[4+i]=c1[i];out[8+i]=c2[i];out[12+i]=t[i];}
+}
 void lg_stereo_eye_projection(const float *p,int kind,const LgStereoProjection *eye,float *out)
 {
     if(kind==LG_STEREO_PASS) {memcpy(out,p,64);return;}

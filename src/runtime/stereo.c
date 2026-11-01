@@ -533,13 +533,9 @@ static void scale_target(GLenum textarget, GLuint tex, GLenum attachment)
      * size and 1024 pixels across: at the eyes' scale Let's Go Jungle's
      * 1024x1024 shadow map was 1550x3040, and the frame took 200 ms. A
      * rectangle texture is sampled in pixels, so it keeps the eyes' scale. */
-    float kx = g_sx, ky = g_sy;
-    if (w > 0 && h > 0 && w == g_pic_w && h == g_pic_h) { kx = (float)g_ew / w; ky = (float)g_eh / h; }   /* the eyes' size */
-    else if (tg == GL_TEXTURE_2D && !(w == GAME_W && h == GAME_H) && w > 0 && h > 0) {
-        float k = fminf(fminf(g_sx, g_sy), 2.0f);
-        k = fminf(k, 1024.0f / (float)(w > h ? w : h));
-        kx = ky = k < 1.0f ? 1.0f : k;
-    }
+    float kx,ky;
+    const LgStereoTargetSize sizes={GAME_W,GAME_H,g_pic_w,g_pic_h,g_ew,g_eh};
+    lg_stereo_target_scale(&sizes,w,h,tg!=GL_TEXTURE_2D,&kx,&ky);
     int nw = (int)lroundf(w * kx), nh = (int)lroundf(h * ky);
     g_scaled_w[g_nscaled - 1] = (short)w; g_scaled_h[g_nscaled - 1] = (short)h;
     g_scaled_k[g_nscaled - 1][0] = kx; g_scaled_k[g_nscaled - 1][1] = ky;
@@ -1655,10 +1651,17 @@ static int transform_call(CPU *c, HleId id, const char *n)
          * screen too, framed by the scope the game draws there. */
         int zoom = persp && g_proj[g_proj_top][0] > zoom_limit() && g_zoom_frames >= 6;
         if (persp && !g_replaying) { if (zoom) g_zoom_draws++; if (g_game_fb == g_hud_fb) g_hudfb_draws++; }
-        int hud = persp ? g_game_fb == g_hud_fb || menu_state() || g_menu || zoom
-                        : !(g_unit0_rect || picture_2d(g_tex2d_bound) || picture_fb(g_game_fb)) || !covers_viewport(c, n);
-        if (offscreen_fb(g_game_fb) || g_flat) hud = 2;  /* the game's own projection, untouched */
-        if (hud == 1 && !persp && g_mv && fills_screen(c, n)) hud = 3;
+        LgStereoDrawFacts facts={0};
+        facts.perspective=persp;facts.hud_target=g_game_fb==g_hud_fb;
+        facts.menu=persp && (menu_state() || g_menu);facts.zoom=zoom;
+        facts.texture_view=g_unit0_rect || picture_2d(g_tex2d_bound);
+        facts.picture_target=picture_fb(g_game_fb);
+        facts.covers_viewport=persp || !(facts.texture_view || facts.picture_target) || covers_viewport(c,n);
+        facts.offscreen=offscreen_fb(g_game_fb);facts.flat=g_flat;facts.multiview=g_mv;
+        int hud=lg_stereo_classify_draw(&facts);
+        if(hud==LG_STEREO_HUD && !persp && g_mv && fills_screen(c,n)) {
+            facts.fills_screen=1;hud=lg_stereo_classify_draw(&facts);
+        }
         { static long dl = -2, dl1; if (dl == -2) { const char *v = getenv("LINDBERGH_DRAW_LOG"); dl = v ? atol(v) : -1;
                                                      dl1 = v && strchr(v, '-') ? atol(strchr(v, '-') + 1) : dl; }   /* =<frame>[-<last>] */
           if ((long)g_frame == g_cap_frame && !g_replaying) cap_note_tex(g_tex2d_bound);

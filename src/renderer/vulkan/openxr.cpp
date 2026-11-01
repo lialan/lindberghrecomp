@@ -1,9 +1,13 @@
 #include "openxr.hpp"
+#include "../../runtime/stereo_projection.h"
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <cmath>
 #include <stdexcept>
+#ifdef __ANDROID__
+#include <unistd.h>
+#endif
 namespace lindbergh::vk {
 void xr_check(XrResult result, const char *what)
 {
@@ -16,8 +20,11 @@ template<class T> static T function(XrInstance instance, const char *name)
     return reinterpret_cast<T>(result);
 }
 OpenXR::OpenXR(bool required, OpenXRPlatform platform, bool transfer_source)
-    : require_foveation_(required), transfer_source_(transfer_source)
+    : OpenXR(OpenXRConfig{required,transfer_source},platform) {}
+OpenXR::OpenXR(OpenXRConfig config,OpenXRPlatform platform)
+    : config_(config),require_foveation_(config.require_foveation),transfer_source_(config.transfer_source)
 {
+    const bool required=config.require_foveation;
     try {
 #ifdef __ANDROID__
         if (!platform.java_vm || !platform.activity)
@@ -50,6 +57,12 @@ OpenXR::OpenXR(bool required, OpenXRPlatform platform, bool transfer_source)
                 extensions.push_back(name);
             }
         }
+        performance_control_=has(XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME);
+        if(performance_control_)extensions.push_back(XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME);
+#ifdef __ANDROID__
+        thread_control_=has(XR_KHR_ANDROID_THREAD_SETTINGS_EXTENSION_NAME);
+        if(thread_control_)extensions.push_back(XR_KHR_ANDROID_THREAD_SETTINGS_EXTENSION_NAME);
+#endif
         refresh_control_=has(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
         if (refresh_control_) extensions.push_back(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
         XrInstanceCreateInfo create{XR_TYPE_INSTANCE_CREATE_INFO};
@@ -119,25 +132,30 @@ void OpenXR::attach(Device &device)
         binding.queueFamilyIndex=h.queue_family; binding.queueIndex=0;
         XrSessionCreateInfo create{XR_TYPE_SESSION_CREATE_INFO}; create.next=&binding; create.systemId=system_;
         xr_check(xrCreateSession(instance_,&create,&session_),"Vulkan OpenXR session");
+        if(performance_control_ && config_.sustained_cpu) {
+            auto set=function<PFN_xrPerfSettingsSetPerformanceLevelEXT>(instance_,"xrPerfSettingsSetPerformanceLevelEXT");
+            const auto level=config_.cpu_boost?XR_PERF_SETTINGS_LEVEL_BOOST_EXT:XR_PERF_SETTINGS_LEVEL_SUSTAINED_HIGH_EXT;
+            const auto result=set(session_,XR_PERF_SETTINGS_DOMAIN_CPU_EXT,level);
+            std::fprintf(stderr,"[vulkan-xr] CPU %s performance request: %d\n",config_.cpu_boost?"boost":"sustained high",int(result));
+        }
+#ifdef __ANDROID__
+        if(thread_control_) {
+            set_thread_=function<PFN_xrSetAndroidApplicationThreadKHR>(instance_,"xrSetAndroidApplicationThreadKHR");
+            const auto result=set_thread_(session_,XR_ANDROID_THREAD_TYPE_APPLICATION_MAIN_KHR,uint32_t(gettid()));
+            std::fprintf(stderr,"[vulkan-xr] game thread %d registered as application main: %d\n",gettid(),int(result));
+            renderer_thread();
+        }
+#endif
         if (refresh_control_) {
-            auto enumerate=function<PFN_xrEnumerateDisplayRefreshRatesFB>(instance_,"xrEnumerateDisplayRefreshRatesFB");
             request_refresh_=function<PFN_xrRequestDisplayRefreshRateFB>(instance_,"xrRequestDisplayRefreshRateFB");
             get_refresh_=function<PFN_xrGetDisplayRefreshRateFB>(instance_,"xrGetDisplayRefreshRateFB");
-            uint32_t count=0;
-            xr_check(enumerate(session_,0,&count,nullptr),"enumerate OpenXR display rates");
-            std::vector<float> rates(count);
-            xr_check(enumerate(session_,count,&count,rates.data()),"OpenXR display rates");
-            // Same 120 Hz / 60 game-frame policy as the established Quest
-            // port. Prefer a supported integer multiple; never claim that a
-            // successful request proves the actual runtime refresh.
-            for (float preferred : {120.f,60.f}) {
-                for (float rate : rates) if (std::fabs(rate-preferred)<0.01f) requested_refresh_=rate;
-                if (requested_refresh_>0) break;
-            }
+            requested_refresh_=config_.refresh;
         }
         XrReferenceSpaceCreateInfo space{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
         space.referenceSpaceType=XR_REFERENCE_SPACE_TYPE_LOCAL; space.poseInReferenceSpace.orientation.w=1;
         xr_check(xrCreateReferenceSpace(session_,&space,&space_),"OpenXR local space");
+        if(config_.anchor_head)xr_check(xrCreateReferenceSpace(session_,&space,&base_space_),"OpenXR base local space");
+        anchor_pending_=config_.anchor_head;
         uint32_t count=0;
         xr_check(xrEnumerateViewConfigurationViews(instance_,system_,XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,0,&count,nullptr),"OpenXR view count");
         if(count!=2) throw std::runtime_error("OpenXR backend requires two stereo views");
@@ -145,6 +163,12 @@ void OpenXR::attach(Device &device)
         xr_check(xrEnumerateViewConfigurationViews(instance_,system_,XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,2,&count,views.data()),"OpenXR eye sizes");
         width_=std::max(views[0].recommendedImageRectWidth,views[1].recommendedImageRectWidth);
         height_=std::max(views[0].recommendedImageRectHeight,views[1].recommendedImageRectHeight);
+        if(config_.height) {
+            width_=config_.width?config_.width:uint32_t(uint64_t(width_)*config_.height/height_);
+            height_=config_.height;
+        } else if(config_.width)width_=config_.width;
+        for(const auto &view:views)if(!width_ || !height_ || width_>view.maxImageRectWidth || height_>view.maxImageRectHeight)
+            throw std::runtime_error("Configured OpenXR resolution exceeds runtime eye limits");
         xr_check(xrEnumerateSwapchainFormats(session_,0,&count,nullptr),"OpenXR formats");
         std::vector<int64_t> formats(count);
         xr_check(xrEnumerateSwapchainFormats(session_,count,&count,formats.data()),"OpenXR formats");
@@ -191,6 +215,16 @@ void OpenXR::attach(Device &device)
         std::fprintf(stderr,"[vulkan-xr] direct two-layer world targets; density-map attachments %s\n",foveation_?"configured":"disabled by desktop policy");
     } catch (...) { detach(); throw; }
 }
+void OpenXR::renderer_thread()
+{
+#ifdef __ANDROID__
+    const auto tid=uint32_t(gettid());
+    if(!session_||!set_thread_||renderer_tid_==tid)return;
+    const auto result=set_thread_(session_,XR_ANDROID_THREAD_TYPE_RENDERER_MAIN_KHR,tid);
+    if(XR_SUCCEEDED(result))renderer_tid_=tid;
+    std::fprintf(stderr,"[vulkan-xr] render owner thread %u registered: %d\n",tid,int(result));
+#endif
+}
 void OpenXR::poll()
 {
     XrEventDataBuffer event{XR_TYPE_EVENT_DATA_BUFFER};
@@ -214,6 +248,8 @@ void OpenXR::poll()
                     xr_check(xrEndSession(session_),"end OpenXR session"); running_=false;
                 } else if(change.state==XR_SESSION_STATE_EXITING||change.state==XR_SESSION_STATE_LOSS_PENDING) exiting_=true;
             }
+        } else if(event.type==XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING) {
+            if(config_.anchor_head)anchor_pending_=true;
         } else if(event.type==XR_TYPE_EVENT_DATA_DISPLAY_REFRESH_RATE_CHANGED_FB) {
             const auto &rate=*reinterpret_cast<const XrEventDataDisplayRefreshRateChangedFB *>(&event);
             std::fprintf(stderr,"[vulkan-xr] runtime refresh changed %.2f -> %.2f Hz\n",rate.fromDisplayRefreshRate,rate.toDisplayRefreshRate);
@@ -230,10 +266,34 @@ Target *OpenXR::begin_frame()
     XrFrameBeginInfo begin{XR_TYPE_FRAME_BEGIN_INFO}; xr_check(xrBeginFrame(session_,&begin),"begin OpenXR frame"); frame_open_=true;
     if(!frame_.shouldRender) return nullptr;
     XrViewLocateInfo locate{XR_TYPE_VIEW_LOCATE_INFO}; locate.viewConfigurationType=XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
-    locate.displayTime=frame_.predictedDisplayTime; locate.space=space_;
+    locate.displayTime=frame_.predictedDisplayTime;locate.space=anchor_pending_?base_space_:space_;
     XrViewState state{XR_TYPE_VIEW_STATE}; uint32_t count=0;
     xr_check(xrLocateViews(session_,&locate,&state,2,&count,views_.data()),"locate OpenXR views");
     if(count!=2 || !(state.viewStateFlags&XR_VIEW_STATE_ORIENTATION_VALID_BIT)) return nullptr;
+    if(anchor_pending_) {
+        if(!(state.viewStateFlags&XR_VIEW_STATE_POSITION_VALID_BIT))return nullptr;
+        const auto &q=views_[0].pose.orientation;
+        const float quaternion[]={q.x,q.y,q.z,q.w},back[]={0,0,-1};float forward[3];
+        lg_stereo_rotate(quaternion,back,forward);
+        const float yaw=std::atan2(-forward[0],-forward[2]);
+        XrReferenceSpaceCreateInfo anchor{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};anchor.referenceSpaceType=XR_REFERENCE_SPACE_TYPE_LOCAL;
+        anchor.poseInReferenceSpace.orientation={0,std::sin(yaw/2),0,std::cos(yaw/2)};
+        anchor.poseInReferenceSpace.position={(views_[0].pose.position.x+views_[1].pose.position.x)/2,
+                                            (views_[0].pose.position.y+views_[1].pose.position.y)/2,
+                                            (views_[0].pose.position.z+views_[1].pose.position.z)/2};
+        XrSpace replacement;
+        xr_check(xrCreateReferenceSpace(session_,&anchor,&replacement),"anchor OpenXR camera on head");
+        xrDestroySpace(space_);space_=replacement;anchor_pending_=false;
+        locate.space=space_;
+        xr_check(xrLocateViews(session_,&locate,&state,2,&count,views_.data()),"locate anchored OpenXR views");
+        if(count!=2 || !(state.viewStateFlags&XR_VIEW_STATE_ORIENTATION_VALID_BIT))return nullptr;
+        std::fprintf(stderr,"[vulkan-xr] camera anchored on head at %.2f %.2f %.2f m; yaw %.1f degrees\n",anchor.poseInReferenceSpace.position.x,anchor.poseInReferenceSpace.position.y,anchor.poseInReferenceSpace.position.z,yaw*57.2957795f);
+    }
+    if(config_.symmetric_fov)for(auto &view:views_) {
+        const auto tx=std::max(std::fabs(std::tan(view.fov.angleLeft)),std::fabs(std::tan(view.fov.angleRight)));
+        const auto ty=std::max(std::fabs(std::tan(view.fov.angleDown)),std::fabs(std::tan(view.fov.angleUp)));
+        view.fov={-std::atan(tx),std::atan(tx),std::atan(ty),-std::atan(ty)};
+    }
     XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
     xr_check(xrAcquireSwapchainImage(swapchain_,&acquire,&image_),"acquire OpenXR eye array"); acquired_=true;
     XrSwapchainImageWaitInfo ready{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO}; ready.timeout=XR_INFINITE_DURATION;
@@ -265,7 +325,12 @@ void OpenXR::detach()
     if(profile_&&destroy_profile_) destroy_profile_(profile_); profile_=XR_NULL_HANDLE;
     if(swapchain_) xrDestroySwapchain(swapchain_); swapchain_=XR_NULL_HANDLE;
     if(space_) xrDestroySpace(space_); space_=XR_NULL_HANDLE;
+    if(base_space_)xrDestroySpace(base_space_);base_space_=XR_NULL_HANDLE;
     if(session_) xrDestroySession(session_); session_=XR_NULL_HANDLE;
+    renderer_tid_=0;
+#ifdef __ANDROID__
+    set_thread_=nullptr;
+#endif
     requested_refresh_=0; session_state_=XR_SESSION_STATE_UNKNOWN;
     device_=nullptr; running_=false; frame_open_=false; acquired_=false; foveation_=false;
 }

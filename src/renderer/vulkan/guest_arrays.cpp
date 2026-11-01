@@ -1,5 +1,6 @@
 #include "guest_arrays.hpp"
 #include <limits>
+#include <cstring>
 #include <stdexcept>
 
 namespace lindbergh::vk {
@@ -35,6 +36,19 @@ static ArrayFormat format(uint32_t type, uint32_t components, bool normalized)
     case 0x1406: return {fp[n], 4}; // GL_FLOAT: normalization has no effect
     default: throw std::invalid_argument("Guest vertex type requires an explicit conversion path");
     }
+}
+
+bool GuestArrays::position(uint32_t index,const GuestMemoryView &memory,const CpuBufferLookup &buffers,
+                           std::array<float,4> &out) const
+{
+    const auto &a=arrays_[0];
+    if(!a.enabled || a.type!=0x1406 || a.components<2)return false;
+    const auto stride=a.stride?a.stride:a.components*4;
+    const uint64_t address=uint64_t(a.address)+uint64_t(index)*stride;
+    if(address>UINT32_MAX)throw std::out_of_range("HUD position address overflow");
+    const auto source=a.buffer?buffers(a.buffer):memory;
+    out={0,0,0,1};std::memcpy(out.data(),source.read(uint32_t(address),a.components*4),a.components*4);
+    return true;
 }
 
 void GuestArrays::pointer(uint32_t location, uint32_t components, uint32_t type,

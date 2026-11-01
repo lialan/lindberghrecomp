@@ -11,6 +11,7 @@ struct GuestMemoryView {
     const void *read(uint32_t pointer, size_t count) const;
 };
 struct GuestBufferView { VkBuffer buffer; VkDeviceSize bytes; };
+using CpuBufferLookup = std::function<GuestMemoryView(uint32_t)>;
 using BufferLookup = std::function<GuestBufferView(uint32_t)>;
 
 struct ArrayPlan {
@@ -37,6 +38,9 @@ public:
     // client arrays retain their original formats and need one bounded upload;
     // there is no intermediate CPU vertex expansion or GL driver state.
     // The returned storage is reused and valid until the next prepare().
+    // Bounded HUD/viewport classification reads CPU guest shadows only.
+    bool position(uint32_t index,const GuestMemoryView &memory,const CpuBufferLookup &buffers,
+                  std::array<float,4> &out) const;
     const ArrayPlan &prepare(Device &device, FrameRing &ring, uint32_t first, uint32_t count,
                              const GuestMemoryView &memory, const BufferLookup &buffers);
 private:
