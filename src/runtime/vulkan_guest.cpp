@@ -320,6 +320,12 @@ struct State {
       recipes.reset();
     }
     renderers.clear();overlay.reset();panel.reset();
+    if(Renderer::command_stats_enabled()) {
+      const auto counts=Renderer::global_command_stats();
+      for(size_t i=0;i<Renderer::command_count;++i)
+        std::fprintf(stderr,"[vulkan-commands] %s: %llu issued, %llu filtered\n",
+          Renderer::command_name(Renderer::Command(i)),(unsigned long long)counts.issued[i],(unsigned long long)counts.filtered[i]);
+    }
     texture_objects.clear();
     buffers.clear();
     samplers.clear();

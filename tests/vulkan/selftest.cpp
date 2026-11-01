@@ -371,6 +371,55 @@ static void render_stereo(Device &device)
     pixel(1, 8, 16, 0); pixel(1, 24, 16, 255);
     std::puts("ok: one Vulkan draw rendered distinct stereo views with build-time SPIR-V");
 
+    // Cached commands must remain correct across another renderer sharing the
+    // pass and across a new command buffer. Use persistent streams so repeated
+    // draws exercise actual identical vertex/index bindings and push constants.
+    {
+        Renderer a(device,target,cache),b(device,target,cache);
+        a.collect_command_stats(true);a.filter_state(true);b.filter_state(true);
+        a.prepare(state);b.prepare(state);
+        const uint32_t elements[]={0,1,2};
+        cmd=ring.begin();auto vertices=ring.upload(triangle,sizeof triangle);
+        auto indices=ring.upload(elements,sizeof elements,4);IndexStream indexed{indices.buffer,indices.offset,VK_INDEX_TYPE_UINT32};
+        const float constants[4]{};VkRect2D full{{0,0},{32,32}};
+        a.begin(cmd,{0,0,0,1});
+        a.viewport(0,0,32,32,full);a.viewport(0,0,32,32,full);
+        a.dynamic_state(0,~0u,~0u,0,0,constants);a.dynamic_state(0,~0u,~0u,0,0,constants);
+        a.draw_buffers(&vertices,1,3,matrices,state,&indexed);a.draw_buffers(&vertices,1,3,matrices,state,&indexed);
+        auto before=a.command_stats();
+        require(before.issued[size_t(Renderer::Command::Viewport)]==1&&before.filtered[size_t(Renderer::Command::Viewport)]==2,
+                "unchanged viewport commands were not filtered");
+        for(auto kind:{Renderer::Command::VertexBuffer,Renderer::Command::IndexBuffer,Renderer::Command::PushConstants})
+            require(before.issued[size_t(kind)]==1&&before.filtered[size_t(kind)]==1,"persistent draw bindings were not filtered");
+        // Overwrite all relevant state using another renderer. Its scissor
+        // intentionally prevents drawing; after returning to A its identical
+        // cached values must still be emitted again.
+        a.detach();b.attach(cmd);b.viewport(0,0,16,16,{{0,0},{0,0}});b.dynamic_state(5,1,1,1,1,constants);
+        auto moved=matrices;moved.view_projection[0][12]+=10;moved.view_projection[1][12]+=10;
+        b.draw_buffers(&vertices,1,3,moved,state,&indexed);b.detach();a.attach(cmd);
+        a.viewport(0,0,32,32,full);a.dynamic_state(0,~0u,~0u,0,0,constants);
+        a.clear(VK_IMAGE_ASPECT_COLOR_BIT|VK_IMAGE_ASPECT_DEPTH_BIT,{0,0,0,1},1,0,full);
+        a.draw_buffers(&vertices,1,3,matrices,state,&indexed);a.end();
+        for(auto kind:{Renderer::Command::VertexBuffer,Renderer::Command::IndexBuffer,Renderer::Command::PushConstants})
+            require(a.command_stats().issued[size_t(kind)]==2,"renderer attachment reused disturbed state");
+        vkCmdCopyImageToBuffer(cmd,target.color,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,output.buffer,1,&copy);
+        vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&barrier,0,nullptr);
+        ring.wait(ring.submit());pixel(0,8,16,255);pixel(0,24,16,0);pixel(1,8,16,0);pixel(1,24,16,255);
+        // A new command buffer must not inherit any cached binding.
+        cmd=ring.begin();vertices=ring.upload(triangle,sizeof triangle);indices=ring.upload(elements,sizeof elements,4);
+        indexed={indices.buffer,indices.offset,VK_INDEX_TYPE_UINT32};a.begin(cmd,{0,0,0,1});
+        a.draw_buffers(&vertices,1,3,matrices,state,&indexed);a.end();ring.wait(ring.submit());
+        require(a.command_stats().issued[size_t(Renderer::Command::PushConstants)]==3,"new command buffer reused stale push constants");
+        // The comparison switch disables only the newly added filtering;
+        // existing pipeline-bind filtering remains present in both controls.
+        a.filter_state(false);cmd=ring.begin();vertices=ring.upload(triangle,sizeof triangle);
+        a.begin(cmd,{0,0,0,1});auto counts=a.command_stats();
+        a.draw_buffers(&vertices,1,3,matrices,state);a.draw_buffers(&vertices,1,3,matrices,state);a.end();ring.wait(ring.submit());
+        require(a.command_stats().issued[size_t(Renderer::Command::PushConstants)]-counts.issued[size_t(Renderer::Command::PushConstants)]==2,
+                "unfiltered comparison path still suppresses commands");
+    }
+    std::puts("ok: native command filtering preserves stereo output across disturbed renderer state and command-buffer reuse");
+
     // Exercise guest fixed-function matrix semantics and GL_QUADS through the
     // direct frontend, then verify actual raster output rather than GL calls.
     GuestState guest_state;
@@ -513,10 +562,21 @@ static void render_stereo(Device &device)
         require(loaded.prepared_count()==1&&loaded.first_use_count()==0,"pipeline was not prepared before target use");
         draw->prepare(state);
         require(loaded.first_use_count()==0,"cached draw created another pipeline");
+        draw->filter_state(true);
         cmd=ring.begin();draw->begin(cmd,{0,0,0,1});bind_legacy(*draw);
         sampled=legacy_material.handle();draw->bind_descriptors(2,1,&sampled);
         offset=uniforms.upload(0,guest_uniforms.bytes().data(),guest_uniforms.bytes().size());descriptors=uniforms.current_set();
-        draw->bind_descriptors(1,1,&descriptors,1,&offset);draw->draw(ring,triangle,3,matrices,state);draw->end();
+        draw->collect_command_stats(true);
+        draw->bind_descriptors(1,1,&descriptors,1,&offset);draw->bind_descriptors(1,1,&descriptors,1,&offset);
+        auto set0=legacy_uniforms.current_set();auto offset0=legacy_uniforms.upload(0,legacy_data.bytes().data(),legacy_data.bytes().size());
+        const VkDescriptorSet group[]={set0,descriptors};const uint32_t offsets[]={offset0,offset};
+        draw->bind_descriptors(0,2,group,2,offsets);draw->bind_descriptors(0,2,group,2,offsets);
+        draw->bind_descriptors(1,1,&descriptors,1,&offset);
+        // Partial bind invalidates the cached overlapping two-set group.
+        draw->bind_descriptors(0,2,group,2,offsets);
+        require(draw->command_stats().issued[size_t(Renderer::Command::Descriptors)]==4&&
+                draw->command_stats().filtered[size_t(Renderer::Command::Descriptors)]==2,"descriptor overlap/offset cache is stale");
+        draw->draw(ring,triangle,3,matrices,state);draw->end();
         vkCmdCopyImageToBuffer(cmd,target.color,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,output.buffer,1,&copy);
         vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&barrier,0,nullptr);
         ring.wait(ring.submit());pixel(0,8,16,255);pixel(0,24,16,0);pixel(1,8,16,0);pixel(1,24,16,255);

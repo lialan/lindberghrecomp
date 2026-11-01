@@ -85,6 +85,10 @@ private:
 // frame uploads; prepare() is explicitly outside the recording path.
 class Renderer {
 public:
+    enum class Command : unsigned { Pipeline, Viewport, Scissor, StencilReference, StencilCompare,
+        StencilWrite, DepthBias, BlendConstants, Descriptors, VertexBuffer, IndexBuffer, PushConstants, Count };
+    static constexpr size_t command_count = size_t(Command::Count);
+    struct CommandStats { std::array<uint64_t,command_count> issued{}, filtered{}; };
     Renderer(Device &device, Target &target, PipelineCache &cache);
     Renderer(Device &device, Target &target, PipelineCache &cache, const ProgramSource &program);
     ~Renderer();
@@ -115,6 +119,12 @@ public:
     void end();
     uint64_t draw_count() const { return draws_; }
     size_t pipeline_count() const { return pipelines_.size(); }
+    void filter_state(bool enabled);
+    void collect_command_stats(bool enabled) { count_commands_=enabled; }
+    const CommandStats &command_stats() const { return commands_; }
+    static CommandStats global_command_stats();
+    static bool command_stats_enabled();
+    static const char *command_name(Command);
 
 private:
     Device &device_;
@@ -129,6 +139,25 @@ private:
     std::vector<VkVertexInputBindingDescription> bindings_;
     std::vector<VkVertexInputAttributeDescription> attributes_;
     uint32_t descriptor_count_ = 0;
+    bool filter_=true, count_commands_=false, viewport_valid_=false, scissor_valid_=false;
+    bool streams_valid_=false, index_valid_=false, matrices_valid_=false;
+    uint32_t dynamic_valid_=0, stencil_ref_=0, stencil_compare_=0, stencil_write_=0;
+    VkViewport viewport_{};
+    VkRect2D scissor_{};
+    std::array<float,2> depth_bias_{};
+    std::array<float,4> blend_constants_{};
+    Matrices matrices_{};
+    std::vector<Upload> streams_;
+    IndexStream index_{};
+    struct DescriptorBinding {
+        bool valid=false;
+        std::vector<VkDescriptorSet> sets;
+        std::vector<uint32_t> offsets;
+    };
+    std::vector<DescriptorBinding> descriptors_;
+    CommandStats commands_;
+    bool emit(Command,bool redundant,bool always_filter=false);
+    void invalidate_state();
     void release();
 };
 

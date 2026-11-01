@@ -4,8 +4,39 @@
 #include <cstddef>
 #include <algorithm>
 #include <stdexcept>
+#include <cstring>
+#include <cstdlib>
 
 namespace lindbergh::vk {
+// Like command recording, optional counters have one renderer-thread owner.
+// The host reads them only after draining the worker at shutdown.
+namespace { Renderer::CommandStats command_totals; }
+bool Renderer::command_stats_enabled() {
+    static const bool enabled=[] {const auto *v=std::getenv("LINDBERGH_VULKAN_COMMAND_STATS");return v&&*v=='1';}();return enabled;
+}
+Renderer::CommandStats Renderer::global_command_stats() {return command_totals;}
+const char *Renderer::command_name(Command kind) {
+    static const char *names[]={"pipeline","viewport","scissor","stencil-reference","stencil-compare","stencil-write",
+        "depth-bias","blend-constants","descriptors","vertex-buffer","index-buffer","push-constants"};
+    return names[size_t(kind)];
+}
+bool Renderer::emit(Command kind,bool redundant,bool always_filter) {
+    const auto i=size_t(kind);
+    if((filter_||always_filter)&&redundant){if(count_commands_){++commands_.filtered[i];++command_totals.filtered[i];}return false;}
+    if(count_commands_){++commands_.issued[i];++command_totals.issued[i];}return true;
+}
+void Renderer::invalidate_state() {
+    // Another renderer can have changed any binding since our last attachment.
+    // Within one attachment our variants share the same pipeline layout and
+    // dynamic-state declarations, so their cached values remain applicable.
+    bound_=VK_NULL_HANDLE;viewport_valid_=scissor_valid_=streams_valid_=index_valid_=matrices_valid_=false;
+    dynamic_valid_=0;for(auto &d:descriptors_)d.valid=false;
+}
+void Renderer::filter_state(bool enabled) {
+    if(cmd_)throw std::logic_error("Cannot change state filtering during render pass");
+    filter_=enabled;invalidate_state();
+}
+
 
 static void image(Device &device, const VkImageCreateInfo &info, VkImage &image, VkDeviceMemory &memory)
 {
@@ -224,6 +255,9 @@ Renderer::Renderer(Device &device, Target &target, PipelineCache &cache, const P
     if (!program.vertex || !program.fragment || !program.vertex_bytes || !program.fragment_bytes ||
         program.vertex_bytes % 4 || program.fragment_bytes % 4)
         throw std::invalid_argument("Invalid precompiled Vulkan shader modules");
+    static const bool filtering=[] {const auto *v=std::getenv("LINDBERGH_VULKAN_STATE_FILTER");return !v||*v!='0';}();
+    filter_=filtering;count_commands_=command_stats_enabled();
+    streams_.resize(bindings_.size());descriptors_.resize(descriptor_count_);
     try {
         VkShaderModuleCreateInfo module{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         module.codeSize = program.vertex_bytes;
@@ -316,34 +350,41 @@ void Renderer::begin(VkCommandBuffer cmd, std::array<float, 4> color, bool prese
     VkViewport viewport{0, target_.info.guest_bottom_origin ? float(target_.info.height) : 0,
                         float(target_.info.width), target_.info.guest_bottom_origin ? -float(target_.info.height) : float(target_.info.height), 0, 1};
     VkRect2D scissor{{0, 0}, pass.renderArea.extent};
-    vkCmdSetViewport(cmd, 0, 1, &viewport); vkCmdSetScissor(cmd, 0, 1, &scissor);
-    cmd_ = cmd; bound_ = VK_NULL_HANDLE;
+    cmd_ = cmd;invalidate_state();
+    if(emit(Command::Viewport,false))vkCmdSetViewport(cmd,0,1,&viewport);
+    if(emit(Command::Scissor,false))vkCmdSetScissor(cmd,0,1,&scissor);
+    viewport_=viewport;scissor_=scissor;viewport_valid_=scissor_valid_=true;
     const float blend_constants[4]{}; dynamic_state(0,~0u,~0u,0,0,blend_constants);
 }
 
 void Renderer::attach(VkCommandBuffer cmd)
 {
     if (cmd_ || !cmd) throw std::logic_error("Invalid Vulkan pipeline attach");
-    cmd_ = cmd; bound_ = VK_NULL_HANDLE;
+    cmd_ = cmd;invalidate_state();
 }
-void Renderer::detach() { cmd_ = VK_NULL_HANDLE; bound_ = VK_NULL_HANDLE; }
+void Renderer::detach() { cmd_ = VK_NULL_HANDLE;invalidate_state(); }
 
 void Renderer::viewport(float x, float y, float width, float height, VkRect2D scissor,float min_depth,float max_depth)
 {
     if (!cmd_) throw std::logic_error("Viewport outside render pass");
     VkViewport vp{x, target_.info.guest_bottom_origin ? y + height : float(target_.info.height) - y - height,
                   width, target_.info.guest_bottom_origin ? -height : height, min_depth, max_depth};
-    vkCmdSetViewport(cmd_, 0, 1, &vp);
-    vkCmdSetScissor(cmd_, 0, 1, &scissor);
+    if(emit(Command::Viewport,viewport_valid_&&!std::memcmp(&viewport_,&vp,sizeof vp)))vkCmdSetViewport(cmd_,0,1,&vp);
+    if(emit(Command::Scissor,scissor_valid_&&!std::memcmp(&scissor_,&scissor,sizeof scissor)))vkCmdSetScissor(cmd_,0,1,&scissor);
+    viewport_=vp;scissor_=scissor;viewport_valid_=scissor_valid_=true;
 }
 
 void Renderer::dynamic_state(uint32_t ref, uint32_t compare_mask, uint32_t write_mask, float factor, float units, const float constants[4])
 {
     if (!cmd_) throw std::logic_error("Dynamic state outside render pass");
-    vkCmdSetStencilReference(cmd_,VK_STENCIL_FACE_FRONT_AND_BACK,ref);
-    vkCmdSetStencilCompareMask(cmd_,VK_STENCIL_FACE_FRONT_AND_BACK,compare_mask);
-    vkCmdSetStencilWriteMask(cmd_,VK_STENCIL_FACE_FRONT_AND_BACK,write_mask);
-    vkCmdSetDepthBias(cmd_,units,0,factor); vkCmdSetBlendConstants(cmd_,constants);
+    if(emit(Command::StencilReference,(dynamic_valid_&1)&&stencil_ref_==ref))vkCmdSetStencilReference(cmd_,VK_STENCIL_FACE_FRONT_AND_BACK,ref);
+    if(emit(Command::StencilCompare,(dynamic_valid_&2)&&stencil_compare_==compare_mask))vkCmdSetStencilCompareMask(cmd_,VK_STENCIL_FACE_FRONT_AND_BACK,compare_mask);
+    if(emit(Command::StencilWrite,(dynamic_valid_&4)&&stencil_write_==write_mask))vkCmdSetStencilWriteMask(cmd_,VK_STENCIL_FACE_FRONT_AND_BACK,write_mask);
+    const std::array<float,2> bias{factor,units};
+    if(emit(Command::DepthBias,(dynamic_valid_&8)&&!std::memcmp(depth_bias_.data(),bias.data(),sizeof bias)))vkCmdSetDepthBias(cmd_,units,0,factor);
+    if(emit(Command::BlendConstants,(dynamic_valid_&16)&&!std::memcmp(blend_constants_.data(),constants,sizeof blend_constants_)))vkCmdSetBlendConstants(cmd_,constants);
+    stencil_ref_=ref;stencil_compare_=compare_mask;stencil_write_=write_mask;depth_bias_=bias;
+    std::copy(constants,constants+4,blend_constants_.begin());dynamic_valid_=31;
 }
 
 void Renderer::clear(VkImageAspectFlags aspects, std::array<float,4> color, float depth, uint32_t stencil, VkRect2D rect)
@@ -369,8 +410,21 @@ void Renderer::bind_descriptors(uint32_t first_set, uint32_t count, const VkDesc
     if (!count || !sets || first_set > descriptor_count_ || count > descriptor_count_ - first_set ||
         (offset_count && !dynamic_offsets))
         throw std::invalid_argument("Invalid Vulkan descriptor binding");
-    vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, first_set, count, sets,
-                            offset_count, dynamic_offsets);
+    auto &saved=descriptors_[first_set];
+    const bool same=saved.valid&&saved.sets.size()==count&&saved.offsets.size()==offset_count&&
+        std::equal(saved.sets.begin(),saved.sets.end(),sets)&&
+        (!offset_count||std::equal(saved.offsets.begin(),saved.offsets.end(),dynamic_offsets));
+    if(!emit(Command::Descriptors,same))return;
+    vkCmdBindDescriptorSets(cmd_,VK_PIPELINE_BIND_POINT_GRAPHICS,layout_,first_set,count,sets,offset_count,dynamic_offsets);
+    // A later partial bind invalidates any cached group overlapping its sets.
+    // Offsets are kept with the complete bind, never guessed per descriptor.
+    for(uint32_t set=0;set<descriptors_.size();++set) {
+        auto &d=descriptors_[set];
+        if(d.valid&&set<first_set+count&&first_set<set+d.sets.size())d.valid=false;
+    }
+    saved.sets.assign(sets,sets+count);
+    if(offset_count)saved.offsets.assign(dynamic_offsets,dynamic_offsets+offset_count);else saved.offsets.clear();
+    saved.valid=true;
 }
 
 void Renderer::draw(FrameRing &ring, const Vertex *vertices, uint32_t count, const Matrices &matrices, RasterState state)
@@ -412,12 +466,21 @@ void Renderer::draw_buffers(const Upload *streams, uint32_t stream_count, uint32
         throw std::invalid_argument("Invalid Vulkan index stream");
     auto p = pipelines_.find(state.key());
     if (p == pipelines_.end()) throw std::logic_error("Unprepared Vulkan pipeline encountered during drawing");
-    if (bound_ != p->second) { vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, p->second); bound_ = p->second; }
-    for (uint32_t i = 0; i < stream_count; ++i)
-        vkCmdBindVertexBuffers(cmd_, bindings_[i].binding, 1, &streams[i].buffer, &streams[i].offset);
-    vkCmdPushConstants(cmd_, layout_, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof matrices, &matrices);
-    if (indices) {
-        vkCmdBindIndexBuffer(cmd_, indices->buffer, indices->offset, indices->type);
+    if(emit(Command::Pipeline,bound_==p->second,true))vkCmdBindPipeline(cmd_,VK_PIPELINE_BIND_POINT_GRAPHICS,p->second);
+    bound_=p->second;
+    for(uint32_t i=0;i<stream_count;++i) {
+        if(emit(Command::VertexBuffer,streams_valid_&&streams_[i].buffer==streams[i].buffer&&streams_[i].offset==streams[i].offset))
+            vkCmdBindVertexBuffers(cmd_,bindings_[i].binding,1,&streams[i].buffer,&streams[i].offset);
+        streams_[i]=streams[i];
+    }
+    streams_valid_=true;
+    if(emit(Command::PushConstants,matrices_valid_&&!std::memcmp(&matrices_,&matrices,sizeof matrices)))
+        vkCmdPushConstants(cmd_,layout_,VK_SHADER_STAGE_VERTEX_BIT,0,sizeof matrices,&matrices);
+    matrices_=matrices;matrices_valid_=true;
+    if(indices) {
+        if(emit(Command::IndexBuffer,index_valid_&&index_.buffer==indices->buffer&&index_.offset==indices->offset&&index_.type==indices->type))
+            vkCmdBindIndexBuffer(cmd_,indices->buffer,indices->offset,indices->type);
+        index_=*indices;index_valid_=true;
         vkCmdDrawIndexed(cmd_, count, 1, 0, 0, 0);
     } else vkCmdDraw(cmd_, count, 1, 0, 0);
     ++draws_;
@@ -426,7 +489,7 @@ void Renderer::draw_buffers(const Upload *streams, uint32_t stream_count, uint32
 void Renderer::end()
 {
     if (!cmd_) throw std::logic_error("Vulkan render pass is not recording");
-    vkCmdEndRenderPass(cmd_); cmd_ = VK_NULL_HANDLE;
+    vkCmdEndRenderPass(cmd_); cmd_ = VK_NULL_HANDLE;invalidate_state();
 }
 
 void Renderer::release()
