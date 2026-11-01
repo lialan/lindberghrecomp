@@ -84,3 +84,29 @@ add_custom_command(OUTPUT "${fixed_archive}"
 add_custom_target(vulkan_fixed_pack DEPENDS "${fixed_archive}")
 add_dependencies(lindbergh_vulkan vulkan_fixed_pack)
 set(LINDBERGH_VULKAN_FIXED_ARCHIVE "${fixed_archive}" CACHE INTERNAL "Fixed-function Vulkan shaders" FORCE)
+
+option(LINDBERGH_VULKAN_GUEST_TEST "Build offscreen real guest-ABI target lifecycle test (requires SDL2 and GL ABI headers)" OFF)
+if(BUILD_TESTING AND LINDBERGH_VULKAN_GUEST_TEST)
+    find_package(SDL2 REQUIRED)
+    if(NOT LINDBERGH_GL_HEADERS)
+        message(FATAL_ERROR "LINDBERGH_VULKAN_GUEST_TEST requires LINDBERGH_GL_HEADERS for ABI declarations only")
+    endif()
+    set(guest_test "${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/vulkan/guest_target_test.cpp")
+    set(guest_abi "${CMAKE_CURRENT_BINARY_DIR}/guest-test-abi")
+    execute_process(COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../../../tools/vulkan/gen_abi.py"
+        "${guest_abi}" "${CMAKE_CURRENT_SOURCE_DIR}/../../runtime/vulkan_guest.cpp" "${LINDBERGH_GL_HEADERS}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../runtime/hle_gl_posix.c" "${guest_test}" COMMAND_ERROR_IS_FATAL ANY)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${guest_test}" "${CMAKE_CURRENT_SOURCE_DIR}/../../runtime/vulkan_guest.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../../tools/vulkan/gen_abi.py" "${CMAKE_CURRENT_SOURCE_DIR}/../../runtime/hle_gl_posix.c" ${LINDBERGH_GL_HEADERS})
+    add_executable(lindbergh_vulkan_guest_target_test "${guest_test}" ../../runtime/vulkan_guest.cpp)
+    add_dependencies(lindbergh_vulkan_guest_target_test vulkan_legacy_fixture)
+    target_include_directories(lindbergh_vulkan_guest_target_test PRIVATE "${guest_abi}" "${CMAKE_CURRENT_SOURCE_DIR}/../../runtime")
+    foreach(header IN LISTS LINDBERGH_GL_HEADERS)
+        get_filename_component(abi_header_dir "${header}" DIRECTORY)
+        target_include_directories(lindbergh_vulkan_guest_target_test PRIVATE "${abi_header_dir}" "${abi_header_dir}/..")
+    endforeach()
+    target_compile_definitions(lindbergh_vulkan_guest_target_test PRIVATE LINDBERGH_VULKAN=1 LINDBERGH_VULKAN_OFFSCREEN=1
+        LINDBERGH_VULKAN_FIXED_ARCHIVE="${fixed_archive}" LV_TEST_SHADER_PACK="${fixture}/fixture.lvsp")
+    target_link_libraries(lindbergh_vulkan_guest_target_test PRIVATE lindbergh_vulkan SDL2::SDL2)
+    add_test(NAME lindbergh_vulkan_guest_target_test COMMAND lindbergh_vulkan_guest_target_test)
+endif()

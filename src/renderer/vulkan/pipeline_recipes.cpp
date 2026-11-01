@@ -308,12 +308,15 @@ void PipelineRecipes::prepare(Target &target) {
             compatible[0], compatible[4], compatible[3],
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
 }
-void PipelineRecipes::retire(Target &target) {
+std::vector<std::shared_ptr<Renderer>> PipelineRecipes::retire(Target &target) {
+    std::vector<std::shared_ptr<Renderer>> retired;
     for (auto i = renderers_.begin(); i != renderers_.end();)
-        if (i->first.first == &target)
+        if (i->first.first == &target) {
+            retired.push_back(std::move(i->second));
             i = renderers_.erase(i);
-        else
+        } else
             ++i;
+    return retired;
 }
 void PipelineRecipes::save() {
     if (path_.empty() || !dirty_)

@@ -31,6 +31,9 @@ class FrameRing {
                       VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
     void wait(Submission submission);
     void keep_alive(std::shared_ptr<void> resource);
+    // Retire after all recorded/submitted work on this ring's queue. Also valid
+    // between frames; never records commands, waits, or adds a submission.
+    void retire(std::shared_ptr<void> resource);
     uint64_t submissions() const { return submissions_; }
     uint32_t slot_count() const { return static_cast<uint32_t>(slots_.size()); }
     uint32_t recording_slot() const;

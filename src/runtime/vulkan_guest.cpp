@@ -267,6 +267,7 @@ struct State {
   std::array<GLenum,8> texture_env{GL_MODULATE,GL_MODULATE,GL_MODULATE,GL_MODULATE,GL_MODULATE,GL_MODULATE,GL_MODULATE,GL_MODULATE};
   std::array<std::array<float,4>,8> env_color{};
   std::unordered_map<unsigned, std::unique_ptr<Target>> drawables;
+  std::unordered_set<unsigned> deleted_drawables;
   std::unordered_map<Target *, std::unique_ptr<Renderer>> renderers;
   std::vector<DrawPacket> packets;
   std::unordered_set<Target *> initialized;
@@ -344,7 +345,7 @@ struct State {
     buffers.clear();
     samplers.clear();
     fallback.reset();
-    drawables.clear();drawable_sizes.clear();stereo.reset();controllers.reset();game_input={};
+    drawables.clear();drawable_sizes.clear();deleted_drawables.clear();stereo.reset();controllers.reset();game_input={};
     initialized.clear();
 #ifndef LINDBERGH_VULKAN_OFFSCREEN
     window.reset();
@@ -917,15 +918,51 @@ extern "C" unsigned lvk_create_drawable(int w, int h) {
 #endif
   return id;
 }
+namespace {
+void retire_drawable(unsigned id) {
+  auto found=state.drawables.find(id);
+  if(found==state.drawables.end())return;
+  // Bake queued draws/clears before detaching their caches. This closes the
+  // render pass but does not submit or wait for GPU work.
+  if(state.cmd)state.flush();
+  auto retired=std::make_shared<RetiredTarget>();
+  retired->target=std::move(found->second);
+  auto *target=retired->target.get();
+  if(state.recipes)retired->renderers=state.recipes->retire(*target);
+  auto detach=[&](Program &program) {
+    if(!program.native)return;
+    auto &renderers=program.native->renderers;
+    for(auto entry=renderers.begin();entry!=renderers.end();) {
+      if(&entry->second->target()==target) {
+        retired->renderers.push_back(std::move(entry->second));
+        entry=renderers.erase(entry);
+      } else ++entry;
+    }
+  };
+  for(auto &program:state.programs)detach(program.second);
+  detach(state.fixed_program);
+  if(auto clear=state.renderers.find(target);clear!=state.renderers.end()) {
+    retired->renderers.push_back(std::move(clear->second));state.renderers.erase(clear);
+  }
+  state.initialized.erase(target);
+  state.drawables.erase(found);state.drawable_sizes.erase(id);state.deleted_drawables.erase(id);
+  if(state.hud_target==id)state.hud_target=~0u;
+  if(state.hud_target_next==id)state.hud_target_next=~0u;
+  state.ring->retire(std::move(retired));
+}
+}
 extern "C" void lvk_destroy_drawable(unsigned id) {
-  // Destruction of in-flight guest render targets needs deferred retirement.
-  if (state.drawables.count(id))
-    gap("guest drawable retirement is not implemented");
+  if(!state.drawables.count(id))return;
+  // GLX keeps a destroyed current pbuffer alive until it is unbound.
+  if(state.drawable==id)state.deleted_drawables.insert(id);
+  else retire_drawable(id);
 }
 extern "C" void lvk_bind_drawable(unsigned id) {
   if (id && !state.drawables.count(id))
     gap("unknown guest Vulkan drawable");
+  const auto previous=state.drawable;
   state.drawable = id;
+  if(previous!=id && state.deleted_drawables.count(previous))retire_drawable(previous);
 }
 
 extern "C" GLenum lvk_glGetError(void) { return state.matrices.error(); }

@@ -394,6 +394,57 @@ static void render_stereo(Device &device)
     pixel(1, 8, 16, 0); pixel(1, 24, 16, 255);
     std::puts("ok: one Vulkan draw rendered distinct stereo views with build-time SPIR-V");
 
+    // Target destruction can arrive while recording or between submissions.
+    // Keep the complete target/pipeline group until the latest queue fence's
+    // normal slot reuse, including earlier in-flight frames on other slots.
+    for(unsigned retirement_mode=0;retirement_mode<3;++retirement_mode) {
+        auto retirement_ring=std::make_unique<FrameRing>(device,3,4096);
+        auto &retiring=*retirement_ring;
+        std::weak_ptr<int> unused;
+        {auto value=std::make_shared<int>(1);unused=value;retiring.retire(std::move(value));}
+        require(unused.expired()&&retiring.submissions()==0,"unused retirement added GPU work or retained a resource");
+        auto group=std::make_shared<RetiredTarget>();
+        group->target=std::make_unique<Target>(device,info);
+        auto draw=std::make_shared<Renderer>(device,*group->target,cache);
+        draw->prepare(state);group->renderers.push_back(draw);
+        std::weak_ptr<RetiredTarget> lifetime=group;
+        std::weak_ptr<Renderer> pipeline_lifetime=draw;
+        Submission last{};
+        for(unsigned frame=0;frame<3;++frame) {
+            cmd=retiring.begin();draw->begin(cmd,{0,0,0,1});
+            draw->draw(retiring,triangle,3,matrices,state);draw->end();
+            vkCmdCopyImageToBuffer(cmd,group->target->color,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,output.buffer,1,&copy);
+            vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&barrier,0,nullptr);
+            if(frame==2&&retirement_mode==0)retiring.retire(group);
+            last=retiring.submit();
+        }
+        if(retirement_mode==1)retiring.retire(group);
+        if(retirement_mode==2) {
+            retiring.begin();retiring.retire(group);
+        }
+        group.reset();draw.reset();
+        require(!lifetime.expired()&&!pipeline_lifetime.expired(),"in-flight target or pipeline destroyed before slot retirement");
+        require(retiring.submissions()==3,"target retirement introduced a submission");
+        if(retirement_mode==2) {
+            // Recording slot 0 holds the sole retirement owner, while queue
+            // work in slots 1/2 can still reference its target and pipelines.
+            retirement_ring.reset();
+            require(lifetime.expired()&&pipeline_lifetime.expired(),"unfinished recording leaked a retired target");
+            pixel(0,8,16,255);pixel(0,24,16,0);pixel(1,8,16,0);pixel(1,24,16,255);
+            continue;
+        }
+        retiring.wait(last);
+        pixel(0,8,16,255);pixel(0,24,16,0);pixel(1,8,16,0);pixel(1,24,16,255);
+        for(unsigned slot=0;slot<3;++slot) {
+            retiring.begin();
+            require(lifetime.expired()==(slot==2)&&pipeline_lifetime.expired()==(slot==2),
+                    "target/pipeline retired on the wrong queue slot");
+            retiring.submit();
+        }
+        require(retiring.submissions()==6,"target retirement changed frame submission accounting");
+    }
+    std::puts("ok: target/pipeline retirement covers three in-flight stereo frames during/between recording and unfinished shutdown without added GPU work");
+
     // Persistent geometry uploads can exceed the fixed ring arena or its
     // remaining space. Dedicated staging must keep its data until the fence,
     // preserving both stereo eyes without an intermediate submission/wait.
@@ -627,7 +678,9 @@ static void render_stereo(Device &device)
         other_info.guest_bottom_origin=!other_info.guest_bottom_origin;Target flipped(device,other_info);
         loaded.prepare(flipped);require(loaded.prepared_count()==2,"incompatible target origin reused a pipeline");
         auto variant_draw = [&](PipelineRecipes &catalogue, TargetInfo variant_info, bool srgb) {
-            Target variant(device,variant_info);
+            auto retirement=std::make_shared<RetiredTarget>();
+            retirement->target=std::make_unique<Target>(device,variant_info);
+            auto &variant=*retirement->target;
             const auto prepared_before=catalogue.prepared_count();
             catalogue.prepare(variant);
             require(catalogue.prepared_count()==prepared_before+1,"portable color/FDM target variant was not prepared");
@@ -643,6 +696,9 @@ static void render_stereo(Device &device)
             pipeline->draw(ring,triangle,3,matrices,state);pipeline->end();
             vkCmdCopyImageToBuffer(cmd,variant.color,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,output.buffer,1,&copy);
             vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&barrier,0,nullptr);
+            retirement->renderers=catalogue.retire(variant);
+            require(retirement->renderers.size()==1,"recipe retirement failed to transfer target pipelines");
+            pipeline.reset();ring.retire(retirement);retirement.reset();
             ring.wait(ring.submit());
             const auto pixels=static_cast<const unsigned char *>(output.mapped);
             for(unsigned eye=0;eye<2;++eye) {
@@ -651,7 +707,6 @@ static void render_stereo(Device &device)
                         "portable target recipe lost destination color encoding or stereo output");
             }
             guest_uniforms.write(uint32_t(tint_location),tint,sizeof tint);
-            catalogue.retire(variant);
         };
         auto variant_info=target.info;variant_info.color_format=VK_FORMAT_R8G8B8A8_SRGB;
         variant_draw(loaded,variant_info,true);

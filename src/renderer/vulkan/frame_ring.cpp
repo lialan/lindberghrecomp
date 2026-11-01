@@ -233,6 +233,19 @@ void FrameRing::keep_alive(std::shared_ptr<void> resource)
     slots_[current_].resources.push_back(std::move(resource));
 }
 
+void FrameRing::retire(std::shared_ptr<void> resource)
+{
+    if (recording_) {
+        keep_alive(std::move(resource));
+    } else if (submissions_) {
+        // All submissions use the same queue: completion of its latest fence
+        // covers earlier slots too. Retain until that slot's normal reuse.
+        const auto last=(current_+uint32_t(slots_.size())-1)%uint32_t(slots_.size());
+        slots_[last].resources.push_back(std::move(resource));
+    }
+    // With no recording or submissions, there can be no outstanding reference.
+}
+
 Submission FrameRing::submit(VkSemaphore wait, VkSemaphore signal, VkPipelineStageFlags wait_stage)
 {
     if (!recording_)
@@ -287,9 +300,13 @@ void FrameRing::wait(Submission submission)
 void FrameRing::release()
 {
     const auto d = device_.handles.device;
-    for (auto &s : slots_) {
+    // A not-yet-submitted recording slot may hold a retired resource used by
+    // earlier slots. Drain every submitted fence before releasing any slot's
+    // resources, including error/shutdown with an unfinished recording.
+    for (auto &s : slots_)
         if (s.submitted)
             vkWaitForFences(d, 1, &s.fence, VK_TRUE, UINT64_MAX);
+    for (auto &s : slots_) {
         if (profile_)
             report(uint32_t(&s - slots_.data()));
         if (s.mapped)

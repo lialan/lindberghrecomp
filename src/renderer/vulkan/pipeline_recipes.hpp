@@ -22,7 +22,8 @@ class PipelineRecipes {
     std::shared_ptr<Renderer> renderer(Target &, const ShaderRecord &,
                                        const std::vector<VkVertexInputBindingDescription> &,
                                        const std::vector<VkVertexInputAttributeDescription> &);
-    void retire(Target &); // target replacement must not leave retained references
+    // Transfer retained renderers to the owner for fence-delayed destruction.
+    std::vector<std::shared_ptr<Renderer>> retire(Target &);
     void save();
     size_t recipe_count() const { return recipes_.size(); }
     size_t first_use_count() const { return first_uses_; }

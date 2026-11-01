@@ -119,6 +119,7 @@ public:
     void end();
     uint64_t draw_count() const { return draws_; }
     size_t pipeline_count() const { return pipelines_.size(); }
+    Target &target() const { return target_; }
     void filter_state(bool enabled);
     void collect_command_stats(bool enabled) { count_commands_=enabled; }
     const CommandStats &command_stats() const { return commands_; }
@@ -159,6 +160,13 @@ private:
     bool emit(Command,bool redundant,bool always_filter=false);
     void invalidate_state();
     void release();
+};
+
+// The retirement fence must cover both framebuffer attachments and pipelines
+// referring to their render pass. Members destroy renderers before the target.
+struct RetiredTarget {
+    std::unique_ptr<Target> target;
+    std::vector<std::shared_ptr<Renderer>> renderers;
 };
 
 } // namespace lindbergh::vk
