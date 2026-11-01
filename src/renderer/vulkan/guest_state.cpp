@@ -32,10 +32,12 @@ uint32_t GuestState::error() { auto e = error_; error_ = 0; return e; }
 
 GuestState::Stack &GuestState::stack()
 {
+    if (mode_ >= guest::Matrix0ARB && mode_ < guest::Matrix0ARB + 8) return program_[mode_ - guest::Matrix0ARB];
     return mode_ == guest::Modelview ? modelview_ : mode_ == guest::Projection ? projection_ : texture_[texture_unit_];
 }
 const GuestState::Stack &GuestState::stack() const
 {
+    if (mode_ >= guest::Matrix0ARB && mode_ < guest::Matrix0ARB + 8) return program_[mode_ - guest::Matrix0ARB];
     return mode_ == guest::Modelview ? modelview_ : mode_ == guest::Projection ? projection_ : texture_[texture_unit_];
 }
 const Matrix &GuestState::current_matrix() const { return stack().matrices[stack().top]; }
@@ -53,7 +55,8 @@ bool GuestState::matrix_allowed()
 void GuestState::matrix_mode(uint32_t mode)
 {
     if (!matrix_allowed()) return;
-    if (mode != guest::Modelview && mode != guest::Projection && mode != guest::Texture) { fail(guest::InvalidEnum); return; }
+    if (mode != guest::Modelview && mode != guest::Projection && mode != guest::Texture &&
+        !(mode >= guest::Matrix0ARB && mode < guest::Matrix0ARB + 8)) { fail(guest::InvalidEnum); return; }
     mode_ = mode;
 }
 

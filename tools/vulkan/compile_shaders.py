@@ -22,6 +22,10 @@ BUILTIN_INPUTS = {
     "gl_Color": ("vec4", 3), "gl_SecondaryColor": ("vec4", 4),
     **{f"gl_MultiTexCoord{i}": ("vec4", 8 + i) for i in range(8)},
 }
+LEGACY_VARYINGS = {
+    "gl_TexCoord": ("legacy_texcoord", "vec4", 8, True),
+    "gl_FogFragCoord": ("legacy_fog_coord", "float", 1, False),
+}
 STATE = {
     "gl_ModelViewMatrix": "legacy.modelview", "gl_ProjectionMatrix": "legacy.projection",
     "gl_ModelViewProjectionMatrix": "(legacy.projection * legacy.modelview)",
@@ -56,6 +60,11 @@ def varyings(vertex, fragment):
         if name in all_vars and all_vars[name] != typ:
             raise ValueError(f"Varying type mismatch: {name}")
         all_vars[name] = typ
+    # Legacy built-in varyings (ARB program translations write and read
+    # them) join the pair's interface like any other varying.
+    for builtin, (name, typ, count, array) in LEGACY_VARYINGS.items():
+        if any(re.search(r"\b" + builtin + r"\b", s) for s in (vertex, fragment)):
+            all_vars[name] = (typ, count, array)
     location, result = 4, {}
     for name, (typ, count, array) in sorted(all_vars.items()):
         columns = int(typ[-1]) if typ.startswith("mat") and typ[-1].isdigit() else 1
@@ -86,8 +95,12 @@ def convert(source, stage, interface, attributes, samplers):
         return f"layout(location={attributes[name]}) in {typ} {name}{arr or ''};"
 
     source = DECL.sub(decl, source)
+    for builtin, (name, typ, count, array) in LEGACY_VARYINGS.items():
+        if name in interface:
+            prefix.append(f"layout(location={interface[name][0]}) {'out' if stage == 'vert' else 'in'} {typ} {name}{f'[{count}]' if array else ''};")
     source = SAMPLER.sub(lambda m: f"layout(set=2, binding={samplers[m[2]]}) uniform {m[1]} {m[2]}{m[3] or ''};", source)
     replacements = dict(STATE)
+    replacements.update({builtin: v[0] for builtin, v in LEGACY_VARYINGS.items()})
     if stage == "vert":
         for name, (typ, location) in BUILTIN_INPUTS.items():
             if re.search(r"\b" + name + r"\b", source) or (name == "gl_Vertex" and re.search(r"\bftransform\b", source)):

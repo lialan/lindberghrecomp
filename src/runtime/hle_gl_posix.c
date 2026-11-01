@@ -680,7 +680,7 @@ static void nv_params(GLenum target, GLuint index, GLuint n, const float *v)
 {
     for (GLuint i = 0; v && i < n; i++) {
         arb_env(target, index + i, v + 4 * i);
-#ifndef LINDBERGH_GL4ES
+#if !defined(LINDBERGH_GL4ES) && !defined(LINDBERGH_VULKAN)
         glProgramEnvParameter4fvARB(target, index + i, v + 4 * i);
 #endif
     }
@@ -697,7 +697,7 @@ static void params_set(GLenum target, GLuint index, GLuint n, const float *v, in
 {
     for (GLuint i = 0; v && i < n; i++) {
         if (local) arb_local(target, index + i, v + 4 * i); else arb_env(target, index + i, v + 4 * i);
-#ifndef LINDBERGH_GL4ES
+#if !defined(LINDBERGH_GL4ES) && !defined(LINDBERGH_VULKAN)
         if (local) glProgramLocalParameter4fvARB(target, index + i, v + 4 * i);
         else glProgramEnvParameter4fvARB(target, index + i, v + 4 * i);
 #endif
@@ -764,10 +764,11 @@ static void h_glIsEnabled(CPU *c)
 static void h_glPushAttrib(CPU *c) { arb_push_attrib(A32(0)); glPushAttrib(A32(0)); }
 static void h_glPopAttrib(CPU *c)  { arb_pop_attrib(); glPopAttrib(); }
 
-#ifdef LINDBERGH_GL4ES
-/* GLES has no assembly programs. Every one is translated to GLSL here
- * (arbprog.c), so the driver never sees them: it is told nothing, and the
- * game's checks are answered as a desktop driver that took them would. */
+#if defined(LINDBERGH_GL4ES) || defined(LINDBERGH_VULKAN)
+/* GLES and the Vulkan host have no assembly programs. Every one is
+ * translated to GLSL here (arbprog.c), so the driver never sees them: it is
+ * told nothing, and the game's checks are answered as a desktop driver that
+ * took them would. */
 static void es_glProgramStringARB(CPU *c) { arb_set_source(A32(0), (const char *)APTR(3), AI32(2)); }
 static void es_glBindProgramARB(CPU *c)  { arb_bind(A32(0), A32(1)); }
 static void es_glDeleteProgramsARB(CPU *c)
@@ -804,7 +805,11 @@ static void es_glGetProgramivARB(CPU *c)
         return;
     }
     }
+#ifdef LINDBERGH_VULKAN
+    *out = 0;
+#else
     glGetProgramivARB(A32(0), A32(1), out);
+#endif
 }
 static void es_glGetIntegerv(CPU *c)
 {
@@ -937,15 +942,17 @@ void hle_register_gl(void)
     hle_bind("gluOrtho2D", h_gluOrtho2D); gl_bind_named("gluOrtho2D", h_gluOrtho2D);
     hle_bind("gluPerspective", h_gluPerspective); gl_bind_named("gluPerspective", h_gluPerspective);
     hle_bind("gluErrorString", h_gluErrorString); gl_bind_named("gluErrorString", h_gluErrorString);
-#ifdef LINDBERGH_GL4ES
-    hle_bind("glProgramStringARB", es_glProgramStringARB);
-    hle_bind("glBindProgramARB", es_glBindProgramARB);
-    hle_bind("glDeleteProgramsARB", es_glDeleteProgramsARB);
-    hle_bind("glProgramEnvParameter4fvARB", es_glProgramEnvParameter4fvARB);
-    hle_bind("glProgramLocalParameter4fvARB", es_glProgramLocalParameter4fvARB);
-    hle_bind("glProgramLocalParameter4fARB", es_glProgramLocalParameter4fARB);
-    hle_bind("glGetProgramivARB", es_glGetProgramivARB);
-    hle_bind("glGetIntegerv", es_glGetIntegerv);
+#if defined(LINDBERGH_GL4ES) || defined(LINDBERGH_VULKAN)
+#define ES_BIND(name, fn) do { hle_bind(name, fn); gl_bind_named(name, fn); } while (0)
+    ES_BIND("glProgramStringARB", es_glProgramStringARB);
+    ES_BIND("glBindProgramARB", es_glBindProgramARB);
+    ES_BIND("glDeleteProgramsARB", es_glDeleteProgramsARB);
+    ES_BIND("glProgramEnvParameter4fvARB", es_glProgramEnvParameter4fvARB);
+    ES_BIND("glProgramLocalParameter4fvARB", es_glProgramLocalParameter4fvARB);
+    ES_BIND("glProgramLocalParameter4fARB", es_glProgramLocalParameter4fARB);
+    ES_BIND("glGetProgramivARB", es_glGetProgramivARB);
+    ES_BIND("glGetIntegerv", es_glGetIntegerv);
+#undef ES_BIND
 #endif
     stereo_init();
 }

@@ -12,7 +12,8 @@ enum : uint32_t {
     InvalidOperation = 0x0502, StackOverflow = 0x0503, StackUnderflow = 0x0504,
     Points = 0, Lines = 1, LineLoop = 2, LineStrip = 3, Triangles = 4,
     TriangleStrip = 5, TriangleFan = 6, Quads = 7, QuadStrip = 8, Polygon = 9,
-    Modelview = 0x1700, Projection = 0x1701, Texture = 0x1702
+    Modelview = 0x1700, Projection = 0x1701, Texture = 0x1702,
+    Matrix0ARB = 0x88C0 // ARB program matrices GL_MATRIX0_ARB..GL_MATRIX7_ARB
 };
 }
 
@@ -58,7 +59,7 @@ private:
         Stack();
     };
     Stack modelview_, projection_;
-    std::array<Stack, 8> texture_;
+    std::array<Stack, 8> texture_, program_;
     uint32_t mode_ = guest::Modelview, error_ = 0, primitive_ = 0;
     unsigned texture_unit_ = 0;
     bool inside_ = false, dirty_ = true;

@@ -1303,9 +1303,41 @@ extern "C" void lvk_glGetIntegerv(GLenum what, GLint *out) {
   case GL_SHADE_MODEL:
     *out = GL_SMOOTH;
     break;
-  default:
+  // GL's initial values for state the game has not set yet (once set, the
+  // value stored in state.integers above answers instead).
+  case GL_ALPHA_TEST_FUNC: case GL_STENCIL_FUNC: *out = GL_ALWAYS; break;
+  case GL_CULL_FACE_MODE: *out = GL_BACK; break;
+  case GL_LIGHT_MODEL_COLOR_CONTROL: *out = GL_SINGLE_COLOR; break;
+  case GL_FRONT_FACE: *out = GL_CCW; break;
+  case GL_STENCIL_FAIL: case GL_STENCIL_PASS_DEPTH_FAIL: case GL_STENCIL_PASS_DEPTH_PASS: *out = GL_KEEP; break;
+  case GL_STENCIL_REF: *out = 0; break;
+  case GL_STENCIL_VALUE_MASK: case GL_STENCIL_WRITEMASK: *out = 0xff; break;
+  case GL_BLEND_EQUATION: *out = GL_FUNC_ADD; break;
+  case GL_LOGIC_OP_MODE: *out = GL_COPY; break;
+  case GL_FOG_MODE: *out = GL_EXP; break;
+  case GL_TEXTURE_BINDING_RECTANGLE_ARB: *out = 0; break;
+  default: {
+    // More of GL's initial state (values once set are stored and answered
+    // above), and state the game set through a float call.
+    static const std::pair<GLenum,GLint> initial[]={
+      {GL_LIGHT_MODEL_LOCAL_VIEWER,0},{GL_LIGHT_MODEL_TWO_SIDE,0},{GL_COLOR_MATERIAL_FACE,GL_FRONT_AND_BACK},
+      {GL_COLOR_MATERIAL_PARAMETER,GL_AMBIENT_AND_DIFFUSE},{GL_PERSPECTIVE_CORRECTION_HINT,GL_DONT_CARE},
+      {GL_POINT_SMOOTH_HINT,GL_DONT_CARE},{GL_LINE_SMOOTH_HINT,GL_DONT_CARE},{GL_POLYGON_SMOOTH_HINT,GL_DONT_CARE},
+      {GL_FOG_HINT,GL_DONT_CARE},{GL_GENERATE_MIPMAP_HINT,GL_DONT_CARE},{GL_BLEND_SRC_ALPHA,GL_ONE},{GL_BLEND_DST_ALPHA,GL_ZERO},
+      {GL_BLEND_EQUATION_ALPHA,GL_FUNC_ADD},{GL_DEPTH_WRITEMASK,1},{GL_MAX_LIGHTS,8},{GL_MAX_CLIP_PLANES,6},
+      {GL_MAX_MODELVIEW_STACK_DEPTH,32},{GL_MAX_PROJECTION_STACK_DEPTH,32},{GL_MAX_TEXTURE_STACK_DEPTH,32},
+      {GL_UNPACK_ROW_LENGTH,0},{GL_UNPACK_SKIP_ROWS,0},{GL_UNPACK_SKIP_PIXELS,0},{GL_PACK_ROW_LENGTH,0},
+      {GL_PACK_SKIP_ROWS,0},{GL_PACK_SKIP_PIXELS,0},{GL_SUBPIXEL_BITS,4},{GL_AUX_BUFFERS,0},{GL_DOUBLEBUFFER,1},
+      {GL_RENDER_MODE,GL_RENDER},{GL_LIST_BASE,0},{GL_FOG_COORD_SRC,GL_FRAGMENT_DEPTH},{GL_TEXTURE_BINDING_3D,0},
+      {GL_TEXTURE_BINDING_CUBE_MAP,0},{GL_DRAW_BUFFER,GL_BACK},{GL_READ_BUFFER,GL_BACK},{GL_SAMPLE_BUFFERS,0},
+      {GL_SAMPLES,0},{GL_MAX_PROGRAM_MATRICES_ARB,8},{GL_MAX_3D_TEXTURE_SIZE,2048},{GL_MAX_CUBE_MAP_TEXTURE_SIZE,4096},
+      {GL_MAX_ELEMENTS_VERTICES,65536},{GL_MAX_ELEMENTS_INDICES,65536},{GL_ACCUM_RED_BITS,0},{GL_ACCUM_GREEN_BITS,0},
+      {GL_ACCUM_BLUE_BITS,0},{GL_ACCUM_ALPHA_BITS,0},{GL_INDEX_BITS,0},{GL_STEREO,0}};
+    for(const auto &[name,v]:initial)if(name==what){*out=v;return;}
+    if(state.floats.count(what)){*out=GLint(std::lround(state.floats.at(what)[0]));return;}
     std::fprintf(stderr, "[vulkan] glGetIntegerv unsupported enum %#x\n", what);
     gap("guest query requires implementation");
+  }
   }
 }
 extern "C" void lvk_glGetBooleanv(GLenum what, GLboolean *out) {
@@ -1336,12 +1368,32 @@ extern "C" void lvk_glGetFloatv(GLenum what, GLfloat *out) {
   if (state.floats.count(what)) {
     auto &v = state.floats.at(what);
     const auto n = (what == GL_FOG_COLOR || what == GL_COLOR_CLEAR_VALUE ||
-                    what == GL_CURRENT_COLOR || what == GL_COLOR_WRITEMASK)
+                    what == GL_CURRENT_COLOR || what == GL_COLOR_WRITEMASK ||
+                    what == GL_LIGHT_MODEL_AMBIENT || what == GL_BLEND_COLOR)
                        ? 4
-                       : 1;
+                       : what == GL_DEPTH_RANGE ? 2 : 1;
     std::copy(v.begin(), v.begin() + n, out);
     return;
   }
+  { // GL's initial values for state the game has not set yet
+    static const std::pair<GLenum,std::array<float,4>> initial[]={
+      {GL_ALPHA_TEST_REF,{0}},{GL_DEPTH_CLEAR_VALUE,{1}},{GL_FOG_DENSITY,{1}},{GL_FOG_START,{0}},{GL_FOG_END,{1}},
+      {GL_LINE_WIDTH,{1}},{GL_POINT_SIZE,{1}},{GL_POLYGON_OFFSET_FACTOR,{0}},{GL_POLYGON_OFFSET_UNITS,{0}},
+      {GL_CURRENT_COLOR,{1,1,1,1}},{GL_COLOR_CLEAR_VALUE,{0,0,0,0}},{GL_FOG_COLOR,{0,0,0,0}},{GL_DEPTH_RANGE,{0,1,0,0}},
+      {GL_LIGHT_MODEL_AMBIENT,{.2f,.2f,.2f,1}},{GL_BLEND_COLOR,{0,0,0,0}},{GL_FOG_INDEX,{0}},{GL_POINT_SIZE_MIN,{0}},
+      {GL_POINT_SIZE_MAX,{1}},{GL_POINT_FADE_THRESHOLD_SIZE,{1}},{GL_CURRENT_RASTER_POSITION,{0,0,0,1}}};
+    for(const auto &[name,v]:initial)if(name==what) {
+      const unsigned n=(what==GL_CURRENT_COLOR||what==GL_COLOR_CLEAR_VALUE||what==GL_FOG_COLOR||what==GL_LIGHT_MODEL_AMBIENT||
+                        what==GL_BLEND_COLOR||what==GL_CURRENT_RASTER_POSITION)?4:what==GL_DEPTH_RANGE?2:1;
+      std::copy(v.begin(),v.begin()+n,out);return;
+    }
+  }
+  if (state.integers.count(what)) { *out = float(state.integers.at(what)); return; }
+  if (what == GL_CURRENT_MATRIX_ARB) { // the current stack, e.g. GL_MATRIXi_ARB
+    std::copy(state.matrices.current_matrix().begin(),state.matrices.current_matrix().end(),out);
+    return;
+  }
+  std::fprintf(stderr, "[vulkan] glGetFloatv unsupported enum %#x\n", what);
   gap("unsupported guest float query");
 }
 extern "C" void lvk_glMatrixMode(GLenum mode) {
@@ -2194,6 +2246,83 @@ extern "C" void lvk_glTexParameterfv(GLenum target, GLenum name,
   if (name != GL_TEXTURE_BORDER_COLOR)
     t.parameters[name] = GLint(values[0]);
 }
+// ARB assembly program names: the programs themselves live in arbprog.c,
+// which keys them by name below its table size (4096).
+extern "C" void lvk_glGenProgramsARB(GLsizei n, GLuint *ids) {
+  static GLuint next=1;
+  for(GLsizei i=0;ids&&i<n;++i){if(next>=4096)gap("too many guest assembly programs");ids[i]=next++;}
+}
+extern "C" GLboolean lvk_glIsProgramARB(GLuint id) {return id&&id<4096?GL_TRUE:GL_FALSE;}
+// Occlusion queries: provisional. Every query reports all of its samples
+// visible until GPU queries are integrated; the call pattern is logged so
+// the readback strategy can follow the game's use.
+namespace { std::unordered_map<GLuint,uint32_t> g_queries; unsigned g_query_log=0; }
+static void query_log(const char *what,GLuint id) {
+  if(g_query_log<40){++g_query_log;std::fprintf(stderr,"[vulkan-query] frame %u %s %u (provisional: reports visible)\n",g_frame,what,id);}
+}
+extern "C" void lvk_glGenQueries(GLsizei n, GLuint *ids) {for(GLsizei i=0;ids&&i<n;++i){ids[i]=object();g_queries[ids[i]]=0;query_log("gen",ids[i]);}}
+extern "C" void lvk_glDeleteQueries(GLsizei n, const GLuint *ids) {for(GLsizei i=0;ids&&i<n;++i)g_queries.erase(ids[i]);}
+extern "C" GLboolean lvk_glIsQuery(GLuint id) {return g_queries.count(id)?GL_TRUE:GL_FALSE;}
+extern "C" void lvk_glBeginQuery(GLenum target, GLuint id) {g_queries[id]=0;query_log("begin",id);(void)target;}
+extern "C" void lvk_glEndQuery(GLenum target) {(void)target;}
+extern "C" void lvk_glGetQueryObjectuiv(GLuint id, GLenum name, GLuint *v) {
+  if(!v)return;query_log(name==GL_QUERY_RESULT_AVAILABLE?"available?":"result",id);
+  *v=name==GL_QUERY_RESULT_AVAILABLE?1u:0x7fffffffu;
+}
+extern "C" void lvk_glGetQueryObjectiv(GLuint id, GLenum name, GLint *v) {GLuint u=0;lvk_glGetQueryObjectuiv(id,name,&u);if(v)*v=GLint(u);}
+extern "C" void lvk_glGetQueryiv(GLenum target, GLenum name, GLint *v) {if(v)*v=name==GL_QUERY_COUNTER_BITS?32:0;(void)target;}
+extern "C" void lvk_glGetTexParameterfv(GLenum target, GLenum name, GLfloat *v) {
+  if (!v) return;
+  auto &t = texture(target);
+  if (name == GL_TEXTURE_BORDER_COLOR) {
+    auto it = t.float_parameters.find(name);
+    for (unsigned i = 0; i < 4; ++i) v[i] = it == t.float_parameters.end() ? 0 : it->second[i];
+    return;
+  }
+  if (auto it = t.float_parameters.find(name); it != t.float_parameters.end()) { v[0] = it->second[0]; return; }
+  if (auto it = t.parameters.find(name); it != t.parameters.end()) { v[0] = GLfloat(it->second); return; }
+  switch (name) { // GL's initial texture parameters
+  case GL_TEXTURE_MIN_FILTER: v[0] = GL_NEAREST_MIPMAP_LINEAR; return;
+  case GL_TEXTURE_MAG_FILTER: v[0] = GL_LINEAR; return;
+  case GL_TEXTURE_WRAP_S: case GL_TEXTURE_WRAP_T: case GL_TEXTURE_WRAP_R: v[0] = GL_REPEAT; return;
+  case GL_TEXTURE_BASE_LEVEL: case GL_GENERATE_MIPMAP: v[0] = 0; return;
+  case GL_TEXTURE_MAX_LEVEL: v[0] = 1000; return;
+  case GL_TEXTURE_MIN_LOD: v[0] = -1000; return;
+  case GL_TEXTURE_MAX_LOD: v[0] = 1000; return;
+  case GL_TEXTURE_COMPARE_MODE: v[0] = GL_NONE; return;
+  case GL_TEXTURE_COMPARE_FUNC: v[0] = GL_LEQUAL; return;
+  case GL_DEPTH_TEXTURE_MODE: v[0] = GL_LUMINANCE; return;
+  case GL_TEXTURE_PRIORITY: case GL_TEXTURE_RESIDENT: case GL_TEXTURE_MAX_ANISOTROPY_EXT: v[0] = 1; return;
+  }
+  std::fprintf(stderr, "[vulkan] glGetTexParameter unsupported %#x\n", name);
+  gap("texture parameter query requires implementation");
+}
+extern "C" void lvk_glGetTexParameteriv(GLenum target, GLenum name, GLint *v) {
+  GLfloat f[4]{};lvk_glGetTexParameterfv(target, name, f);
+  for (unsigned i = 0; i < (name == GL_TEXTURE_BORDER_COLOR ? 4u : 1u); ++i)
+    v[i] = name == GL_TEXTURE_BORDER_COLOR ? GLint(f[i] * 2147483647.f) : GLint(f[i]);
+}
+extern "C" void lvk_glGetTexLevelParameteriv(GLenum target, GLint level, GLenum name, GLint *v) {
+  if (!v) return;
+  auto &t = texture(target);
+  auto it = t.levels.find(level);
+  if (it == t.levels.end()) { *v = 0; return; } // an undefined level reports zero size
+  const auto &l = it->second;
+  switch (name) {
+  case GL_TEXTURE_WIDTH: *v = l.width; return;
+  case GL_TEXTURE_HEIGHT: *v = l.height; return;
+  case GL_TEXTURE_DEPTH: *v = 1; return;
+  case GL_TEXTURE_INTERNAL_FORMAT: *v = l.internal; return;
+  case GL_TEXTURE_BORDER: *v = 0; return;
+  case GL_TEXTURE_COMPRESSED: *v = l.compressed; return;
+  case GL_TEXTURE_COMPRESSED_IMAGE_SIZE: *v = GLint(l.bytes.size()); return;
+  }
+  std::fprintf(stderr, "[vulkan] glGetTexLevelParameter unsupported %#x\n", name);
+  gap("texture level query requires implementation");
+}
+extern "C" void lvk_glGetTexLevelParameterfv(GLenum target, GLint level, GLenum name, GLfloat *v) {
+  GLint i = 0;lvk_glGetTexLevelParameteriv(target, level, name, &i);if (v) *v = GLfloat(i);
+}
 extern "C" void lvk_glAlphaFunc(GLenum compare, GLclampf reference) { ++state.legacy_version;
   state.integers[GL_ALPHA_TEST_FUNC] = compare;
   state.floats[GL_ALPHA_TEST_REF] = {std::clamp(reference, 0.f, 1.f), 0, 0, 0};
@@ -2826,6 +2955,32 @@ extern "C" void lvk_glBlendEquation(GLenum op) {state.integers[GL_BLEND_EQUATION
 extern "C" void lvk_glBlendEquationSeparate(GLenum rgb,GLenum alpha) {state.integers[GL_BLEND_EQUATION_RGB]=rgb;state.integers[GL_BLEND_EQUATION_ALPHA]=alpha;}
 extern "C" void lvk_glBlendColor(GLclampf r,GLclampf g,GLclampf b,GLclampf a) {state.floats[GL_BLEND_COLOR]={r,g,b,a};}
 extern "C" void lvk_glTexEnvi(GLenum target,GLenum name,GLint v) {glTexEnvf(target,name,GLfloat(v));}
+extern "C" void lvk_glGetTexEnvfv(GLenum target,GLenum name,GLfloat *v) {
+  if(!v)return;
+  const unsigned unit=state.active_texture-GL_TEXTURE0;
+  if(target==GL_TEXTURE_ENV&&name==GL_TEXTURE_ENV_COLOR){std::copy(state.env_color[unit].begin(),state.env_color[unit].end(),v);return;}
+  if(target==GL_TEXTURE_ENV&&name==GL_TEXTURE_ENV_MODE){v[0]=GLfloat(state.texture_env[unit]);return;}
+  if(auto it=state.floats.find((target<<16)|name);it!=state.floats.end()){v[0]=it->second[0];return;}
+  // GL's initial texture environment
+  switch(name){
+  case GL_COMBINE_RGB: case GL_COMBINE_ALPHA: v[0]=GL_MODULATE; return;
+  case GL_SOURCE0_RGB: case GL_SOURCE0_ALPHA: v[0]=GL_TEXTURE; return;
+  case GL_SOURCE1_RGB: case GL_SOURCE1_ALPHA: v[0]=GL_PREVIOUS; return;
+  case GL_SOURCE2_RGB: case GL_SOURCE2_ALPHA: v[0]=GL_CONSTANT; return;
+  case GL_OPERAND0_RGB: case GL_OPERAND1_RGB: v[0]=GL_SRC_COLOR; return;
+  case GL_OPERAND2_RGB: case GL_OPERAND2_ALPHA: v[0]=GL_SRC_ALPHA; return;
+  case GL_OPERAND0_ALPHA: case GL_OPERAND1_ALPHA: v[0]=GL_SRC_ALPHA; return;
+  case GL_RGB_SCALE: case GL_ALPHA_SCALE: v[0]=1; return;
+  case GL_TEXTURE_LOD_BIAS: v[0]=0; return;
+  }
+  std::fprintf(stderr,"[vulkan] glGetTexEnv unsupported %#x %#x\n",target,name);
+  gap("texture environment query requires implementation");
+}
+extern "C" void lvk_glGetTexEnviv(GLenum target,GLenum name,GLint *v) {
+  GLfloat f[4]{};lvk_glGetTexEnvfv(target,name,f);
+  const unsigned n=name==GL_TEXTURE_ENV_COLOR?4:1;
+  for(unsigned i=0;i<n;++i)v[i]=name==GL_TEXTURE_ENV_COLOR?GLint(f[i]*2147483647.f):GLint(f[i]);
+}
 extern "C" void lvk_glTexEnvfv(GLenum target,GLenum name,const GLfloat *v) {if(target!=GL_TEXTURE_ENV||name!=GL_TEXTURE_ENV_COLOR)gap("unsupported texture environment vector");state.env_color[state.active_texture-GL_TEXTURE0]={v[0],v[1],v[2],v[3]};}
 extern "C" void lvk_glDepthRange(GLclampd n,GLclampd f) {++state.legacy_version;state.floats[GL_DEPTH_RANGE]={float(std::clamp(n,0.,1.)),float(std::clamp(f,0.,1.)),0,0};}
 extern "C" void lvk_glPolygonMode(GLenum face,GLenum mode) {if(mode!=GL_FILL)gap("non-solid polygon mode requires Vulkan non-solid fill support");state.integers[(face<<16)|GL_POLYGON_MODE]=mode;}
