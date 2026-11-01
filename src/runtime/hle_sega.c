@@ -1,3 +1,4 @@
+#include "display_cadence.h"
 /*
  * hle_sega.c - the cabinet's own library, answered from here.
  *
@@ -632,7 +633,6 @@ static void (*g_idle_wait)(CPU *);
 static void h_idle_wait(CPU *c)
 {
     uint32_t keep = rd32(FRAME_TARGET_VA), now;
-    extern float host_frame_period_ms(void);
     float t = host_frame_period_ms();
     if (!(t > 5.0f && t < 40.0f)) memcpy(&t, &keep, 4);
     memcpy(&now, &t, 4);

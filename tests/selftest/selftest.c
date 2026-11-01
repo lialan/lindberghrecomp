@@ -7,6 +7,8 @@
  * it needs a real ELF, and the first title exercises it.
  */
 
+#include "display_cadence.h"
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -65,8 +67,45 @@ static void test_hle_names(void)
     CHECK(HLE_COUNT == HLE_test_solib_function + 1);
 }
 
+static void test_display_cadence(void)
+{
+    const int64_t p120 = 8333333, p60 = 16666667;
+    int64_t t = 1000000000;
+    host_display_timing_reset();
+    CHECK(host_frame_period_ms() == 0);
+    host_display_timing(t, p120);
+    CHECK(fabsf(host_frame_period_ms() - 16.666666f) < 0.001f);
+    for (int i = 0; i < 8; ++i) {
+        t += 2 * p120;
+        host_display_timing(t, p120);
+        CHECK(fabsf(host_frame_period_ms() - 16.666666f) < 0.001f);
+    }
+    /* Actual 1/3 delivery phase: one correction, not a permanently slower game. */
+    host_display_timing(t += p120, p120);
+    host_display_timing(t += 3 * p120, p120);
+    CHECK(fabsf(host_frame_period_ms() - 20.833333f) < 0.001f);
+    CHECK(fabsf(host_frame_period_ms() - 16.666666f) < 0.001f);
+    /* Tiny period noise preserves history; a real refresh change resets it. */
+    host_display_timing(t += p120, p120);
+    host_display_timing(t += 3 * p120, p120 + 1);
+    CHECK(host_frame_period_ms() > 20);
+    host_display_timing(t += p120, p120);
+    host_display_timing(t += 3 * p120, p120);
+    host_display_timing(t += p60, p60);
+    CHECK(fabsf(host_frame_period_ms() - 16.666667f) < 0.001f);
+    host_display_timing(t += 13888889, 13888889); /* 72 Hz cannot divide 60 evenly */
+    CHECK(host_frame_period_ms() == 0);
+    host_display_timing(t += 11111111, 11111111); /* neither can 90 Hz */
+    CHECK(host_frame_period_ms() == 0);
+    host_display_timing(1000000000, p120); /* new session clock/phase */
+    CHECK(fabsf(host_frame_period_ms() - 16.666666f) < 0.001f);
+    host_display_timing_reset();
+    CHECK(host_frame_period_ms() == 0);
+}
+
 int main(void)
 {
+    test_display_cadence();
     test_dispatch();
     test_syscall_write();
     test_syscall_unknown();
