@@ -15,6 +15,7 @@ namespace lindbergh::vk {
 struct OpenXRPlatform { void *java_vm = nullptr; void *activity = nullptr; };
 struct OpenXRConfig {
     bool require_foveation=false,transfer_source=false,anchor_head=false,symmetric_fov=false;
+    int foveation_level=2; // 0 off, 1 low, 2 medium, 3 high
     uint32_t width=0,height=0; // zero: runtime recommendation; width-only zero: preserve recommended aspect
     float refresh=120; // request only; predicted runtime timing remains authoritative
     bool sustained_cpu=true,cpu_boost=false,enable_input=false;
@@ -51,6 +52,8 @@ public:
     uint32_t width() const { return width_; }
     uint32_t height() const { return height_; }
     bool foveation_active() const { return foveation_; }
+    // Changes the swapchain's fixed foveation level (0 off .. 3 high) live.
+    void set_foveation(int level);
     // Borrowed views remain valid until detach. Use only the current acquired
     // image's map for GPU work; other views may be used to prepare framebuffers.
     const std::vector<VkImageView> &density_maps() const { return density_views_; }
@@ -88,6 +91,8 @@ private:
     PFN_xrRequestDisplayRefreshRateFB request_refresh_ = nullptr;
     PFN_xrGetDisplayRefreshRateFB get_refresh_ = nullptr;
     PFN_xrDestroyFoveationProfileFB destroy_profile_ = nullptr;
+    PFN_xrCreateFoveationProfileFB create_profile_ = nullptr;
+    PFN_xrUpdateSwapchainFB update_swapchain_ = nullptr;
     void poll();
     void release();
 };

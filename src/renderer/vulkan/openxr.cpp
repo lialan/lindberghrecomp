@@ -195,15 +195,10 @@ void OpenXR::attach(Device &device)
         swap.sampleCount=1; swap.width=width_; swap.height=height_; swap.faceCount=1; swap.arraySize=2; swap.mipCount=1;
         xr_check(xrCreateSwapchain(session_,&swap,&swapchain_),"OpenXR stereo array swapchain");
         if(require_foveation_) {
-            auto make=function<PFN_xrCreateFoveationProfileFB>(instance_,"xrCreateFoveationProfileFB");
+            create_profile_=function<PFN_xrCreateFoveationProfileFB>(instance_,"xrCreateFoveationProfileFB");
             destroy_profile_=function<PFN_xrDestroyFoveationProfileFB>(instance_,"xrDestroyFoveationProfileFB");
-            auto update=function<PFN_xrUpdateSwapchainFB>(instance_,"xrUpdateSwapchainFB");
-            XrFoveationLevelProfileCreateInfoFB level{XR_TYPE_FOVEATION_LEVEL_PROFILE_CREATE_INFO_FB};
-            level.level=XR_FOVEATION_LEVEL_MEDIUM_FB; level.dynamic=XR_FOVEATION_DYNAMIC_DISABLED_FB;
-            XrFoveationProfileCreateInfoFB profile{XR_TYPE_FOVEATION_PROFILE_CREATE_INFO_FB}; profile.next=&level;
-            xr_check(make(session_,&profile,&profile_),"OpenXR foveation profile");
-            XrSwapchainStateFoveationFB state{XR_TYPE_SWAPCHAIN_STATE_FOVEATION_FB}; state.profile=profile_;
-            xr_check(update(swapchain_,reinterpret_cast<XrSwapchainStateBaseHeaderFB *>(&state)),"OpenXR foveation swapchain state");
+            update_swapchain_=function<PFN_xrUpdateSwapchainFB>(instance_,"xrUpdateSwapchainFB");
+            set_foveation(config_.foveation_level);
         }
         xr_check(xrEnumerateSwapchainImages(swapchain_,0,&count,nullptr),"OpenXR swapchain image count");
         std::vector<XrSwapchainImageVulkanKHR> images(count,{XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
@@ -328,6 +323,21 @@ Target *OpenXR::begin_frame()
     XrSwapchainImageWaitInfo ready{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO}; ready.timeout=XR_INFINITE_DURATION;
     xr_check(xrWaitSwapchainImage(swapchain_,&ready),"wait OpenXR eye array");
     return targets_.at(image_).get();
+}
+void OpenXR::set_foveation(int level)
+{
+    if(!create_profile_||!update_swapchain_||!swapchain_)return;
+    static const XrFoveationLevelFB levels[]={XR_FOVEATION_LEVEL_NONE_FB,XR_FOVEATION_LEVEL_LOW_FB,XR_FOVEATION_LEVEL_MEDIUM_FB,XR_FOVEATION_LEVEL_HIGH_FB};
+    XrFoveationLevelProfileCreateInfoFB info{XR_TYPE_FOVEATION_LEVEL_PROFILE_CREATE_INFO_FB};
+    info.level=levels[level<0||level>3?2:level]; info.dynamic=XR_FOVEATION_DYNAMIC_DISABLED_FB;
+    XrFoveationProfileCreateInfoFB profile{XR_TYPE_FOVEATION_PROFILE_CREATE_INFO_FB}; profile.next=&info;
+    XrFoveationProfileFB created=XR_NULL_HANDLE;
+    xr_check(create_profile_(session_,&profile,&created),"OpenXR foveation profile");
+    XrSwapchainStateFoveationFB state{XR_TYPE_SWAPCHAIN_STATE_FOVEATION_FB}; state.profile=created;
+    xr_check(update_swapchain_(swapchain_,reinterpret_cast<XrSwapchainStateBaseHeaderFB *>(&state)),"OpenXR foveation swapchain state");
+    if(profile_&&destroy_profile_)destroy_profile_(profile_);
+    profile_=created;
+    std::fprintf(stderr,"[vulkan-xr] foveation level %d\n",level);
 }
 void OpenXR::request_refresh(float hz)
 {

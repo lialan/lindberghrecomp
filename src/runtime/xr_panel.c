@@ -10,7 +10,7 @@ void xp_items(const XpPanel *menu,const LgXrSettings *cfg,int hand,int hud_locke
     static const char *const laser[] = { "Laser and dot", "Dot only", "Off" };
     static const char *const labels[XP_COUNT] = {
         "Sight", "Laser", "Game crosshair", "Gun model", "Gun hand", "Dual wield", "Show FPS", "Screen distance", "HUD position", "Display rate", "Resolution per eye",
-        "Coins", "Insert a coin", "Recentre view", "Arcade Test button (select)",
+        "Foveation", "Coins", "Insert a coin", "Recentre view", "Arcade Test button (select)",
         "Arcade Service button (next)", "Reset game", "Close" };
     for (int i = 0; i < XP_COUNT; i++) { it[i].label = labels[i]; it[i].value[0] = 0; }
     snprintf(it[XP_SIGHT].value, 40, "%s", sight[cfg->sight]);
@@ -31,6 +31,8 @@ void xp_items(const XpPanel *menu,const LgXrSettings *cfg,int hand,int hud_locke
     else snprintf(res, sizeof res, "%d", cfg->resolution);
     if (cfg->resolution == running_resolution && cfg->width == running_width) snprintf(it[XP_RES].value, 40, "%s", res);
     else snprintf(it[XP_RES].value, 40, "%s (on restart)", res);
+    static const char *const foveation[] = { "Off", "Low", "Medium", "High" };
+    snprintf(it[XP_FOVEATION].value, 40, "%s", foveation[cfg->foveation < 0 || cfg->foveation > 3 ? 2 : cfg->foveation]);
     snprintf(it[XP_COINS].value, 40, "%s", cfg->auto_coins ? "Automatic" : "By menu");
     if (menu->reset_armed) snprintf(it[XP_RESET].value, 40, "Pull again to reset");
 }
@@ -55,6 +57,7 @@ unsigned xp_choose(XpPanel *p,LgXrSettings *cfg,int *hand,int item,const float *
     case XP_RES:{static const int sizes[][2]={{0,1216},{0,1440},{0,1680},{0,1920},{0,2208},{2064,2280}};int k=0;
         while(k<6&&(sizes[k][1]<cfg->resolution||(sizes[k][1]==cfg->resolution&&sizes[k][0]<=cfg->width)))++k;
         cfg->width=sizes[k%6][0];cfg->resolution=sizes[k%6][1];break;}
+    case XP_FOVEATION:cfg->foveation=(cfg->foveation+1)%4;effects|=XP_FOVEATION_CHANGED;break;
     case XP_COINS:cfg->auto_coins=!cfg->auto_coins;break;
     case XP_COIN:p->coin=1;break;
     case XP_RECENTRE:effects|=XP_RECENTER;break;

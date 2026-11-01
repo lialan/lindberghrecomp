@@ -10,8 +10,8 @@ extern "C" {
 #endif
 
 #define XM_W 768                /* the panel's picture, in pixels */
-#define XM_H 752
-#define XM_ROWS 18
+#define XM_H 788
+#define XM_ROWS 19
 
 typedef struct {
     const char *label;

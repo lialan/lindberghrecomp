@@ -5,15 +5,17 @@
 #include <string.h>
 static const char *const LASER_NAME[]={"laser","dot","off"};
 static const char *const SIGHT_NAME[]={"none","reddot","holo"};
+static const char *const FOVEATION_NAME[]={"off","low","medium","high"};
 void xr_settings_save(const LgXrSettings *c)
 {
     FILE *f = fopen("vr.cfg", "w");
     if (!f) return;
     fprintf(f, "scale %g\nscreen %g\naim %g\nresolution %d\nwidth %d\nrefresh %d\nhand %s\nlaser %s\ncoins %s\n"
-               "sight %s\ncrosshair %s\ngun %s\nhud_pitch %d\ndual %s\nfps %s\n",
+               "sight %s\ncrosshair %s\ngun %s\nhud_pitch %d\ndual %s\nfps %s\nfoveation %s\n",
             c->scale, c->screen, c->aim, c->resolution, c->width, c->refresh, c->left_handed ? "left" : "right",
             LASER_NAME[c->laser], c->auto_coins ? "auto" : "manual",
-            SIGHT_NAME[c->sight], c->crosshair ? "on" : "off", c->show_gun ? "on" : "off", c->hud_pitch, c->dual ? "on" : "off", c->show_fps ? "on" : "off");
+            SIGHT_NAME[c->sight], c->crosshair ? "on" : "off", c->show_gun ? "on" : "off", c->hud_pitch, c->dual ? "on" : "off", c->show_fps ? "on" : "off",
+            FOVEATION_NAME[c->foveation < 0 || c->foveation > 3 ? 2 : c->foveation]);
     fclose(f);
 }
 
@@ -59,5 +61,8 @@ void xr_settings_set(LgXrSettings *c,const char *key,const char *val)
         else if (!strcmp(key, "gun")) c->show_gun = strcmp(val, "off") != 0;
         else if (!strcmp(key, "dual")) c->dual = !strcmp(val, "on");
         else if (!strcmp(key, "fps")) c->show_fps = !strcmp(val, "on");
+        else if (!strcmp(key, "foveation")) {
+            for (int i = 0; i < 4; i++) if (!strcmp(val, FOVEATION_NAME[i])) c->foveation = i;
+        }
     }
 }

@@ -730,6 +730,7 @@ void State::panel_input(ControllerSample sample,int64_t time,bool focused)
   if(effects&XP_SAVE)xr_settings_save(&settings);
 #ifdef LINDBERGH_VULKAN_XR
   if(effects&XP_RATE_CHANGED)xr->request_refresh(float(settings.refresh));
+  if(effects&XP_FOVEATION_CHANGED)xr->set_foveation(settings.foveation);
   if(effects&XP_RECENTER)xr->recenter();
   if(effects&XP_RESTART)activity->restart();
 #endif
@@ -804,7 +805,7 @@ extern "C" int lvk_host_init(SDL_Window *window, int w, int h) {
     state.stereo=std::make_unique<StereoScene>(stereo);
     state.controllers=std::make_unique<ControllerInput>(controller_settings(state.settings,w,h));
     OpenXRConfig config{true,true,true,true,uint32_t(state.settings.width),uint32_t(state.settings.resolution),float(state.settings.refresh)};
-    config.enable_input=true;
+    config.enable_input=true;config.foveation_level=state.settings.foveation;
     if(const auto *v=std::getenv("LINDBERGH_CPU_BOOST"))config.cpu_boost=*v=='1';
     state.xr=std::make_unique<OpenXR>(config,state.activity->platform());
     state.device=Device::create(state.xr->device_options());
