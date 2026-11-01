@@ -38,8 +38,53 @@ def read_trace(path, first_frame=None, last_frame=None):
     return metadata, rows, intervals
 
 
-def summarize(path, target_fps=60, slack_ms=0.5, first_frame=None, last_frame=None):
-    if not math.isfinite(target_fps) or not math.isfinite(slack_ms) or target_fps <= 0 or slack_ms < 0:
+def pacing_metrics(intervals, first_frame, target_fps, swing_ms):
+    """Describe uneven CPU cadence without claiming display/compositor timing.
+
+    A late-only burst counter misses an alternating short/long sequence. Keep
+    both its adjacent interval changes and runs crossing the target budget.
+    The swing threshold is diagnostic and never grants hardware acceptance.
+    """
+    budget = 1000.0 / target_fps
+    changes = [abs(b-a) for a,b in zip(intervals, intervals[1:])]
+    ordered_changes = sorted(changes)
+    alternating = longest = current = 0
+    for a,b in zip(intervals, intervals[1:]):
+        uneven = (a-budget)*(b-budget) < 0 and abs(b-a) >= swing_ms
+        current = current + 1 if uneven else 0
+        longest = max(longest, current)
+        alternating += uneven
+    # A fixed number of consecutive game intervals keeps transitions and slow
+    # frames in the window, rather than skipping frames that missed a deadline.
+    width = max(1, math.ceil(target_fps))
+    slowest = None
+    if len(intervals) >= width:
+        total = sum(intervals[:width])
+        worst, start = total, 0
+        for end in range(width, len(intervals)):
+            total += intervals[end] - intervals[end-width]
+            if total > worst:
+                worst, start = total, end-width+1
+        slowest = {"first_frame": first_frame+start, "last_frame": first_frame+start+width,
+                   "intervals": width, "duration_ms": worst,
+                   "average_cpu_cadence_fps": 1000.0*width/worst}
+    return {
+        "swing_threshold_ms": swing_ms,
+        "adjacent_interval_change_ms": {
+            "p95": ordered_changes[max(0, math.ceil(.95*len(changes))-1)] if changes else None,
+            "max": max(changes) if changes else None},
+        "alternating_uneven_pairs": alternating,
+        "longest_alternating_run_intervals": longest+1 if longest else 0,
+        "slowest_rolling_target_second": slowest,
+        "worst_intervals": [
+            {"from_frame": first_frame+i,"to_frame": first_frame+i+1,"interval_ms": value}
+            for i,value in sorted(enumerate(intervals), key=lambda entry: entry[1], reverse=True)[:10]],
+    }
+
+
+def summarize(path, target_fps=60, slack_ms=0.5, first_frame=None, last_frame=None, swing_ms=2.0):
+    if (not all(map(math.isfinite, (target_fps, slack_ms, swing_ms)))
+            or target_fps <= 0 or slack_ms < 0 or swing_ms <= 0):
         raise ValueError("invalid target FPS or late-frame slack")
     metadata, rows, intervals = read_trace(path, first_frame, last_frame)
     ordered = sorted(intervals)
@@ -65,6 +110,7 @@ def summarize(path, target_fps=60, slack_ms=0.5, first_frame=None, last_frame=No
         "over_25_ms": sum(v > 25 for v in intervals),
         "over_33_333_ms": sum(v > 1000.0/30 for v in intervals),
         "longest_late_burst": longest,
+        "pacing": pacing_metrics(intervals, rows[0][0], target_fps, swing_ms),
     }
 
 
@@ -74,13 +120,15 @@ def main():
     parser.add_argument("--baseline", type=Path)
     parser.add_argument("--target-fps", type=float, default=60)
     parser.add_argument("--slack-ms", type=float, default=.5)
+    parser.add_argument("--pacing-swing-ms", type=float, default=2.0,
+                        help="minimum adjacent short/long change counted as uneven (diagnostic)")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--from-frame", type=int)
     parser.add_argument("--to-frame", type=int)
     args = parser.parse_args()
-    result = {"candidate": summarize(args.trace, args.target_fps, args.slack_ms, args.from_frame, args.to_frame)}
+    result = {"candidate": summarize(args.trace, args.target_fps, args.slack_ms, args.from_frame, args.to_frame, args.pacing_swing_ms)}
     if args.baseline:
-        baseline = summarize(args.baseline, args.target_fps, args.slack_ms, args.from_frame, args.to_frame)
+        baseline = summarize(args.baseline, args.target_fps, args.slack_ms, args.from_frame, args.to_frame, args.pacing_swing_ms)
         candidate = result["candidate"]
         if (candidate["first_frame"], candidate["last_frame"]) != (baseline["first_frame"], baseline["last_frame"]):
             raise ValueError("baseline/candidate frame windows differ")

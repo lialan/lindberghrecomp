@@ -47,6 +47,35 @@ class FrameTimingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             metrics.summarize(path, first_frame=1, last_frame=9)
 
+    def test_alternating_cadence_is_not_hidden_by_sixty_fps(self):
+        result = metrics.summarize(self.trace([1000/120, 25]*60))
+        self.assertAlmostEqual(result["average_cpu_cadence_fps"], 60, places=2)
+        self.assertEqual(result["longest_late_burst"], 1)
+        pacing = result["pacing"]
+        self.assertEqual(pacing["alternating_uneven_pairs"], 119)
+        self.assertEqual(pacing["longest_alternating_run_intervals"], 120)
+        self.assertGreater(pacing["adjacent_interval_change_ms"]["p95"], 16)
+        self.assertEqual(pacing["worst_intervals"][0]["to_frame"], 2)
+
+    def test_local_slowdown_is_not_hidden_by_fast_frames_elsewhere(self):
+        result = metrics.summarize(self.trace([10]*120+[25]*60+[10]*120))
+        self.assertGreater(result["average_cpu_cadence_fps"], 60)
+        worst = result["pacing"]["slowest_rolling_target_second"]
+        self.assertEqual((worst["first_frame"],worst["last_frame"]), (120,180))
+        self.assertEqual(worst["average_cpu_cadence_fps"], 40)
+        selected = metrics.summarize(self.trace([100,16,40,16,100]), first_frame=1,last_frame=4)
+        self.assertEqual(selected["pacing"]["worst_intervals"][0]["from_frame"], 2)
+        self.assertIsNone(selected["pacing"]["slowest_rolling_target_second"])
+
+    def test_tiny_quantization_and_invalid_diagnostics(self):
+        result = metrics.summarize(self.trace([16.666,16.667]*60))
+        self.assertEqual(result["pacing"]["alternating_uneven_pairs"], 0)
+        for value in (0,-1,float("nan"),float("inf")):
+            with self.assertRaises(ValueError):
+                metrics.summarize(self.trace([16,17]),swing_ms=value)
+        result = metrics.summarize(self.trace([16]))
+        self.assertIsNone(result["pacing"]["adjacent_interval_change_ms"]["max"])
+
     def test_missing_frames_are_not_timing_samples(self):
         with self.assertRaises(ValueError):
             metrics.summarize(self.trace([16,16], [1,3]))
