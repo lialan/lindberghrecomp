@@ -163,15 +163,23 @@ RasterKey RasterState::key() const
     if (cull>3 || depth_compare>7 || topology>VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN ||
         src_rgb>VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA || dst_rgb>VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA ||
         src_alpha>VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA || dst_alpha>VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA ||
-        blend_rgb>VK_BLEND_OP_MAX || blend_alpha>VK_BLEND_OP_MAX || color_mask>15 || alpha_func>8 || fixed_texture>255 || fog_mode>3)
+        blend_rgb>VK_BLEND_OP_MAX || blend_alpha>VK_BLEND_OP_MAX || stencil_compare>7 ||
+        stencil_fail>7 || stencil_depth_fail>7 || stencil_pass>7 || color_mask>15 || alpha_func>8 || fixed_texture>255 || fog_mode>3)
         throw std::invalid_argument("Invalid Vulkan raster state");
-    uint64_t a=depth_test | (uint64_t(depth_write)<<1) | (uint64_t(blend)<<2) | (uint64_t(cull)<<3) |
-        (uint64_t(depth_compare)<<5) | (uint64_t(topology)<<8) | (uint64_t(color_mask)<<12) |
-        (uint64_t(stencil)<<16) | (uint64_t(stencil_compare)<<17) | (uint64_t(stencil_fail)<<20) |
-        (uint64_t(stencil_depth_fail)<<23) | (uint64_t(stencil_pass)<<26) | (uint64_t(depth_bias)<<29) |
+    // Disabled tests do not affect rendering. Canonical keys avoid creating
+    // separate pipelines when the guest changes their dormant parameters.
+    const auto compare=depth_test?depth_compare:VK_COMPARE_OP_ALWAYS;
+    const uint64_t stencil_bits=stencil ? (uint64_t(1)<<16) | (uint64_t(stencil_compare)<<17) |
+        (uint64_t(stencil_fail)<<20) | (uint64_t(stencil_depth_fail)<<23) | (uint64_t(stencil_pass)<<26)
+        : (uint64_t(VK_COMPARE_OP_ALWAYS)<<17);
+    const uint64_t blend_bits=blend ? uint64_t(src_rgb) | (uint64_t(dst_rgb)<<5) | (uint64_t(src_alpha)<<10) |
+        (uint64_t(dst_alpha)<<15) | (uint64_t(blend_rgb)<<20) | (uint64_t(blend_alpha)<<23)
+        : uint64_t(VK_BLEND_FACTOR_ONE) | (uint64_t(VK_BLEND_FACTOR_ONE)<<10);
+    uint64_t a=depth_test | (uint64_t(depth_test && depth_write)<<1) | (uint64_t(blend)<<2) | (uint64_t(cull)<<3) |
+        (uint64_t(compare)<<5) | (uint64_t(topology)<<8) | (uint64_t(color_mask)<<12) |
+        stencil_bits | (uint64_t(depth_bias)<<29) |
         (uint64_t(clockwise)<<30);
-    uint64_t b=uint64_t(src_rgb) | (uint64_t(dst_rgb)<<5) | (uint64_t(src_alpha)<<10) | (uint64_t(dst_alpha)<<15) |
-        (uint64_t(blend_rgb)<<20) | (uint64_t(blend_alpha)<<23) | (uint64_t(alpha_func)<<26) |
+    uint64_t b=blend_bits | (uint64_t(alpha_func)<<26) |
         (uint64_t(fixed_texture)<<30) | (uint64_t(fixed_env)<<38) | (uint64_t(fog_mode)<<62);
     return {a,b};
 }
@@ -239,17 +247,21 @@ void Renderer::prepare(RasterState state)
     VkPipelineMultisampleStateCreateInfo samples{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     samples.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     VkPipelineDepthStencilStateCreateInfo depth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
-    depth.depthTestEnable = state.depth_test; depth.depthWriteEnable = state.depth_write;
-    depth.depthCompareOp = state.depth_compare;
+    depth.depthTestEnable = state.depth_test; depth.depthWriteEnable = state.depth_test && state.depth_write;
+    depth.depthCompareOp = state.depth_test?state.depth_compare:VK_COMPARE_OP_ALWAYS;
     depth.stencilTestEnable=state.stencil;
-    depth.front={state.stencil_fail,state.stencil_pass,state.stencil_depth_fail,state.stencil_compare,~0u,~0u,0};
+    depth.front=state.stencil ? VkStencilOpState{state.stencil_fail,state.stencil_pass,state.stencil_depth_fail,state.stencil_compare,~0u,~0u,0}
+                             : VkStencilOpState{VK_STENCIL_OP_KEEP,VK_STENCIL_OP_KEEP,VK_STENCIL_OP_KEEP,VK_COMPARE_OP_ALWAYS,~0u,~0u,0};
     depth.back=depth.front;
     VkPipelineColorBlendAttachmentState attachment{};
     attachment.colorWriteMask = state.color_mask;
     attachment.blendEnable = state.blend;
-    attachment.srcColorBlendFactor = state.src_rgb; attachment.srcAlphaBlendFactor = state.src_alpha;
-    attachment.dstColorBlendFactor = state.dst_rgb; attachment.dstAlphaBlendFactor = state.dst_alpha;
-    attachment.colorBlendOp = state.blend_rgb; attachment.alphaBlendOp = state.blend_alpha;
+    attachment.srcColorBlendFactor = state.blend?state.src_rgb:VK_BLEND_FACTOR_ONE;
+    attachment.srcAlphaBlendFactor = state.blend?state.src_alpha:VK_BLEND_FACTOR_ONE;
+    attachment.dstColorBlendFactor = state.blend?state.dst_rgb:VK_BLEND_FACTOR_ZERO;
+    attachment.dstAlphaBlendFactor = state.blend?state.dst_alpha:VK_BLEND_FACTOR_ZERO;
+    attachment.colorBlendOp = state.blend?state.blend_rgb:VK_BLEND_OP_ADD;
+    attachment.alphaBlendOp = state.blend?state.blend_alpha:VK_BLEND_OP_ADD;
     VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     blend.attachmentCount = 1; blend.pAttachments = &attachment;
     VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_DEPTH_BIAS, VK_DYNAMIC_STATE_BLEND_CONSTANTS};

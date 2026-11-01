@@ -92,6 +92,19 @@ static void render_stereo(Device &device)
     renderer.prepare(state);
     renderer.prepare(state);
     require(renderer.pipeline_count() == 1, "pipeline key failed to deduplicate state");
+    auto dormant=state;
+    dormant.src_rgb=VK_BLEND_FACTOR_SRC_ALPHA;dormant.dst_rgb=VK_BLEND_FACTOR_ONE;
+    dormant.blend_rgb=VK_BLEND_OP_SUBTRACT;dormant.stencil_compare=VK_COMPARE_OP_NEVER;
+    dormant.stencil_pass=VK_STENCIL_OP_REPLACE;
+    renderer.prepare(dormant);
+    require(renderer.pipeline_count()==1, "disabled blend/stencil parameters created duplicate pipelines");
+    auto no_depth=state;no_depth.depth_test=false;
+    auto no_depth_other=no_depth;no_depth_other.depth_write=false;no_depth_other.depth_compare=VK_COMPARE_OP_GREATER;
+    require(no_depth.key()==no_depth_other.key(), "disabled depth parameters changed the pipeline key");
+    dormant.blend=true;require(!(dormant.key()==state.key()), "enabled blend state was lost from the key");
+    dormant=state;dormant.stencil=true;require(!(dormant.key()==state.key()), "enabled stencil state was lost from the key");
+    dormant=state;dormant.clockwise=!state.clockwise;
+    require(!(dormant.key()==state.key()), "front-face shader semantics were lost with culling disabled");
     Readback output(device, 32 * 32 * 4 * 2);
     // Ring is declared last so outstanding work completes before resources die.
     FrameRing ring(device);
@@ -106,7 +119,8 @@ static void render_stereo(Device &device)
     Matrices matrices{};
     for (auto &m : matrices.view_projection) for (unsigned i = 0; i < 4; i++) m[i * 5] = 1;
     matrices.view_projection[1][12] = 0.8f;
-    renderer.draw(ring, triangle, 3, matrices, state);
+    dormant=state;dormant.src_rgb=VK_BLEND_FACTOR_SRC_ALPHA;dormant.dst_rgb=VK_BLEND_FACTOR_ONE;
+    renderer.draw(ring, triangle, 3, matrices, dormant);
     renderer.end();
     require(renderer.draw_count() == 1, "stereo required more than one draw command");
     VkBufferImageCopy copy{};
