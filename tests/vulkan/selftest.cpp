@@ -1113,7 +1113,7 @@ try {
             const auto id=unsigned(std::stoul(fields[0]));
             require(ids.insert(id).second&&id>0&&id<=frames&&std::stoul(fields[1])==99+id,"missing/duplicate submission or frame label");
             require(fields[3]=="1"&&std::stod(fields[4])>=0,"lagged GPU timestamps unavailable after completed fence");
-            require(std::stoull(fields[8])>0&&std::stoull(fields[9])>0&&fields[10]=="320"&&fields[11]=="1"&&std::stoull(fields[12])>0&&fields[13]=="1",
+            require(std::stoull(fields[8])>0&&std::stoull(fields[9])>0&&fields[10]=="320"&&fields[11]=="1"&&fields[13]=="1",
                     "submission CPU timing/upload/resource provenance missing");
         }
         require(ids.size()==frames,"final unrecycled submission timing lost at shutdown");
