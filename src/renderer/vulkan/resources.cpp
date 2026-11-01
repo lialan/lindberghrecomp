@@ -5,6 +5,46 @@
 
 namespace lindbergh::vk {
 
+ConstantDensityMap::ConstantDensityMap(Device &d,FrameRing &ring,uint32_t width,uint32_t height,uint32_t layers,float density):device_(d)
+{
+    if(!d.capabilities.density_map || !d.capabilities.density_map_non_subsampled || !width || !height || (layers!=1&&layers!=2) ||
+       !std::isfinite(density)||density<=0||density>1)throw std::invalid_argument("Invalid constant density map");
+    try {
+        VkImageCreateInfo create{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};create.imageType=VK_IMAGE_TYPE_2D;
+        create.format=VK_FORMAT_R8G8_UNORM;create.extent={width,height,1};create.mipLevels=1;create.arrayLayers=layers;
+        create.samples=VK_SAMPLE_COUNT_1_BIT;create.tiling=VK_IMAGE_TILING_OPTIMAL;
+        create.usage=VK_IMAGE_USAGE_FRAGMENT_DENSITY_MAP_BIT_EXT|VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        check(vkCreateImage(d.handles.device,&create,nullptr,&image_),"constant density image");
+        VkMemoryRequirements req;vkGetImageMemoryRequirements(d.handles.device,image_,&req);
+        VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};alloc.allocationSize=req.size;
+        alloc.memoryTypeIndex=d.memory_type(req.memoryTypeBits,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        check(vkAllocateMemory(d.handles.device,&alloc,nullptr,&memory_),"constant density memory");
+        check(vkBindImageMemory(d.handles.device,image_,memory_,0),"bind constant density memory");
+        VkImageViewCreateInfo v{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};v.image=image_;v.viewType=VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+        v.format=create.format;v.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,layers};
+        check(vkCreateImageView(d.handles.device,&v,nullptr,&view_),"constant density view");
+        auto cmd=ring.begin();VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b.image=image_;b.subresourceRange=v.subresourceRange;b.srcQueueFamilyIndex=b.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
+        b.newLayout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;b.dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,0,nullptr,1,&b);
+        VkClearColorValue color{{density,density,0,0}};
+        vkCmdClearColorImage(cmd,image_,b.newLayout,&color,1,&v.subresourceRange);
+        b.oldLayout=b.newLayout;b.newLayout=VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT;
+        b.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;b.dstAccessMask=VK_ACCESS_FRAGMENT_DENSITY_MAP_READ_BIT_EXT;
+        vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_FRAGMENT_DENSITY_PROCESS_BIT_EXT,0,0,nullptr,0,nullptr,1,&b);
+        // Static views can be read by the host at BeginRenderPass. Finish this
+        // one-time initialization before publishing the view; never per frame.
+        ring.wait(ring.submit());
+    } catch(...) {release();throw;}
+}
+void ConstantDensityMap::release()
+{
+    if(view_)vkDestroyImageView(device_.handles.device,view_,nullptr);
+    if(image_)vkDestroyImage(device_.handles.device,image_,nullptr);
+    if(memory_)vkFreeMemory(device_.handles.device,memory_,nullptr);
+}
+ConstantDensityMap::~ConstantDensityMap() {release();}
+
 GeometryBuffer::GeometryBuffer(Device &device, VkDeviceSize bytes) : device_(device), bytes_(bytes)
 {
     if (!bytes) throw std::invalid_argument("Empty Vulkan geometry buffer");

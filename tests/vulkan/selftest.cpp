@@ -82,6 +82,44 @@ struct Readback {
     }
 };
 
+static void render_density_reuse(Device &device)
+{
+    if(!device.capabilities.density_map || !device.capabilities.density_map_non_subsampled) {
+        std::puts("skip: density-map framebuffer reuse requires supported non-subsampled FDM");return;
+    }
+    FrameRing ring(device);ConstantDensityMap full(device,ring,32,32,2),coarse(device,ring,32,32,2,.5f);
+    TargetInfo info{32,32,2};info.density_map=full.view();info.final_layout=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    Target target(device,info);const auto first=target.framebuffer;
+    target.prepare_density_maps({full.view(),coarse.view(),full.view()});
+    require(target.density_framebuffer_count()==2,"density-map framebuffers were not deduplicated");
+    target.select_density_map(coarse.view());const auto second=target.framebuffer;
+    require(first!=second,"density-map selection retained the wrong framebuffer");
+    rejected([&]{target.select_density_map(VK_NULL_HANDLE);},"unknown density-map view accepted");
+    PipelineCache cache(device,"");Renderer renderer(device,target,cache);RasterState raster;renderer.prepare(raster);
+    Readback output(device,3*32*32*4*2);Matrices matrices{};
+    for(auto &m:matrices.view_projection)for(unsigned i=0;i<4;++i)m[i*5]=1;
+    Vertex triangle[]={{{-.9f,-.9f,0,1},{1,0,0,1}},{{.9f,-.9f,0,1},{1,0,0,1}},{{0,.9f,0,1},{1,0,0,1}}};
+    Submission last{};
+    for(unsigned frame=0;frame<3;++frame) {
+        target.select_density_map(frame%2?coarse.view():full.view());
+        require(target.framebuffer==(frame%2?second:first),"density-map framebuffer was recreated during selection");
+        auto cmd=ring.begin();renderer.begin(cmd,{0,0,0,1});renderer.draw(ring,triangle,3,matrices,raster);renderer.end();
+        VkBufferImageCopy copy{};copy.bufferOffset=frame*32*32*4*2;copy.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,2};copy.imageExtent={32,32,1};
+        vkCmdCopyImageToBuffer(cmd,target.color,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,output.buffer,1,&copy);
+        VkBufferMemoryBarrier b{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};b.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;b.dstAccessMask=VK_ACCESS_HOST_READ_BIT;
+        b.srcQueueFamilyIndex=b.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;b.buffer=output.buffer;b.size=VK_WHOLE_SIZE;
+        vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&b,0,nullptr);
+        last=ring.submit();
+    }
+    ring.wait(last);const auto *pixels=static_cast<const uint8_t *>(output.mapped);
+    for(unsigned frame=0;frame<3;++frame)for(unsigned eye=0;eye<2;++eye) {
+        const auto *p=pixels+((frame*2+eye)*32*32+16*32+16)*4;
+        require(p[0]==255&&p[1]==0&&p[2]==0&&p[3]==255,"density-map selection changed stereo drawing");
+    }
+    require(target.density_framebuffer_count()==2,"density-map selection allocated additional framebuffers");
+    std::puts("ok: two density maps reuse prepared world framebuffers across asynchronous stereo draws");
+}
+
 static void render_stereo(Device &device)
 {
     TargetInfo info;
@@ -719,6 +757,7 @@ try {
     rejected([&] { Texture unsupported(*limited, luminance); },
              "unsupported texture component swizzle accepted");
     render_stereo(*device);
+    render_density_reuse(*device);
     render_copy(*device);
     render_stereo_depth_copy(*device);
     if (argc == 2) {

@@ -23,6 +23,21 @@ private:
     void release();
 };
 
+// Immutable density map, initialized once before rendering. Full rate is a
+// safe owned attachment when no runtime swapchain image has been acquired.
+class ConstantDensityMap {
+public:
+    ConstantDensityMap(Device &device,FrameRing &ring,uint32_t width,uint32_t height,uint32_t layers,float density=1);
+    ~ConstantDensityMap();
+    ConstantDensityMap(const ConstantDensityMap &)=delete;
+    ConstantDensityMap &operator=(const ConstantDensityMap &)=delete;
+    VkImageView view() const { return view_; }
+private:
+    Device &device_;
+    VkImage image_=VK_NULL_HANDLE;VkDeviceMemory memory_=VK_NULL_HANDLE;VkImageView view_=VK_NULL_HANDLE;
+    void release();
+};
+
 struct TextureInfo {
     uint32_t width, height;
     uint32_t levels = 1, layers = 1;

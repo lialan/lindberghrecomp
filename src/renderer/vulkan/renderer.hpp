@@ -64,12 +64,19 @@ public:
     VkImage depth_image() const { return depth_; }
     static constexpr VkFormat depth_format = VK_FORMAT_D32_SFLOAT_S8_UINT;
     VkFramebuffer framebuffer = VK_NULL_HANDLE;
+    // Pre-register all runtime views during target creation, then select only
+    // the map belonging to the currently acquired OpenXR image each frame.
+    void prepare_density_maps(const std::vector<VkImageView> &maps);
+    void select_density_map(VkImageView map);
+    size_t density_framebuffer_count() const { return density_framebuffers_.size(); }
 
 private:
     Device &device_;
     VkImage depth_ = VK_NULL_HANDLE;
     VkImageView color_view_ = VK_NULL_HANDLE, depth_view_ = VK_NULL_HANDLE;
     VkDeviceMemory color_memory_ = VK_NULL_HANDLE, depth_memory_ = VK_NULL_HANDLE;
+    std::vector<std::pair<VkImageView,VkFramebuffer>> density_framebuffers_;
+    VkFramebuffer make_framebuffer(VkImageView density_map);
     void release();
 };
 

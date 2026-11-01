@@ -221,6 +221,7 @@ struct State {
   std::unique_ptr<ActivityRef> activity;
   std::unique_ptr<OpenXR> xr;
   std::unique_ptr<Target> unfocused;
+  std::unique_ptr<ConstantDensityMap> unfocused_density;
   bool xr_rendering = false;
 #endif
   std::unique_ptr<PipelineCache> cache;
@@ -291,7 +292,7 @@ struct State {
     initialized.clear();
     window.reset();
 #ifdef LINDBERGH_VULKAN_XR
-    unfocused.reset();
+    unfocused.reset();unfocused_density.reset();
     xr.reset();
     activity.reset();
     host_display_timing_reset();
@@ -322,7 +323,13 @@ struct State {
             eyes[i].tangents={-std::tan(v.fov.angleLeft),std::tan(v.fov.angleRight),-std::tan(v.fov.angleDown),std::tan(v.fov.angleUp)};
           }
           stereo->publish(eyes);
-        } else stereo->invalidate();
+          for(auto &entry:drawables)if(entry.second->info.density_map)
+            entry.second->select_density_map(screen->info.density_map);
+        } else {
+          stereo->invalidate();
+          for(auto &entry:drawables)if(entry.second->info.density_map)
+            entry.second->select_density_map(unfocused_density->view());
+        }
         if (screen) {
           static bool first=true;
           if (first) {first=false;std::fprintf(stderr,"[vulkan-xr] first game target %ux%u, %u layers; foveation %s; session %d\n",screen->info.width,screen->info.height,screen->info.layers,xr->foveation_active()?"active":"disabled",int(xr->session_state()));}
@@ -493,6 +500,10 @@ extern "C" int lvk_host_init(SDL_Window *window, int w, int h) {
     if (!cache_path.empty()) std::fprintf(stderr,"[vulkan] pipeline cache %s: %s\n",
                                          state.cache->loaded()?"loaded":"cold",cache_path.c_str());
     state.ring = std::make_unique<FrameRing>(*state.device, 3, 64u << 20);
+#ifdef LINDBERGH_VULKAN_XR
+    const auto density=state.xr->density_extent();
+    state.unfocused_density=std::make_unique<ConstantDensityMap>(*state.device,*state.ring,density[0],density[1],2);
+#endif
     state.game_width=w; state.game_height=h;
     state.viewport = state.scissor = {0, 0, w, h};
     state.arrays.current(3,{1,1,1,1});state.arrays.current(2,{0,0,1,0});
@@ -615,10 +626,23 @@ extern "C" unsigned lvk_create_drawable(int w, int h) {
   float sx,sy;lg_stereo_target_scale(&sizes,w,h,0,&sx,&sy);
   info.width=uint32_t(std::lround(w*sx));info.height=uint32_t(std::lround(h*sy));
   std::fprintf(stderr,"[vulkan-xr] pbuffer %u: %dx%d -> %ux%u, %u layers\n",id,w,h,info.width,info.height,info.layers);
+  const bool foveated_world=state.picture_size(w,h) && info.width==state.xr->width() && info.height==state.xr->height();
+  if(foveated_world) {
+    if(state.xr->density_maps().empty())gap("World pbuffer requires runtime density maps");
+    info.density_map=state.unfocused_density->view();
+  }
 #endif
   state.drawable_sizes[id]={w,h};
   info.guest_bottom_origin=true;
   state.drawables[id] = std::make_unique<Target>(*state.device, info);
+#ifdef LINDBERGH_VULKAN_XR
+  if(foveated_world) {
+    auto &target=*state.drawables.at(id);
+    target.prepare_density_maps(state.xr->density_maps());
+    if(state.xr_rendering)target.select_density_map(state.screen->info.density_map);
+    std::fprintf(stderr,"[vulkan-xr] world pbuffer %u uses acquired-image foveation; %zu framebuffers prepared\n",id,target.density_framebuffer_count());
+  }
+#endif
   return id;
 }
 extern "C" void lvk_destroy_drawable(unsigned id) {

@@ -201,7 +201,10 @@ void OpenXR::attach(Device &device)
         for(uint32_t i=0;i<count;++i) {
             VkImageView map=VK_NULL_HANDLE;
             if(require_foveation_) {
-                if(!density[i].image) throw std::runtime_error("OpenXR did not provide the required Vulkan density map");
+                if(!density[i].image || !density[i].width || !density[i].height) throw std::runtime_error("OpenXR did not provide the required Vulkan density map");
+                if(i && density_extent_!=std::array<uint32_t,2>{density[i].width,density[i].height})
+                    throw std::runtime_error("OpenXR density-map extents differ across swapchain images");
+                density_extent_={density[i].width,density[i].height};
                 VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO}; view.image=density[i].image;
                 view.viewType=VK_IMAGE_VIEW_TYPE_2D_ARRAY; view.format=VK_FORMAT_R8G8_UNORM;
                 view.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,2};
@@ -321,7 +324,7 @@ void OpenXR::detach()
     if(device_) vkDeviceWaitIdle(device_->handles.device); // session shutdown, not frame submission
     targets_.clear();
     if(device_) for(auto view:density_views_) vkDestroyImageView(device_->handles.device,view,nullptr);
-    density_views_.clear();
+    density_views_.clear();density_extent_={};
     if(profile_&&destroy_profile_) destroy_profile_(profile_); profile_=XR_NULL_HANDLE;
     if(swapchain_) xrDestroySwapchain(swapchain_); swapchain_=XR_NULL_HANDLE;
     if(space_) xrDestroySpace(space_); space_=XR_NULL_HANDLE;

@@ -131,22 +131,44 @@ Target::Target(Device &device, TargetInfo target) : info(target), device_(device
         attachments[1].loadOp = attachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         attachments[1].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
         check(vkCreateRenderPass(device.handles.device, &pass, nullptr, &load_pass), "Vulkan preserving render pass");
-        VkImageView views[] = {color_view_, depth_view_, info.density_map};
-        VkFramebufferCreateInfo framebuffer_info{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
-        framebuffer_info.renderPass = render_pass;
-        framebuffer_info.attachmentCount = pass.attachmentCount;
-        framebuffer_info.pAttachments = views;
-        framebuffer_info.width = info.width;
-        framebuffer_info.height = info.height;
-        framebuffer_info.layers = 1; // multiview selects array layers
-        check(vkCreateFramebuffer(device.handles.device, &framebuffer_info, nullptr, &framebuffer), "Vulkan world framebuffer");
+        framebuffer=make_framebuffer(info.density_map);
+        if(info.density_map)density_framebuffers_.push_back({info.density_map,framebuffer});
     } catch (...) { release(); throw; }
+}
+
+VkFramebuffer Target::make_framebuffer(VkImageView map)
+{
+    VkImageView views[]={color_view_,depth_view_,map};
+    VkFramebufferCreateInfo create{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+    create.renderPass=render_pass;create.attachmentCount=info.density_map?3:2;
+    create.pAttachments=views;create.width=info.width;create.height=info.height;create.layers=1;
+    VkFramebuffer result;
+    check(vkCreateFramebuffer(device_.handles.device,&create,nullptr,&result),"Vulkan world framebuffer");
+    return result;
+}
+void Target::prepare_density_maps(const std::vector<VkImageView> &maps)
+{
+    if(!info.density_map || maps.empty())throw std::invalid_argument("Target has no density-map attachment");
+    density_framebuffers_.reserve(density_framebuffers_.size()+maps.size());
+    for(auto map:maps) {
+        if(!map)throw std::invalid_argument("Null density-map view");
+        const auto found=std::find_if(density_framebuffers_.begin(),density_framebuffers_.end(),[&](const auto &e){return e.first==map;});
+        if(found==density_framebuffers_.end())density_framebuffers_.push_back({map,make_framebuffer(map)});
+    }
+}
+void Target::select_density_map(VkImageView map)
+{
+    const auto found=std::find_if(density_framebuffers_.begin(),density_framebuffers_.end(),[&](const auto &e){return e.first==map;});
+    if(found==density_framebuffers_.end())throw std::invalid_argument("Density-map framebuffer was not prepared");
+    framebuffer=found->second; // handle selection only: no Vulkan allocation/wait
 }
 
 void Target::release()
 {
     const auto d = device_.handles.device;
-    if (framebuffer) vkDestroyFramebuffer(d, framebuffer, nullptr);
+    if(density_framebuffers_.empty()) {
+        if(framebuffer)vkDestroyFramebuffer(d,framebuffer,nullptr);
+    } else for(const auto &entry:density_framebuffers_)vkDestroyFramebuffer(d,entry.second,nullptr);
     if (load_pass) vkDestroyRenderPass(d, load_pass, nullptr);
     if (render_pass) vkDestroyRenderPass(d, render_pass, nullptr);
     if (depth_view_) vkDestroyImageView(d, depth_view_, nullptr);

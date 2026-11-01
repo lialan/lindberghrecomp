@@ -45,6 +45,10 @@ public:
     uint32_t width() const { return width_; }
     uint32_t height() const { return height_; }
     bool foveation_active() const { return foveation_; }
+    // Borrowed views remain valid until detach. Use only the current acquired
+    // image's map for GPU work; other views may be used to prepare framebuffers.
+    const std::vector<VkImageView> &density_maps() const { return density_views_; }
+    std::array<uint32_t,2> density_extent() const { return density_extent_; }
 private:
     XrInstance instance_ = XR_NULL_HANDLE;
     XrSystemId system_ = XR_NULL_SYSTEM_ID;
@@ -62,6 +66,7 @@ private:
     std::array<XrView,2> views_{{{XR_TYPE_VIEW},{XR_TYPE_VIEW}}};
     std::vector<std::unique_ptr<Target>> targets_;
     std::vector<VkImageView> density_views_;
+    std::array<uint32_t,2> density_extent_{};
     PFN_xrCreateVulkanInstanceKHR create_instance_ = nullptr;
     PFN_xrCreateVulkanDeviceKHR create_device_ = nullptr;
     PFN_xrGetVulkanGraphicsDevice2KHR get_device_ = nullptr;
