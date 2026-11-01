@@ -344,11 +344,19 @@ extern "C" void lvk_host_present(void) {
     const auto old=state.drawable;state.drawable=0;state.renderer();state.end_pass();state.drawable=old;
   }
   const char *shot=std::getenv("LINDBERGH_SHOT");const char *at=std::getenv("LINDBERGH_SHOT_FRAME");
+  const char *period=std::getenv("LINDBERGH_SHOT_EVERY"), *from=std::getenv("LINDBERGH_SHOT_FROM");
+  const unsigned every=period?unsigned(std::strtoul(period,nullptr,10)):0;
+  std::string capture_path;
+  if (shot && *shot && (every ? (g_frame && g_frame%every==0 && g_frame>=unsigned(from?std::strtoul(from,nullptr,10):0))
+                             : g_frame==unsigned(at?std::strtoul(at,nullptr,10):600))) {
+    capture_path=shot;
+    if(every) { char suffix[32];std::snprintf(suffix,sizeof suffix,".%05u.ppm",g_frame);capture_path+=suffix; }
+  }
   std::unique_ptr<FrameCapture> capture;
-  if(shot && g_frame==unsigned(at?std::strtoul(at,nullptr,10):0)) capture=std::make_unique<FrameCapture>(*state.device,state.cmd,*state.screen);
+  if(!capture_path.empty()) capture=std::make_unique<FrameCapture>(*state.device,state.cmd,*state.screen);
   auto submitted=state.window->present(*state.ring);
   state.last_submission=submitted;
-  if(capture) {state.ring->wait(submitted);capture->write(shot,*state.screen);}
+  if(capture) {state.ring->wait(submitted);capture->write(capture_path.c_str(),*state.screen);}
   state.cmd=VK_NULL_HANDLE;
   state.screen=nullptr;
 }
@@ -793,6 +801,7 @@ extern "C" void lvk_glLinkProgram(GLuint id) {
     p.uniforms.clear();
     p.locations.clear();
     p.location_names.clear();
+    p.sampler_units.clear(); // successful GL relink resets all guest uniforms
     for (const auto &layout : p.record->uniforms)
       p.uniforms.push_back(std::make_unique<UniformData>(layout));
   }
@@ -916,6 +925,28 @@ int integer(GLenum name, int fallback) {
   auto it = state.integers.find(name);
   return it == state.integers.end() ? fallback : it->second;
 }
+size_t pixel_size(GLenum format, GLenum type) {
+  if (type == GL_UNSIGNED_BYTE) return size_t(components(format));
+  if (format == GL_DEPTH_COMPONENT && (type == GL_UNSIGNED_INT || type == GL_FLOAT)) return 4;
+  if ((format == GL_RGBA || format == GL_BGRA) && type == GL_UNSIGNED_INT_8_8_8_8_REV) return 4;
+  if ((format == GL_RGB && type == GL_UNSIGNED_SHORT_5_6_5) ||
+      (format == GL_BGRA && type == GL_UNSIGNED_SHORT_4_4_4_4_REV)) return 2;
+  return 0;
+}
+struct UnpackRows { size_t stride, skip, bytes; };
+UnpackRows unpack_rows(GLsizei w, GLsizei h, size_t pixel_bytes, GLenum type) {
+  const auto alignment = integer(GL_UNPACK_ALIGNMENT, 4);
+  const auto width = integer(GL_UNPACK_ROW_LENGTH, 0);
+  const auto rows = integer(GL_UNPACK_SKIP_ROWS, 0), columns = integer(GL_UNPACK_SKIP_PIXELS, 0);
+  if ((alignment != 1 && alignment != 2 && alignment != 4 && alignment != 8) || width < 0 || rows < 0 || columns < 0)
+    gap("invalid guest pixel unpack layout");
+  if (integer(GL_UNPACK_SWAP_BYTES, 0) && type != GL_UNSIGNED_BYTE)
+    gap("guest pixel byte swapping needs implementation");
+  const size_t raw = size_t(width ? width : w) * pixel_bytes;
+  const size_t stride = (raw + alignment - 1) & ~size_t(alignment - 1);
+  const size_t skip = size_t(rows) * stride + size_t(columns) * pixel_bytes;
+  return {stride, skip, skip + (h ? size_t(h - 1) * stride + size_t(w) * pixel_bytes : 0)};
+}
 const uint8_t *pixels(const void *pointer, size_t count) {
   if (!state.unpack_buffer)
     return static_cast<const uint8_t *>(pointer);
@@ -971,16 +1002,9 @@ extern "C" void lvk_glTexImage2D(GLenum target, GLint level, GLint internal,
                                  GLsizei w, GLsizei h, GLint border,
                                  GLenum format, GLenum type,
                                  const GLvoid *pointer) {
-  // Lindbergh's little-endian 8888_REV storage already matches native
-  // RGBA/BGRA byte order; retain it directly instead of repacking each pixel.
-  const bool packed_bytes = type == GL_UNSIGNED_INT_8_8_8_8_REV &&
-                            (format == GL_RGBA || format == GL_BGRA);
-  const bool packed_565 = type == GL_UNSIGNED_SHORT_5_6_5 && format == GL_RGB;
-  const bool packed_4444 = type == GL_UNSIGNED_SHORT_4_4_4_4_REV && format == GL_BGRA;
-  if (w < 0 || h < 0 || level < 0 || border ||
-      (type != GL_UNSIGNED_BYTE && !packed_bytes && !packed_565 && !packed_4444 &&
-       !(format == GL_DEPTH_COMPONENT &&
-         (type == GL_UNSIGNED_INT || type == GL_FLOAT)))) {
+  // Packed guest storage maps directly to native formats and view swizzles.
+  const auto pixel_bytes = pixel_size(format, type);
+  if (w < 0 || h < 0 || level < 0 || border || !pixel_bytes) {
     std::fprintf(
         stderr,
         "[vulkan] texture internal %#x format %#x type %#x size %dx%d\n",
@@ -990,22 +1014,13 @@ extern "C" void lvk_glTexImage2D(GLenum target, GLint level, GLint internal,
   auto &object=texture(target); ++object.revision; object.dynamic=object.dynamic || bool(object.stable.image);
   auto &v = object.levels[level];
   v = {internal, w, h, format, type, {}, false};
-  const auto pixel_bytes =
-      packed_bytes ? 4 : (packed_565 || packed_4444) ? 2 : components(format) * (type == GL_UNSIGNED_BYTE ? 1 : 4);
   const auto row = size_t(w) * pixel_bytes;
   v.bytes.resize(row * size_t(h));
   if (!pointer && !state.unpack_buffer)
     return;
-  const auto alignment = integer(GL_UNPACK_ALIGNMENT, 4);
-  if (alignment != 1 && alignment != 2 && alignment != 4 && alignment != 8)
-    gap("invalid guest pixel unpack alignment");
-  const auto width = integer(GL_UNPACK_ROW_LENGTH, 0);
-  const auto raw = size_t(width ? width : w) * pixel_bytes;
-  const auto stride = (raw + alignment - 1) & ~size_t(alignment - 1);
-  const auto skip = integer(GL_UNPACK_SKIP_ROWS, 0) * stride +
-                    integer(GL_UNPACK_SKIP_PIXELS, 0) * pixel_bytes;
-  const auto source =
-      pixels(pointer, skip + (h ? size_t(h - 1) * stride + row : 0));
+  const auto layout = unpack_rows(w, h, pixel_bytes, type);
+  const auto stride = layout.stride, skip = layout.skip;
+  const auto source = pixels(pointer, layout.bytes);
   if (format == GL_COLOR_INDEX) {
     if (integer(GL_INDEX_SHIFT, 0) || integer(GL_INDEX_OFFSET, 0))
       gap("indexed texture transfer shift/offset needs implementation");
@@ -1028,6 +1043,29 @@ extern "C" void lvk_glTexImage2D(GLenum target, GLint level, GLint internal,
     for (GLsizei y = 0; y < h; ++y)
       std::memcpy(v.bytes.data() + size_t(y) * row,
                   source + skip + size_t(y) * stride, row);
+}
+extern "C" void lvk_glTexSubImage2D(GLenum target, GLint level, GLint x, GLint y,
+                                    GLsizei w, GLsizei h, GLenum format, GLenum type,
+                                    const GLvoid *pointer) {
+  auto &object = texture(target);
+  const auto it = object.levels.find(level);
+  if (it == object.levels.end()) gap("guest texture subimage has no allocated level");
+  auto &v = it->second;
+  if (x < 0 || y < 0 || w < 0 || h < 0 || x > v.width || w > v.width - x ||
+      y > v.height || h > v.height - y || v.compressed)
+    gap("guest texture subimage exceeds level storage");
+  if (!w || !h) return;
+  const auto pixel_bytes = pixel_size(format, type);
+  if (!pixel_bytes || format != v.format || type != v.type || format == GL_COLOR_INDEX)
+    gap("guest texture subimage requires pixel conversion");
+  if (!pointer && !state.unpack_buffer) gap("null guest texture subimage source");
+  const auto layout = unpack_rows(w, h, pixel_bytes, type);
+  const auto source = pixels(pointer, layout.bytes);
+  for (GLsizei row = 0; row < h; ++row)
+    std::memcpy(v.bytes.data() + (size_t(y + row) * v.width + x) * pixel_bytes,
+                source + layout.skip + size_t(row) * layout.stride, size_t(w) * pixel_bytes);
+  ++object.revision;
+  object.dynamic = object.dynamic || bool(object.stable.image);
 }
 extern "C" void lvk_glCompressedTexImage2D(GLenum target, GLint level,
                                            GLenum internal, GLsizei w,
