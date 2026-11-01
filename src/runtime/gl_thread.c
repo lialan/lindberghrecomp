@@ -289,7 +289,7 @@ static uint32_t pixel_bytes(uint32_t w, uint32_t h, uint32_t fmt, uint32_t type)
  * glFog* or a texture deleted. LINDBERGH_GLQ_NODEDUP=1 and
  * LINDBERGH_GLQ_DEDUP_CHECK=1 cover these as well. */
 enum { ST_NONE, ST_ENABLE, ST_DISABLE, ST_MATRIXMODE, ST_ACTIVETEX, ST_BINDTEX, ST_DEPTHMASK,
-       ST_DEPTHFUNC, ST_SHADE, ST_ALPHAFUNC, ST_BLENDFUNC, ST_FOGF };
+       ST_DEPTHFUNC, ST_SHADE, ST_ALPHAFUNC, ST_BLENDFUNC, ST_FOGF, ST_FRONTFACE, ST_POLYOFFSET };
 #define SRV_N 1024
 static struct { uint64_t key, val; uint32_t gen; } g_srv[SRV_N];
 static uint32_t g_srv_gen = 1;
@@ -310,6 +310,56 @@ static int srv_same(uint64_t key, uint64_t val)
     if (g_srv[i].gen == g_srv_gen && g_srv[i].key == key && g_srv[i].val == val) return 1;
     g_srv[i].gen = g_srv_gen; g_srv[i].key = key; g_srv[i].val = val;
     return 0;
+}
+/* 1: the record holds key's value (put in *val) */
+static unsigned g_n_answered;
+static int srv_get(uint64_t key, uint64_t *val)
+{
+    uint32_t i = srv_slot(key);
+    if (g_srv[i].gen != g_srv_gen || g_srv[i].key != key) return 0;
+    *val = g_srv[i].val;
+    return 1;
+}
+/* A state read the record answers: glGetIntegerv (f 0) or glGetFloatv (f 1)
+ * of pname, one value into *out (an integer, or a float's bits). GSE reads
+ * these back around every draw, ~340 times a frame. */
+static int srv_answer(uint32_t pname, int f, uint32_t *out)
+{
+    uint64_t v; float x;
+    switch (pname) {
+    case 0x0BE1: case 0x0BE0:                       /* GL_BLEND_SRC / GL_BLEND_DST */
+        if (f || !srv_get((uint64_t)ST_BLENDFUNC << 56, &v)) return 0;
+        *out = pname == 0x0BE1 ? (uint32_t)v : (uint32_t)(v >> 32); return 1;
+    case 0x0BC1:                                    /* GL_ALPHA_TEST_FUNC */
+        if (f || !srv_get((uint64_t)ST_ALPHAFUNC << 56, &v)) return 0;
+        *out = (uint32_t)v; return 1;
+    case 0x0BC2:                                    /* GL_ALPHA_TEST_REF */
+        if (!f || !srv_get((uint64_t)ST_ALPHAFUNC << 56, &v)) return 0;
+        *out = (uint32_t)(v >> 32); return 1;
+    case 0x0B46:                                    /* GL_FRONT_FACE */
+        if (f || !srv_get((uint64_t)ST_FRONTFACE << 56, &v)) return 0;
+        *out = (uint32_t)v; return 1;
+    case 0x8038: case 0x2A00:                       /* GL_POLYGON_OFFSET_FACTOR / _UNITS */
+        if (!f || !srv_get((uint64_t)ST_POLYOFFSET << 56, &v)) return 0;
+        *out = pname == 0x8038 ? (uint32_t)v : (uint32_t)(v >> 32); return 1;
+    case 0x84E0:                                    /* GL_ACTIVE_TEXTURE */
+        if (g_srv_unit < 0) return 0;
+        x = (float)(0x84C0 + g_srv_unit);
+        if (f) memcpy(out, &x, 4); else *out = 0x84C0u + (uint32_t)g_srv_unit;
+        return 1;
+    case 0x8069:                                    /* GL_TEXTURE_BINDING_2D */
+        if (g_srv_unit < 0 || !srv_get((uint64_t)ST_BINDTEX << 56 | (uint64_t)g_srv_unit << 40 | 0x0DE1, &v)) return 0;
+        x = (float)(uint32_t)v;
+        if (f) memcpy(out, &x, 4); else *out = (uint32_t)v;
+        return 1;
+    }
+    return 0;
+}
+static int shadow_check(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *v = getenv("LINDBERGH_GLQ_SHADOW_CHECK"); on = v && *v == '1'; }
+    return on;
 }
 static int tex_cap(uint32_t cap)
 {
@@ -350,10 +400,12 @@ static const Cls *cls(HleId id)
         { "glActiveTexture", ST_ACTIVETEX }, { "glActiveTextureARB", ST_ACTIVETEX },
         { "glBindTexture", ST_BINDTEX }, { "glDepthMask", ST_DEPTHMASK }, { "glDepthFunc", ST_DEPTHFUNC },
         { "glShadeModel", ST_SHADE }, { "glAlphaFunc", ST_ALPHAFUNC }, { "glBlendFunc", ST_BLENDFUNC },
-        { "glFogf", ST_FOGF },
+        { "glFogf", ST_FOGF }, { "glFrontFace", ST_FRONTFACE }, { "glPolygonOffset", ST_POLYOFFSET },
     };
     for (unsigned i = 0; i < sizeof S / sizeof S[0]; i++) if (!strcmp(n, S[i].name)) k.st = S[i].st;
-    k.sinv = k.inv || !strcmp(n, "glPopAttrib") || (!strncmp(n, "glFog", 5) && strcmp(n, "glFogf")) ||
+    /* display lists run (or, compiling, only record) calls the record never saw */
+    k.sinv = k.inv || !strcmp(n, "glPopAttrib") || !strncmp(n, "glCallList", 10) || !strcmp(n, "glNewList") ||
+             !strcmp(n, "glEndList") || !strncmp(n, "glBlendFuncSeparate", 19) || (!strncmp(n, "glFog", 5) && strcmp(n, "glFogf")) ||
              !strncmp(n, "glDeleteTextures", 16);
     k.words = words_of(n);
     for (unsigned i = 0; i < sizeof T / sizeof T[0]; i++)
@@ -362,7 +414,8 @@ static const Cls *cls(HleId id)
     {   /* LINDBERGH_GLQ_NOSHADOW=1: every read waits, as before */
         const char *v = getenv("LINDBERGH_GLQ_NOSHADOW");
         k.sh = !(v && *v == '1') && (!strcmp(n, "glViewport") || !strcmp(n, "glScissor") ||
-                                     !strcmp(n, "glPopAttrib") || !strcmp(n, "glGetIntegerv"));
+                                     !strcmp(n, "glPopAttrib") || !strcmp(n, "glGetIntegerv") ||
+                                     !strcmp(n, "glGetFloatv"));
     }
     g_cls[id] = k;
     return &g_cls[id];
@@ -548,7 +601,7 @@ static uint32_t put_sync(CPU *c, HleId id, HleHandler fn)
 }
 
 /* the viewport and scissor box the game last set (shadow_state, below) */
-static HleId g_id_viewport, g_id_scissor, g_id_popattrib, g_id_getint, g_id_makecurrent;
+static HleId g_id_viewport, g_id_scissor, g_id_popattrib, g_id_getint, g_id_getfloat, g_id_makecurrent;
 static HleId g_id_getctx, g_id_getdraw;
 /* the drawable the game last made current, for glXGetCurrentDrawable without
  * waiting (hle_glx_posix.c says what that call answers for it) */
@@ -581,6 +634,16 @@ static void call_sync(CPU *c, HleId id, HleHandler fn)
     uint32_t s = put_sync(c, id, fn);
     GAME_WAIT((int32_t)(atomic_load_explicit(&g_done_seq, memory_order_acquire) - s) >= 0);
     g_n_sync++; g_sync_by_id[id]++;
+    if (shadow_check() && id && (id == g_id_getint || id == g_id_getfloat) && A32(1)) {
+        uint32_t v;      /* LINDBERGH_GLQ_SHADOW_CHECK=1: what the record would have answered, against GL */
+        if (srv_answer(A32(0), id == g_id_getfloat, &v)) {
+            static unsigned checked, wrong;
+            checked++;
+            if (rd32(A32(1)) != v && wrong++ < 40)
+                fprintf(stderr, "[glq] shadow check: %s(%#x) record %#x, GL %#x\n", hle_name(id), A32(0), v, rd32(A32(1)));
+            if ((checked & 0xFFFF) == 0) fprintf(stderr, "[glq] shadow check: %u answers compared, %u wrong\n", checked, wrong);
+        }
+    }
     if (id && id == g_id_getint && A32(1)) {      /* the answer, kept for the next read */
         uint32_t pname = A32(0), out = A32(1);
         int32_t *v = pname == 0x0BA2 ? g_vp_shadow : pname == 0x0C10 ? g_sc_shadow : NULL;
@@ -600,6 +663,7 @@ static void shadow_ids(void)
         else if (!strcmp(n, "glScissor")) g_id_scissor = (HleId)i;
         else if (!strcmp(n, "glPopAttrib")) g_id_popattrib = (HleId)i;
         else if (!strcmp(n, "glGetIntegerv")) g_id_getint = (HleId)i;
+        else if (!strcmp(n, "glGetFloatv")) g_id_getfloat = (HleId)i;
         else if (!strcmp(n, "glXMakeCurrent")) g_id_makecurrent = (HleId)i;
         else if (!strcmp(n, "glXGetCurrentContext")) g_id_getctx = (HleId)i;
         else if (!strcmp(n, "glXGetCurrentDrawable")) g_id_getdraw = (HleId)i;
@@ -612,6 +676,10 @@ static int shadow_state(CPU *c, HleId id)
     if (id == g_id_viewport) { for (int i = 0; i < 4; i++) g_vp_shadow[i] = (int32_t)A32(i); g_vp_known = 1; return 0; }
     if (id == g_id_scissor)  { for (int i = 0; i < 4; i++) g_sc_shadow[i] = (int32_t)A32(i); g_sc_known = 1; return 0; }
     if (id == g_id_popattrib) { g_vp_known = g_sc_known = 0; return 0; }
+    if ((id == g_id_getint || id == g_id_getfloat) && A32(1) && !shadow_check()) {
+        uint32_t v;
+        if (srv_answer(A32(0), id == g_id_getfloat, &v)) { wr32(A32(1), v); g_n_answered++; return 1; }
+    }
     if (id == g_id_getint) {
         uint32_t pname = A32(0), out = A32(1);
         const int32_t *v = pname == 0x0BA2 && g_vp_known ? g_vp_shadow : pname == 0x0C10 && g_sc_known ? g_sc_shadow : NULL;
@@ -742,7 +810,7 @@ static int srv_redundant(CPU *c, int st)
         if (g_srv_unit < 0) return 0;
         key |= (uint64_t)g_srv_unit << 40 | a0; val = a1;
         break;
-    case ST_ALPHAFUNC: case ST_BLENDFUNC: val = (uint64_t)a1 << 32 | a0; break;
+    case ST_ALPHAFUNC: case ST_BLENDFUNC: case ST_POLYOFFSET: val = (uint64_t)a1 << 32 | a0; break;
     case ST_FOGF: key |= a0; val = a1; break;
     default: val = a0; break;           /* matrix mode, depth mask and func, shade model */
     }
@@ -959,7 +1027,7 @@ void glq_report(unsigned frames)
     fprintf(stderr, "[glq] ms per frame: game thread %.1f (waiting %.1f), GL thread %.1f; ",
             game0 ? (game - game0) / frames : 0, g_wait_ms / frames, work0 ? (work - work0) / frames : 0);
     game0 = game; work0 = work; g_wait_ms = 0;
-    fprintf(stderr, "per frame: %u queued, %u dropped as redundant, %u waited for", g_n_async / frames, g_n_dropped / frames, g_n_sync / frames);
+    fprintf(stderr, "per frame: %u queued, %u dropped as redundant, %u reads answered here, %u waited for", g_n_async / frames, g_n_dropped / frames, g_n_answered / frames, g_n_sync / frames);
     if (dedup_check()) fprintf(stderr, " (dedup check: %u wrong so far)", atomic_load(&g_dedup_wrong));
     for (int k = 0; k < 10; k++) {
         unsigned best = 0;
@@ -970,7 +1038,7 @@ void glq_report(unsigned frames)
     }
     fputc('\n', stderr);
     memset(g_sync_by_id, 0, sizeof g_sync_by_id);
-    g_n_async = g_n_sync = g_n_dropped = 0;
+    g_n_async = g_n_sync = g_n_dropped = g_n_answered = 0;
 }
 
 /* Start, from the game thread at its first swap. release() lets go of the GL
