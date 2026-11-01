@@ -67,6 +67,11 @@ class ControlsTests(unittest.TestCase):
         self.assertEqual(self.step(1010,dual=1,auto_coins=1,trigger=[1,0]).coins,0)
         self.step(3100,dual=1,auto_coins=1)
         self.assertEqual(self.step(3110,dual=1,auto_coins=1,trigger=[1,0]).coins,1)
+    def test_menu_blocks_a_previously_scheduled_join_start(self):
+        self.step(0,dual=1,auto_coins=1,trigger=[1,0])
+        r=self.step(150,dual=1,auto_coins=1,blocked=1,trigger=[1,0])
+        self.assertEqual((r.held,r.coins),(0,0))
+
     def test_start_credits_are_edge_triggered(self):
         self.assertEqual(self.step(0,auto_coins=1,stick=[1,0]).coins,1)
         self.assertEqual(self.step(10,auto_coins=1,stick=[1,0]).coins,0)

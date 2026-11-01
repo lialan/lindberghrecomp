@@ -150,6 +150,10 @@ void OpenXR::attach(Device &device)
             request_refresh_=function<PFN_xrRequestDisplayRefreshRateFB>(instance_,"xrRequestDisplayRefreshRateFB");
             get_refresh_=function<PFN_xrGetDisplayRefreshRateFB>(instance_,"xrGetDisplayRefreshRateFB");
             requested_refresh_=config_.refresh;
+            const auto enumerate=function<PFN_xrEnumerateDisplayRefreshRatesFB>(instance_,"xrEnumerateDisplayRefreshRatesFB");
+            uint32_t count=0;xr_check(enumerate(session_,0,&count,nullptr),"enumerate refresh rate count");
+            refresh_rates_.resize(count);if(count)xr_check(enumerate(session_,count,&count,refresh_rates_.data()),"enumerate refresh rates");
+            std::sort(refresh_rates_.begin(),refresh_rates_.end());
         }
         XrReferenceSpaceCreateInfo space{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
         space.referenceSpaceType=XR_REFERENCE_SPACE_TYPE_LOCAL; space.poseInReferenceSpace.orientation.w=1;
@@ -318,6 +322,12 @@ Target *OpenXR::begin_frame()
     xr_check(xrWaitSwapchainImage(swapchain_,&ready),"wait OpenXR eye array");
     return targets_.at(image_).get();
 }
+void OpenXR::request_refresh(float hz)
+{
+    requested_refresh_=hz;
+    if(request_refresh_&&running_){const auto result=request_refresh_(session_,hz);
+        std::fprintf(stderr,"[vulkan-xr] menu refresh request %.2f Hz: %d\n",hz,int(result));}
+}
 void OpenXR::end_frame(bool rendered)
 {
     if(!frame_open_) return;
@@ -350,7 +360,7 @@ void OpenXR::detach()
 #ifdef __ANDROID__
     set_thread_=nullptr;
 #endif
-    requested_refresh_=0; session_state_=XR_SESSION_STATE_UNKNOWN;
+    refresh_rates_.clear();requested_refresh_=0; session_state_=XR_SESSION_STATE_UNKNOWN;
     device_=nullptr; running_=false; frame_open_=false; acquired_=false; foveation_=false;
 }
 void OpenXR::release() { detach(); if(instance_) xrDestroyInstance(instance_); instance_=XR_NULL_HANDLE; }

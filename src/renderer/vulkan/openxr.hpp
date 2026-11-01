@@ -33,6 +33,9 @@ public:
     void detach();
     bool input(LgXrActionSample &sample);
     void rumble(int hand,float amplitude,int milliseconds);
+    const std::vector<float> &refresh_rates() const {return refresh_rates_;}
+    void request_refresh(float hz);
+    void recenter() {if(config_.anchor_head)anchor_pending_=true;}
     void renderer_thread(); // call when the shared worker takes rendering ownership
     // A null target still requires end_frame(false): shouldRender can be false.
     // Returns null before READY without opening a frame.
@@ -80,6 +83,7 @@ private:
 #ifdef __ANDROID__
     PFN_xrSetAndroidApplicationThreadKHR set_thread_=nullptr;
 #endif
+    std::vector<float> refresh_rates_;
     float requested_refresh_ = 0;
     PFN_xrRequestDisplayRefreshRateFB request_refresh_ = nullptr;
     PFN_xrGetDisplayRefreshRateFB get_refresh_ = nullptr;

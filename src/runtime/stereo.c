@@ -1,3 +1,4 @@
+#include "xr_sight.h"
 /*
  * stereo.c - drawing each frame once per eye.
  *
@@ -196,11 +197,7 @@ static int movie_draw(void)
 static float    g_gun_ndc[2] = { -9, -9 };   /* where the gun points, in the game's NDC */
 static float    g_gun2_ndc[2] = { -9, -9 };  /* the second gun's (dual wielding); -9: none */
 static int      g_show_sight = 1;
-static GLuint   g_sight_tex, g_sight_cand;
-static GLuint   g_sight2_tex, g_sight2_cand;   /* the second gun's sight, when it differs */
-static unsigned g_sight2_hits, g_sight2_frame;
-static unsigned g_sight_hits, g_sight_frame;
-static float    g_sight_from[2];
+static LgXrSight g_sight;
 static GLint    g_menu_vp[4];           /* this frame's first sub-viewport a screen 3D draw used (LINDBERGH_HUD_LOG) */             /* the lens the screen was sized by at this frame's first 2D draw on it */
 
 /* ---- the recording ---- */
@@ -1054,34 +1051,11 @@ static int sight_draw(CPU *c, const char *n)
                     w * 320, h * 240, cx * 320, -cy * 240, (g_gun_ndc[0] + 1) * 320, (1 - g_gun_ndc[1]) * 240);
         }
     }
-    if (cx * cx * 100 + cy * cy * 56 > 0.02f) {            /* centred on the gun, within a few pixels */
-        /* or on the second gun: a sight already found (its own texture, or the same) */
-        float c2x = (b[0] + b[2]) * 0.5f - g_gun2_ndc[0], c2y = (b[1] + b[3]) * 0.5f - g_gun2_ndc[1];
-        if (g_gun2_ndc[0] < -2 || c2x * c2x * 100 + c2y * c2y * 56 > 0.02f) return 0;
-        if (g_tex2d_bound != g_sight_tex && !g_sight2_tex && g_sight_tex) {
-            if (g_tex2d_bound != g_sight2_cand) { g_sight2_cand = g_tex2d_bound; g_sight2_hits = 0; }
-            if (g_frame != g_sight2_frame) { g_sight2_frame = g_frame; g_sight2_hits++; }
-            if (g_sight2_hits >= 30) {      /* on the second gun, frame after frame */
-                g_sight2_tex = g_sight2_cand;
-                fprintf(stderr, "[stereo] frame %u: the second gun's sight is texture %u\n", g_frame, g_sight2_tex);
-            }
-        }
-        return !g_show_sight && g_sight_tex && (g_tex2d_bound == g_sight_tex || g_tex2d_bound == g_sight2_tex);
-    }
-    if (!g_sight_tex) {
-        if (g_tex2d_bound != g_sight_cand) {
-            g_sight_cand = g_tex2d_bound; g_sight_hits = 0;
-            g_sight_from[0] = g_gun_ndc[0]; g_sight_from[1] = g_gun_ndc[1];
-        }
-        if (g_frame != g_sight_frame) { g_sight_frame = g_frame; g_sight_hits++; }
-        float mx = g_gun_ndc[0] - g_sight_from[0], my = g_gun_ndc[1] - g_sight_from[1];
-        if (g_sight_hits >= 30 && mx * mx + my * my > 0.01f) {   /* followed a moving gun */
-            g_sight_tex = g_sight_cand;
-            fprintf(stderr, "[stereo] frame %u: the game's sight is texture %u\n", g_frame, g_sight_tex);
-        }
-        return 0;
-    }
-    return !g_show_sight && (g_tex2d_bound == g_sight_tex || (g_sight2_tex && g_tex2d_bound == g_sight2_tex));
+    const unsigned primary=g_sight.primary,secondary=g_sight.secondary;
+    const int hide=lg_xr_sight_draw(&g_sight,g_frame,g_tex2d_bound,g_tex2d_on,b,g_gun_ndc,g_gun2_ndc,g_show_sight);
+    if(primary!=g_sight.primary)fprintf(stderr,"[stereo] frame %u: the game's sight is texture %u\n",g_frame,g_sight.primary);
+    if(secondary!=g_sight.secondary)fprintf(stderr,"[stereo] frame %u: the second gun's sight is texture %u\n",g_frame,g_sight.secondary);
+    return hide;
 }
 
 /* The world's lens: the one most of a frame's 3D is drawn with. The game's
@@ -3255,6 +3229,6 @@ void stereo_set_gun(int x, int y)
 void stereo_show_game_sight(int show)
 {
     g_show_sight = show;
-    fprintf(stderr, "[stereo] game sight %s (texture %u)\n", show ? "shown" : "hidden", g_sight_tex);
+    fprintf(stderr, "[stereo] game sight %s (texture %u)\n", show ? "shown" : "hidden", g_sight.primary);
 }
 

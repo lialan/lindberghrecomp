@@ -4,6 +4,8 @@
 #include "overlay_gun_frag.hpp"
 #include "overlay_beam_vert.hpp"
 #include "overlay_beam_frag.hpp"
+#include "overlay_panel_vert.hpp"
+#include "overlay_panel_frag.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -31,7 +33,22 @@ Overlay::Overlay(Device &device,FrameRing &ring,PipelineCache &cache):device_(de
         mesh.vertices=uint32_t(count);const auto bytes=size_t(count)*9*sizeof(float);
         mesh.buffer=std::make_unique<GeometryBuffer>(device,bytes);mesh.buffer->upload(cmd,ring,vertices.data(),bytes);
     }
+    const float quad[]={-1,-1,1,-1,-1,1,1,1};
+    quad_=std::make_unique<GeometryBuffer>(device,sizeof quad);quad_->upload(cmd,ring,quad,sizeof quad);
+    SamplerInfo sampling;sampling.min_filter=sampling.mag_filter=VK_FILTER_LINEAR;
+    sampling.u=sampling.v=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    panel_sampler_=std::make_unique<Sampler>(device,sampling);
+    for(unsigned i=0;i<2;++i) {
+        panel_textures_[i]=std::make_unique<Texture>(device,TextureInfo{uint32_t(i?XM_LABEL_W:XM_W),uint32_t(i?XM_LABEL_H:XM_H)});
+        panel_sets_[i]=std::make_unique<SampledSet>(device,std::vector<SampledImage>{{0,panel_textures_[i]->view(),panel_sampler_->handle()}});
+    }
     ring_.submit(); // queue-ordered once at initialization; no CPU wait
+}
+void Overlay::upload_panel(VkCommandBuffer cmd,unsigned slot,const void *rgba,size_t bytes)
+{
+    if(slot>=2||!rgba||bytes!=size_t(panel_textures_[slot]->info.width)*panel_textures_[slot]->info.height*4)
+        throw std::invalid_argument("Invalid panel image");
+    panel_textures_[slot]->upload(cmd,ring_,0,0,rgba,bytes);panel_ready_[slot]=true;++panel_uploads_;
 }
 void Overlay::prepare(Target &target)
 {
@@ -44,17 +61,22 @@ void Overlay::prepare(Target &target)
         {{0,sizeof(BeamVertex),VK_VERTEX_INPUT_RATE_VERTEX}},{{0,0,VK_FORMAT_R32G32B32_SFLOAT,0},{1,0,VK_FORMAT_R32G32B32_SFLOAT,12},{2,0,VK_FORMAT_R32G32_SFLOAT,24}},
         {uniforms_.layout()}};
     bundle.gun=std::make_unique<Renderer>(device_,target,cache_,gun);bundle.beam=std::make_unique<Renderer>(device_,target,cache_,beam);
+    ProgramSource panel{overlay_panel_vert,overlay_panel_frag,sizeof overlay_panel_vert,sizeof overlay_panel_frag,
+        {{0,8,VK_VERTEX_INPUT_RATE_VERTEX}},{{0,0,VK_FORMAT_R32G32_SFLOAT,0}},{panel_sets_[0]->layout()}};
+    bundle.panel=std::make_unique<Renderer>(device_,target,cache_,panel);
+    auto panel_state=beam_state();panel_state.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;bundle.panel->prepare(panel_state);
     bundle.gun->prepare(gun_state());bundle.beam->prepare(beam_state());bundle.beam->prepare(glass_state());bundle.beam->prepare(reticle_state());
 }
 uint64_t Overlay::draw_count() const {
-    uint64_t count=0;for(const auto &entry:targets_)count+=entry.second.gun->draw_count()+entry.second.beam->draw_count();return count;
+    uint64_t count=0;for(const auto &entry:targets_)count+=entry.second.gun->draw_count()+entry.second.beam->draw_count()+entry.second.panel->draw_count();return count;
 }
 void Overlay::draw(VkCommandBuffer cmd,Target &target,const Matrices &views,const std::array<std::array<float,3>,2> &eyes,
-                   const std::array<XoFrame,2> &frames,Renderer *previous,bool preserve)
+                   const std::array<XoFrame,2> &frames,Renderer *previous,bool preserve,const std::array<PanelDraw,2> &panels)
 {
     auto found=targets_.find(&target);if(found==targets_.end())throw std::logic_error("Overlay target was not prepared");
     auto &bundle=found->second;bool any=false;
     for(const auto &f:frames)any|=f.gun_valid&&(f.show_gun||f.beam||f.dot||f.flash);
+    for(unsigned i=0;i<2;++i)any|=panels[i].visible&&panel_ready_[i];
     if(!any){if(previous)previous->end();return;}
     Renderer *active;
     if(previous){previous->detach();bundle.gun->attach(cmd);active=bundle.gun.get();}
@@ -81,6 +103,15 @@ void Overlay::draw(VkCommandBuffer cmd,Target &target,const Matrices &views,cons
         for(int eye=0;eye<2;++eye)visible|=xo_spot_vertices(q[eye],eyes[eye].data(),position,radii[eye])!=0;
         if(visible)shape(q,color,ring,thick,reticle?reticle_state():beam_state(),reticle);
     };
+    auto draw_panel=[&](unsigned slot) {
+        if(!panels[slot].visible||!panel_ready_[slot])return;
+        select(*bundle.panel,false);const auto set=panel_sets_[slot]->handle();active->bind_descriptors(0,1,&set);
+        Matrices mvp;for(int eye=0;eye<2;++eye){Matrix vp;std::copy(views.view_projection[eye],views.view_projection[eye]+16,vp.begin());
+            const auto m=multiply(vp,panels[slot].model);std::copy(m.begin(),m.end(),mvp.view_projection[eye]);}
+        const Upload stream{quad_->handle(),0};auto raster=beam_state();raster.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+        active->draw_buffers(&stream,1,4,mvp,raster);
+    };
+    if(panels[0].visible){draw_panel(1);draw_panel(0);} // guns stay over an open menu, with one draw each
     for(const auto &f:frames) {
         if(!f.gun_valid)continue;
         if(f.gun_model<0||f.gun_model>2||f.sight<0||f.sight>2)throw std::invalid_argument("Invalid overlay model/sight");
@@ -112,6 +143,7 @@ void Overlay::draw(VkCommandBuffer cmd,Target &target,const Matrices &views,cons
         if(f.dot)spot(f.end,radii(.006f),color,0,0,false);
         if(f.flash)spot(f.muzzle,{.045f,.045f},{1,.75f,.3f,.9f},0,0,false);
     }
+    if(!panels[0].visible)draw_panel(1);
     active->end();
 }
 }

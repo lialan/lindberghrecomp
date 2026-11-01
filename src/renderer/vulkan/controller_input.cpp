@@ -10,14 +10,20 @@ ControllerInput::ControllerInput(ControllerSettings settings):settings_(settings
         throw std::invalid_argument("Invalid controller dimensions/aim distance");
     controls_.gun_hand=settings.left_handed?0:1;
 }
-std::array<ControllerHaptic,2> ControllerInput::update(const StereoScene &scene,const ControllerSample &sample,int64_t time,bool focused)
+void ControllerInput::configure(ControllerSettings settings,int hand)
+{
+    if(settings.width<=0||settings.height<=0||!std::isfinite(settings.aim_distance)||settings.aim_distance<=0||hand>1)
+        throw std::invalid_argument("Invalid controller settings");
+    settings_=settings;if(hand>=0)controls_.gun_hand=hand;
+}
+std::array<ControllerHaptic,2> ControllerInput::update(const StereoScene &scene,const ControllerSample &sample,int64_t time,bool focused,bool select_hand)
 {
     overlay_={};
     ControllerSnapshot next;next.dual=settings_.dual;std::array<ControllerHaptic,2> haptics{};
     focused=focused&&scene.tracking_valid();
     if(focused) {
         auto frame=sample.buttons;frame.time=time;frame.dual=settings_.dual;frame.auto_coins=settings_.auto_coins;
-        const int main=lg_xr_controls_select(&controls_,frame.trigger,frame.dual);
+        const int main=select_hand?lg_xr_controls_select(&controls_,frame.trigger,frame.dual):controls_.gun_hand;
         for(int pl=0;pl<(frame.dual?2:1);++pl) {
             const int hand=pl?1-main:main;
             if(sample.valid[hand]) {
@@ -49,12 +55,14 @@ std::array<ControllerHaptic,2> ControllerInput::update(const StereoScene &scene,
             }
             fire_phase_[pl]=phase;
         }
-        const auto cabinet=lg_xr_controls_update(&controls_,&frame);next.held=cabinet.held;next.coins=cabinet.coins;
+        const auto cabinet=lg_xr_controls_update(&controls_,&frame);next.held=cabinet.held|sample.extra_held;next.coins=cabinet.coins+sample.extra_coins;
+        if(frame.blocked)for(int pl=0;pl<2;++pl){next.valid[pl]=0;next.ray[pl].x=next.ray[pl].y=-100000;}
     } else {
         for(int h=0;h<2;++h){controls_.prev_trigger[h]=controls_.prev_grip[h]=controls_.prev_start[h]=0;fire_phase_[h]=1;}
     }
+    producer_=next;
     std::lock_guard<std::mutex> lock(mutex_);
-    pulses_=focused?(pulses_|(next.held&~last_held_)):0;
+    pulses_=focused?((sample.buttons.blocked?0:pulses_)|(next.held&~last_held_)):0;
     last_held_=next.held;next.coins+=pending_.coins;pending_=next;available_=true;return haptics;
 }
 bool ControllerInput::consume(ControllerSnapshot &snapshot)

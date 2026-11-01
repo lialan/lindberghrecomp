@@ -11,6 +11,12 @@ StereoScene::StereoScene(StereoSettings settings):settings_(settings)
     cache_.reserve(32);
     for(auto &m:identity_.view_projection) for(unsigned i=0;i<4;++i)m[i*5]=1;
 }
+void StereoScene::configure(StereoSettings settings)
+{
+    if(!std::isfinite(settings.scale)||settings.scale<=0||!std::isfinite(settings.screen)||settings.screen<=0)
+        throw std::invalid_argument("Invalid stereo settings");
+    settings_=settings;if(valid_)publish(eyes_);
+}
 void StereoScene::invalidate() { valid_=false;cache_.clear();last_=0;builds_=0; }
 void StereoScene::publish(const std::array<StereoPose,2> &eyes)
 {

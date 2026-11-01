@@ -34,7 +34,7 @@ LgXrCabinet lg_xr_controls_update(LgXrControls *s,const LgXrControlFrame *f)
         if(start&&!s->prev_start[0])++out.coins;
         if(start2&&!s->prev_start[1])++out.coins;
     }
-    if(join_start)out.held|=CAB_P2_START;
+    if(join_start&&!f->blocked)out.held|=CAB_P2_START;
     s->prev_start[0]=start;s->prev_start[1]=start2;
     for(int h=0;h<2;++h){s->prev_trigger[h]=f->trigger[h];s->prev_grip[h]=f->grip[h];}
     return out;

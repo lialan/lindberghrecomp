@@ -21,6 +21,10 @@ public:
     explicit StereoScene(StereoSettings settings);
     void publish(const std::array<StereoPose,2> &eyes);
     void invalidate();
+    void configure(StereoSettings settings);
+    const std::array<float,4> &head_orientation() const {return eyes_[0].orientation;}
+    const StereoSettings &settings() const {return settings_;}
+    bool head_locked() const {return settings_.head_locked;}
     bool aim(const StereoPose &controller,int width,int height,bool on_hud,float aim_distance,StereoRay &ray) const;
     const Matrices &overlay_matrices() const {return overlay_;}
     const std::array<std::array<float,3>,2> &overlay_eyes() const {return eye_positions_;}

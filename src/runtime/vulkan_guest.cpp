@@ -5,6 +5,7 @@
 #include "../renderer/vulkan/stereo_scene.hpp"
 #include "../renderer/vulkan/controller_input.hpp"
 #include "../renderer/vulkan/overlay.hpp"
+#include "../renderer/vulkan/settings_panel.hpp"
 #include "../renderer/vulkan/shader_pack.hpp"
 #include "../renderer/vulkan/window.hpp"
 #include "../renderer/vulkan/resources.hpp"
@@ -21,6 +22,7 @@ extern "C" {
 #include "game_profile.h"
 #include "display_cadence.h"
 #include "xr_settings.h"
+#include "xr_sight.h"
 }
 #include <algorithm>
 #include <cstdio>
@@ -164,6 +166,12 @@ struct ActivityRef {
     auto *env = static_cast<JNIEnv *>(SDL_AndroidGetJNIEnv());
     if (env && activity) env->DeleteGlobalRef(activity);
   }
+  void restart() {
+    auto *env=static_cast<JNIEnv *>(SDL_AndroidGetJNIEnv());if(!env)return;
+    const auto cls=env->GetObjectClass(activity);const auto method=env->GetMethodID(cls,"restartGame","()V");
+    if(method)env->CallVoidMethod(activity,method);env->DeleteLocalRef(cls);
+    if(env->ExceptionCheck()){env->ExceptionClear();std::fprintf(stderr,"[vulkan-xr] game restart failed\n");}
+  }
   void shader_defaults() {
     auto *env=static_cast<JNIEnv *>(SDL_AndroidGetJNIEnv());
     if (env->PushLocalFrame(8)<0) throw std::runtime_error("Cannot create shader asset JNI frame");
@@ -206,7 +214,10 @@ struct State {
   std::unique_ptr<Window> window;
   std::unique_ptr<StereoScene> stereo;
   std::unique_ptr<Overlay> overlay;
+  std::unique_ptr<SettingsPanel> panel;
+  void panel_input(ControllerSample sample,int64_t time,bool focused);
   std::unique_ptr<ControllerInput> controllers;ControllerSnapshot game_input;
+  LgXrSight sight{};
   int fake_guns=0;
   void fake_controllers();
   LgXrSettings settings=LG_XR_SETTINGS_DEFAULT;
@@ -289,7 +300,7 @@ struct State {
     for (auto &slot : materials) slot.clear();
     programs.clear();
     fixed_program.native.reset();
-    renderers.clear();overlay.reset();
+    renderers.clear();overlay.reset();panel.reset();
     texture_objects.clear();
     buffers.clear();
     samplers.clear();
@@ -338,12 +349,14 @@ struct State {
             sample.buttons.trigger[h]=input.trigger[h]>.55f;sample.buttons.grip[h]=input.grip[h]>.6f;
             sample.buttons.lower[h]=input.lower[h];sample.buttons.upper[h]=input.upper[h];sample.buttons.stick[h]=input.stick[h];
           }
-          const auto haptics=controllers->update(*stereo,sample,xr->display_time(),focused);
+          sample.menu=input.menu;
+          panel_input(sample,xr->display_time(),focused);
+          const auto &haptics=panel->haptics();
           for(int h=0;h<2;++h)if(haptics[h].milliseconds)xr->rumble(h,haptics[h].amplitude,haptics[h].milliseconds);
           for(auto &entry:drawables)if(entry.second->info.density_map)
             entry.second->select_density_map(screen->info.density_map);
         } else {
-          stereo->invalidate();controllers->update(*stereo,{},xr->display_time(),false);
+          stereo->invalidate();panel_input({},xr->display_time(),false);
           for(auto &entry:drawables)if(entry.second->info.density_map)
             entry.second->select_density_map(unfocused_density->view());
         }
@@ -362,6 +375,7 @@ struct State {
         if(stereo) {stereo->publish(fake_eyes);if(fake_guns)fake_controllers();}
 #endif
       }
+      if(panel&&overlay)panel->upload(*overlay,cmd);
       if (materials[ring->recording_slot()].size()>2048) materials[ring->recording_slot()].clear();
     }
   }
@@ -437,6 +451,15 @@ struct State {
 State state;
 void State::fake_controllers()
 {
+  // In the device-free panel demonstration, turn toward the placed panel after
+  // opening it. The menu remains fixed in LOCAL space, as on the headset.
+  static const bool look_at_panel=[] {const auto *v=std::getenv("LINDBERGH_VULKAN_FAKE_MENU_LOOK");return v&&*v=='1';}();
+  if(look_at_panel&&g_frame>120) {
+    auto eyes=fake_eyes;const float delta=.55f,q[]={0,std::sin(delta/2),0,std::cos(delta/2)};
+    for(auto &eye:eyes){const auto old=eye.position;lg_stereo_rotate(q,old.data(),eye.position.data());
+      const float a=2*std::atan2(eye.orientation[1],eye.orientation[3])+delta;eye.orientation={0,std::sin(a/2),0,std::cos(a/2)};}
+    stereo->publish(eyes);
+  }
   ControllerSample sample;const int64_t time=1000000000+int64_t(g_frame)*1000000000/60;
   const double seconds=double(g_frame)/60;
   for(int h=0;h<2;++h) {
@@ -447,7 +470,23 @@ void State::fake_controllers()
     sample.buttons.trigger[h]=(h==controllers->gun_hand()||fake_guns>1)&&(reload||std::fmod(seconds,1.)<.5);
     sample.buttons.stick[h]=std::fmod(seconds+(h==controllers->gun_hand()?0:5),10.)<.2;
   }
-  controllers->update(*stereo,sample,time,true);
+  panel_input(sample,time,true);
+}
+void State::panel_input(ControllerSample sample,int64_t time,bool focused)
+{
+  static const std::vector<float> no_rates;
+#ifdef LINDBERGH_VULKAN_XR
+  const auto &rates=xr->refresh_rates();
+#else
+  const auto &rates=no_rates;
+#endif
+  const unsigned effects=panel->update(settings,*stereo,*controllers,sample,time,focused,rates);
+  if(effects&XP_SAVE)xr_settings_save(&settings);
+#ifdef LINDBERGH_VULKAN_XR
+  if(effects&XP_RATE_CHANGED)xr->request_refresh(float(settings.refresh));
+  if(effects&XP_RECENTER)xr->recenter();
+  if(effects&XP_RESTART)activity->restart();
+#endif
 }
 ControllerSettings controller_settings(const LgXrSettings &settings,int width,int height)
 {
@@ -569,6 +608,8 @@ extern "C" int lvk_host_init(SDL_Window *window, int w, int h) {
     state.unfocused_density=std::make_unique<ConstantDensityMap>(*state.device,*state.ring,density[0],density[1],2);
 #endif
     if(state.controllers) {
+      const auto *fake=std::getenv("LINDBERGH_VULKAN_FAKE_MENU");
+      state.panel=std::make_unique<SettingsPanel>(state.settings.width,state.settings.resolution,game_profile()->title,fake&&*fake=='1');
       state.overlay=std::make_unique<Overlay>(*state.device,*state.ring,*state.cache);
 #ifdef LINDBERGH_VULKAN_XR
       for(const auto &target:state.xr->render_targets())state.overlay->prepare(*target);
@@ -643,7 +684,7 @@ extern "C" void lvk_host_present(void) {
   if(show_overlay) {
     Renderer *previous=state.active_target==state.screen?state.active:nullptr;
     if(state.active&&!previous)state.end_pass();
-    state.overlay->draw(state.cmd,*state.screen,state.stereo->overlay_matrices(),state.stereo->overlay_eyes(),state.controllers->overlay_frames(),previous);
+    state.overlay->draw(state.cmd,*state.screen,state.stereo->overlay_matrices(),state.stereo->overlay_eyes(),state.panel->guns(),previous,true,state.panel->draws());
     state.active=nullptr;state.active_target=nullptr;
     static const bool overlay_log=std::getenv("LINDBERGH_VULKAN_OVERLAY_LOG")!=nullptr;
     if(overlay_log&&g_frame%600==0)std::fprintf(stderr,"[vulkan-overlay] frame %u: %zu retained meshes, %zu prepared targets, %llu multiview draws, %llu additional passes\n",
@@ -2161,12 +2202,12 @@ bool picture_composite(GLint first,GLsizei count,const std::vector<uint32_t> &el
   }
   return box[0]<=-.98f&&box[1]<=-.98f&&box[2]>=.98f&&box[3]>=.98f;
 }
-void stereo_packet(DrawPacket &packet,GLint first,GLsizei count,const std::vector<uint32_t> &elements,
+bool stereo_packet(DrawPacket &packet,GLint first,GLsizei count,const std::vector<uint32_t> &elements,
                    const void *immediate,uint32_t stride,bool guest_indexed)
 {
   if(!state.stereo) {
     for(auto &m:packet.matrices.view_projection)for(unsigned i=0;i<4;++i)m[i*5]=1;
-    return;
+    return false;
   }
   const auto &p=state.matrices.matrix(GL_PROJECTION);
   LgStereoDrawFacts facts{};facts.perspective=state.stereo->world_camera(p);
@@ -2179,9 +2220,10 @@ void stereo_packet(DrawPacket &packet,GLint first,GLsizei count,const std::vecto
   const auto *profile=game_profile();
   facts.picture_target=profile->vr.world_w>0 && size[0]==profile->vr.world_w && size[1]==profile->vr.world_h;
   facts.covers_viewport=1;
+  std::array<float,4> box{};bool bounded=false;
   if(!facts.perspective) {
-    std::array<float,4> box;
-    if(stereo_bounds(p,first,count,elements,immediate,stride,guest_indexed,box)) {
+    bounded=stereo_bounds(p,first,count,elements,immediate,stride,guest_indexed,box);
+    if(bounded) {
       facts.covers_viewport=box[0]<=-.95f&&box[1]<=-.95f&&box[2]>=.95f&&box[3]>=.95f;
       facts.fills_screen=box[0]<=-.98f&&box[1]<=-.98f&&box[2]>=.98f&&box[3]>=.98f;
     }
@@ -2198,6 +2240,17 @@ void stereo_packet(DrawPacket &packet,GLint first,GLsizei count,const std::vecto
   if(kind==LG_STEREO_HUD) {
     const bool raw_perspective=lg_stereo_is_perspective(p.data());
     if(!raw_perspective)state.hud_target_next=state.drawable;
+    if(!raw_perspective&&bounded&&state.controllers) {
+      float gun[2][2]={{-100,-100},{-100,-100}};const auto &aim=state.controllers->aims();const auto &settings=state.controllers->settings();
+      for(int pl=0;pl<2;++pl)if(aim.valid[pl]&&aim.ray[pl].x>=0&&aim.ray[pl].y>=0) {
+        gun[pl][0]=2.f*aim.ray[pl].x/settings.width-1;gun[pl][1]=1-2.f*aim.ray[pl].y/settings.height;
+      }
+      const unsigned primary=state.sight.primary,secondary=state.sight.secondary;
+      const bool hide=lg_xr_sight_draw(&state.sight,g_frame,state.textures[0],state.texture_enabled[0],box.data(),gun[0],gun[1],state.settings.crosshair);
+      if(primary!=state.sight.primary||secondary!=state.sight.secondary)
+        std::fprintf(stderr,"[vulkan-sight] frame %u learned primary %u secondary %u\n",g_frame,state.sight.primary,state.sight.secondary);
+      if(hide)return true;
+    }
     const bool movie=texture!=state.texture_objects.end()&&texture->second.movie;
     if(!raw_perspective || (state.world_draws && !movie))packet.raster.depth_write=false;
     if(!facts.perspective && raw_perspective && (!state.world_draws || movie)) {
@@ -2213,6 +2266,7 @@ void stereo_packet(DrawPacket &packet,GLint first,GLsizei count,const std::vecto
   }
   if(log_range[1] && g_frame>=log_range[0] && g_frame<=log_range[1])
     std::fprintf(stderr,"[vulkan-class] frame %u target %u %dx%d class %d lens %.4f %.4f texture-view %d offscreen %d; cache builds %zu; program %u texture %u gpu-target %d world draws %u\n",g_frame,state.drawable,size[0],size[1],kind,p[0],p[5],facts.texture_view,facts.offscreen,state.stereo->transform_builds(),state.program,state.textures[0],texture!=state.texture_objects.end()&&texture->second.gpu_target,state.world_draws);
+  return false;
 }
 void draw_geometry(GLenum mode,GLint first,GLsizei count,const void *indices,GLenum index_type,bool indexed,
                    const void *immediate=nullptr,uint32_t immediate_stride=0) {
@@ -2270,7 +2324,7 @@ void draw_geometry(GLenum mode,GLint first,GLsizei count,const void *indices,GLe
     renderer=std::make_unique<Renderer>(*state.device,*target,*state.cache,source);
   }
   auto packet=packet_for(target,renderer.get());packet.raster=raster;packet.streams=std::move(plan.streams);packet.count=uint32_t(count);
-  stereo_packet(packet,first,count,elements,immediate,immediate_stride,guest_indexed);
+  if(stereo_packet(packet,first,count,elements,immediate,immediate_stride,guest_indexed))return;
   if(indexed) {auto upload=state.ring->upload(elements.data(),size_t(count)*4,4);packet.index={upload.buffer,upload.offset,VK_INDEX_TYPE_UINT32};}
   for(size_t block=0;block<p.record->uniforms.size();++block) {
     const auto set=p.record->uniforms[block].set;if(set>=2)gap("unexpected uniform descriptor set");

@@ -1,6 +1,9 @@
 #include "stereo_scene.hpp"
 #include "controller_input.hpp"
 #include "overlay.hpp"
+#include "settings_panel.hpp"
+#include "../../src/runtime/xr_sight.h"
+#include "../../src/runtime/cabinet_buttons.h"
 #include "../../src/runtime/stereo_projection.h"
 #include "device.hpp"
 #include "frame_ring.hpp"
@@ -188,6 +191,101 @@ static void render_overlay(Device &device,bool foveation=false)
     require(overlay.draw_count()==28,"overlay primitives were replayed per eye or silently dropped");
     require(overlay.render_pass_starts()==0,"overlay failed to reuse the final game render pass");
     std::puts(foveation?"ok: shared gun/laser/sight overlay runs inside a density-map render pass":"ok: persistent gun meshes, stereo lasers/sight masks, preserved alpha and shared final render pass");
+}
+
+static void render_panels(Device &device,bool foveation=false)
+{
+    FrameRing ring(device);std::unique_ptr<ConstantDensityMap> density;
+    if(foveation)density=std::make_unique<ConstantDensityMap>(device,ring,32,32,2);
+    TargetInfo info{128,128,2};if(density)info.density_map=density->view();info.final_layout=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    Target target(device,info);PipelineCache cache(device,"");Renderer background(device,target,cache);
+    Overlay overlay(device,ring,cache);overlay.prepare(target);
+    StereoScene scene({});std::array<StereoPose,2> eyes;eyes[0].position={-.032f,0,0};eyes[1].position={.032f,0,0};scene.publish(eyes);
+    std::vector<uint8_t> picture(XM_W*XM_H*4);
+    for(int y=0;y<XM_H;++y)for(int x=0;x<XM_W;++x){auto *p=picture.data()+(y*XM_W+x)*4;p[0]=y<XM_H/2?255:0;p[2]=y<XM_H/2?0:255;p[3]=128;}
+    std::array<PanelDraw,2> panels{};panels[0].visible=true;panels[0].model=identity();panels[0].model[0]=panels[0].model[5]=.5f;panels[0].model[14]=-1;
+    Readback output(device,128*128*4*2);
+    for(int frame=0;frame<4;++frame){auto cmd=ring.begin();if(!frame)overlay.upload_panel(cmd,0,picture.data(),picture.size());
+        background.begin(cmd,{.1f,.1f,.1f,.37f});overlay.draw(cmd,target,scene.overlay_matrices(),scene.overlay_eyes(),{},&background,true,panels);
+        if(frame==3){VkBufferImageCopy copy{};copy.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,2};copy.imageExtent={128,128,1};
+            vkCmdCopyImageToBuffer(cmd,target.color,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,output.buffer,1,&copy);
+            VkBufferMemoryBarrier barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};barrier.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_HOST_READ_BIT;
+            barrier.srcQueueFamilyIndex=barrier.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;barrier.buffer=output.buffer;barrier.size=VK_WHOLE_SIZE;
+            vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&barrier,0,nullptr);}
+        const auto submitted=ring.submit();if(frame==3)ring.wait(submitted);
+    }
+    const auto *pixels=static_cast<const uint8_t *>(output.mapped);
+    for(unsigned eye=0;eye<2;++eye){const auto *p=pixels+eye*128*128*4,*top=p+(40*128+64)*4,*bottom=p+(88*128+64)*4;
+        require(top[0]>120&&top[2]<30&&bottom[2]>120&&bottom[0]<30,"panel UV orientation or stereo texture sampling changed");
+        require(top[3]==94&&bottom[3]==94,"panel changed game alpha");
+    }
+    require(overlay.panel_uploads()==1&&overlay.draw_count()==4,"unchanged panel was reuploaded or replayed per eye");
+    require(overlay.render_pass_starts()==0,"panel added a render pass");
+    LgXrSettings cfg=LG_XR_SETTINGS_DEFAULT;cfg.show_fps=1;cfg.auto_coins=0;
+    ControllerSettings controls;controls.auto_coins=false;ControllerInput input(controls);
+    SettingsPanel menu(cfg.width,cfg.resolution,"Test",true);ControllerSample sample;sample.valid={1,1};
+    const std::vector<float> rates;Submission last{};
+    for(unsigned frame=0;frame<45;++frame){menu.update(cfg,scene,input,sample,1000000000+int64_t(frame)*16666667,true,rates);
+        auto cmd=ring.begin();menu.upload(overlay,cmd);background.begin(cmd,{0,0,0,1});
+        overlay.draw(cmd,target,scene.overlay_matrices(),scene.overlay_eyes(),menu.guns(),&background,true,menu.draws());last=ring.submit();}
+    ring.wait(last);
+    require(menu.draws()[0].visible&&menu.draws()[1].visible,"native settings/FPS panel did not become visible");
+    require(overlay.panel_uploads()==3,"unchanged settings or FPS image was uploaded each frame");
+    require(overlay.render_pass_starts()==0,"native UI controller added a final render pass");
+    std::puts("ok: retained panel image, top-first UV, stereo alpha blending and shared final pass");
+}
+
+static void test_sight_policy()
+{
+    LgXrSight sight{};float gun[]={0,0},gun2[]={-100,-100},box[]={-.02f,-.02f,.02f,.02f};
+    for(unsigned frame=1;frame<=40;++frame)require(!lg_xr_sight_draw(&sight,frame,7,1,box,gun,gun2,0),"stationary HUD was hidden as a sight");
+    require(!sight.primary,"stationary icon was learned as the gun sight");
+    gun[0]=.2f;box[0]+=.2f;box[2]+=.2f;
+    require(!lg_xr_sight_draw(&sight,41,7,1,box,gun,gun2,0)&&sight.primary==7,"moving sight failed to learn");
+    require(lg_xr_sight_draw(&sight,42,7,1,box,gun,gun2,0),"recognized primary sight was not hidden");
+    require(!lg_xr_sight_draw(&sight,43,7,1,box,gun,gun2,1),"shown sight was hidden");
+    require(!lg_xr_sight_draw(&sight,44,8,1,box,gun,gun2,0),"unrecognized texture was hidden");
+    gun2[0]=-.3f;gun2[1]=0;box[0]=-.32f;box[2]=-.28f;
+    for(unsigned frame=50;frame<79;++frame)require(!lg_xr_sight_draw(&sight,frame,8,1,box,gun,gun2,0),"second sight learned before 30 distinct frames");
+    require(lg_xr_sight_draw(&sight,79,8,1,box,gun,gun2,0)&&sight.secondary==8,"second gun sight did not learn");
+    box[2]=box[0]+.8f;require(!lg_xr_sight_draw(&sight,80,7,1,box,gun,gun2,0),"large HUD rectangle was hidden");
+    std::puts("ok: shared crosshair recognition preserves unlearned and stationary HUD sprites");
+}
+
+static void test_settings_panel()
+{
+    StereoScene scene({});std::array<StereoPose,2> eyes;scene.publish(eyes);
+    ControllerSettings controls;controls.auto_coins=false;ControllerInput input(controls);
+    LgXrSettings settings=LG_XR_SETTINGS_DEFAULT;settings.auto_coins=0;
+    SettingsPanel panel(settings.width,settings.resolution,"Test");ControllerSample sample;sample.valid={1,1};sample.menu=1;
+    const std::vector<float> rates{72,90,120};int64_t time=1000000000;
+    auto step=[&]{time+=16666667;return panel.update(settings,scene,input,sample,time,true,rates);};
+    step();require(panel.open()&&panel.draws()[0].visible,"menu button did not open native panel");
+    ControllerSnapshot snapshot;input.consume(snapshot);
+    require(!snapshot.valid[0]&&snapshot.ray[0].x==-100000,"open panel leaked game aiming");
+    require(panel.guns()[0].gun_valid&&panel.guns()[0].beam,"open panel lost its pointing overlay");
+    step();require(panel.open(),"held menu button repeated its toggle");sample.menu=0;step();
+    XpPanel placement{};float head[]={0,0,0},orientation[]={0,0,0,1};xp_place(&placement,head,orientation);
+    auto point=[&](int row,int hand){
+        const float v=float(64+8+row*36+18)/XM_H;
+        std::array<float,3> direction;float length=0;
+        for(int i=0;i<3;++i){direction[i]=placement.c[i]+placement.up[i]*(1-2*v)*placement.hh;length+=direction[i]*direction[i];}
+        length=std::sqrt(length);for(auto &x:direction)x/=length;
+        auto &q=sample.pose[hand].orientation;q={direction[1],-direction[0],0,1-direction[2]};
+        float norm=0;for(float x:q)norm+=x*x;norm=std::sqrt(norm);for(auto &x:q)x/=norm;
+    };
+    auto click=[&](int row){sample.buttons.trigger[0]=sample.buttons.trigger[1]=0;step();const int hand=input.gun_hand();point(row,hand);step();
+        sample.buttons.trigger[hand]=1;const auto effects=step();input.consume(snapshot);require(!(snapshot.held&CAB_P1_TRIGGER),"menu click fired the game");return effects;};
+    require((click(XP_HAND)&XP_HAND_CHANGED)&&input.gun_hand()==0&&settings.left_handed,"native menu hand choice was undone by its selection trigger");
+    require((click(XP_SCREEN)&XP_SCREEN_CHANGED)&&scene.settings().screen==4,"screen distance did not update live camera");
+    require((click(XP_HUD)&XP_HUD_CHANGED)&&scene.settings().hud_pitch==-10,"HUD pitch did not update live camera");
+    require(click(XP_COIN)&XP_SAVE,"coin action missing");require(snapshot.coins==1,"menu coin did not reach game-thread mailbox");
+    require(click(XP_TEST)&XP_SAVE,"test action missing");require(snapshot.held&CAB_TEST,"menu test did not reach cabinet");
+    require(click(XP_RESET)&XP_SAVE,"reset arm missing");require(click(XP_RESET)&XP_RESTART,"double reset confirmation missing");
+    require(click(XP_CLOSE)&XP_SAVE,"close missing");require(!panel.open(),"close did not hide native panel");
+    sample.buttons={};step();require(!panel.draws()[0].visible,"closed panel retained draw");
+    panel.update(settings,scene,input,sample,time,false,rates);require(!panel.draws()[0].visible&&!panel.guns()[0].gun_valid,"focus loss left UI visible");
+    std::puts("ok: native menu actions, live camera settings, blocked game input and cabinet actions");
 }
 
 static void render_stereo(Device &device)
@@ -714,6 +812,12 @@ static void test_controller_input()
     sample.buttons.trigger[1]=0;input.update(scene,sample,1030000000,true);
     require(input.consume(snapshot)&&(snapshot.held&(1<<4)),"mailbox lost a trigger pulse between game-thread reads");
     require(input.consume(snapshot)&&!(snapshot.held&(1<<4)),"mailbox replayed an already consumed trigger pulse");
+    sample.buttons.trigger[1]=1;input.update(scene,sample,1031000000,true);
+    sample.buttons.blocked=1;input.update(scene,sample,1032000000,true);
+    require(input.consume(snapshot)&&!(snapshot.held&((1<<4)|(1<<8)))&&!snapshot.valid[0]&&!snapshot.valid[1],
+            "menu opening leaked buffered fire or game shot rays");
+    require(input.overlay_frames()[0].gun_valid&&input.overlay_frames()[1].gun_valid,"blocked game aim removed pointing guns");
+    sample.buttons.blocked=0;
     input.update(scene,sample,1040000000,false);
     require(!input.overlay_frames()[0].gun_valid&&!input.overlay_frames()[1].gun_valid,"focus loss left stale overlay guns");
     require(input.consume(snapshot)&&snapshot.held==0&&!snapshot.valid[0]&&!snapshot.valid[1],"focus loss retained firing or old gun rays");
@@ -865,8 +969,11 @@ try {
     rejected([&] { Texture unsupported(*limited, luminance); },
              "unsupported texture component swizzle accepted");
     render_stereo(*device);
+    test_sight_policy();
+    test_settings_panel();
+    render_panels(*device);
     render_overlay(*device);
-    if(device->capabilities.density_map&&device->capabilities.density_map_non_subsampled)render_overlay(*device,true);
+    if(device->capabilities.density_map&&device->capabilities.density_map_non_subsampled){render_overlay(*device,true);render_panels(*device,true);}
     render_density_reuse(*device);
     render_copy(*device);
     render_stereo_depth_copy(*device);
