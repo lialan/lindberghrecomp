@@ -3,7 +3,8 @@
 #include <stdint.h>
 /* Initialize on the game thread before starting the render worker. Records
  * CPU submission boundaries, not GPU completion or compositor presentation.
- * Disabled by default; enabled collection allocates once and writes at exit. */
+ * Disabled by default; collection allocates once and writes after its window
+ * ends (or at drained exit), never inside the measured interval. */
 #ifdef __cplusplus
 extern "C" {
 #endif
