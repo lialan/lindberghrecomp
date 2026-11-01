@@ -24,6 +24,8 @@
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
+#include <sstream>
+#include <set>
 
 using namespace lindbergh::vk;
 static void require(bool test, const char *what)
@@ -1057,13 +1059,21 @@ try {
 
     constexpr uint32_t frames = 12, words = 16;
     Readback output(*device, frames * words * sizeof(uint32_t));
+    const auto profile_path=(std::filesystem::temp_directory_path()/
+        ("lindbergh-submissions-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()))).string();
+    bool profiling=false;
     {
         FrameRing ring(*device, 3, 4096);
+        require(!ring.profile(""),"empty profiling path unexpectedly enabled timestamps");
+        profiling=ring.profile(profile_path);
         rejected([&] { ring.submit(); }, "empty submission accepted");
         rejected([&] { ring.upload(nullptr, 1); }, "upload outside frame accepted");
         Submission last{};
         for (uint32_t frame = 0; frame < frames; frame++) {
+            ring.frame_id(100+frame);
             auto cmd = ring.begin();
+            ring.keep_alive(std::make_shared<int>(int(frame)));
+            rejected([&] {ring.profile(profile_path);},"profiling started during frame recording");
             rejected([&] { ring.begin(); }, "overlapping frame recording accepted");
             std::array<uint32_t, words> values;
             for (uint32_t i = 0; i < words; i++) values[i] = 0x12340000u + frame * 100 + i;
@@ -1091,6 +1101,32 @@ try {
             for (uint32_t i = 0; i < words; i++)
                 require(read[frame * words + i] == 0x12340000u + frame * 100 + i,
                         "GPU upload corrupted across buffered frame reuse");
+    }
+
+    if(profiling) {
+        std::ifstream in(profile_path);std::string line;std::set<unsigned> ids;
+        while(std::getline(in,line)) {
+            if(line.empty()||line[0]=='#'||line.rfind("submission,",0)==0)continue;
+            std::istringstream row(line);std::vector<std::string> fields;std::string field;
+            while(std::getline(row,field,','))fields.push_back(field);
+            require(fields.size()==14,"incomplete Vulkan submission timing record");
+            const auto id=unsigned(std::stoul(fields[0]));
+            require(ids.insert(id).second&&id>0&&id<=frames&&std::stoul(fields[1])==99+id,"missing/duplicate submission or frame label");
+            require(fields[3]=="1"&&std::stod(fields[4])>=0,"lagged GPU timestamps unavailable after completed fence");
+            require(std::stoull(fields[8])>0&&std::stoull(fields[9])>0&&fields[10]=="320"&&fields[11]=="1"&&std::stoull(fields[12])>0&&fields[13]=="1",
+                    "submission CPU timing/upload/resource provenance missing");
+        }
+        require(ids.size()==frames,"final unrecycled submission timing lost at shutdown");
+        {
+            FrameRing handed(*device,3,4096);require(handed.profile(profile_path),"profiling capability changed");
+            handed.frame_id(7);handed.begin();
+            std::thread worker([&]{handed.submit();});worker.join();
+        }
+        std::ifstream handed(profile_path);std::string last;
+        while(std::getline(handed,line))if(!line.empty()&&line[0]!='#')last=line;
+        require(last.size()>4&&last.substr(last.size()-4)==",0,0","cross-thread CPU clocks were subtracted");
+        std::filesystem::remove(profile_path);
+        std::puts("ok: lagged GPU submission timestamps, CPU recording/retirement, explicit frame labels and final-slot draining");
     }
 
     const auto path = (std::filesystem::temp_directory_path() /

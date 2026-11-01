@@ -349,6 +349,7 @@ struct State {
   ~State() { shutdown(); }
   void frame() {
     if (!cmd) {
+      ring->frame_id(g_frame);
       cmd = ring->begin();
       if (!screen) {
 #ifdef LINDBERGH_VULKAN_XR
@@ -649,6 +650,7 @@ extern "C" int lvk_host_init(SDL_Window *window, int w, int h) {
     if (!cache_path.empty()) std::fprintf(stderr,"[vulkan] pipeline cache %s: %s\n",
                                          state.cache->loaded()?"loaded":"cold",cache_path.c_str());
     state.ring = std::make_unique<FrameRing>(*state.device, 3, 64u << 20);
+    if(const auto *path=std::getenv("LINDBERGH_VULKAN_SUBMISSION_TIMINGS"))state.ring->profile(path);
 #ifdef LINDBERGH_VULKAN_XR
     const auto density=state.xr->density_extent();
     state.unfocused_density=std::make_unique<ConstantDensityMap>(*state.device,*state.ring,density[0],density[1],2);
