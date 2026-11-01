@@ -587,9 +587,10 @@ static void h_snprintf(CPU *c)
 }
 
 /* ---- stdio ---- */
+static int host_device_refused(const char *path);   /* below, with open() */
 static void h_fopen (CPU *c)
 {
-    FILE *f = fopen(ASTR(0), ASTR(1));
+    FILE *f = host_device_refused(ASTR(0)) ? NULL : fopen(ASTR(0), ASTR(1));
     if (getenv("LINDBERGH_OPENS") || !f)
         fprintf(stderr, "[open] fopen(%s, %s) -> %s\n", ASTR(0), ASTR(1), f ? "ok" : "FAILED");
     RET(guest_file_wrap(f));
@@ -1170,9 +1171,31 @@ static int guest_open_flags(uint32_t f)
     return out;
 }
 
+/* The cabinet's devices are not the host's. On macOS and Android none of
+ * them exist, but desktop Linux (Steam Frame) has real /dev/input/js*,
+ * /dev/ttyS* and the like: the game opened Steam's virtual pad as its I/O and
+ * blocked for good in read() before its first frame. So the guest gets no
+ * host device - only the pseudo-devices that are the same everywhere. */
+static int host_device_refused(const char *path)
+{
+    static const char *const allowed[] = {
+        "/dev/null", "/dev/zero", "/dev/random", "/dev/urandom", NULL };
+    if (!path || strncmp(path, "/dev/", 5)) return 0;
+    for (int i = 0; allowed[i]; i++)
+        if (!strcmp(path, allowed[i])) return 0;
+    return 1;
+}
+
 static void h_open(CPU *c)
 {
     int fd = rideboard_open(ASTR(0));
+    if (fd < 0 && host_device_refused(ASTR(0))) {
+        if (g_guest_errno) *g_guest_errno = 2;     /* ENOENT: no such device here */
+        if (getenv("LINDBERGH_OPENS"))
+            fprintf(stderr, "[open] %s -> -1 (host device withheld)\n", ASTR(0));
+        RET(-1);
+        return;
+    }
     if (fd < 0) fd = _open(ASTR(0), guest_open_flags(A32(1)), 0666);
     /* The cabinet's devices are the ones that matter here: a JVS I/O board
      * hangs off a serial port, and a game that cannot open it stops at an
