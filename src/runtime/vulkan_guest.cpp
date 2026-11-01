@@ -67,6 +67,7 @@ struct BufferVersion {
   uint64_t revision = 0, use_frame = 0;
 };
 struct TextureObject {
+  uint32_t layers = 1;
   uint64_t revision = 1;
   bool dynamic = false;
   ImageVersion stable;
@@ -542,7 +543,13 @@ extern "C" unsigned lvk_create_drawable(int w, int h) {
   if (w <= 0 || h <= 0)
     gap("invalid guest drawable dimensions");
   const auto id = state.next_drawable++;
-  TargetInfo info{uint32_t(w), uint32_t(h), 1};
+  TargetInfo info{uint32_t(w), uint32_t(h),
+#ifdef LINDBERGH_VULKAN_XR
+                  2
+#else
+                  1
+#endif
+  };
   info.guest_bottom_origin=true;
   state.drawables[id] = std::make_unique<Target>(*state.device, info);
   return id;
@@ -1622,7 +1629,7 @@ std::shared_ptr<Texture> native_image(TextureObject &o, int overwritten_level = 
     return state.fallback;
   }
   const auto &base=o.levels.at(0);
-  TextureInfo info{uint32_t(base.width),uint32_t(base.height),uint32_t(o.levels.rbegin()->first+1),1,texture_format(base)};
+  TextureInfo info{uint32_t(base.width),uint32_t(base.height),uint32_t(o.levels.rbegin()->first+1),o.layers,texture_format(base)};
   if(base.format==GL_BGRA && base.type==GL_UNSIGNED_SHORT_4_4_4_4_REV)
     info.components={VK_COMPONENT_SWIZZLE_G,VK_COMPONENT_SWIZZLE_B,VK_COMPONENT_SWIZZLE_A,VK_COMPONENT_SWIZZLE_R};
   if(base.format==GL_LUMINANCE)info.components={VK_COMPONENT_SWIZZLE_R,VK_COMPONENT_SWIZZLE_R,VK_COMPONENT_SWIZZLE_R,VK_COMPONENT_SWIZZLE_ONE};
@@ -1632,7 +1639,7 @@ std::shared_ptr<Texture> native_image(TextureObject &o, int overwritten_level = 
   const auto frame=state.ring->submissions()+1;
   if(version.revision!=o.revision) {
     if(!version.image || version.use_frame==frame || version.image->info.width!=info.width || version.image->info.height!=info.height ||
-        version.image->info.levels!=info.levels || version.image->info.format!=info.format ||
+        version.image->info.levels!=info.levels || version.image->info.layers!=info.layers || version.image->info.format!=info.format ||
         std::memcmp(&version.image->info.components,&info.components,sizeof info.components))
       version.image=std::make_shared<Texture>(*state.device,info);
     for(const auto &[level,v]:o.levels) {
@@ -1650,7 +1657,8 @@ std::shared_ptr<Texture> native_image(TextureObject &o, int overwritten_level = 
         for(size_t i=0;i<bytes;i+=4) {uint32_t d;std::memcpy(&d,v.bytes.data()+i,4);const float f=float(double(d)/4294967295.0);std::memcpy(expanded.data()+i,&f,4);}
         data=expanded.data();
       }
-      version.image->upload(state.cmd,*state.ring,uint32_t(level),0,data,bytes);
+      for(uint32_t layer=0;layer<info.layers;++layer)
+        version.image->upload(state.cmd,*state.ring,uint32_t(level),layer,data,bytes);
     }
     version.revision=o.revision;
   }
@@ -1748,8 +1756,9 @@ extern "C" void lvk_glCopyTexSubImage2D(GLenum target,GLint level,GLint dx,GLint
   if(!state.initialized.count(source)) {state.renderer();state.end_pass();}
   const auto &v=o.levels.at(level);
   const bool full_level=dx==0 && dy==0 && w==v.width && h==v.height;
+  o.layers=source->info.layers;
   changed(o);auto gpu=native_image(o,full_level?level:-1);
-  gpu->copy_from(state.cmd,*source,uint32_t(level),dx,dy,x,y,uint32_t(w),uint32_t(h));
+  gpu->copy_from(state.cmd,*source,uint32_t(level),dx,dy,x,y,uint32_t(w),uint32_t(h),0,0,o.layers);
 }
 
 namespace {
@@ -1899,7 +1908,10 @@ std::shared_ptr<Material> material(Program &p) {
     const auto unit=p.sampler_units[int(s.binding)];if(unit<0||unit>=8)gap("guest sampler texture unit outside supported range");
     auto &object=state.texture_objects[state.textures[unsigned(unit)]];
     auto image=native_image(object);auto sampler=native_sampler(object,image->info.levels,s.type.find("Shadow")!=std::string::npos);
-    bindings.push_back({s.binding,image->view(),sampler->handle()});key_word(key,(uint64_t)(uintptr_t)image->view());key_word(key,(uint64_t)(uintptr_t)sampler->handle());
+    const bool array=s.type.find("2DArray")!=std::string::npos;
+    if(image->info.layers>1 && !array)gap("stereo texture requires a rebuilt offline shader archive with array samplers");
+    const auto view=array?image->array_view():image->view();
+    bindings.push_back({s.binding,view,sampler->handle()});key_word(key,(uint64_t)(uintptr_t)view);key_word(key,(uint64_t)(uintptr_t)sampler->handle());
     images.push_back(image);samplers.push_back(sampler);
   }
   auto &entry=state.materials[state.ring->recording_slot()][key];

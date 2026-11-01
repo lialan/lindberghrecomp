@@ -98,6 +98,7 @@ function(lindbergh_runtime target generated_dir)
             "${LINDBERGH_RUNTIME_DIR}/glsl_pp.c"
             "${LINDBERGH_RUNTIME_DIR}/glsl_compat.c"
             "${LINDBERGH_RUNTIME_DIR}/stereo.c"
+            "${LINDBERGH_RUNTIME_DIR}/stereo_projection.c"
             "${LINDBERGH_RUNTIME_DIR}/gl_thread.c"
             "${LINDBERGH_RUNTIME_DIR}/hle_openal.c"
             "${LINDBERGH_RUNTIME_DIR}/hle_alsa.c"
@@ -108,7 +109,7 @@ function(lindbergh_runtime target generated_dir)
         target_compile_definitions(${target} PRIVATE RECOMP_GUEST_BASE=1)
     endif()
     if(LINDBERGH_RENDERER STREQUAL "VULKAN")
-        list(REMOVE_ITEM platform_sources "${LINDBERGH_RUNTIME_DIR}/stereo.c")
+        list(REMOVE_ITEM platform_sources "${LINDBERGH_RUNTIME_DIR}/stereo.c" "${LINDBERGH_RUNTIME_DIR}/stereo_projection.c")
         set(abi "${CMAKE_CURRENT_BINARY_DIR}/vulkan-abi-${target}")
         set(abi_inputs "${LINDBERGH_RUNTIME_DIR}/hle_gl_posix.c"
             "${LINDBERGH_RUNTIME_DIR}/arbprog.c" "${LINDBERGH_RUNTIME_DIR}/host_sdl.c"

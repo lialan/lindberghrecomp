@@ -115,6 +115,19 @@ Texture::Texture(Device &device, TextureInfo texture) : info(texture), device_(d
     } catch (...) { release(); throw; }
 }
 
+VkImageView Texture::array_view()
+{
+    if (info.layers > 1) return view_;
+    if (!array_view_) {
+        VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        view.image=image_;view.format=info.format;view.components=info.components;
+        view.viewType=VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+        view.subresourceRange={info.format==Target::depth_format?VK_IMAGE_ASPECT_DEPTH_BIT:VK_IMAGE_ASPECT_COLOR_BIT,0,info.levels,0,1};
+        check(vkCreateImageView(device_.handles.device,&view,nullptr,&array_view_),"one-layer array texture view");
+    }
+    return array_view_;
+}
+
 void Texture::upload(VkCommandBuffer cmd, FrameRing &ring, uint32_t level, uint32_t layer,
                      const void *data, size_t bytes)
 {
@@ -147,9 +160,12 @@ void Texture::upload(VkCommandBuffer cmd, FrameRing &ring, uint32_t level, uint3
 }
 
 void Texture::copy_from(VkCommandBuffer cmd, Target &source, uint32_t level, int32_t dx, int32_t dy,
-                         int32_t sx, int32_t sy, uint32_t width, uint32_t height)
+                         int32_t sx, int32_t sy, uint32_t width, uint32_t height,
+                         uint32_t source_layer, uint32_t destination_layer, uint32_t layer_count)
 {
-    if (level >= info.levels || info.layers != 1 || !width || !height || dx < 0 || dy < 0 || sx < 0 || sy < 0 ||
+    if (!layer_count || source_layer >= source.info.layers || layer_count > source.info.layers-source_layer ||
+        destination_layer >= info.layers || layer_count > info.layers-destination_layer ||
+        level >= info.levels || !width || !height || dx < 0 || dy < 0 || sx < 0 || sy < 0 ||
         uint64_t(dx)+width > std::max(1u,info.width>>level) || uint64_t(dy)+height > std::max(1u,info.height>>level) ||
         uint64_t(sx)+width > source.info.width || uint64_t(sy)+height > source.info.height)
         throw std::invalid_argument("Invalid Vulkan texture copy rectangle");
@@ -157,42 +173,54 @@ void Texture::copy_from(VkCommandBuffer cmd, Target &source, uint32_t level, int
     const auto aspect = depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
     const VkImageAspectFlags all_aspects = depth ? VK_IMAGE_ASPECT_DEPTH_BIT|VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
     const auto old = depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : source.info.final_layout;
-    VkImageMemoryBarrier barriers[2]{};
+    // Render targets have one or two layers. Both eyes share one GPU copy
+    // command; only destination layout transitions need per-layer state.
+    VkImageMemoryBarrier barriers[3]{};
+    const uint32_t barrier_count=1+layer_count;
     for (auto &b : barriers) { b.sType=VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER; b.srcQueueFamilyIndex=b.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED; }
     auto &from=barriers[0]; from.image=depth?source.depth_image():source.color;
-    from.subresourceRange={all_aspects,0,1,0,1}; from.oldLayout=old; from.newLayout=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    from.subresourceRange={all_aspects,0,1,source_layer,layer_count}; from.oldLayout=old; from.newLayout=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     from.srcAccessMask=depth?VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT:VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
     from.dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT;
-    auto &to=barriers[1]; to.image=image_; to.subresourceRange={all_aspects,level,1,0,1};
-    to.oldLayout=initialized_[level]?VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:VK_IMAGE_LAYOUT_UNDEFINED;
-    to.newLayout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; to.srcAccessMask=initialized_[level]?VK_ACCESS_SHADER_READ_BIT:0;
-    to.dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;
-    vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,0,nullptr,2,barriers);
+    for (uint32_t layer=0;layer<layer_count;++layer) {
+        const uint32_t destination=destination_layer+layer;
+        const bool initialized=initialized_[size_t(destination)*info.levels+level];
+        auto &to=barriers[1+layer];to.image=image_;
+        to.subresourceRange={all_aspects,level,1,destination,1};
+        to.oldLayout=initialized?VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:VK_IMAGE_LAYOUT_UNDEFINED;
+        to.newLayout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;to.srcAccessMask=initialized?VK_ACCESS_SHADER_READ_BIT:0;
+        to.dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;
+    }
+    vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,0,nullptr,barrier_count,barriers);
     if(source.info.guest_bottom_origin && (depth || source.info.color_format==info.format)) {
-        VkImageCopy copy{}; copy.srcSubresource={aspect,0,0,1}; copy.srcOffset={sx,sy,0};
-        copy.dstSubresource={aspect,level,0,1}; copy.dstOffset={dx,dy,0}; copy.extent={width,height,1};
-        vkCmdCopyImage(cmd,from.image,from.newLayout,image_,to.newLayout,1,&copy);
+        VkImageCopy copy{}; copy.srcSubresource={aspect,0,source_layer,layer_count}; copy.srcOffset={sx,sy,0};
+        copy.dstSubresource={aspect,level,destination_layer,layer_count}; copy.dstOffset={dx,dy,0}; copy.extent={width,height,1};
+        vkCmdCopyImage(cmd,from.image,from.newLayout,image_,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&copy);
     } else {
         VkFormatProperties props;
         vkGetPhysicalDeviceFormatProperties(device_.handles.physical,info.format,&props);
         if(!(props.optimalTilingFeatures&VK_FORMAT_FEATURE_BLIT_DST_BIT)) throw std::runtime_error("Texture copy requires supported Vulkan blit format");
-        VkImageBlit blit{}; blit.srcSubresource={aspect,0,0,1}; blit.dstSubresource={aspect,level,0,1};
+        VkImageBlit blit{}; blit.srcSubresource={aspect,0,source_layer,layer_count}; blit.dstSubresource={aspect,level,destination_layer,layer_count};
         blit.srcOffsets[0]={sx,source.info.guest_bottom_origin?sy:int32_t(source.info.height)-sy,0};
         blit.srcOffsets[1]={sx+int32_t(width),source.info.guest_bottom_origin?sy+int32_t(height):int32_t(source.info.height)-sy-int32_t(height),1};
         blit.dstOffsets[0]={dx,dy,0}; blit.dstOffsets[1]={dx+int32_t(width),dy+int32_t(height),1};
-        vkCmdBlitImage(cmd,from.image,from.newLayout,image_,to.newLayout,1,&blit,VK_FILTER_NEAREST);
+        vkCmdBlitImage(cmd,from.image,from.newLayout,image_,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&blit,VK_FILTER_NEAREST);
     }
     from.oldLayout=from.newLayout; from.newLayout=old; from.srcAccessMask=VK_ACCESS_TRANSFER_READ_BIT;
     from.dstAccessMask=depth?VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT|VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT:
                            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT|VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    to.oldLayout=to.newLayout; to.newLayout=VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    to.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT; to.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;
-    vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,0,0,nullptr,0,nullptr,2,barriers);
-    initialized_[level]=true;
+    for (uint32_t layer=0;layer<layer_count;++layer) {
+        auto &to=barriers[1+layer];
+        to.oldLayout=to.newLayout;to.newLayout=VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        to.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;to.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;
+        initialized_[size_t(destination_layer+layer)*info.levels+level]=true;
+    }
+    vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,0,0,nullptr,0,nullptr,barrier_count,barriers);
 }
 
 void Texture::release()
 {
+    if (array_view_) vkDestroyImageView(device_.handles.device, array_view_, nullptr);
     if (view_) vkDestroyImageView(device_.handles.device, view_, nullptr);
     if (image_) vkDestroyImage(device_.handles.device, image_, nullptr);
     if (memory_) vkFreeMemory(device_.handles.device, memory_, nullptr);

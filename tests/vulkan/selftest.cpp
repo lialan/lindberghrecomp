@@ -1,3 +1,4 @@
+#include "../../src/runtime/stereo_projection.h"
 #include "device.hpp"
 #include "frame_ring.hpp"
 #include "renderer.hpp"
@@ -117,8 +118,18 @@ static void render_stereo(Device &device)
         {{-0.4f,  0.9f, 0, 1}, {1, 0, 0, 1}}
     };
     Matrices matrices{};
-    for (auto &m : matrices.view_projection) for (unsigned i = 0; i < 4; i++) m[i * 5] = 1;
-    matrices.view_projection[1][12] = 0.8f;
+    // The same camera/HUD projection helper used by the GL stereo backend
+    // produces direct Vulkan clip transforms. No replay or host GL is needed.
+    Matrix game_projection{};game_projection[0]=game_projection[5]=1;
+    game_projection[10]=-2;game_projection[11]=-1;game_projection[14]=-3;
+    const float tangents[]={1,1,1,1},screen_lens[]={1,1};
+    for(unsigned eye=0;eye<2;++eye) {
+        auto view=identity();view[12]=eye?1.2f:0;
+        LgStereoProjection policy{view.data(),view.data(),tangents,screen_lens,3};
+        Matrix effective;
+        lg_stereo_eye_projection(game_projection.data(),LG_STEREO_WORLD,&policy,effective.data());
+        require(lg_stereo_clip_reprojection(game_projection.data(),effective.data(),matrices.view_projection[eye]),"shared eye reprojection rejected a valid camera");
+    }
     dormant=state;dormant.src_rgb=VK_BLEND_FACTOR_SRC_ALPHA;dormant.dst_rgb=VK_BLEND_FACTOR_ONE;
     renderer.draw(ring, triangle, 3, matrices, dormant);
     renderer.end();
@@ -224,8 +235,8 @@ static void render_stereo(Device &device)
     Texture legacy_texture(device, texture_info);
     Texture texture(device, {2, 2, 2});
     Sampler sampler(device);
-    SampledSet material(device, {{0, texture.view(), sampler.handle()}});
-    SampledSet legacy_material(device, {{0, legacy_texture.view(), sampler.handle()}});
+    SampledSet material(device, {{0, texture.array_view(), sampler.handle()}});
+    SampledSet legacy_material(device, {{0, legacy_texture.array_view(), sampler.handle()}});
     ProgramSource legacy{vs.data(), fs.data(), vs.size() * 4, fs.size() * 4,
         {{0, sizeof(Vertex), VK_VERTEX_INPUT_RATE_VERTEX}},
         {{0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(Vertex, position)},
@@ -271,7 +282,7 @@ static void render_stereo(Device &device)
         const bool is_4444=format==VK_FORMAT_R4G4B4A4_UNORM_PACK16;
         if (is_4444) packed_info.components={VK_COMPONENT_SWIZZLE_G,VK_COMPONENT_SWIZZLE_B,VK_COMPONENT_SWIZZLE_A,VK_COMPONENT_SWIZZLE_R};
         Texture packed(device, packed_info);
-        SampledSet packed_material(device, {{0,packed.view(),sampler.handle()}});
+        SampledSet packed_material(device, {{0,packed.array_view(),sampler.handle()}});
         cmd=ring.begin();
         const uint8_t bgra[]={0,0,255,255}, rgb565[]={0,248}, bgra4444[]={0,255};
         const bool is_565=format==VK_FORMAT_R5G6B5_UNORM_PACK16;
@@ -292,6 +303,33 @@ static void render_stereo(Device &device)
                 "packed guest texture channels changed");
     }
     std::puts("ok: native BGRA8888, RGB565 and swizzled BGRA4444 guest storage samples without pixel conversion");
+
+    // Copy both rendered eye images into an array texture, then sample that
+    // texture in another multiview pass. A layer-0-only copy or sampler would
+    // put the left eye's triangle in the right eye and fail these pixel checks.
+    Texture eye_copy(device,{32,32,1,2});
+    SampledSet eye_material(device,{{0,eye_copy.array_view(),sampler.handle()}});
+    require(eye_copy.array_view()==eye_copy.array_view(),"array texture view was recreated");
+    cmd=ring.begin();
+    std::vector<uint8_t> old_pixels(32*32*4,0);
+    eye_copy.upload(cmd,ring,0,0,old_pixels.data(),old_pixels.size()); // mixed destination layouts
+    eye_copy.copy_from(cmd,target,0,0,0,0,0,32,32,0,0,2);
+    rejected([&]{eye_copy.copy_from(cmd,target,0,0,0,0,0,32,32,1,0,2);},"invalid stereo source layers accepted");
+    rejected([&]{eye_copy.copy_from(cmd,target,0,0,0,0,0,32,32,0,1,2);},"invalid stereo destination layers accepted");
+    converted.begin(cmd,{0,0,0,1});bind_legacy(converted);
+    auto eyes_ds=eye_material.handle();converted.bind_descriptors(2,1,&eyes_ds);
+    auto eyes_offset=uniforms.upload(0,guest_uniforms.bytes().data(),guest_uniforms.bytes().size());
+    eyes_ds=uniforms.current_set();converted.bind_descriptors(1,1,&eyes_ds,1,&eyes_offset);
+    Matrices full_screen{};for(auto &m:full_screen.view_projection)for(unsigned i=0;i<4;++i)m[i*5]=1;
+    const Vertex quad[]={{{-1,-1,0,1},{1,1,1,1}},{{1,-1,0,1},{1,1,1,1}},{{1,1,0,1},{1,1,1,1}},
+                         {{-1,-1,0,1},{1,1,1,1}},{{1,1,0,1},{1,1,1,1}},{{-1,1,0,1},{1,1,1,1}}};
+    converted.draw(ring,quad,6,full_screen,state);converted.end();
+    vkCmdCopyImageToBuffer(cmd,target.color,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,output.buffer,1,&copy);
+    vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&barrier,0,nullptr);
+    ring.wait(ring.submit());
+    pixel(0,8,16,255);pixel(0,24,16,0);pixel(1,8,16,0);pixel(1,24,16,255);
+    std::puts("ok: both eyes survive a GPU framebuffer copy and converted postprocessing sample");
+
 
     // Different draws and frames must retain independent uniform snapshots even
     // with several frames in flight and descriptor sets recycled by slot.
@@ -367,7 +405,7 @@ static void render_stereo(Device &device)
     SamplerInfo mip_info;
     mip_info.min_lod = mip_info.max_lod = 1;
     Sampler mip_sampler(device, mip_info);
-    SampledSet mip_material(device, {{0, texture.view(), mip_sampler.handle()}});
+    SampledSet mip_material(device, {{0, texture.array_view(), mip_sampler.handle()}});
     const uint8_t texels[] = {255,0,0,255, 0,255,0,255, 0,0,255,255, 255,255,255,255};
     const uint8_t mip[] = {255,255,0,255};
     for (auto &m : matrices.view_projection) m[12] = 0;
@@ -494,8 +532,88 @@ static void render_copy(Device &device)
     std::puts("ok: preserving pbuffer passes, guest bottom-origin viewport and GPU color/depth copies");
 }
 
+static void render_stereo_depth_copy(Device &device)
+{
+    TargetInfo info{16,16,2};info.guest_bottom_origin=true;
+    Target target(device,info);PipelineCache cache(device,"");Renderer renderer(device,target,cache);
+    RasterState raster;renderer.prepare(raster);
+    Texture depth(device,{16,16,1,2,Target::depth_format});
+    Texture routed(device,{16,16,1,2,Target::depth_format});
+    Readback output(device,16*16*4*6);FrameRing ring(device);
+    auto cmd=ring.begin();
+    std::vector<float> old_depth(16*16,.9f);
+    depth.upload(cmd,ring,0,0,old_depth.data(),old_depth.size()*4);
+    routed.upload(cmd,ring,0,1,old_depth.data(),old_depth.size()*4);
+    Matrices matrices{};for(auto &m:matrices.view_projection)for(unsigned i=0;i<4;++i)m[i*5]=1;
+    matrices.view_projection[1][14]=.5f;
+    Vertex triangle[]={{{-1,-1,0,1},{1,0,0,1}},{{0,-1,0,1},{1,0,0,1}},{{-.5f,1,0,1},{1,0,0,1}}};
+    renderer.begin(cmd,{0,0,0,1});renderer.draw(ring,triangle,3,matrices,raster);renderer.end();
+    depth.copy_from(cmd,target,0,0,0,0,0,16,16,0,0,2);
+    routed.copy_from(cmd,target,0,0,0,0,0,16,16,1,0,1);
+    const VkImage images[]={target.depth_image(),depth.image(),routed.image()};
+    VkImageMemoryBarrier barriers[3]{};
+    for(unsigned i=0;i<3;++i) {
+        auto &b=barriers[i];b.sType=VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        b.image=images[i];b.srcQueueFamilyIndex=b.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
+        b.oldLayout=i?VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        b.newLayout=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;b.srcAccessMask=VK_ACCESS_MEMORY_WRITE_BIT|VK_ACCESS_MEMORY_READ_BIT;b.dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT;
+        b.subresourceRange={VK_IMAGE_ASPECT_DEPTH_BIT|VK_IMAGE_ASPECT_STENCIL_BIT,0,1,0,2};
+    }
+    vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,0,nullptr,3,barriers);
+    for(unsigned i=0;i<3;++i) {
+        VkBufferImageCopy copy{};copy.bufferOffset=i*16*16*4*2;
+        copy.imageSubresource={VK_IMAGE_ASPECT_DEPTH_BIT,0,0,2};copy.imageExtent={16,16,1};
+        vkCmdCopyImageToBuffer(cmd,images[i],VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,output.buffer,1,&copy);
+    }
+    VkBufferMemoryBarrier ready{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};ready.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;ready.dstAccessMask=VK_ACCESS_HOST_READ_BIT;
+    ready.srcQueueFamilyIndex=ready.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;ready.buffer=output.buffer;ready.size=VK_WHOLE_SIZE;
+    vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&ready,0,nullptr);
+    ring.wait(ring.submit());const auto *z=static_cast<const float *>(output.mapped);
+    require(!std::memcmp(z,z+512,512*4),"stereo GPU depth copy lost an eye");
+    require(z[2*16+4]==.5f && z[256+2*16+4]==.75f,"stereo depth fixture lacks distinct eye depths");
+    require(!std::memcmp(z+256,z+1024,256*4),"explicit source eye was not routed to destination eye");
+    for(unsigned i=0;i<256;++i) require(z[1280+i]==.9f,"copy overwrote an untouched destination eye");
+    std::puts("ok: stereo GPU depth copies preserve each eye, mixed layouts and explicit layer routing");
+}
+
+static void test_shared_projection()
+{
+    auto p=identity(),view=identity(),head=identity();
+    p[10]=-2;p[11]=-1;p[14]=-3;p[15]=0;
+    const float tan[]={1,1,1,1},lens[]={1,1};
+    LgStereoProjection eye{view.data(),head.data(),tan,lens,3};
+    Matrix effective{},reprojection{};
+    lg_stereo_eye_projection(p.data(),LG_STEREO_PASS,&eye,effective.data());
+    require(effective==p,"offscreen pass changed guest projection");
+    lg_stereo_eye_projection(p.data(),LG_STEREO_WORLD,&eye,effective.data());
+    require(effective==p,"matching eye camera changed finite guest projection");
+    require(lg_stereo_clip_reprojection(p.data(),effective.data(),reprojection.data()),"finite guest clip inverse failed");
+    const auto unit=identity();
+    for(unsigned i=0;i<16;++i) require(std::fabs(reprojection[i]-unit[i])<1e-6f,"matching camera clip transform is not identity");
+    view[12]=1;
+    auto ortho=identity();
+    lg_stereo_eye_projection(ortho.data(),LG_STEREO_HUD,&eye,effective.data());
+    // A head-locked screen stays centred despite a translated world view.
+    require(effective[12]==0 && effective[15]==3 && std::fabs(effective[0]-3)<1e-6f,"HUD screen no longer follows the selected head view");
+    eye.hud_view=view.data();
+    lg_stereo_eye_projection(ortho.data(),LG_STEREO_HUD,&eye,effective.data());
+    require(effective[12]==1,"world-locked HUD did not use world view");
+    lg_stereo_eye_projection(p.data(),LG_STEREO_FILL,&eye,effective.data());
+    for(unsigned c=0;c<4;++c) require(effective[4*c+2]==-.999f*effective[4*c+3],"fill did not cover the eye at the foreground plane");
+    // Infinite-far matrices are invertible even when their float Z scale is -1.
+    p[10]=-1;p[14]=-.2f;
+    lg_stereo_eye_projection(p.data(),LG_STEREO_WORLD,&eye,effective.data());
+    for(float v:effective) require(std::isfinite(v),"infinite far projection generated nonfinite coefficients");
+    require(effective[10]==-1 && effective[14]==-.2f,"infinite guest depth coefficients were lost");
+    require(lg_stereo_clip_reprojection(p.data(),effective.data(),reprojection.data()),"infinite-far clip inverse failed");
+    Matrix singular{};auto unchanged=reprojection;
+    require(!lg_stereo_clip_reprojection(singular.data(),effective.data(),reprojection.data()) && reprojection==unchanged,"singular inverse modified output or was silently accepted");
+    std::puts("ok: shared world/HUD/pass/fill projection and deep-scene clip reprojection");
+}
+
 int main(int argc, char **argv)
 try {
+    test_shared_projection();
     require(shader_source_digest("a\r\n") == shader_source_digest("a \n"),
             "shader identity differs from guest CR normalization");
     require(shader_source_digest("a") == shader_source_digest("a\n"),
@@ -543,6 +661,7 @@ try {
              "unsupported texture component swizzle accepted");
     render_stereo(*device);
     render_copy(*device);
+    render_stereo_depth_copy(*device);
     if (argc == 2) {
         ShaderPack game_pack(argv[1]);
         size_t fields = 0;

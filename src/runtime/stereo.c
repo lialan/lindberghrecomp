@@ -44,6 +44,7 @@
 
 #include "gl_posix.h"
 #include "stereo.h"
+#include "stereo_projection.h"
 #ifdef LINDBERGH_GL4ES
 #include <EGL/egl.h>
 #endif
@@ -240,7 +241,7 @@ static void mat_frustum(float *m, double l, double r, double b, double t, double
     m[8] = (float)((r + l) / (r - l)); m[9] = (float)((t + b) / (t - b));
     m[10] = (float)(-(f + n) / (f - n)); m[11] = -1; m[14] = (float)(-2 * f * n / (f - n));
 }
-static int is_perspective(const float *m) { return fabsf(m[11] + 1) < 1e-4f && fabsf(m[15]) < 1e-4f; }
+static int is_perspective(const float *m) { return lg_stereo_is_perspective(m); }
 
 /* What GL is given for the game's projection p.
  *
@@ -278,10 +279,8 @@ int stereo_hud_is_head_locked(void)
 
 static void effective_projection(const float *p, int hud, float *out)
 {
-    if (!g_on || hud == 2) { memcpy(out, p, 64); return; }
-    if (hud == 3) {     /* a 2D layer over the whole screen - a fade, a wipe: over the whole eye, in front */
-        memcpy(out, p, 64);
-        for (int col = 0; col < 4; col++) out[col * 4 + 2] = -0.999f * out[col * 4 + 3];
+    if (!g_on || hud == LG_STEREO_PASS || hud == LG_STEREO_FILL) {
+        lg_stereo_eye_projection(p,!g_on?LG_STEREO_PASS:hud,NULL,out);
         return;
     }
     if (g_wide) {
@@ -295,29 +294,9 @@ static void effective_projection(const float *p, int hud, float *out)
             for (int col = 0; col < 4; col++) out[col * 4] += g_wide_s * out[col * 4 + 3];
         return;
     }
-    const float *t = g_tan[g_eye];
-    float e[16], ev[16];
-    if (is_perspective(p) && !hud) {
-        memcpy(g_last_persp, p, 64);
-        float n = p[14] / (p[10] - 1), f = p[14] / (p[10] + 1);
-        mat_frustum(e, -t[0] * n, t[1] * n, -t[2] * n, t[3] * n, n, f);
-        mat_mul(out, e, g_view[g_eye]);
-        return;
-    }
-    if (!hud) { memcpy(out, p, 64); return; }
-    float d = g_screen_dist, sc[16];
-    mat_identity(sc);                   /* game NDC -> a point on the screen */
-    sc[0] = d / g_screen_lens[0]; sc[5] = d / g_screen_lens[1];
-    sc[10] = -0.02f * d;                /* a sliver of depth keeps the game's depth order */
-    sc[14] = -d;
-    /* near and far close around the screen: everything on it lies within
-     * that sliver, and a 1 cm near plane left the depth buffer only ~1300
-     * steps there - a scoped view's whole scene fought over them */
-    float zn = 0.25f * d, zf = 4.0f * d;
-    mat_frustum(e, -t[0] * zn, t[1] * zn, -t[2] * zn, t[3] * zn, zn, zf);
-    mat_mul(ev, e, hud_view(g_eye));
-    mat_mul(ev, ev, sc);
-    mat_mul(out, ev, p);
+    if (is_perspective(p) && !hud) memcpy(g_last_persp,p,64);
+    const LgStereoProjection eye={g_view[g_eye],hud?hud_view(g_eye):g_view[g_eye],g_tan[g_eye],g_screen_lens,g_screen_dist};
+    lg_stereo_eye_projection(p,hud,&eye,out);
 }
 
 static int mat_invert(const float *m, float *out);

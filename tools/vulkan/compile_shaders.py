@@ -14,7 +14,7 @@ import re
 import subprocess
 
 VERSION = "lindbergh-vulkan-glsl-1"
-GENERATOR_HASH = hashlib.sha256(Path(__file__).read_bytes() + Path(__file__).with_name("legacy.glsl").read_bytes()).digest()
+GENERATOR_HASH = hashlib.sha256(Path(__file__).read_bytes() + Path(__file__).with_name("legacy.glsl").read_bytes() + Path(__file__).with_name("sampling.glsl").read_bytes()).digest()
 DECL = re.compile(r"\b(attribute|varying)\s+(\w+)\s+(\w+)\s*(\[\s*(\d+)\s*\])?\s*;")
 SAMPLER = re.compile(r"\buniform\s+(sampler\w+)\s+(\w+)\s*(\[[^]]+\])?\s*;")
 BUILTIN_INPUTS = {
@@ -100,8 +100,10 @@ def convert(source, stage, interface, attributes, samplers):
         replacements.update({"gl_Color": "(gl_FrontFacing ? legacy_front_color : legacy_back_color)",
                              "gl_SecondaryColor": "(gl_FrontFacing ? legacy_front_secondary : legacy_back_secondary)",
                              "gl_FragColor": "legacy_frag_color", "gl_FragCoord": "legacy_frag_coord()"})
-    replacements.update({"texture2D": "texture", "textureCube": "texture", "texture3D": "texture",
-                         "texture2DProj": "textureProj", "texture2DLod": "textureLod",
+    replacements.update({"sampler2D": "sampler2DArray", "sampler2DShadow": "sampler2DArrayShadow",
+                         "texture2D": "legacy_texture2D", "textureCube": "texture", "texture3D": "texture",
+                         "texture2DProj": "legacy_texture2DProj", "texture2DLod": "legacy_texture2DLod",
+                         "texture2DProjLod": "legacy_texture2DProjLod",
                          "ftransform": "legacy_ftransform", "shadow2D": "legacy_shadow2D", "shadow2DProj": "legacy_shadow2DProj"})
     source = re.sub(r"\b(?:" + "|".join(re.escape(k) for k in replacements) + r")\b",
                     lambda m: replacements[m[0]], source)
@@ -139,7 +141,9 @@ void main() {
     if(!keep) discard;
 }
 """
-    return "\n".join(prefix) + "\n" + legacy + "\n" + source
+    sampling = Path(__file__).with_name("sampling.glsl").read_text()
+    if stage == "vert": sampling = sampling.split("// FRAGMENT_BIAS_OVERLOADS")[0]
+    return "\n".join(prefix) + "\n" + legacy + "\n" + sampling + "\n" + source
 
 
 def program_key(row, root):

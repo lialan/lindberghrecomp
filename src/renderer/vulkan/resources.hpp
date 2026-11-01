@@ -39,14 +39,16 @@ public:
     void upload(VkCommandBuffer cmd, FrameRing &ring, uint32_t level, uint32_t layer,
                 const void *data, size_t bytes);
     void copy_from(VkCommandBuffer cmd, Target &source, uint32_t level, int32_t dst_x, int32_t dst_y,
-                   int32_t src_x, int32_t src_y, uint32_t width, uint32_t height);
+                   int32_t src_x, int32_t src_y, uint32_t width, uint32_t height,
+                   uint32_t source_layer = 0, uint32_t destination_layer = 0, uint32_t layer_count = 1);
     VkImage image() const { return image_; }
     VkImageView view() const { return view_; }
+    VkImageView array_view(); // cached array view; one-layer static images are shared by both eyes
     const TextureInfo info;
 private:
     Device &device_;
     VkImage image_ = VK_NULL_HANDLE;
-    VkImageView view_ = VK_NULL_HANDLE;
+    VkImageView view_ = VK_NULL_HANDLE, array_view_ = VK_NULL_HANDLE;
     VkDeviceMemory memory_ = VK_NULL_HANDLE;
     std::vector<bool> initialized_;
     uint32_t block_width_, block_bytes_;
