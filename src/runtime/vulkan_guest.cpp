@@ -1675,7 +1675,8 @@ RasterState raster_state(bool fixed) {
 Program &current_program() {
   if(state.program)return state.programs.at(state.program);
   if(!state.fixed_pack) {
-    state.fixed_pack=std::make_unique<ShaderPack>(LINDBERGH_VULKAN_FIXED_ARCHIVE);
+    const auto *fixed=std::getenv("LINDBERGH_VULKAN_FIXED_SHADERS");
+    state.fixed_pack=std::make_unique<ShaderPack>(fixed && *fixed ? fixed : LINDBERGH_VULKAN_FIXED_ARCHIVE);
     auto &p=state.fixed_program;p.record=&state.fixed_pack->programs().at(0);
     for(const auto &u:p.record->uniforms)p.uniforms.push_back(std::make_unique<UniformData>(u));
     for(const auto &s:p.record->samplers) {
