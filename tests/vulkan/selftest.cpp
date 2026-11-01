@@ -1150,6 +1150,19 @@ static void test_live_stereo_scene()
 
 static void test_shared_projection()
 {
+    auto box_matrix=identity();box_matrix[0]=2;box_matrix[5]=3;box_matrix[12]=4;box_matrix[13]=6;
+    const float homogeneous[]={1,2,0,2};float xy[]={7,9};
+    require(lg_stereo_project_xy(box_matrix.data(),homogeneous,xy)&&xy[0]==5&&xy[1]==9,
+            "HUD bounds lost homogeneous vertex W or translation");
+    Matrix hud{};hud[0]=hud[5]=1.8107f;hud[11]=-1;
+    const float panel[]={.65f,-.65f,-4,1};
+    require(lg_stereo_project_xy(hud.data(),panel,xy)&&std::abs(xy[0]-.29423875f)<1e-6f&&std::abs(xy[1]+.29423875f)<1e-6f,
+            "perspective HUD bounds omitted clip W");
+    for(const auto &invalid:std::array<std::array<float,4>,4>{{{0,0,4,1},{0,0,0,1},{NAN,0,-4,1},{0,INFINITY,-4,1}}}) {
+        xy[0]=7;xy[1]=9;
+        require(!lg_stereo_project_xy(hud.data(),invalid.data(),xy)&&xy[0]==7&&xy[1]==9,
+                "invalid/behind-camera bounds produced a classification rectangle");
+    }
     auto p=identity(),view=identity(),head=identity();
     p[10]=-2;p[11]=-1;p[14]=-3;p[15]=0;
     const float tan[]={1,1,1,1},lens[]={1,1};

@@ -1313,10 +1313,9 @@ static void aim_box_track(CPU *c, int k)
         float x = n[9] == 'i' ? (float)AI32(0) : argf(c, 0), y = n[9] == 'i' ? (float)AI32(1) : argf(c, 1);
         float z = n[8] == '3' ? argf(c, 2) : 0;
         const float *m = g_proj[g_proj_top];
-        float w = m[3] * x + m[7] * y + m[11] * z + m[15];
-        if (w <= 1e-6f) { g_imm = 0; return; }
-        float nx = (m[0] * x + m[4] * y + m[8] * z + m[12]) / w, ny = (m[1] * x + m[5] * y + m[9] * z + m[13]) / w;
-        float gx = GAME_W * 0.5f * (1 + nx), gy = GAME_H * 0.5f * (1 - ny);
+        const float vertex[4] = { x, y, z, 1 };float xy[2];
+        if (!lg_stereo_project_xy(m, vertex, xy)) { g_imm = 0; return; }
+        float gx = GAME_W * 0.5f * (1 + xy[0]), gy = GAME_H * 0.5f * (1 - xy[1]);
         g_imm_z += z;
         if (gx < g_imm_box[0]) g_imm_box[0] = gx; if (gy < g_imm_box[1]) g_imm_box[1] = gy;
         if (gx > g_imm_box[2]) g_imm_box[2] = gx; if (gy > g_imm_box[3]) g_imm_box[3] = gy;

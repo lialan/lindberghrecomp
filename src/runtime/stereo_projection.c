@@ -2,6 +2,15 @@
 #include <math.h>
 #include <string.h>
 static void identity(float *m) {memset(m,0,64);m[0]=m[5]=m[10]=m[15]=1;}
+int lg_stereo_project_xy(const float m[16],const float v[4],float xy[2])
+{
+    const float w=m[3]*v[0]+m[7]*v[1]+m[11]*v[2]+m[15]*v[3];
+    if(!isfinite(w)||w<=1e-6f)return 0;
+    const float x=(m[0]*v[0]+m[4]*v[1]+m[8]*v[2]+m[12]*v[3])/w;
+    const float y=(m[1]*v[0]+m[5]*v[1]+m[9]*v[2]+m[13]*v[3])/w;
+    if(!isfinite(x)||!isfinite(y))return 0;
+    xy[0]=x;xy[1]=y;return 1;
+}
 static void multiply(float *out,const float *a,const float *b)
 {
     float r[16];

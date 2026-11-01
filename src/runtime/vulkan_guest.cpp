@@ -2354,13 +2354,8 @@ bool stereo_bounds(const Matrix &p,GLint first,GLsizei count,const std::vector<u
     if(immediate)std::memcpy(v.data(),static_cast<const uint8_t *>(immediate)+size_t(index)*stride,16);
     else if(!state.legacy_bounds_arrays.position(index,{g_guest_base,uint64_t(1)<<32},[](uint32_t id){
       const auto &b=state.buffers.at(id);return GuestMemoryView{b.bytes.data(),b.bytes.size()};},v))return false;
-    float x=p[0]*v[0]+p[4]*v[1]+p[12],y=p[1]*v[0]+p[5]*v[1]+p[13];
-    if(immediate) { // legacy glBegin fill tracking also includes clip W/Z
-      const float w=p[3]*v[0]+p[7]*v[1]+p[11]*v[2]+p[15];
-      if(w<=1e-6f)return false;
-      x=(x+p[8]*v[2])/w;y=(y+p[9]*v[2])/w;
-    }
-    box[0]=std::min(box[0],x);box[1]=std::min(box[1],y);box[2]=std::max(box[2],x);box[3]=std::max(box[3],y);
+    float xy[2];if(!lg_stereo_project_xy(p.data(),v.data(),xy))return false;
+    box[0]=std::min(box[0],xy[0]);box[1]=std::min(box[1],xy[1]);box[2]=std::max(box[2],xy[0]);box[3]=std::max(box[3],xy[1]);
   }
   return true;
 }
@@ -2379,12 +2374,8 @@ bool picture_composite(GLint first,GLsizei count,const std::vector<uint32_t> &el
     if(immediate)std::memcpy(v.data(),static_cast<const uint8_t *>(immediate)+size_t(index)*stride,16);
     else if(!state.arrays.position(index,{g_guest_base,uint64_t(1)<<32},[](uint32_t id){
       const auto &b=state.buffers.at(id);return GuestMemoryView{b.bytes.data(),b.bytes.size()};},v))return false;
-    const float w=m[3]*v[0]+m[7]*v[1]+m[11]*v[2]+m[15]*v[3];
-    if(!std::isfinite(w)||w<=1e-6f)return false;
-    const float x=(m[0]*v[0]+m[4]*v[1]+m[8]*v[2]+m[12]*v[3])/w;
-    const float y=(m[1]*v[0]+m[5]*v[1]+m[9]*v[2]+m[13]*v[3])/w;
-    if(!std::isfinite(x)||!std::isfinite(y))return false;
-    box[0]=std::min(box[0],x);box[1]=std::min(box[1],y);box[2]=std::max(box[2],x);box[3]=std::max(box[3],y);
+    float xy[2];if(!lg_stereo_project_xy(m.data(),v.data(),xy))return false;
+    box[0]=std::min(box[0],xy[0]);box[1]=std::min(box[1],xy[1]);box[2]=std::max(box[2],xy[0]);box[3]=std::max(box[3],xy[1]);
   }
   return box[0]<=-.98f&&box[1]<=-.98f&&box[2]>=.98f&&box[3]>=.98f;
 }

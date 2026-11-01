@@ -10,7 +10,7 @@ extern "C" {
 unsigned char *g_guest_base=nullptr;
 unsigned g_frame=0;
 const LgGameProfile *game_profile() {
-    static const auto profile=[] {LgGameProfile p{};p.title="Vulkan target test";p.width=p.height=64;p.vr.scale=1;return p;}();
+    static const auto profile=[] {LgGameProfile p{};p.title="Vulkan target test";p.width=p.height=64;p.vr.scale=1;p.vr.hud_lens=1.8107f;p.vr.hud_head_locked=1;return p;}();
     return &profile;
 }
 void xr_settings_load(LgXrSettings *p) {*p=LgXrSettings LG_XR_SETTINGS_DEFAULT;p->width=p->resolution=64;}
@@ -35,6 +35,18 @@ static void pixel(const std::string &path,unsigned size) {
     std::vector<unsigned char> rgb(size_t(w)*h*3);in.read(reinterpret_cast<char *>(rgb.data()),rgb.size());
     const auto at=(size_t(h/2)*w+w/2)*3;
     require(in&&rgb[at]==0&&rgb[at+1]==255&&rgb[at+2]==0,"retired/current target lost its green triangle");
+}
+static void hud_pixels(const std::string &path) {
+    std::ifstream in(path,std::ios::binary);std::string magic;unsigned w,h,maximum;
+    in>>magic>>w>>h>>maximum;in.get();
+    require(in&&magic=="P6"&&w==64&&h==64&&maximum==255,"missing perspective HUD readback");
+    std::vector<unsigned char> rgb(size_t(w)*h*3);in.read(reinterpret_cast<char *>(rgb.data()),rgb.size());
+    require(bool(in),"truncated perspective HUD readback");
+    for(unsigned x:{25u,32u,38u}) {
+        const auto at=(32*w+x)*3;
+        require(rgb[at]==0&&rgb[at+1]==(x==32?255:0)&&rgb[at+2]==0,
+                "small perspective HUD array incorrectly classified as full-screen fill");
+    }
 }
 static void triangle(unsigned size) {
     glViewport(0,0,size,size);glClearColor(0,0,0,1);glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
@@ -73,9 +85,32 @@ int main() {
             const auto unused=lvk_create_drawable(16,16);lvk_destroy_drawable(unused);
             ++g_frame;
         }
+        // HOTD4 Special's HUD lens is perspective. A panel at z=-4 covers
+        // only +/-0.294 NDC, although its pre-divide X extends past +/-1.
+        // A fill classification skips its HUD screen-plane projection.
+        const auto hud=lvk_create_drawable(64,64);lvk_bind_drawable(hud);
+        glViewport(0,0,64,64);glClearColor(0,0,0,1);glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
+        glMatrixMode(GL_PROJECTION);glLoadIdentity();
+        float projection[16]{};projection[0]=projection[5]=1.8107f;
+        projection[10]=-100.1f/99.9f;projection[11]=-1;projection[14]=-20.f/99.9f;
+        glLoadMatrixf(projection);
+        glMatrixMode(GL_MODELVIEW);glLoadIdentity();
+        const float quad[][4]={{-.65f,-.65f,-4,1},{.65f,-.65f,-4,1},{-.65f,.65f,-4,1},{.65f,.65f,-4,1}};
+        GLuint buffer;glGenBuffers(1,&buffer);glBindBuffer(GL_ARRAY_BUFFER,buffer);
+        glBufferData(GL_ARRAY_BUFFER,sizeof quad,quad,GL_STATIC_DRAW);
+        glEnableClientState(GL_VERTEX_ARRAY);glVertexPointer(4,GL_FLOAT,0,nullptr);
+        glColor4f(0,1,0,1);glDrawArrays(GL_TRIANGLE_STRIP,0,4);
+        glDisableClientState(GL_VERTEX_ARRAY);glBindBuffer(GL_ARRAY_BUFFER,0);glDeleteBuffers(1,&buffer);
+        std::filesystem::remove(directory+"/frame.ppm");std::filesystem::remove(directory+"/frame.right.ppm");
+        SDL_setenv("LINDBERGH_SHOT",(directory+"/frame.ppm").c_str(),1);
+        SDL_setenv("LINDBERGH_SHOT_FRAME",std::to_string(g_frame).c_str(),1);
+        SDL_setenv("LINDBERGH_VULKAN_SHOT_DRAWABLE",std::to_string(hud).c_str(),1);
+        lvk_host_present();hud_pixels(directory+"/frame.ppm");hud_pixels(directory+"/frame.right.ppm");
+        lvk_bind_drawable(0);lvk_destroy_drawable(hud);++g_frame;
+        glMatrixMode(GL_PROJECTION);glLoadIdentity();
         const auto unfinished=lvk_create_drawable(32,32);lvk_bind_drawable(unfinished);
         triangle(32);lvk_destroy_drawable(unfinished);lvk_bind_drawable(0);
-        std::puts("ok: real guest ABI current/unbound pbuffer destruction, queued draws, repeated resize/recreation, stereo readback and unfinished shutdown");
+        std::puts("ok: real guest ABI pbuffer lifetime/recreation, perspective HUD array bounds, stereo readback and unfinished shutdown");
         return 0; // production atexit drain runs before fixture cleanup
     } catch(const std::exception &error) {std::cerr<<error.what()<<'\n';return 1;}
 }

@@ -3,6 +3,9 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+/* Homogeneous guest position to NDC XY. Rejects behind-camera/nonfinite
+ * vertices; output is unchanged on failure. Shared by HUD and pass bounds. */
+int lg_stereo_project_xy(const float matrix[16],const float vertex[4],float xy[2]);
 enum { LG_STEREO_WORLD=0, LG_STEREO_HUD=1, LG_STEREO_PASS=2, LG_STEREO_FILL=3 };
 typedef struct {
     int perspective,hud_target,menu,zoom;
