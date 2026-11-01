@@ -106,6 +106,7 @@ struct NativeProgram {
 struct Program {
   bool delete_pending = false;
   bool fixed_fragment = false; // no guest fragment shader: fixed.frag follows its vertex program
+  bool skipped = false;        // not in the pack: drawn as nothing (see lvk_glLinkProgram)
   std::shared_ptr<NativeProgram> native;
 
   std::vector<GLuint> shaders;
@@ -161,7 +162,7 @@ struct DrawPacket {
 // or depth by GPU copy the next time a draw samples them after it was drawn.
 struct Framebuffer {
   GLuint color=0,depth=0,depth_renderbuffer=0;
-  bool rect=false,drawn=false;
+  bool rect=false,drawn=false,depthless=false; // depthless: how its drawable was made
   unsigned drawable=0;
   std::array<int,2> size{};
 };
@@ -556,20 +557,29 @@ struct State {
     }
   }
   Target *target() { frame(); return drawable ? drawables.at(drawable).get() : screen; }
-  void flush(bool keep_last=false) {
+  // limit: record only the first limit packets; later ones stay queued (a
+  // copy can then go between a source's passes and its consumer's).
+  void flush(bool keep_last=false,size_t limit=SIZE_MAX) {
     end_pass();
+    const size_t n=std::min(limit,packets.size());
+    if(pass_profile.active&&std::getenv("LINDBERGH_VULKAN_FLUSH_LOG")) {
+      std::fprintf(stderr,"[vulkan-flush] frame %u: %zu of %zu packets:",g_frame,n,packets.size());
+      for(size_t i=0;i<packets.size();++i){unsigned id=0;for(const auto &d:drawables)if(d.second.get()==packets[i].target)id=d.first;
+        std::fprintf(stderr," %s%u%s%s",i==n?"| ":"",id,packets[i].count?"":"c",packets[i].clear_aspects?"C":"");}
+      std::fputc(10,stderr);
+    }
     static const bool profile_prepare=[] {const auto *v=std::getenv("LINDBERGH_VULKAN_PREPARE_TIMING");return v && *v=='1';}();
     if (profile_prepare) {
       const auto start=std::chrono::steady_clock::now();
       size_t created=0;
-      for (auto &p : packets) if (p.count) {
+      for (size_t i=0;i<n;++i) if (auto &p=packets[i];p.count) {
         const auto before=p.renderer->pipeline_count();
         p.renderer->prepare(p.raster);
         created+=p.renderer->pipeline_count()-before;
       }
       const auto ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
       if (created || ms>2) std::fprintf(stderr,"[vulkan-prepare] frame %u: %zu packets, %zu new pipelines, %.3f ms\n",g_frame,packets.size(),created,ms);
-    } else for (auto &p : packets) if (p.count) p.renderer->prepare(p.raster);
+    } else for (size_t i=0;i<n;++i) if (packets[i].count) packets[i].renderer->prepare(packets[i].raster);
     constexpr VkImageAspectFlags color_depth=VK_IMAGE_ASPECT_COLOR_BIT|VK_IMAGE_ASPECT_DEPTH_BIT;
     static const bool defer_clears=[]{const auto *v=std::getenv("LINDBERGH_VULKAN_DEFER_CLEAR");return !v||*v!='0';}();
     static const bool limit_area=[]{const auto *v=std::getenv("LINDBERGH_VULKAN_LIMIT_AREA");return !v||*v!='0';}();
@@ -577,14 +587,16 @@ struct State {
       if(q.count||!covers(q.scissor,q.target)||(q.clear_aspects&color_depth)!=color_depth)return false;
       return (q.clear_aspects&VK_IMAGE_ASPECT_STENCIL_BIT)||(stencil_bits.count(q.target)&&!stencil_bits[q.target]);
     };
-    for (size_t index=0;index<packets.size();++index) {
+    for (size_t index=0;index<n;++index) {
       auto &p=packets[index];
       bool cleared_on_begin=false;
       if (active_target != p.target && defer_clears && full_clear(p)) {
         // A run on this target of whole-target clears only: defer it.
-        size_t end=index;while(end<packets.size()&&packets[end].target==p.target&&full_clear(packets[end]))++end;
+        size_t end=index;while(end<n&&packets[end].target==p.target&&full_clear(packets[end]))++end;
         if(end==packets.size()?!keep_last:packets[end].target!=p.target) {
-          end_pass();
+          // Deferring records nothing: an open pass on another target goes on.
+          static const bool keep_open=[]{const auto *v=std::getenv("LINDBERGH_VULKAN_DEFER_KEEPS_PASS");return !v||*v!='0';}();
+          if(!keep_open)end_pass();
           const auto &last=packets[end-1];
           const uint32_t stencil=(last.clear_aspects&VK_IMAGE_ASPECT_STENCIL_BIT)?last.clear_stencil&255:0;
           pending_clears[p.target]={last.color,last.clear_depth,stencil};
@@ -620,7 +632,7 @@ struct State {
           // Begins with a whole-target clear but draws only part of it: limit
           // the pass to that part; the rest of the clear stays pending.
           VkRect2D area{};
-          for(size_t k=index+1;k<packets.size()&&packets[k].target==p.target;++k) {
+          for(size_t k=index+1;k<n&&packets[k].target==p.target;++k) {
             const auto &q=packets[k];VkRect2D r=q.scissor;
             if(q.count) {
               const int vx=int(std::floor(q.viewport[0])),vx1=int(std::ceil(q.viewport[0]+q.viewport[2]));
@@ -678,7 +690,7 @@ struct State {
         active->draw_buffers(p.streams.data(),uint32_t(p.streams.size()),p.count,p.matrices,p.raster,p.index.buffer?&p.index:nullptr);
       }
     }
-    packets.clear();if(!keep_last)end_pass();
+    packets.erase(packets.begin(),packets.begin()+std::ptrdiff_t(n));if(!keep_last)end_pass();
   }
   Renderer &renderer() {
     frame();
@@ -1091,7 +1103,7 @@ extern "C" void lvk_host_present(void) {
 }
 extern "C" void lvk_glFlush(void) {
   if (!state.cmd) return;
-  state.flush();
+  state.flush();state.pass_stamp("glFlush");
 #ifdef LINDBERGH_VULKAN_XR
   state.last_submission=state.ring->submit();
 #else
@@ -1108,14 +1120,15 @@ extern "C" void lvk_glFinish(void) {
   if (state.last_submission) state.ring->wait(*state.last_submission);
 }
 namespace {
-unsigned create_drawable(int w, int h, bool rect);
+unsigned create_drawable(int w, int h, bool rect, bool depthless = false);
 void changed(TextureObject &o);
 std::shared_ptr<Texture> native_image(TextureObject &o, int overwritten_level, bool gpu_copy);
 }
 extern "C" unsigned lvk_create_drawable(int w, int h) { return create_drawable(w,h,false); }
 namespace {
 // rect: a rectangle texture's target, sampled in pixels, keeps the eyes' scale.
-unsigned create_drawable(int w, int h, bool rect) {
+// depthless: a framebuffer object without depth or stencil attachments.
+unsigned create_drawable(int w, int h, bool rect, bool depthless) {
   if (w <= 0 || h <= 0)
     gap("invalid guest drawable dimensions");
   const auto id = state.next_drawable++;
@@ -1153,7 +1166,7 @@ unsigned create_drawable(int w, int h, bool rect) {
       id,w,h,info.width,info.height,info.layers,info.density_map?"enabled":"disabled");
 #endif
   state.drawable_sizes[id]={w,h};
-  info.guest_bottom_origin=true;
+  info.guest_bottom_origin=true;info.transient_depth=depthless;
   state.drawables[id] = std::make_unique<Target>(*state.device, info);
   if(state.recipes)state.recipes->prepare(*state.drawables[id]);
 #ifdef LINDBERGH_VULKAN_XR
@@ -1237,9 +1250,10 @@ void sync_framebuffer(Framebuffer &f) {
   for(auto id:{f.color,f.depth})if(!size[0]&&id)if(auto *o=texture_object(id);o&&o->levels.count(0))
     size={o->levels.at(0).width,o->levels.at(0).height};
   if(!size[0]&&f.depth_renderbuffer)if(auto it=state.renderbuffers.find(f.depth_renderbuffer);it!=state.renderbuffers.end())size=it->second;
-  if(size!=f.size)release_framebuffer_drawable(f);
+  const bool depthless=!f.depth&&!f.depth_renderbuffer;
+  if(size!=f.size||depthless!=f.depthless)release_framebuffer_drawable(f);
   if(!f.drawable&&size[0]>0&&size[1]>0) {
-    f.drawable=create_drawable(size[0],size[1],f.rect);f.size=size;
+    f.drawable=create_drawable(size[0],size[1],f.rect,depthless);f.size=size;f.depthless=depthless;
     std::fprintf(stderr,"[vulkan] framebuffer drawable %u: %dx%d%s, colour texture %u, depth %s %u\n",f.drawable,size[0],size[1],
       f.rect?" (rect)":"",f.color,f.depth?"texture":"renderbuffer",f.depth?f.depth:f.depth_renderbuffer);
   }
@@ -1256,7 +1270,12 @@ void resolve_texture(GLuint id) {
   const auto source_it=state.drawables.find(drawable);auto *o=texture_object(id);
   if(source_it==state.drawables.end()||!o||!o->levels.count(0))return;
   Target *source=source_it->second.get();
-  state.frame();state.flush();
+  // Record what was queued up to the source's last packet; packets after it
+  // (the consumer's) stay queued, so the copy does not split their pass.
+  size_t upto=0;for(size_t i=0;i<state.packets.size();++i)if(state.packets[i].target==source)upto=i+1;
+  static const bool whole=[]{const auto *v=std::getenv("LINDBERGH_VULKAN_COPY_SPLITS");return v&&*v=='1';}();
+  state.frame();state.flush(false,whole?SIZE_MAX:upto);
+  state.pass_stamp("resolve texture "+std::to_string(id)+" from drawable "+std::to_string(drawable)+", "+std::to_string(upto)+" packets recorded");
   if(!state.initialized.count(source))return;
   o->layers=source->info.layers;o->gpu_target=true;o->picture_view=true;
   o->render_width=source->info.width;o->render_height=source->info.height;
@@ -1828,7 +1847,7 @@ extern "C" void lvk_glLinkProgram(GLuint id) {
     state.pack = std::make_unique<ShaderPack>(path);
   }
   auto &p = state.programs.at(id);
-  p.record = nullptr;
+  p.record = nullptr; p.skipped = false;
   p.native.reset(); // submitted frames retain their previous native program
   SourceDigest vs{}, fs{};
   std::string vertex_source, fragment_source;
@@ -1898,6 +1917,15 @@ extern "C" void lvk_glLinkProgram(GLuint id) {
       harvest_program(id, p, vertex_source, fragment_source);
       return; // its draws are skipped
     }
+    // A player's game keeps running without this program's draws; diagnostics
+    // can insist on a complete pack with LINDBERGH_VULKAN_STRICT_SHADERS=1.
+    static const bool strict=[]{const auto *v=std::getenv("LINDBERGH_VULKAN_STRICT_SHADERS");return v&&*v=='1';}();
+    if (!strict) {
+      std::fprintf(stderr, "[vulkan] MISSING SHADER: guest program %u is not in the offline pack; its draws are skipped "
+                           "(harvest it with LINDBERGH_VULKAN_SHADER_HARVEST)\n", id);
+      p.skipped = true;
+      return;
+    }
     std::fprintf(stderr,
                  "[vulkan] missing offline shader pair for guest program %u\n",
                  id);
@@ -1905,7 +1933,7 @@ extern "C" void lvk_glLinkProgram(GLuint id) {
   }
 }
 extern "C" void lvk_glUseProgram(GLuint id) {
-  if (id && !state.programs.at(id).record && !harvest_directory())
+  if (id && !state.programs.at(id).record && !harvest_directory() && !state.programs.at(id).skipped)
     gap("guest selected an unlinked Vulkan program");
   const auto previous = state.program;
   state.program = id;
@@ -1930,7 +1958,7 @@ extern "C" void lvk_glGetShaderiv(GLuint id, GLenum p, GLint *out) {
 extern "C" void lvk_glGetProgramiv(GLuint id, GLenum p, GLint *out) {
   const auto &v = state.programs.at(id);
   if (p == GL_LINK_STATUS || p == GL_VALIDATE_STATUS)
-    *out = v.record != nullptr || harvest_directory() != nullptr;
+    *out = v.record != nullptr || v.skipped || harvest_directory() != nullptr;
   else if (p == GL_INFO_LOG_LENGTH)
     *out = 1;
   else if (p == GL_DELETE_STATUS)
@@ -2791,6 +2819,7 @@ void queue_clear(GLbitfield mask) {
     p.raster.depth_write=p.raster.depth_test;p.raster.depth_compare=VK_COMPARE_OP_ALWAYS;
     p.raster.color_mask=0;if(mask&GL_COLOR_BUFFER_BIT)for(unsigned i=0;i<4;++i)if(write==state.floats.end()||write->second[i])p.raster.color_mask|=1u<<i;
     p.raster.stencil=(mask&GL_STENCIL_BUFFER_BIT)&&(p.stencil_write_mask&255);p.raster.stencil_compare=VK_COMPARE_OP_ALWAYS;
+    if(target->info.transient_depth)p.raster.depth_test=p.raster.depth_write=p.raster.stencil=false;
     p.raster.stencil_pass=VK_STENCIL_OP_REPLACE;p.stencil_ref=p.clear_stencil;
     const auto z=std::clamp(p.clear_depth,0.f,1.f)*2-1;
     Vertex quad[]={{{-1,-1,z,1},{}},{{1,-1,z,1},{}},{{1,1,z,1},{}},{{-1,-1,z,1},{}},{{1,1,z,1},{}},{{-1,1,z,1},{}}};
@@ -3181,7 +3210,7 @@ bool stereo_packet(DrawPacket &packet,GLint first,GLsizei count,const std::vecto
 void draw_geometry(GLenum mode,GLint first,GLsizei count,const void *indices,GLenum index_type,bool indexed,
                    const void *immediate=nullptr,uint32_t immediate_stride=0) {
   if(count<=0)return;if(first<0)gap("negative guest first vertex");
-  if(state.program&&!state.programs.at(state.program).record)return; // harvesting: not converted yet
+  if(state.program&&!state.programs.at(state.program).record)return; // harvesting or missing from the pack
   // LINDBERGH_VULKAN_DEBUG_DRAWS=drawable:k keeps the first k draws into that
   // drawable each frame (bisecting a diagnostic capture); the rest are dropped.
   static const auto debug_draws=[]{std::array<unsigned,2> r{~0u,~0u};if(const auto *v=std::getenv("LINDBERGH_VULKAN_DEBUG_DRAWS"))std::sscanf(v,"%u:%u",&r[0],&r[1]);return r;}();
@@ -3263,6 +3292,7 @@ void draw_geometry(GLenum mode,GLint first,GLsizei count,const void *indices,GLe
   static const bool metal_layers=std::strncmp(state.device->capabilities.properties.deviceName,"Apple",5)==0;
   if(metal_layers&&mode==GL_TRIANGLE_FAN)mode=GL_POLYGON; // the same triangles
   auto raster=raster_state(fixed);raster.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+  if(target->info.transient_depth)raster.depth_test=raster.depth_write=raster.stencil=false; // no depth buffer in GL
   if(mode==GL_TRIANGLE_STRIP)raster.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
   else if(mode==GL_TRIANGLE_FAN)raster.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
   else if(mode==GL_POINTS) {

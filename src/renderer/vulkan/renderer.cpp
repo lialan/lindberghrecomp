@@ -105,6 +105,10 @@ Target::Target(Device &device, TargetInfo target) : info(target), device_(device
         attachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
         attachments[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
         attachments[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        if (info.transient_depth) {
+            attachments[1].loadOp = attachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            attachments[1].storeOp = attachments[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        }
         VkAttachmentReference col{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
         VkAttachmentReference depth{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
         VkSubpassDescription subpass{};
@@ -160,8 +164,10 @@ Target::Target(Device &device, TargetInfo target) : info(target), device_(device
         check(vkCreateRenderPass(device.handles.device, &pass, nullptr, &render_pass), "Vulkan world render pass");
         attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         attachments[0].initialLayout = info.final_layout;
-        attachments[1].loadOp = attachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-        attachments[1].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        if (!info.transient_depth) {
+            attachments[1].loadOp = attachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+            attachments[1].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        }
         check(vkCreateRenderPass(device.handles.device, &pass, nullptr, &load_pass), "Vulkan preserving render pass");
         framebuffer=make_framebuffer(info.density_map);
         if(info.density_map)density_framebuffers_.push_back({info.density_map,framebuffer});

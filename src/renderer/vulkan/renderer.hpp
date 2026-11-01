@@ -50,6 +50,10 @@ struct TargetInfo {
     VkImageLayout final_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     VkImageView density_map = VK_NULL_HANDLE; // borrowed runtime foveation image
     bool guest_bottom_origin = false; // offscreen rows follow guest GL texture storage
+    // A guest framebuffer object without depth/stencil attachments has no depth
+    // buffer: draws there disable depth and stencil, and the attachment is never
+    // loaded or stored (a tiler keeps it on chip).
+    bool transient_depth = false;
 };
 
 class Target {
