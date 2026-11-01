@@ -56,7 +56,9 @@ OpenXR::OpenXR(bool required, OpenXRPlatform platform) : require_foveation_(requ
         create.next = &android;
 #endif
         std::strcpy(create.applicationInfo.applicationName,"Lindbergh Vulkan");
-        create.applicationInfo.apiVersion = XR_MAKE_VERSION(1,0,0);
+        // Match the shared GL host's tested API level. On the tested Quest
+        // runtime, requesting 1.0.0 left chained density-map outputs empty.
+        create.applicationInfo.apiVersion = XR_MAKE_VERSION(1,0,34);
         create.enabledExtensionCount=static_cast<uint32_t>(extensions.size()); create.enabledExtensionNames=extensions.data();
         xr_check(xrCreateInstance(&create,&instance_),"create OpenXR instance");
         XrSystemGetInfo system{XR_TYPE_SYSTEM_GET_INFO}; system.formFactor=XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;

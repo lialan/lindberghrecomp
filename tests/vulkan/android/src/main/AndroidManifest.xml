@@ -10,12 +10,16 @@
     </queries>
     <application android:label="Vulkan XR probe" android:hasCode="false" android:allowBackup="false" android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen">
         <uses-native-library android:name="libopenxr.google.so" android:required="false" />
-        <activity android:name="android.app.NativeActivity" android:exported="true" android:configChanges="orientation|keyboardHidden|screenSize" >
+        <meta-data android:name="com.oculus.supportedDevices" android:value="quest2|quest3|quest3s|questpro" />
+        <meta-data android:name="com.oculus.intent.category.VR" android:value="vr_only" />
+        <meta-data android:name="com.oculus.vr.focusaware" android:value="true" />
+        <activity android:screenOrientation="landscape" android:launchMode="singleTask" android:name="android.app.NativeActivity" android:exported="true" android:configChanges="orientation|keyboardHidden|screenSize" >
             <meta-data android:name="android.app.lib_name" android:value="lindbergh_vulkan_android_xr_probe" />
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
                 <category android:name="org.khronos.openxr.intent.category.IMMERSIVE_HMD" />
+                <category android:name="com.oculus.intent.category.VR" />
             </intent-filter>
         </activity>
     </application>
