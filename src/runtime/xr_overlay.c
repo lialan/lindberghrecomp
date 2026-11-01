@@ -80,78 +80,14 @@ static GLint u_panel_mvp, u_panel_tex;
 static GLint u_gun_mvp, u_gun_model, u_beam_mvp, u_beam_color, u_beam_shape;
 static int gun_verts;
 
-/* ---- the gun ----
- * Chosen by the game's profile: Quaternius' SubmachineGun_2 (CC0), made into
- * xr_gun_model.h by quest/tools/obj2gun.py; a B&T TP9 and the Ghost Squad
- * cabinet's gun, built by quest/tools/gunbuild.py (xr_gun_tp9.h, xr_gun_gs.h). Both: barrel along -Z on the aim
- * ray, the rail on top. A sight goes on the rail, built from boxes here: its
- * glass is where the reticle shows. */
-#include "xr_gun_model.h"
-#include "xr_gun_tp9.h"
-#include "xr_gun_gs.h"
-
-/* a debug switch, looked up once */
+#include "xr_overlay_geometry.h"
 #define ENV_ON(name) ({ static int _on = -1; if (_on < 0) _on = getenv(name) != NULL; _on; })
-
-/* the sights' boxes, y measured up from the rail's top */
-typedef struct { float c[3], h[3], rgb[3]; } Box;
-static const Box RED_DOT[] = {          /* a slim reflex sight, like a Trijicon RMR */
-    { { 0, 0.003f, 0.028f }, { 0.0125f, 0.003f, 0.020f }, { 0.12f, 0.12f, 0.13f } },          /* base */
-    { { 0, 0.008f, 0.040f }, { 0.0115f, 0.004f, 0.008f }, { 0.15f, 0.15f, 0.16f } },          /* emitter housing */
-    { { -0.0110f, 0.0155f, 0.018f }, { 0.0015f, 0.0095f, 0.004f }, { 0.15f, 0.15f, 0.16f } }, /* hood: sides */
-    { { 0.0110f, 0.0155f, 0.018f }, { 0.0015f, 0.0095f, 0.004f }, { 0.15f, 0.15f, 0.16f } },
-    { { 0, 0.0255f, 0.018f }, { 0.0125f, 0.0015f, 0.004f }, { 0.15f, 0.15f, 0.16f } },        /* hood: top */
-};
-static const Box HOLO[] = {             /* a window sight, like an EOTech */
-    { { 0, 0.008f, 0.032f }, { 0.017f, 0.008f, 0.048f }, { 0.12f, 0.12f, 0.13f } },           /* body */
-    { { -0.019f, 0.032f, 0.018f }, { 0.003f, 0.020f, 0.022f }, { 0.15f, 0.15f, 0.16f } },     /* hood: sides */
-    { { 0.019f, 0.032f, 0.018f }, { 0.003f, 0.020f, 0.022f }, { 0.15f, 0.15f, 0.16f } },
-    { { 0, 0.050f, 0.018f }, { 0.022f, 0.003f, 0.022f }, { 0.15f, 0.15f, 0.16f } },          /* hood: top */
-    { { 0.008f, 0.018f, 0.064f }, { 0.007f, 0.004f, 0.010f }, { 0.08f, 0.08f, 0.09f } },      /* buttons */
-};
-/* each sight's glass: centre z, half width, half height, and the sight line's height above the rail */
-static const float GLASS[3][4] = { { 0, 0, 0, 0 }, { 0.018f, 0.0095f, 0.0085f, 0.0145f },
-                                   { 0.004f, 0.016f, 0.017f, 0.030f } };
-
-#define MAX2(a, b) ((a) > (b) ? (a) : (b))
-#define MAX_VERTS MAX2(MAX2(GUN_VERTS, TP9_VERTS), GS_VERTS)
-static float mesh[(MAX_VERTS + 8 * 36) * 9];
-static float rail_y;                    /* the current gun's rail top */
-
-static void add_boxes(int *n, const Box *bx, int count)
+static float *mesh,rail_y;
+static int cur_sight=-1,cur_model=-1;
+static void build_gun(int sight,int model)
 {
-    static const int face[6][4] = { { 1, 3, 7, 5 }, { 0, 4, 6, 2 }, { 2, 6, 7, 3 },
-                                    { 0, 1, 5, 4 }, { 4, 5, 7, 6 }, { 0, 2, 3, 1 } };
-    static const float nrm[6][3] = { { 1, 0, 0 }, { -1, 0, 0 }, { 0, 1, 0 }, { 0, -1, 0 }, { 0, 0, 1 }, { 0, 0, -1 } };
-    for (int p = 0; p < count; p++) {
-        float v[8][3];
-        for (int k = 0; k < 8; k++)
-            for (int a = 0; a < 3; a++)
-                v[k][a] = bx[p].c[a] + (a == 1 ? rail_y : 0) + ((k >> a) & 1 ? bx[p].h[a] : -bx[p].h[a]);
-        for (int f = 0; f < 6; f++) {
-            static const int tri[6] = { 0, 1, 2, 0, 2, 3 };
-            for (int t = 0; t < 6; t++) {
-                float *o = &mesh[(*n)++ * 9];
-                memcpy(o, v[face[f][tri[t]]], 12);
-                memcpy(o + 3, nrm[f], 12);
-                memcpy(o + 6, bx[p].rgb, 12);
-            }
-        }
-    }
-}
-
-static int cur_sight = -1, cur_model = -1;
-static void build_gun(int sight, int model)
-{
-    int n;
-    if (model == XO_GUN_TP9) { memcpy(mesh, TP9_MESH, sizeof TP9_MESH); n = TP9_VERTS; rail_y = TP9_RAIL_Y; }
-    else if (model == XO_GUN_GHOST_SQUAD) { memcpy(mesh, GS_MESH, sizeof GS_MESH); n = GS_VERTS; rail_y = GS_RAIL_Y; }
-    else { memcpy(mesh, GUN_MESH, sizeof GUN_MESH); n = GUN_VERTS; rail_y = GUN_RAIL_Y; }
-    if (sight == XO_SIGHT_RED_DOT) add_boxes(&n, RED_DOT, (int)(sizeof RED_DOT / sizeof *RED_DOT));
-    if (sight == XO_SIGHT_HOLO) add_boxes(&n, HOLO, (int)(sizeof HOLO / sizeof *HOLO));
-    gun_verts = n;
-    cur_sight = sight;
-    cur_model = model;
+    gun_verts=xo_gun_build(model,sight,mesh,xo_gun_capacity(),&rail_y);
+    cur_sight=sight;cur_model=model;
 }
 
 static GLuint shader(GLenum type, const char *src)
@@ -254,12 +190,14 @@ int xo_init(void)
     gl.SamplerParameteri(smp_screen, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     gl.SamplerParameteri(smp_screen, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
+    if(!mesh)mesh=malloc(xo_gun_capacity()*9*sizeof(float));
+    if(!mesh)return 0;
     build_gun(XO_SIGHT_NONE, XO_GUN_SMG);
     gl.GenVertexArrays(1, &vao_gun);
     gl.GenBuffers(1, &vbo_gun);
     gl.BindVertexArray(vao_gun);
     gl.BindBuffer(GL_ARRAY_BUFFER, vbo_gun);
-    gl.BufferData(GL_ARRAY_BUFFER, (GLsizeiptr)sizeof mesh, mesh, GL_DYNAMIC_DRAW);
+    gl.BufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(xo_gun_capacity()*9*sizeof(float)), mesh, GL_DYNAMIC_DRAW);
     for (int a = 0; a < 3; a++) {
         gl.VertexAttribPointer((GLuint)a, 3, GL_FLOAT, GL_FALSE, 36, (const void *)(uintptr_t)(a * 12));
         gl.EnableVertexAttribArray((GLuint)a);
@@ -289,15 +227,6 @@ static void mul(float *o, const float *a, const float *b)
 }
 
 /* rigid transform from a pose: rotation q, then translation p */
-static void pose_matrix(const float q[4], const float p[3], float *m)
-{
-    float x = q[0], y = q[1], z = q[2], w = q[3];
-    m[0] = 1 - 2 * (y * y + z * z); m[1] = 2 * (x * y + z * w);     m[2] = 2 * (x * z - y * w);     m[3] = 0;
-    m[4] = 2 * (x * y - z * w);     m[5] = 1 - 2 * (x * x + z * z); m[6] = 2 * (y * z + x * w);     m[7] = 0;
-    m[8] = 2 * (x * z + y * w);     m[9] = 2 * (y * z - x * w);     m[10] = 1 - 2 * (x * x + y * y); m[11] = 0;
-    m[12] = p[0]; m[13] = p[1]; m[14] = p[2]; m[15] = 1;
-}
-
 /* ---- per eye ---- */
 typedef struct {
     GLint prog, vao, vbo, vp[4], blend_src[2], blend_dst[2], depth_func, front, cull_face;
@@ -348,16 +277,7 @@ static void restore(const Saved *s)
 static void beam(const float *vp, const float eye[3], const float a[3], const float b[3], float w,
                  float r, float g, float bl, float alpha)
 {
-    float d[3] = { b[0] - a[0], b[1] - a[1], b[2] - a[2] }, e[3] = { eye[0] - a[0], eye[1] - a[1], eye[2] - a[2] };
-    float s[3] = { d[1] * e[2] - d[2] * e[1], d[2] * e[0] - d[0] * e[2], d[0] * e[1] - d[1] * e[0] };
-    float l = sqrtf(s[0] * s[0] + s[1] * s[1] + s[2] * s[2]);
-    if (l < 1e-6f) return;
-    for (int i = 0; i < 3; i++) s[i] *= w / l;
-    float q[6][5] = {
-        { a[0] - s[0], a[1] - s[1], a[2] - s[2], -1, 0 }, { a[0] + s[0], a[1] + s[1], a[2] + s[2], 1, 0 },
-        { b[0] + s[0], b[1] + s[1], b[2] + s[2], 1, 0 }, { a[0] - s[0], a[1] - s[1], a[2] - s[2], -1, 0 },
-        { b[0] + s[0], b[1] + s[1], b[2] + s[2], 1, 0 }, { b[0] - s[0], b[1] - s[1], b[2] - s[2], -1, 0 },
-    };
+    float q[6][5];if(!xo_beam_vertices(q,eye,a,b,w))return;
     gl.BindBuffer(GL_ARRAY_BUFFER, vbo_beam);
     gl.BufferData(GL_ARRAY_BUFFER, sizeof q, q, GL_DYNAMIC_DRAW);
     gl.UniformMatrix4fv(u_beam_mvp, 1, GL_FALSE, vp);
@@ -378,21 +298,7 @@ static void spot(const float *vp, const float eye[3], const float p[3], float ra
 static void spot_shape(const float *vp, const float eye[3], const float p[3], float rad, float r, float g, float b, float alpha,
                        float ring, float thick)
 {
-    float f[3] = { eye[0] - p[0], eye[1] - p[1], eye[2] - p[2] };
-    float l = sqrtf(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]);
-    if (l < 1e-6f) return;
-    for (int i = 0; i < 3; i++) f[i] /= l;
-    float up[3] = { 0, 1, 0 }, x[3] = { up[1] * f[2] - up[2] * f[1], up[2] * f[0] - up[0] * f[2], up[0] * f[1] - up[1] * f[0] };
-    float xl = sqrtf(x[0] * x[0] + x[1] * x[1] + x[2] * x[2]);
-    if (xl < 1e-6f) { x[0] = 1; x[1] = x[2] = 0; xl = 1; }
-    for (int i = 0; i < 3; i++) x[i] *= rad / xl;
-    float y[3] = { f[1] * x[2] - f[2] * x[1], f[2] * x[0] - f[0] * x[2], f[0] * x[1] - f[1] * x[0] };
-    float q[6][5];
-    static const float c[6][2] = { { -1, -1 }, { 1, -1 }, { 1, 1 }, { -1, -1 }, { 1, 1 }, { -1, 1 } };
-    for (int k = 0; k < 6; k++) {
-        for (int i = 0; i < 3; i++) q[k][i] = p[i] + c[k][0] * x[i] + c[k][1] * y[i];
-        q[k][3] = c[k][0]; q[k][4] = c[k][1];
-    }
+    float q[6][5];if(!xo_spot_vertices(q,eye,p,rad))return;
     gl.BindBuffer(GL_ARRAY_BUFFER, vbo_beam);
     gl.BufferData(GL_ARRAY_BUFFER, sizeof q, q, GL_DYNAMIC_DRAW);
     gl.UniformMatrix4fv(u_beam_mvp, 1, GL_FALSE, vp);
@@ -405,15 +311,7 @@ static void spot_shape(const float *vp, const float eye[3], const float p[3], fl
  * where the reticle may show (depth cleared to 0 first, so nothing else). */
 static void glass(const float *vp, const float *model, int sight, float r, float g, float b, float a)
 {
-    const float *gz = GLASS[sight];
-    float q[6][5];
-    static const float c[6][2] = { { -1, -1 }, { 1, -1 }, { 1, 1 }, { -1, -1 }, { 1, 1 }, { -1, 1 } };
-    for (int k = 0; k < 6; k++) {
-        float lp[3] = { c[k][0] * gz[1], rail_y + gz[3] + c[k][1] * gz[2], gz[0] };
-        for (int i = 0; i < 3; i++)
-            q[k][i] = model[i] * lp[0] + model[4 + i] * lp[1] + model[8 + i] * lp[2] + model[12 + i];
-        q[k][3] = 0; q[k][4] = 0;
-    }
+    float q[6][5];if(!xo_glass_vertices(q,model,sight,rail_y))return;
     gl.BindBuffer(GL_ARRAY_BUFFER, vbo_beam);
     gl.BufferData(GL_ARRAY_BUFFER, sizeof q, q, GL_DYNAMIC_DRAW);
     gl.UniformMatrix4fv(u_beam_mvp, 1, GL_FALSE, vp);
@@ -442,7 +340,7 @@ void xo_draw(const XoFrame *f, const float viewproj[16], const float eye_pos[3],
     if (f->gun_valid && f->show_gun) {
         /* the gun: depth-tested against itself only, always in front of the game */
         float mvp[16], kick[16];
-        pose_matrix(f->gun_q, f->gun_p, model);
+        xo_pose_matrix(f->gun_q, f->gun_p, model);
         memset(kick, 0, 64); kick[0] = kick[5] = kick[10] = kick[15] = 1;
         kick[14] = f->recoil;                       /* back along the barrel */
         mul(model, model, kick);

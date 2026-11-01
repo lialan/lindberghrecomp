@@ -327,11 +327,11 @@ void Renderer::attach(VkCommandBuffer cmd)
 }
 void Renderer::detach() { cmd_ = VK_NULL_HANDLE; bound_ = VK_NULL_HANDLE; }
 
-void Renderer::viewport(float x, float y, float width, float height, VkRect2D scissor)
+void Renderer::viewport(float x, float y, float width, float height, VkRect2D scissor,float min_depth,float max_depth)
 {
     if (!cmd_) throw std::logic_error("Viewport outside render pass");
     VkViewport vp{x, target_.info.guest_bottom_origin ? y + height : float(target_.info.height) - y - height,
-                  width, target_.info.guest_bottom_origin ? -height : height, 0, 1};
+                  width, target_.info.guest_bottom_origin ? -height : height, min_depth, max_depth};
     vkCmdSetViewport(cmd_, 0, 1, &vp);
     vkCmdSetScissor(cmd_, 0, 1, &scissor);
 }

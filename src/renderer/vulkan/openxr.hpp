@@ -52,6 +52,7 @@ public:
     // image's map for GPU work; other views may be used to prepare framebuffers.
     const std::vector<VkImageView> &density_maps() const { return density_views_; }
     std::array<uint32_t,2> density_extent() const { return density_extent_; }
+    const std::vector<std::unique_ptr<Target>> &render_targets() const {return targets_;}
 private:
     LgXrActions actions_{};
     XrInstance instance_ = XR_NULL_HANDLE;

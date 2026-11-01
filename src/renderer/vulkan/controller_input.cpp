@@ -1,5 +1,7 @@
 #include "controller_input.hpp"
+#include <algorithm>
 #include <cmath>
+#include "../../runtime/xr_settings.h"
 #include <stdexcept>
 namespace lindbergh::vk {
 ControllerInput::ControllerInput(ControllerSettings settings):settings_(settings)
@@ -10,6 +12,7 @@ ControllerInput::ControllerInput(ControllerSettings settings):settings_(settings
 }
 std::array<ControllerHaptic,2> ControllerInput::update(const StereoScene &scene,const ControllerSample &sample,int64_t time,bool focused)
 {
+    overlay_={};
     ControllerSnapshot next;next.dual=settings_.dual;std::array<ControllerHaptic,2> haptics{};
     focused=focused&&scene.tracking_valid();
     if(focused) {
@@ -28,6 +31,22 @@ std::array<ControllerHaptic,2> ControllerInput::update(const StereoScene &scene,
             const float phase=firing?std::fmod(float((time-fire_start_[pl])/1000000)/100.f,1.f):1.f;
             if(firing&&phase<fire_phase_[pl])haptics[hand]={.7f,35};
             if(frame.trigger[hand]&&!frame.aimed[pl]&&!controls_.prev_trigger[hand]&&!frame.blocked)haptics[hand]={.3f,40};
+            auto &f=overlay_[pl];f.gun_valid=next.valid[pl];f.p2=pl;
+            if(f.gun_valid) {
+                std::copy(sample.pose[hand].orientation.begin(),sample.pose[hand].orientation.end(),f.gun_q);
+                std::copy(sample.pose[hand].position.begin(),sample.pose[hand].position.end(),f.gun_p);
+                f.recoil=firing?.018f*(1-phase)*(1-phase):0;f.flash=firing&&phase<.35f;
+                const float tip[]={0,-.006f,-.26f};float muzzle[3];
+                lg_stereo_rotate(f.gun_q,tip,muzzle);
+                float reach=5;
+                if(frame.aimed[pl]) {
+                    StereoRay world;
+                    reach=settings_.aim_on_hud&&scene.aim(sample.pose[hand],settings_.width,settings_.height,false,settings_.aim_distance,world)?world.reach:next.ray[pl].reach;
+                }
+                for(int i=0;i<3;++i){f.muzzle[i]=f.gun_p[i]+muzzle[i];f.end[i]=f.gun_p[i]+next.ray[pl].direction[i]*reach;}
+                f.beam=settings_.laser==LASER_ON;f.dot=frame.aimed[pl]&&settings_.laser!=LASER_OFF;
+                f.show_gun=settings_.show_gun;f.sight=f.show_gun?settings_.sight:XO_SIGHT_NONE;f.gun_model=settings_.gun_model;
+            }
             fire_phase_[pl]=phase;
         }
         const auto cabinet=lg_xr_controls_update(&controls_,&frame);next.held=cabinet.held;next.coins=cabinet.coins;

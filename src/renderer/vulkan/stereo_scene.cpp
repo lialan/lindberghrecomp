@@ -22,6 +22,14 @@ void StereoScene::publish(const std::array<StereoPose,2> &eyes)
         for(float v:eyes[eye].position) if(!std::isfinite(v)) throw std::invalid_argument("Invalid stereo eye position");
         for(float v:eyes[eye].orientation) if(!std::isfinite(v)) throw std::invalid_argument("Invalid stereo orientation");
         tangents_[eye]=eyes[eye].tangents;
+        eye_positions_[eye]=eyes[eye].position;
+        Matrix overlay_view,projection{};
+        lg_stereo_pose_view(eyes[eye].orientation.data(),eyes[eye].position.data(),1,overlay_view.data());
+        const auto &t=eyes[eye].tangents;const float n=.02f,f=100;
+        projection[0]=2/(t[0]+t[1]);projection[5]=2/(t[2]+t[3]);
+        projection[8]=(t[1]-t[0])/(t[0]+t[1]);projection[9]=(t[3]-t[2])/(t[2]+t[3]);
+        projection[10]=-(f+n)/(f-n);projection[11]=-1;projection[14]=-2*f*n/(f-n);
+        const auto vp=multiply(projection,overlay_view);std::copy(vp.begin(),vp.end(),overlay_.view_projection[eye]);
         lg_stereo_pose_view(eyes[eye].orientation.data(),eyes[eye].position.data(),settings_.scale,view_[eye].data());
         float offset[3],relative[3];
         for(unsigned i=0;i<3;++i) offset[i]=eyes[eye].position[i]-.5f*(eyes[0].position[i]+eyes[1].position[i]);

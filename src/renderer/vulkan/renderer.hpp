@@ -92,7 +92,7 @@ public:
     Renderer &operator=(const Renderer &) = delete;
     void prepare(RasterState state);
     void begin(VkCommandBuffer cmd, std::array<float, 4> clear, bool preserve = false);
-    void viewport(float x, float y, float width, float height, VkRect2D scissor);
+    void viewport(float x, float y, float width, float height, VkRect2D scissor,float min_depth=0,float max_depth=1);
     void dynamic_state(uint32_t stencil_ref, uint32_t stencil_compare_mask, uint32_t stencil_write_mask,
                        float depth_bias_factor, float depth_bias_units, const float blend_constants[4]);
     void clear(VkImageAspectFlags aspects, std::array<float, 4> color, float depth, uint32_t stencil, VkRect2D rect);

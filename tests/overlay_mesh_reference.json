@@ -1,0 +1,42 @@
+{
+  "source_commit": "9cae523",
+  "source": "src/runtime/xr_overlay.c build_gun before shared extraction",
+  "meshes": {
+    "0,0": {
+      "vertices": 4122,
+      "sha256": "85f236fdd25bb325f39c61e3ee9dd10d8186dfe8b4ddda3b247b107f603766ff"
+    },
+    "0,1": {
+      "vertices": 4302,
+      "sha256": "eeb715119778d4be82c134efe82907730e715b54b761ad1191fa0ee74f356633"
+    },
+    "0,2": {
+      "vertices": 4302,
+      "sha256": "86d23f9c301c1cd03f2665c573d87b7a91020081b1a47ebf044632074274c06d"
+    },
+    "1,0": {
+      "vertices": 1050,
+      "sha256": "6e514caa69f8a2ee891cb580f335a0d5f039bd4c7a45d5575292ebb9929ed989"
+    },
+    "1,1": {
+      "vertices": 1230,
+      "sha256": "1d4807fe1dd77399d5e3f6423b32ff79e82c8c1691e7e71405430c166a171f01"
+    },
+    "1,2": {
+      "vertices": 1230,
+      "sha256": "b4cfcfec4f330d30a595726121f370debf2b06086b414e257e8fccafbcd9c7d7"
+    },
+    "2,0": {
+      "vertices": 1194,
+      "sha256": "48bc5702d15c85ebd169887a481de5cf1e157eb5d8262a58bdcaba8bcb8b2ca4"
+    },
+    "2,1": {
+      "vertices": 1374,
+      "sha256": "1b5fdea6eef8f20d6b529ba05a0c7fd3eb5687d7061a2df7c80492d16cb622d7"
+    },
+    "2,2": {
+      "vertices": 1374,
+      "sha256": "7a6f3021039249114e81c627344d837b1c1001fc2e3e0e3982c3cdf83aaaf2d6"
+    }
+  }
+}

@@ -1,5 +1,6 @@
 #include "stereo_scene.hpp"
 #include "controller_input.hpp"
+#include "overlay.hpp"
 #include "../../src/runtime/stereo_projection.h"
 #include "device.hpp"
 #include "frame_ring.hpp"
@@ -119,6 +120,74 @@ static void render_density_reuse(Device &device)
     }
     require(target.density_framebuffer_count()==2,"density-map selection allocated additional framebuffers");
     std::puts("ok: two density maps reuse prepared world framebuffers across asynchronous stereo draws");
+}
+
+static void render_overlay(Device &device,bool foveation=false)
+{
+    FrameRing ring(device);std::unique_ptr<ConstantDensityMap> density;
+    if(foveation)density=std::make_unique<ConstantDensityMap>(device,ring,32,32,2);
+    TargetInfo info{128,128,2};info.final_layout=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    if(density)info.density_map=density->view();
+    Target target(device,info);PipelineCache cache(device,"");
+    Renderer background(device,target,cache);Overlay overlay(device,ring,cache);overlay.prepare(target);overlay.prepare(target);
+    require(overlay.mesh_buffer_count()==9&&overlay.target_count()==1,"overlay geometry/target resources were not retained");
+    StereoScene scene({});std::array<StereoPose,2> eyes;eyes[0].position={-.032f,0,0};eyes[1].position={.032f,0,0};scene.publish(eyes);
+    std::array<XoFrame,2> frames{};
+    for(int pl=0;pl<2;++pl) {
+        auto &f=frames[pl];f.gun_valid=f.show_gun=f.beam=f.dot=1;f.gun_q[3]=1;f.p2=pl;
+        f.gun_model=pl?XO_GUN_GHOST_SQUAD:XO_GUN_TP9;f.sight=pl?XO_SIGHT_HOLO:XO_SIGHT_RED_DOT;
+        f.gun_p[0]=pl?.16f:-.16f;f.gun_p[1]=-.15f;f.gun_p[2]=-.45f;
+        f.muzzle[0]=pl?.025f:-.025f;f.muzzle[1]=-.01f;f.muzzle[2]=-.2f;
+        f.end[0]=pl?.25f:-.25f;f.end[1]=.1f;f.end[2]=-1;
+    }
+    Readback output(device,5*128*128*4*2);Submission last{};
+    for(unsigned frame=0;frame<5;++frame) {
+        frames[0].flash=frame==0;
+        for(auto &f:frames){f.show_gun=frame!=1;f.beam=f.dot=frame!=2;}
+        if(frame==3) {
+            frames[1].gun_valid=0;auto &gun=frames[0];gun.show_gun=1;gun.sight=XO_SIGHT_HOLO;gun.beam=gun.dot=gun.flash=0;
+            gun.gun_p[0]=-.032f;gun.gun_p[1]=-.069f;gun.gun_p[2]=-.4f;
+            gun.end[0]=-.047625f;gun.end[1]=.015625f;gun.end[2]=-2;
+        }
+        if(frame==4) {
+            frames[1].gun_valid=0;auto &gun=frames[0];gun.show_gun=0;gun.sight=XO_SIGHT_NONE;gun.beam=1;gun.dot=gun.flash=0;
+            gun.muzzle[0]=gun.end[0]=-.032f;gun.muzzle[1]=gun.end[1]=0;gun.muzzle[2]=-.1f;gun.end[2]=-2;
+        }
+        auto cmd=ring.begin();background.begin(cmd,{.1f,.1f,.1f,.37f});
+        overlay.draw(cmd,target,scene.overlay_matrices(),scene.overlay_eyes(),frames,&background);
+        VkBufferImageCopy copy{};copy.bufferOffset=frame*128*128*4*2;copy.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,2};copy.imageExtent={128,128,1};
+        vkCmdCopyImageToBuffer(cmd,target.color,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,output.buffer,1,&copy);
+        VkBufferMemoryBarrier b{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};b.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;b.dstAccessMask=VK_ACCESS_HOST_READ_BIT;
+        b.srcQueueFamilyIndex=b.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;b.buffer=output.buffer;b.size=VK_WHOLE_SIZE;
+        vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&b,0,nullptr);last=ring.submit();
+    }
+    ring.wait(last);const auto *pixels=static_cast<const uint8_t *>(output.mapped);
+    for(unsigned frame=0;frame<4;++frame) {
+        const auto *left=pixels+frame*128*128*4*2,*right=left+128*128*4;
+        require(std::memcmp(left,right,128*128*4)!=0,"overlay lost stereo eye separation");
+        for(unsigned eye=0;eye<2;++eye) {
+            const auto *p=eye?right:left;unsigned changed=0,red=0,blue=0;
+            for(unsigned i=0;i<128*128;++i) {
+                changed+=p[i*4]!=26||p[i*4+1]!=26||p[i*4+2]!=26;
+                red+=p[i*4]>p[i*4+2]+20;blue+=p[i*4+2]>p[i*4]+20;
+                if(frame==1)require(p[i*4+3]==94,"laser blending changed the game's alpha");
+            }
+            require(changed>(frame==1?0u:30u),"overlay gun/beam pixels missing");
+            if(frame==1)require(red&&blue,"player laser colors missing from an eye");
+        }
+    }
+    const auto *ads=pixels+3*128*128*4*2;
+    const auto *dot=ads+(63*128+63)*4;
+    require(dot[0]>150&&dot[0]>dot[1]*2,"holographic sight dot missing inside the left eye glass mask");
+    unsigned right_red=0;for(unsigned i=0;i<128*128;++i){const auto *p=ads+128*128*4+i*4;right_red+=p[0]>150&&p[0]>p[1]*2;}
+    require(!right_red,"reticle leaked outside the right eye glass mask");
+    const auto *edge=pixels+4*128*128*4*2;
+    for(unsigned i=0;i<128*128;++i)require(edge[i*4]==26&&edge[i*4+1]==26&&edge[i*4+2]==26,"collinear left-eye laser produced pixels");
+    const auto *gradient=edge+128*128*4+(63*128+24)*4;
+    require(gradient[0]>30&&gradient[0]<180,"right-eye laser lost its gradient when left-eye geometry was degenerate");
+    require(overlay.draw_count()==28,"overlay primitives were replayed per eye or silently dropped");
+    require(overlay.render_pass_starts()==0,"overlay failed to reuse the final game render pass");
+    std::puts(foveation?"ok: shared gun/laser/sight overlay runs inside a density-map render pass":"ok: persistent gun meshes, stereo lasers/sight masks, preserved alpha and shared final render pass");
 }
 
 static void render_stereo(Device &device)
@@ -633,6 +702,8 @@ static void test_controller_input()
     sample.pose[0].position[0]-=.1f;sample.pose[1].position[0]+=.1f;
     sample.buttons.trigger[0]=1;sample.buttons.trigger[1]=1;
     const auto haptics=input.update(scene,sample,1000000000,true);
+    require(input.overlay_frames()[0].gun_valid&&input.overlay_frames()[1].gun_valid&&input.overlay_frames()[1].p2,
+            "controller poses did not populate separate overlay guns");
     require(haptics[0].milliseconds==35&&haptics[1].milliseconds==35,"dual guns did not receive independent recoil haptics");
     require(input.consume(snapshot)&&snapshot.dual&&snapshot.valid[0]&&snapshot.valid[1]&&snapshot.coins==1,"dual input/rays or P2 join credit were lost");
     require(snapshot.ray[0].origin!=snapshot.ray[1].origin,"both player shot hooks received the same gun ray");
@@ -644,6 +715,7 @@ static void test_controller_input()
     require(input.consume(snapshot)&&(snapshot.held&(1<<4)),"mailbox lost a trigger pulse between game-thread reads");
     require(input.consume(snapshot)&&!(snapshot.held&(1<<4)),"mailbox replayed an already consumed trigger pulse");
     input.update(scene,sample,1040000000,false);
+    require(!input.overlay_frames()[0].gun_valid&&!input.overlay_frames()[1].gun_valid,"focus loss left stale overlay guns");
     require(input.consume(snapshot)&&snapshot.held==0&&!snapshot.valid[0]&&!snapshot.valid[1],"focus loss retained firing or old gun rays");
     scene.invalidate();sample.buttons.trigger[1]=1;input.update(scene,sample,1050000000,true);
     require(input.consume(snapshot)&&snapshot.held==0&&!snapshot.valid[0],"invalid tracking published active gun input");
@@ -793,6 +865,8 @@ try {
     rejected([&] { Texture unsupported(*limited, luminance); },
              "unsupported texture component swizzle accepted");
     render_stereo(*device);
+    render_overlay(*device);
+    if(device->capabilities.density_map&&device->capabilities.density_map_non_subsampled)render_overlay(*device,true);
     render_density_reuse(*device);
     render_copy(*device);
     render_stereo_depth_copy(*device);

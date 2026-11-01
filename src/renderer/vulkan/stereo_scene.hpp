@@ -22,6 +22,8 @@ public:
     void publish(const std::array<StereoPose,2> &eyes);
     void invalidate();
     bool aim(const StereoPose &controller,int width,int height,bool on_hud,float aim_distance,StereoRay &ray) const;
+    const Matrices &overlay_matrices() const {return overlay_;}
+    const std::array<std::array<float,3>,2> &overlay_eyes() const {return eye_positions_;}
     bool tracking_valid() const { return valid_; }
     bool world_camera(const Matrix &projection) const;
     bool zoomed(const Matrix &projection) const;
@@ -33,6 +35,7 @@ public:
 private:
     StereoSettings settings_;
     std::array<StereoPose,2> eyes_;
+    Matrices overlay_{};std::array<std::array<float,3>,2> eye_positions_;
     bool valid_=false;
     std::array<Matrix,2> view_,hud_view_;
     std::array<std::array<float,4>,2> tangents_;

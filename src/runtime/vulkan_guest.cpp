@@ -4,6 +4,7 @@
 #include "../renderer/vulkan/guest_state.hpp"
 #include "../renderer/vulkan/stereo_scene.hpp"
 #include "../renderer/vulkan/controller_input.hpp"
+#include "../renderer/vulkan/overlay.hpp"
 #include "../renderer/vulkan/shader_pack.hpp"
 #include "../renderer/vulkan/window.hpp"
 #include "../renderer/vulkan/resources.hpp"
@@ -204,6 +205,7 @@ struct State {
   std::unique_ptr<Device> device;
   std::unique_ptr<Window> window;
   std::unique_ptr<StereoScene> stereo;
+  std::unique_ptr<Overlay> overlay;
   std::unique_ptr<ControllerInput> controllers;ControllerSnapshot game_input;
   int fake_guns=0;
   void fake_controllers();
@@ -287,7 +289,7 @@ struct State {
     for (auto &slot : materials) slot.clear();
     programs.clear();
     fixed_program.native.reset();
-    renderers.clear();
+    renderers.clear();overlay.reset();
     texture_objects.clear();
     buffers.clear();
     samplers.clear();
@@ -370,7 +372,7 @@ struct State {
     }
   }
   Target *target() { frame(); return drawable ? drawables.at(drawable).get() : screen; }
-  void flush() {
+  void flush(bool keep_last=false) {
     end_pass();
     static const bool profile_prepare=[] {const auto *v=std::getenv("LINDBERGH_VULKAN_PREPARE_TIMING");return v && *v=='1';}();
     if (profile_prepare) {
@@ -400,7 +402,7 @@ struct State {
         active->draw_buffers(p.streams.data(),uint32_t(p.streams.size()),p.count,p.matrices,p.raster,p.index.buffer?&p.index:nullptr);
       }
     }
-    packets.clear(); end_pass();
+    packets.clear();if(!keep_last)end_pass();
   }
   Renderer &renderer() {
     frame();
@@ -451,8 +453,10 @@ ControllerSettings controller_settings(const LgXrSettings &settings,int width,in
 {
   const auto *profile=game_profile();bool hud=profile->vr.aim_on_hud;
   if(const auto *v=std::getenv("LINDBERGH_XR_AIM_HUD"))hud=*v=='1';
-  return {profile->vr.width?profile->vr.width:width,profile->vr.height?profile->vr.height:height,
+  ControllerSettings result{profile->vr.width?profile->vr.width:width,profile->vr.height?profile->vr.height:height,
           bool(settings.dual),bool(settings.auto_coins),bool(settings.left_handed),hud,settings.aim};
+  result.show_gun=settings.show_gun;result.laser=settings.laser;result.sight=settings.sight;result.gun_model=profile->vr.gun_model;
+  return result;
 }
 
 void shutdown_vulkan() { state.shutdown(); }
@@ -564,6 +568,14 @@ extern "C" int lvk_host_init(SDL_Window *window, int w, int h) {
     const auto density=state.xr->density_extent();
     state.unfocused_density=std::make_unique<ConstantDensityMap>(*state.device,*state.ring,density[0],density[1],2);
 #endif
+    if(state.controllers) {
+      state.overlay=std::make_unique<Overlay>(*state.device,*state.ring,*state.cache);
+#ifdef LINDBERGH_VULKAN_XR
+      for(const auto &target:state.xr->render_targets())state.overlay->prepare(*target);
+#else
+      for(const auto &target:state.window->render_targets())state.overlay->prepare(*target);
+#endif
+    }
     state.game_width=w; state.game_height=h;
     state.viewport = state.scissor = {0, 0, w, h};
     state.arrays.current(3,{1,1,1,1});state.arrays.current(2,{0,0,1,0});
@@ -619,9 +631,23 @@ struct FrameCapture {
 }
 extern "C" unsigned g_frame;
 extern "C" void lvk_host_present(void) {
-  state.frame(); state.flush();
+  state.frame();
+  bool show_overlay=state.overlay&&state.stereo&&state.stereo->tracking_valid();
+#ifdef LINDBERGH_VULKAN_XR
+  show_overlay=show_overlay&&state.xr_rendering;
+#endif
+  state.flush(show_overlay);
   if (!state.initialized.count(state.screen)) {
     const auto old=state.drawable;state.drawable=0;state.renderer();state.end_pass();state.drawable=old;
+  }
+  if(show_overlay) {
+    Renderer *previous=state.active_target==state.screen?state.active:nullptr;
+    if(state.active&&!previous)state.end_pass();
+    state.overlay->draw(state.cmd,*state.screen,state.stereo->overlay_matrices(),state.stereo->overlay_eyes(),state.controllers->overlay_frames(),previous);
+    state.active=nullptr;state.active_target=nullptr;
+    static const bool overlay_log=std::getenv("LINDBERGH_VULKAN_OVERLAY_LOG")!=nullptr;
+    if(overlay_log&&g_frame%600==0)std::fprintf(stderr,"[vulkan-overlay] frame %u: %zu retained meshes, %zu prepared targets, %llu multiview draws, %llu additional passes\n",
+        g_frame,state.overlay->mesh_buffer_count(),state.overlay->target_count(),(unsigned long long)state.overlay->draw_count(),(unsigned long long)state.overlay->render_pass_starts());
   }
   const char *shot=std::getenv("LINDBERGH_SHOT");const char *at=std::getenv("LINDBERGH_SHOT_FRAME");
   const char *period=std::getenv("LINDBERGH_SHOT_EVERY"), *from=std::getenv("LINDBERGH_SHOT_FROM");

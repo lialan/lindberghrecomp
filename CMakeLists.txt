@@ -218,7 +218,7 @@ function(lindbergh_runtime target generated_dir)
             if(NOT LINDBERGH_RENDERER STREQUAL "VULKAN")
                 target_sources(${target} PRIVATE "${LINDBERGH_RUNTIME_DIR}/host_xr.c"
                     "${LINDBERGH_RUNTIME_DIR}/xr_actions.c"
-                    "${LINDBERGH_RUNTIME_DIR}/xr_overlay.c" "${LINDBERGH_RUNTIME_DIR}/xr_menu.c")
+                    "${LINDBERGH_RUNTIME_DIR}/xr_overlay.c" "${LINDBERGH_RUNTIME_DIR}/xr_overlay_geometry.c" "${LINDBERGH_RUNTIME_DIR}/xr_menu.c")
                 target_compile_definitions(${target} PRIVATE LINDBERGH_GL4ES LINDBERGH_OPENXR)
                 target_include_directories(${target} PRIVATE "${GL4ES_DIR}/include" "${OPENXR_DIR}/include")
                 target_link_libraries(${target} PRIVATE "${GL4ES_LIB}" "${OPENXR_LIB}" EGL)
@@ -242,7 +242,7 @@ function(lindbergh_runtime target generated_dir)
                 find_package(OpenXR CONFIG REQUIRED)
                 target_sources(${target} PRIVATE "${LINDBERGH_RUNTIME_DIR}/host_xr.c"
                     "${LINDBERGH_RUNTIME_DIR}/xr_actions.c"
-                    "${LINDBERGH_RUNTIME_DIR}/xr_overlay.c" "${LINDBERGH_RUNTIME_DIR}/xr_menu.c")
+                    "${LINDBERGH_RUNTIME_DIR}/xr_overlay.c" "${LINDBERGH_RUNTIME_DIR}/xr_overlay_geometry.c" "${LINDBERGH_RUNTIME_DIR}/xr_menu.c")
                 target_compile_definitions(${target} PRIVATE LINDBERGH_OPENXR)
                 target_link_libraries(${target} PRIVATE OpenXR::openxr_loader)
             endif()

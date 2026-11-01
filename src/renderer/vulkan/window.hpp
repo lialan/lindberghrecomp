@@ -15,6 +15,7 @@ public:
     // Submit before presentation (guest glFlush) without reacquiring the image.
     Submission flush(FrameRing &ring);
     Submission present(FrameRing &ring);
+    const std::vector<std::unique_ptr<Target>> &render_targets() const {return targets_;}
 private:
     Device &device_;
     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
