@@ -10,6 +10,7 @@
 #include "renderer.hpp"
 #include "guest_state.hpp"
 #include "guest_arrays.hpp"
+#include "guest_indices.hpp"
 #include "guest_pixels.hpp"
 #include "uniforms.hpp"
 #include "resources.hpp"
@@ -297,6 +298,28 @@ static void test_settings_panel()
     std::puts("ok: native menu actions, live camera settings, blocked game input and cabinet actions");
 }
 
+static void test_guest_indices()
+{
+    GuestIndexRanges ranges;uint16_t indices[]={99,0,2,1};
+    require(ranges.vertices(indices,sizeof indices,1,2,3,0x1403)==3,"EBO offset/count bounds changed");
+    require(ranges.vertices(indices,sizeof indices,1,2,3,0x1403)==3&&ranges.scans()==1&&ranges.hits()==1,"unchanged EBO range was rescanned");
+    indices[2]=7;
+    require(ranges.vertices(indices,sizeof indices,2,2,3,0x1403)==8&&ranges.scans()==2,"buffer revision reused stale maximum index");
+    uint16_t replacement[]={99,0,1,1};
+    require(ranges.vertices(replacement,sizeof replacement,2,2,3,0x1403)==2,"new buffer shadow reused stale bounds");
+    rejected([&]{ranges.vertices(replacement,4,2,2,3,0x1403);},"truncated EBO range accepted from cache");
+    rejected([&]{ranges.vertices(replacement,sizeof replacement,2,UINT64_MAX,UINT32_MAX,0x1405);},"EBO range arithmetic overflow accepted");
+    require(ranges.vertices(nullptr,0,3,0,0,0x1403)==0,"empty EBO range requires storage");
+    std::vector<uint32_t> expanded;uint8_t unaligned[9]{};const uint32_t wide[]={3,1};std::memcpy(unaligned+1,wide,sizeof wide);
+    require(GuestIndexRanges::decode(unaligned+1,2,0x1405,expanded)==4&&expanded==std::vector<uint32_t>({3,1}),"unaligned uint32 index decoding changed");
+    const uint8_t narrow[]={255,0,1};require(GuestIndexRanges::decode(narrow,3,0x1401,expanded)==256,"byte-index expansion lost range");
+    const uint32_t overflow=UINT32_MAX;rejected([&]{ranges.vertices(&overflow,4,4,0,1,0x1405);},"UINT32_MAX index overflow accepted");
+    for(uint32_t mode:{0u,1u,3u,4u,5u,6u})require(GuestIndexRanges::native(mode,0x1403,2),"native primitive incorrectly lowered");
+    for(uint32_t mode:{2u,7u,8u,9u,99u})require(!GuestIndexRanges::native(mode,0x1403,0),"legacy primitive bypassed lowering");
+    require(!GuestIndexRanges::native(4,0x1403,1)&&!GuestIndexRanges::native(4,0x1401,0),"unsupported native index storage accepted");
+    std::puts("ok: revision-bound EBO ranges, unaligned decoding, legacy primitive eligibility and overflow rejection");
+}
+
 static void render_stereo(Device &device)
 {
     TargetInfo info;
@@ -370,6 +393,24 @@ static void render_stereo(Device &device)
     pixel(0, 8, 16, 255); pixel(0, 24, 16, 0);
     pixel(1, 8, 16, 0); pixel(1, 24, 16, 255);
     std::puts("ok: one Vulkan draw rendered distinct stereo views with build-time SPIR-V");
+
+    // Persistent geometry uploads can exceed the fixed ring arena or its
+    // remaining space. Dedicated staging must keep its data until the fence,
+    // preserving both stereo eyes without an intermediate submission/wait.
+    for(unsigned capacity:{64u,128u,256u}) {
+        GeometryBuffer persistent(device,sizeof triangle);FrameRing tiny(device,3,capacity);
+        require(!tiny.can_upload(4),"upload space reported outside a recording");cmd=tiny.begin();
+        if(capacity==128)tiny.upload(triangle,64,4);
+        require(tiny.can_upload(sizeof triangle,4)==(capacity==256),"arena capacity query is incorrect");
+        persistent.upload(cmd,tiny,triangle,sizeof triangle,0,capacity==256);
+        require(tiny.can_upload(capacity==128?64:capacity,1),"dedicated staging consumed the fixed arena");
+        renderer.begin(cmd,{0,0,0,1});Upload stream{persistent.handle(),0};renderer.draw_buffers(&stream,1,3,matrices,state);renderer.end();
+        vkCmdCopyImageToBuffer(cmd,target.color,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,output.buffer,1,&copy);
+        vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&barrier,0,nullptr);
+        tiny.wait(tiny.submit());require(tiny.submissions()==1,"geometry overflow forced an intermediate submission");
+        pixel(0,8,16,255);pixel(0,24,16,0);pixel(1,8,16,0);pixel(1,24,16,255);
+    }
+    std::puts("ok: persistent geometry uses fence-retained overflow staging without flushing the frame");
 
     // Cached commands must remain correct across another renderer sharing the
     // pass and across a new command buffer. Use persistent streams so repeated
@@ -725,6 +766,7 @@ static void render_stereo(Device &device)
         throw std::runtime_error("vertex pointer did not capture its array-buffer binding");
     };
     IndexStream elements_gpu{indices_gpu.handle(), 0, VK_INDEX_TYPE_UINT16};
+    GuestIndexRanges element_ranges;
     SamplerInfo mip_info;
     mip_info.min_lod = mip_info.max_lod = 1;
     Sampler mip_sampler(device, mip_info);
@@ -756,7 +798,8 @@ static void render_stereo(Device &device)
             arrays.bind_array_buffer(8);
             arrays.pointer(3, 4, 0x1401, true, 0, 0);
         }
-        const auto &plan = arrays.prepare(device, ring, 0, 4, memory, buffers);
+        const auto bound=element_ranges.vertices(elements,sizeof elements,1,0,6,0x1403);
+        const auto &plan = arrays.prepare(device, ring, 0, bound, memory, buffers);
         require(plan.streams[0].buffer == positions_gpu.handle() && plan.streams[0].offset == 0,
                 "guest static geometry was copied instead of bound directly");
         if (!frame) {
@@ -805,7 +848,8 @@ static void render_stereo(Device &device)
     require(textured->draw_count() + constant_color->draw_count() == frames &&
             textured->pipeline_count() == 1 && constant_color->pipeline_count() == 1,
             "static textured stereo geometry was replayed or recompiled");
-    std::puts("ok: guest VBO/client/current arrays render directly with textures, uint16 indices and mip descriptors");
+    require(element_ranges.scans()==1&&element_ranges.hits()==frames-1,"persistent uint16 geometry rescanned per frame");
+    std::puts("ok: guest VBO/client/current arrays render directly with textures, cached uint16 EBO bounds and mip descriptors");
 }
 
 
@@ -1084,6 +1128,7 @@ try {
                             VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_ONE};
     rejected([&] { Texture unsupported(*limited, luminance); },
              "unsupported texture component swizzle accepted");
+    test_guest_indices();
     render_stereo(*device);
     test_sight_policy();
     test_settings_panel();

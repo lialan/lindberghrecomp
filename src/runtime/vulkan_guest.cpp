@@ -8,6 +8,7 @@
 #include "../renderer/vulkan/settings_panel.hpp"
 #include "../renderer/vulkan/shader_pack.hpp"
 #include "../renderer/vulkan/pipeline_recipes.hpp"
+#include "../renderer/vulkan/guest_indices.hpp"
 #include "../renderer/vulkan/window.hpp"
 #include "../renderer/vulkan/resources.hpp"
 #include "../renderer/vulkan/uniforms.hpp"
@@ -47,6 +48,10 @@ namespace {
   std::fprintf(stderr, "[vulkan] %s\n", what);
   std::abort();
 }
+bool index_reuse_enabled() {
+  static const bool enabled=[] {const auto *v=std::getenv("LINDBERGH_VULKAN_INDEX_REUSE");return !v||*v!='0';}();return enabled;
+}
+std::shared_ptr<GeometryBuffer> native_buffer(GLuint id,bool dedicated_staging=false);
 struct Shader {
   GLenum type;
   std::string source;
@@ -113,6 +118,7 @@ struct Buffer {
   std::array<BufferVersion,3> slots;
 
   std::vector<unsigned char> bytes;
+  GuestIndexRanges index_ranges;
   GLenum usage = GL_STATIC_DRAW;
 };
 struct Attributes {
@@ -293,6 +299,8 @@ struct State {
   std::array<float, 4> clear{0, 0, 0, 0};
   RasterState raster;
   bool ready = false;
+  bool index_stats=false;
+  uint64_t direct_index_draws=0,uploaded_index_draws=0,uploaded_index_bytes=0;
   uint64_t legacy_version=1;
   bool in_begin=false; GLenum immediate_mode=GL_TRIANGLES;
   std::vector<std::array<float,64>> immediate;
@@ -320,6 +328,12 @@ struct State {
       recipes.reset();
     }
     renderers.clear();overlay.reset();panel.reset();
+    if(index_stats) {
+      uint64_t hits=0,scans=0;for(const auto &b:buffers){hits+=b.second.index_ranges.hits();scans+=b.second.index_ranges.scans();}
+      std::fprintf(stderr,"[vulkan-indices] %llu native draws, %llu expanded draws, %llu expanded bytes; live EBO range cache %llu hits, %llu scans\n",
+        (unsigned long long)direct_index_draws,(unsigned long long)uploaded_index_draws,(unsigned long long)uploaded_index_bytes,
+        (unsigned long long)hits,(unsigned long long)scans);
+    }
     if(Renderer::command_stats_enabled()) {
       const auto counts=Renderer::global_command_stats();
       for(size_t i=0;i<Renderer::command_count;++i)
@@ -656,6 +670,7 @@ extern "C" int lvk_host_init(SDL_Window *window, int w, int h) {
     if (!cache_path.empty()) std::fprintf(stderr,"[vulkan] pipeline cache %s: %s\n",
                                          state.cache->loaded()?"loaded":"cold",cache_path.c_str());
     state.ring = std::make_unique<FrameRing>(*state.device, 3, 64u << 20);
+    state.index_stats=Renderer::command_stats_enabled();
     if(const auto *path=std::getenv("LINDBERGH_VULKAN_SUBMISSION_TIMINGS"))state.ring->profile(path);
 #ifdef LINDBERGH_VULKAN_XR
     const auto density=state.xr->density_extent();
@@ -1177,6 +1192,10 @@ extern "C" void lvk_glBufferData(GLenum target, GLsizeiptr n,
   if (data && n)
     std::memcpy(b.bytes.data(), data, size_t(n));
   b.usage = usage;
+  // Match static GL buffer upload timing: populate immutable EBOs while the
+  // guest loads them, rather than allocating/copying them at the first combat draw.
+  if(state.ready&&target==GL_ELEMENT_ARRAY_BUFFER&&state.binding(target)&&data&&n&&
+     usage==GL_STATIC_DRAW&&!b.dynamic&&index_reuse_enabled())native_buffer(state.binding(target),true);
 }
 extern "C" void lvk_glBufferSubData(GLenum target, GLintptr offset,
                                     GLsizeiptr n, const GLvoid *data) {
@@ -2025,7 +2044,7 @@ std::shared_ptr<Texture> native_image(TextureObject &o, int overwritten_level = 
   }
   version.use_frame=frame;state.ring->keep_alive(version.image);return version.image;
 }
-std::shared_ptr<GeometryBuffer> native_buffer(GLuint id) {
+std::shared_ptr<GeometryBuffer> native_buffer(GLuint id,bool dedicated_staging) {
   auto &o=state.buffers.at(id);state.frame();state.end_pass();
   auto &version=o.dynamic?o.slots[state.ring->recording_slot()]:o.stable;
   const auto frame=state.ring->submissions()+1;
@@ -2035,8 +2054,8 @@ std::shared_ptr<GeometryBuffer> native_buffer(GLuint id) {
     if(!version.buffer||version.use_frame==frame||version.bytes!=bytes) {
       version.buffer=std::make_shared<GeometryBuffer>(*state.device,bytes);version.bytes=bytes;
     }
-    if(bytes==o.bytes.size())version.buffer->upload(state.cmd,*state.ring,o.bytes.data(),bytes);
-    else {auto copy=o.bytes;copy.resize(bytes);version.buffer->upload(state.cmd,*state.ring,copy.data(),bytes);}
+    if(bytes==o.bytes.size())version.buffer->upload(state.cmd,*state.ring,o.bytes.data(),bytes,0,dedicated_staging);
+    else {auto copy=o.bytes;copy.resize(bytes);version.buffer->upload(state.cmd,*state.ring,copy.data(),bytes,0,dedicated_staging);}
     version.revision=o.revision;
   }
   version.use_frame=frame;state.ring->keep_alive(version.buffer);return version.buffer;
@@ -2409,13 +2428,28 @@ void draw_geometry(GLenum mode,GLint first,GLsizei count,const void *indices,GLe
   auto images=material(p);p.native->layouts[2]=images->descriptors->layout();
   std::vector<uint32_t> locations;for(const auto &input:p.record->inputs)locations.push_back(input.location);
   uint32_t vertices=uint32_t(count);std::vector<uint32_t> elements;
+  bool direct_indices=false;VkDeviceSize index_offset=0;
   if(indexed) {
     const size_t bytes=index_type==GL_UNSIGNED_BYTE?1:index_type==GL_UNSIGNED_SHORT?2:index_type==GL_UNSIGNED_INT?4:0;
     if(!bytes)gap("unsupported guest index type");
     const uint8_t *data=static_cast<const uint8_t *>(indices);
-    if(state.element_buffer) {auto &b=state.buffers.at(state.element_buffer);const auto offset=(uintptr_t)indices;check_range(b.bytes.size(),GLintptr(offset),GLsizeiptr(size_t(count)*bytes));data=b.bytes.data()+offset;}
-    elements.resize(size_t(count));vertices=0;
-    for(size_t i=0;i<size_t(count);++i) {uint32_t v=0;std::memcpy(&v,data+i*bytes,bytes);elements[i]=v;if(v==UINT32_MAX)gap("guest index range overflow");vertices=std::max(vertices,v+1);}
+    if(state.element_buffer) {
+      auto &b=state.buffers.at(state.element_buffer);const auto offset=(uintptr_t)indices;
+      check_range(b.bytes.size(),GLintptr(offset),GLsizeiptr(size_t(count)*bytes));data=b.bytes.data()+offset;
+      // Rewritten/streaming EBOs keep the efficient frame-upload path instead
+      // of allocating a new device-local buffer for each same-frame revision.
+      direct_indices=index_reuse_enabled()&&!b.dynamic&&b.usage==GL_STATIC_DRAW&&
+          GuestIndexRanges::native(mode,index_type,offset);index_offset=offset;
+      if(direct_indices) {
+        vertices=b.index_ranges.vertices(b.bytes.data(),b.bytes.size(),b.revision,offset,uint32_t(count),index_type);
+        // The bounded HUD/composite classifiers still inspect small CPU lists.
+        if(count<=64)GuestIndexRanges::decode(data,uint32_t(count),index_type,elements);
+      }
+    }
+    if(!direct_indices) {
+      elements.resize(size_t(count));vertices=0;
+      for(size_t i=0;i<size_t(count);++i) {uint32_t v=0;std::memcpy(&v,data+i*bytes,bytes);elements[i]=v;if(v==UINT32_MAX)gap("guest index range overflow");vertices=std::max(vertices,v+1);}
+    }
   }
   auto raster=raster_state(fixed);raster.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
   if(mode==GL_TRIANGLE_STRIP)raster.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
@@ -2457,7 +2491,14 @@ void draw_geometry(GLenum mode,GLint first,GLsizei count,const void *indices,GLe
   }
   auto packet=packet_for(target,renderer.get());packet.raster=raster;packet.streams=std::move(plan.streams);packet.count=uint32_t(count);
   if(stereo_packet(packet,first,count,elements,immediate,immediate_stride,guest_indexed))return;
-  if(indexed) {auto upload=state.ring->upload(elements.data(),size_t(count)*4,4);packet.index={upload.buffer,upload.offset,VK_INDEX_TYPE_UINT32};}
+  if(direct_indices) {
+    auto gpu=native_buffer(state.element_buffer,true);
+    packet.index={gpu->handle(),index_offset,index_type==GL_UNSIGNED_SHORT?VK_INDEX_TYPE_UINT16:VK_INDEX_TYPE_UINT32};
+    if(state.index_stats)++state.direct_index_draws;
+  } else if(indexed) {
+    auto upload=state.ring->upload(elements.data(),size_t(count)*4,4);packet.index={upload.buffer,upload.offset,VK_INDEX_TYPE_UINT32};
+    if(state.index_stats){++state.uploaded_index_draws;state.uploaded_index_bytes+=size_t(count)*4;}
+  }
   for(size_t block=0;block<p.record->uniforms.size();++block) {
     const auto set=p.record->uniforms[block].set;if(set>=2)gap("unexpected uniform descriptor set");
     const auto version=p.uniforms[block]->version(),frame=state.ring->submissions()+1;

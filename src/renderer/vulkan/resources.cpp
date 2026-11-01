@@ -64,11 +64,37 @@ GeometryBuffer::GeometryBuffer(Device &device, VkDeviceSize bytes) : device_(dev
     } catch (...) { release(); throw; }
 }
 
-void GeometryBuffer::upload(VkCommandBuffer cmd, FrameRing &ring, const void *data, size_t bytes, VkDeviceSize offset)
+namespace {
+// Rare overflow staging is retired by the same frame fence as ring uploads.
+// It avoids flushing/waiting or rejecting a valid persistent geometry upload
+// just because earlier commands consumed this slot's fixed upload arena.
+struct GeometryStaging {
+    Device &device;VkBuffer buffer=VK_NULL_HANDLE;VkDeviceMemory memory=VK_NULL_HANDLE;
+    GeometryStaging(Device &d,const void *data,size_t bytes):device(d) {
+        try {
+            VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};info.size=bytes;info.usage=VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+            check(vkCreateBuffer(d.handles.device,&info,nullptr,&buffer),"overflow geometry staging");
+            VkMemoryRequirements req;vkGetBufferMemoryRequirements(d.handles.device,buffer,&req);
+            VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};alloc.allocationSize=req.size;
+            alloc.memoryTypeIndex=d.memory_type(req.memoryTypeBits,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            check(vkAllocateMemory(d.handles.device,&alloc,nullptr,&memory),"overflow geometry staging memory");
+            check(vkBindBufferMemory(d.handles.device,buffer,memory,0),"bind overflow geometry staging");
+            void *mapped=nullptr;check(vkMapMemory(d.handles.device,memory,0,bytes,0,&mapped),"map overflow geometry staging");
+            std::memcpy(mapped,data,bytes);vkUnmapMemory(d.handles.device,memory);
+        }catch(...){release();throw;}
+    }
+    void release(){if(buffer)vkDestroyBuffer(device.handles.device,buffer,nullptr);if(memory)vkFreeMemory(device.handles.device,memory,nullptr);buffer=VK_NULL_HANDLE;memory=VK_NULL_HANDLE;}
+    ~GeometryStaging(){release();}
+};
+}
+void GeometryBuffer::upload(VkCommandBuffer cmd, FrameRing &ring, const void *data, size_t bytes, VkDeviceSize offset,
+                            bool dedicated_staging)
 {
     if (!cmd || !data || !bytes || offset % 4 || bytes % 4 || offset > bytes_ || bytes > bytes_ - offset)
         throw std::invalid_argument("Invalid Vulkan geometry upload");
-    auto source = ring.upload(data, bytes, 4);
+    Upload source{};
+    if(!dedicated_staging&&ring.can_upload(bytes,4))source=ring.upload(data,bytes,4);
+    else {auto staging=std::make_shared<GeometryStaging>(device_,data,bytes);source={staging->buffer,0};ring.keep_alive(staging);ring.record_external_upload(bytes);}
     VkBufferMemoryBarrier barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
     barrier.srcAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;

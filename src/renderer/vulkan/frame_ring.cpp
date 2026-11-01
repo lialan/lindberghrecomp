@@ -164,6 +164,7 @@ VkCommandBuffer FrameRing::begin()
         s.timing.cpu_thread = std::this_thread::get_id();
     }
     s.used = 0;
+    s.external_uploads=0;
     ++s.generation;
     VkCommandBufferBeginInfo info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -174,6 +175,23 @@ VkCommandBuffer FrameRing::begin()
     }
     recording_ = true;
     return s.cmd;
+}
+
+bool FrameRing::can_upload(size_t bytes,VkDeviceSize alignment) const
+{
+    if(!recording_||!alignment||(alignment&(alignment-1)))return false;
+    const auto used=slots_[current_].used;
+    const auto padding=(alignment-(used&(alignment-1)))&(alignment-1);
+    return padding<=capacity_-used&&bytes<=capacity_-used-padding;
+}
+void FrameRing::record_external_upload(size_t bytes)
+{
+    if(!recording_)throw std::logic_error("External upload outside frame recording");
+    if(profile_) {
+        auto &s=slots_[current_];
+        if(bytes>UINT64_MAX-s.used-s.external_uploads)throw std::overflow_error("Upload timing counter overflow");
+        s.external_uploads+=bytes;
+    }
 }
 
 Upload FrameRing::upload(const void *data, size_t bytes, VkDeviceSize alignment)
@@ -229,7 +247,7 @@ Submission FrameRing::submit(VkSemaphore wait, VkSemaphore signal, VkPipelineSta
         const auto cpu = thread_ticks();
         s.timing.cpu_valid = s.timing.cpu_thread == std::this_thread::get_id() && cpu >= s.timing.cpu_started;
         s.timing.record_thread = s.timing.cpu_valid ? cpu - s.timing.cpu_started : 0;
-        s.timing.uploads = s.used;
+        s.timing.uploads = s.used+s.external_uploads;
         s.timing.retained = s.resources.size();
         s.timing.submission = submissions_ + 1;
     }

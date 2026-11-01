@@ -36,6 +36,8 @@ class FrameRing {
     uint32_t recording_slot() const;
     VkBuffer upload_buffer(uint32_t slot) const;
     VkDeviceSize upload_capacity() const { return capacity_; }
+    bool can_upload(size_t bytes, VkDeviceSize alignment=16) const;
+    void record_external_upload(size_t bytes);
     // Opt-in diagnostics. Query results are read only after an existing slot
     // fence wait; profiling never adds a submission wait or queue-idle call.
     bool profile(const std::string &path);
@@ -50,6 +52,7 @@ class FrameRing {
         VkDeviceMemory memory = VK_NULL_HANDLE;
         void *mapped = nullptr;
         VkDeviceSize used = 0;
+        uint64_t external_uploads=0;
         uint64_t generation = 0;
         bool submitted = false;
         std::vector<std::shared_ptr<void>> resources;

@@ -13,7 +13,8 @@ public:
     ~GeometryBuffer();
     GeometryBuffer(const GeometryBuffer &) = delete;
     GeometryBuffer &operator=(const GeometryBuffer &) = delete;
-    void upload(VkCommandBuffer cmd, FrameRing &ring, const void *data, size_t bytes, VkDeviceSize offset = 0);
+    void upload(VkCommandBuffer cmd, FrameRing &ring, const void *data, size_t bytes, VkDeviceSize offset = 0,
+                bool dedicated_staging = false);
     VkBuffer handle() const { return buffer_; }
 private:
     Device &device_;
