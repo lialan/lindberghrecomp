@@ -93,6 +93,7 @@ function(lindbergh_runtime target generated_dir)
             "${LINDBERGH_RUNTIME_DIR}/display_cadence.c"
             "${LINDBERGH_RUNTIME_DIR}/xr_settings.c"
             "${LINDBERGH_RUNTIME_DIR}/xr_controls.c"
+            "${LINDBERGH_RUNTIME_DIR}/xr_panel.c"
             "${LINDBERGH_RUNTIME_DIR}/host_settings.c"
             "${LINDBERGH_RUNTIME_DIR}/game_profile.c"
             "${LINDBERGH_RUNTIME_DIR}/hle_gl_posix.c"
@@ -111,7 +112,7 @@ function(lindbergh_runtime target generated_dir)
         target_compile_definitions(${target} PRIVATE RECOMP_GUEST_BASE=1)
     endif()
     if(LINDBERGH_RENDERER STREQUAL "VULKAN")
-        list(REMOVE_ITEM platform_sources "${LINDBERGH_RUNTIME_DIR}/stereo.c" "${LINDBERGH_RUNTIME_DIR}/stereo_projection.c" "${LINDBERGH_RUNTIME_DIR}/xr_controls.c")
+        list(REMOVE_ITEM platform_sources "${LINDBERGH_RUNTIME_DIR}/stereo.c" "${LINDBERGH_RUNTIME_DIR}/stereo_projection.c" "${LINDBERGH_RUNTIME_DIR}/xr_controls.c" "${LINDBERGH_RUNTIME_DIR}/xr_panel.c")
         set(abi "${CMAKE_CURRENT_BINARY_DIR}/vulkan-abi-${target}")
         set(abi_inputs "${LINDBERGH_RUNTIME_DIR}/hle_gl_posix.c"
             "${LINDBERGH_RUNTIME_DIR}/arbprog.c" "${LINDBERGH_RUNTIME_DIR}/host_sdl.c"

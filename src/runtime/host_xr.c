@@ -2,6 +2,7 @@
 #include "xr_settings.h"
 #include "xr_controls.h"
 #include "xr_actions.h"
+#include "xr_panel.h"
 #include "stereo_projection.h"
 /*
  * host_xr.c - the headset, through OpenXR (Android and Windows PC VR).
@@ -290,14 +291,7 @@ static int fake_gun(void)
  * towards them, the game's screen still in view (the arcade's own Test menu
  * is worked from here too). Point the gun at a row and pull the trigger;
  * the game gets no input meanwhile. */
-enum { M_SIGHT, M_LASER, M_CROSSHAIR, M_GUN, M_HAND, M_DUAL, M_FPS, M_SCREEN, M_HUD, M_RATE, M_RES, M_COINS, M_COIN, M_RECENTRE,
-       M_TEST, M_SERVICE, M_RESET, M_CLOSE, M_COUNT };
-static struct {
-    int open, hover, dirty;
-    float c[3], right[3], up[3], n[3], hw, hh;  /* where it hangs, in LOCAL metres */
-    int test_frames, service_frames, coin;
-    int reset_armed;            /* "Reset game" chosen once: a second time resets */
-} menu;
+static XpPanel menu;
 static float rates[16];
 static int running_resolution, running_width;
 /* the gun's ray this frame (game units), what it reached two frames ago */
@@ -312,33 +306,7 @@ static int nrates;
 
 static void menu_items(XmItem *it)
 {
-    static const char *const sight[] = { "Point shooting", "Red dot", "Holographic" };
-    static const char *const laser[] = { "Laser and dot", "Dot only", "Off" };
-    static const char *const labels[M_COUNT] = {
-        "Sight", "Laser", "Game crosshair", "Gun model", "Gun hand", "Dual wield", "Show FPS", "Screen distance", "HUD position", "Display rate", "Resolution per eye",
-        "Coins", "Insert a coin", "Recentre view", "Arcade Test button (select)",
-        "Arcade Service button (next)", "Reset game", "Close" };
-    for (int i = 0; i < M_COUNT; i++) { it[i].label = labels[i]; it[i].value[0] = 0; }
-    snprintf(it[M_SIGHT].value, 40, "%s", sight[cfg.sight]);
-    snprintf(it[M_LASER].value, 40, "%s", laser[cfg.laser]);
-    snprintf(it[M_CROSSHAIR].value, 40, "%s", cfg.crosshair ? "Shown" : "Hidden");
-    snprintf(it[M_GUN].value, 40, "%s", cfg.show_gun ? "Shown" : "Hidden");
-    snprintf(it[M_HAND].value, 40, "%s", gun_hand == HAND_L ? "Left" : "Right");
-    if (cfg.dual) it[M_HAND].label = "Player 1 hand";    /* the other is player 2's */
-    snprintf(it[M_DUAL].value, 40, "%s", !cfg.dual ? "Off" : gun_hand == HAND_L ? "On (right hand P2)" : "On (left hand P2)");
-    snprintf(it[M_FPS].value, 40, "%s", cfg.show_fps ? "On" : "Off");
-    snprintf(it[M_SCREEN].value, 40, "%.1f m", cfg.screen);
-    if (!stereo_hud_is_head_locked()) snprintf(it[M_HUD].value, 40, "With the screen");
-    else if (cfg.hud_pitch == 0) snprintf(it[M_HUD].value, 40, "Centre");
-    else snprintf(it[M_HUD].value, 40, "%s %d deg", cfg.hud_pitch < 0 ? "Down" : "Up", abs(cfg.hud_pitch));
-    snprintf(it[M_RATE].value, 40, "%d Hz", cfg.refresh);
-    char res[24];
-    if (cfg.width) snprintf(res, sizeof res, "%d x %d", cfg.width, cfg.resolution);
-    else snprintf(res, sizeof res, "%d", cfg.resolution);
-    if (cfg.resolution == running_resolution && cfg.width == running_width) snprintf(it[M_RES].value, 40, "%s", res);
-    else snprintf(it[M_RES].value, 40, "%s (on restart)", res);
-    snprintf(it[M_COINS].value, 40, "%s", cfg.auto_coins ? "Automatic" : "By menu");
-    if (menu.reset_armed) snprintf(it[M_RESET].value, 40, "Pull again to reset");
+    xp_items(&menu,&cfg,gun_hand,stereo_hud_is_head_locked(),running_resolution,running_width,it);
 }
 
 /* The arcade's reset: the game starts again from its boot, as a new process
@@ -385,11 +353,11 @@ static const char *app_title(void)
 static void menu_paint(void)
 {
     static unsigned char img[XM_W * XM_H * 4];
-    XmItem it[M_COUNT];
+    XmItem it[XP_COUNT];
     char title[80];
     menu_items(it);
     snprintf(title, sizeof title, "%s - settings", app_title());
-    xm_paint(img, title, it, M_COUNT, menu.hover,
+    xm_paint(img, title, it, XP_COUNT, menu.hover,
              "Point and pull the trigger. Menu button: close.");
     xo_panel_upload(img, XM_W, XM_H);
     menu.dirty = 0;
@@ -397,20 +365,9 @@ static void menu_paint(void)
 
 static void menu_place(void)
 {
-    float head[3], f[3];
-    const float back[3] = { 0, 0, -1 };
-    for (int i = 0; i < 3; i++) head[i] = 0.5f * ((&views[0].pose.position.x)[i] + (&views[1].pose.position.x)[i]);
-    qrot(views[0].pose.orientation, back, f);
-    float yaw = atan2f(-f[0], -f[2]) + 0.55f;   /* about 30 degrees to the left */
-    float fwd[3] = { -sinf(yaw), 0, -cosf(yaw) };
-    for (int i = 0; i < 3; i++) menu.c[i] = head[i] + fwd[i] * 0.95f;
-    menu.c[1] = head[1] - 0.12f;
-    for (int i = 0; i < 3; i++) menu.n[i] = -fwd[i];
-    menu.up[0] = 0; menu.up[1] = 1; menu.up[2] = 0;
-    menu.right[0] = menu.up[1] * menu.n[2] - menu.up[2] * menu.n[1];
-    menu.right[1] = menu.up[2] * menu.n[0] - menu.up[0] * menu.n[2];
-    menu.right[2] = menu.up[0] * menu.n[1] - menu.up[1] * menu.n[0];
-    menu.hw = 0.33f; menu.hh = menu.hw * XM_H / XM_W;
+    float head[3],q[]={views[0].pose.orientation.x,views[0].pose.orientation.y,views[0].pose.orientation.z,views[0].pose.orientation.w};
+    for(int i=0;i<3;++i)head[i]=.5f*((&views[0].pose.position.x)[i]+(&views[1].pose.position.x)[i]);
+    xp_place(&menu,head,q);
 }
 
 /* ---- the frame rate readout (cfg.show_fps) ----
@@ -447,79 +404,19 @@ static void fps_update(XrTime now)
 }
 
 /* where the ray meets the panel: 0..1 from its top left; 0 if it misses */
-static int menu_hit(const float p[3], const float d[3], float *u, float *v, float hit[3])
-{
-    float dn = d[0] * menu.n[0] + d[1] * menu.n[1] + d[2] * menu.n[2];
-    if (dn > -1e-4f) return 0;
-    float t = ((menu.c[0] - p[0]) * menu.n[0] + (menu.c[1] - p[1]) * menu.n[1] + (menu.c[2] - p[2]) * menu.n[2]) / dn;
-    if (t <= 0) return 0;
-    float r[3];
-    for (int i = 0; i < 3; i++) { hit[i] = p[i] + d[i] * t; r[i] = hit[i] - menu.c[i]; }
-    float x = (r[0] * menu.right[0] + r[1] * menu.right[1] + r[2] * menu.right[2]) / menu.hw;
-    float y = (r[0] * menu.up[0] + r[1] * menu.up[1] + r[2] * menu.up[2]) / menu.hh;
-    *u = (x + 1) * 0.5f; *v = (1 - y) * 0.5f;
-    return x >= -1 && x <= 1 && y >= -1 && y <= 1;
-}
+static int menu_hit(const float p[3],const float d[3],float *u,float *v,float hit[3])
+{return xp_hit(&menu,p,d,u,v,hit);}
 
 static void menu_choose(int item)
 {
-    static const float screens[] = { 2.0f, 2.5f, 3.0f, 4.0f, 5.0f };
-    int armed = menu.reset_armed;
-    menu.reset_armed = 0;           /* anything else chosen in between: no reset */
-    switch (item) {
-    case M_SIGHT: cfg.sight = (cfg.sight + 1) % 3; break;
-    case M_LASER: cfg.laser = (cfg.laser + 1) % 3; break;
-    case M_CROSSHAIR: cfg.crosshair = !cfg.crosshair; stereo_show_game_sight(cfg.crosshair); break;
-    case M_GUN: cfg.show_gun = !cfg.show_gun; break;
-    case M_HAND: gun_hand = 1 - gun_hand; cfg.left_handed = gun_hand == HAND_L; break;
-    case M_DUAL: cfg.dual = !cfg.dual; fprintf(stderr, "[xr] dual wield %s\n", cfg.dual ? "on" : "off"); break;
-    case M_FPS: cfg.show_fps = !cfg.show_fps; break;
-    case M_SCREEN: {
-        int k = 0;
-        while (k < 5 && screens[k] <= cfg.screen + 0.01f) k++;
-        cfg.screen = screens[k % 5];
-        stereo_set_screen_distance(cfg.screen * cfg.scale);
-        break;
-    }
-    case M_HUD: {       /* a head-locked HUD tilted, for where the eye rests */
-        static const int pitches[] = { 0, -10, -20, -30, 10 };
-        int k = 0;
-        while (k < 5 && pitches[k] != cfg.hud_pitch) k++;
-        cfg.hud_pitch = pitches[(k + 1) % 5];
-        stereo_set_hud_pitch((float)cfg.hud_pitch);
-        break;
-    }
-    case M_RATE:
-        if (nrates) {
-            int k = 0;
-            while (k < nrates && rates[k] <= cfg.refresh + 0.5f) k++;
-            cfg.refresh = (int)(rates[k % nrates] + 0.5f);
-            if (request_rate) request_rate(session, (float)cfg.refresh);
-        }
-        break;
-    case M_RES: {
-        /* the eye images are set up once, so this takes effect next launch */
-        static const int sizes[][2] = { { 0, 1216 }, { 0, 1440 }, { 0, 1680 }, { 0, 1920 }, { 0, 2208 }, { 2064, 2280 } };
-        int k = 0;
-        while (k < 6 && (sizes[k][1] < cfg.resolution || (sizes[k][1] == cfg.resolution && sizes[k][0] <= cfg.width))) k++;
-        cfg.width = sizes[k % 6][0];
-        cfg.resolution = sizes[k % 6][1];
-        break;
-    }
-    case M_COINS: cfg.auto_coins = !cfg.auto_coins; break;
-    case M_COIN: menu.coin = 1; break;
-    case M_RECENTRE: anchor_pending = 1; break;
-    case M_TEST: menu.test_frames = 12; break;
-    case M_SERVICE: menu.service_frames = 12; break;
-    case M_RESET:
-        if (!armed) { menu.reset_armed = 1; break; }
-        cfg_save();
-        reset_game();
-        break;
-    case M_CLOSE: menu.open = 0; break;
-    }
-    cfg_save();
-    menu.dirty = 1;
+    const unsigned effects=xp_choose(&menu,&cfg,&gun_hand,item,rates,nrates);
+    if(effects&XP_CROSSHAIR_CHANGED)stereo_show_game_sight(cfg.crosshair);
+    if(effects&XP_SCREEN_CHANGED)stereo_set_screen_distance(cfg.screen*cfg.scale);
+    if(effects&XP_HUD_CHANGED)stereo_set_hud_pitch((float)cfg.hud_pitch);
+    if((effects&XP_RATE_CHANGED)&&request_rate)request_rate(session,(float)cfg.refresh);
+    if(effects&XP_RECENTER)anchor_pending=1;
+    if(effects&XP_SAVE)cfg_save();
+    if(effects&XP_RESTART)reset_game();
 }
 
 /* the stand-in for a controller (LINDBERGH_XR_FAKE_GUN, for a headset or
@@ -642,7 +539,7 @@ static int aim_gun(int h, int pl, XrTime t, int *trig, XoFrame *x, float *gx_, f
         if (menu.open) {        /* the laser points at the panel; the game is not aimed at */
             float u, v, hit[3];
             int on = menu_hit(p, d, &u, &v, hit);
-            int row = on ? xm_row_at(u, v, M_COUNT) : -1;
+            int row = on ? xm_row_at(u, v, XP_COUNT) : -1;
             /* the panel's highlight follows the gun last on it */
             if (on && row != menu.hover) { menu.hover = row; menu.dirty = 1; }
             if (!on && pl == 0 && !cfg.dual && menu.hover != -1) { menu.hover = -1; menu.dirty = 1; }
@@ -695,8 +592,7 @@ static void input_frame(XrTime t)
     int menu_btn = get_bool(a_menu, HAND_L);
     if (fake_menu < 0) { const char *v = getenv("LINDBERGH_XR_FAKE_MENU"); fake_menu = v && *v == '1'; }
     if (fake_menu && !menu.open && views_ok) { menu.open = 1; menu_place(); menu.hover = -1; menu.dirty = 1; }
-    if (menu_btn && !prev[HAND_L][6]) {
-        menu.open = !menu.open; menu.reset_armed = 0;
+    if (xp_menu_button(&menu,menu_btn,prev[HAND_L][6])) {
         fprintf(stderr, "[xr] settings panel %s\n", menu.open ? "open" : "closed");
         if (menu.open) { menu_place(); menu.hover = -1; menu.dirty = 1; }
     }
@@ -715,10 +611,7 @@ static void input_frame(XrTime t)
      * second, opens and closes the settings panel too - not when that hand
      * is player 2's gun, whose buttons they are */
     static XrTime panel_held;
-    if (!dual && btn_b[off] && !prev[off][3]) panel_held = t;
-    if (!dual && btn_b[off] && panel_held && t - panel_held >= 1000000000) {
-        panel_held = 0;
-        menu.open = !menu.open; menu.reset_armed = 0;
+    if(xp_hold_button(&menu,btn_b[off],prev[off][3],dual,t,&panel_held)) {
         if (menu.open) { menu_place(); menu.hover = -1; menu.dirty = 1; }
         rumble(off, 0.3f, 20);
         fprintf(stderr, "[xr] settings panel %s (held button)\n", menu.open ? "open" : "closed");

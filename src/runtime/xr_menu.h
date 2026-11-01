@@ -5,6 +5,10 @@
 #ifndef XR_MENU_H
 #define XR_MENU_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define XM_W 768                /* the panel's picture, in pixels */
 #define XM_H 752
 #define XM_ROWS 18
@@ -24,4 +28,7 @@ void xm_paint_label(unsigned char *rgba, const char *s);
 /* The row under panel coordinates u, v (0..1 from the top left); -1 if none. */
 int  xm_row_at(float u, float v, int n);
 
+#ifdef __cplusplus
+}
+#endif
 #endif
