@@ -18,8 +18,17 @@ endif()
 # 64-bit hosts use the shared guest-memory window and typed GL thunks.
 # Legacy 32-bit Windows retains its direct-address backend.
 option(LINDBERGH_VULKAN_OFFSCREEN "Diagnostic game renderer without window surface or OpenXR" OFF)
-set(LINDBERGH_RENDERER "OPENGL" CACHE STRING "Host renderer: OPENGL or VULKAN")
+# Native Vulkan is the default wherever its host exists (macOS, Android/Quest);
+# -DLINDBERGH_RENDERER=OPENGL keeps the OpenGL renderer. Other hosts stay on
+# OpenGL until the Vulkan host supports them.
+if(APPLE OR ANDROID)
+    set(lindbergh_default_renderer "VULKAN")
+else()
+    set(lindbergh_default_renderer "OPENGL")
+endif()
+set(LINDBERGH_RENDERER "${lindbergh_default_renderer}" CACHE STRING "Host renderer: OPENGL or VULKAN")
 set_property(CACHE LINDBERGH_RENDERER PROPERTY STRINGS OPENGL VULKAN)
+message(STATUS "Lindbergh renderer: ${LINDBERGH_RENDERER} (-DLINDBERGH_RENDERER=OPENGL|VULKAN)")
 if(LINDBERGH_RENDERER STREQUAL "VULKAN")
     if(LINDBERGH_VULKAN_OFFSCREEN AND LINDBERGH_OPENXR)
         message(FATAL_ERROR "Offscreen diagnostics require -DLINDBERGH_OPENXR=OFF")
