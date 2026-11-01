@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -19,6 +20,13 @@ using namespace lindbergh::vk;
 static void require(bool test, const char *what)
 {
     if (!test) throw std::runtime_error(what);
+}
+
+// Cross-compiled tests stage only source-owned fixtures onto the simulator.
+static std::string fixture_path(const char *directory, const char *fallback, const char *name)
+{
+    const char *override = std::getenv(directory);
+    return std::string(override ? override : fallback) + "/" + name;
 }
 
 static std::string source(const std::string &path)
@@ -166,12 +174,12 @@ static void render_stereo(Device &device)
     require(renderer.pipeline_count() == 1, "guest state translation recompiled a cached pipeline");
     std::puts("ok: guest matrices, quad/strip assembly and indexed Vulkan stereo rasterization");
 
-    ShaderPack pack(std::string(LV_TEST_SHADER_DIR) + "/fixture.lvsp");
-    auto vertex_source = source(std::string(LV_TEST_SOURCE_DIR) + "/legacy.vert");
+    ShaderPack pack(fixture_path("LV_TEST_SHADER_DIR", LV_TEST_SHADER_DIR, "fixture.lvsp"));
+    auto vertex_source = source(fixture_path("LV_TEST_SOURCE_DIR", LV_TEST_SOURCE_DIR, "legacy.vert"));
     require(!vertex_source.empty() && vertex_source.back() == '\n', "fixture must exercise EOF newline normalization");
     vertex_source.pop_back();
     const auto vs_hash = shader_source_digest(vertex_source);
-    const auto fs_hash = shader_source_digest(source(std::string(LV_TEST_SOURCE_DIR) + "/legacy.frag"));
+    const auto fs_hash = shader_source_digest(source(fixture_path("LV_TEST_SOURCE_DIR", LV_TEST_SOURCE_DIR, "legacy.frag")));
     const auto record = pack.find(vs_hash, fs_hash, {});
     require(record && pack.programs().size() == 1, "offline shader archive lookup failed");
     require(!pack.find(SourceDigest{}, fs_hash, {}), "unknown shader source silently accepted");
@@ -240,6 +248,35 @@ static void render_stereo(Device &device)
     pixel(0, 8, 16, 255); pixel(0, 24, 16, 0);
     pixel(1, 8, 16, 0); pixel(1, 24, 16, 255);
     std::puts("ok: converted GLSL 1.20 shaders preserve front-face color and multiview raster output");
+
+    // Game loading uses packed BGRA8888_REV and RGB565. Sample the original
+    // guest byte order directly; checking channels catches a mistaken swizzle.
+    for (auto format : {VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_R5G6B5_UNORM_PACK16, VK_FORMAT_R4G4B4A4_UNORM_PACK16}) {
+        TextureInfo packed_info{1,1,1,1,format};
+        const bool is_4444=format==VK_FORMAT_R4G4B4A4_UNORM_PACK16;
+        if (is_4444) packed_info.components={VK_COMPONENT_SWIZZLE_G,VK_COMPONENT_SWIZZLE_B,VK_COMPONENT_SWIZZLE_A,VK_COMPONENT_SWIZZLE_R};
+        Texture packed(device, packed_info);
+        SampledSet packed_material(device, {{0,packed.view(),sampler.handle()}});
+        cmd=ring.begin();
+        const uint8_t bgra[]={0,0,255,255}, rgb565[]={0,248}, bgra4444[]={0,255};
+        const bool is_565=format==VK_FORMAT_R5G6B5_UNORM_PACK16;
+        packed.upload(cmd,ring,0,0,is_565?rgb565:is_4444?bgra4444:bgra,(is_565||is_4444)?2:4);
+        converted.begin(cmd,{0,0,0,1});bind_legacy(converted);
+        auto ds=packed_material.handle();converted.bind_descriptors(2,1,&ds);
+        auto u=uniforms.upload(0,guest_uniforms.bytes().data(),guest_uniforms.bytes().size());
+        ds=uniforms.current_set();converted.bind_descriptors(1,1,&ds,1,&u);
+        auto white_triangle=std::vector<Vertex>(std::begin(triangle),std::end(triangle));
+        for (auto &vertex:white_triangle) for (auto &channel:vertex.color) channel=1;
+        converted.draw(ring,white_triangle.data(),3,matrices,state);converted.end();
+        vkCmdCopyImageToBuffer(cmd,target.color,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,output.buffer,1,&copy);
+        vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,
+                             0,0,nullptr,1,&barrier,0,nullptr);
+        ring.wait(ring.submit());
+        const auto rgba=static_cast<const uint8_t *>(output.mapped)+(16*32+8)*4;
+        require(rgba[0]==255 && rgba[1]==0 && rgba[2]==0 && rgba[3]==255,
+                "packed guest texture channels changed");
+    }
+    std::puts("ok: native BGRA8888, RGB565 and swizzled BGRA4444 guest storage samples without pixel conversion");
 
     // Different draws and frames must retain independent uniform snapshots even
     // with several frames in flight and descriptor sets recycled by slot.

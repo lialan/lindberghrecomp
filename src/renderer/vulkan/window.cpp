@@ -71,13 +71,23 @@ Target &Window::acquire(FrameRing &ring)
     if (slot_ >= acquire_.size()) throw std::logic_error("Vulkan frame count mismatch");
     const auto result = vkAcquireNextImageKHR(device_.handles.device, swapchain_, UINT64_MAX, acquire_[slot_], VK_NULL_HANDLE, &image_);
     if (result != VK_SUBOPTIMAL_KHR) check(result, "acquire desktop image (resize requires swapchain recreation)");
-    acquired_ = true;
+    acquired_ = acquire_pending_ = true;
     return *targets_.at(image_);
+}
+Submission Window::flush(FrameRing &ring)
+{
+    if (!acquired_ || (acquire_pending_ && ring.recording_slot() != slot_))
+        throw std::logic_error("No matching acquired desktop image");
+    const auto submitted = ring.submit(acquire_pending_ ? acquire_[slot_] : VK_NULL_HANDLE);
+    acquire_pending_ = false;
+    return submitted;
 }
 Submission Window::present(FrameRing &ring)
 {
-    if (!acquired_ || ring.recording_slot() != slot_) throw std::logic_error("No matching acquired desktop image");
-    const auto submitted = ring.submit(acquire_[slot_], present_[image_]);
+    if (!acquired_ || (acquire_pending_ && ring.recording_slot() != slot_))
+        throw std::logic_error("No matching acquired desktop image");
+    const auto submitted = ring.submit(acquire_pending_ ? acquire_[slot_] : VK_NULL_HANDLE, present_[image_]);
+    acquire_pending_ = false;
     VkPresentInfoKHR info{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     info.waitSemaphoreCount = 1; info.pWaitSemaphores = &present_[image_];
     info.swapchainCount = 1; info.pSwapchains = &swapchain_; info.pImageIndices = &image_;

@@ -19,16 +19,26 @@ try {
         Vertex triangle[]={{{-1,-1,0,1},{1,0,0,1}},{{1,-1,0,1},{0,1,0,1}},{{0,1,0,1},{0,0,1,1}}};
         RasterState raster;
         Submission last{};
+        uint64_t expected_submissions=0;
         for(unsigned frame=0;frame<12;++frame) {
             SDL_PumpEvents();
             auto command=ring.begin(); auto &target=swapchain.acquire(ring);
             auto &renderer=renderers[&target];
             if(!renderer) {renderer=std::make_unique<Renderer>(*device,target,cache);renderer->prepare(raster);}
             renderer->begin(command,{0,0,0,1}); renderer->draw(ring,triangle,3,matrices,raster); renderer->end();
-            last=swapchain.present(ring);
+            // More partial submits than slots exercises acquire consumption,
+            // image retention and slot reuse before a single final present.
+            for (unsigned partial=0;partial<frame%5;++partial) {
+                swapchain.flush(ring);++expected_submissions;
+                command=ring.begin();
+                renderer->begin(command,{0,0,0,1},true);
+                renderer->draw(ring,triangle,3,matrices,raster);renderer->end();
+            }
+            last=swapchain.present(ring);++expected_submissions;
         }
         ring.wait(last);
-        std::puts("ok: 12 direct Vulkan SDL swapchain presents with buffered acquire/render/present synchronization");
+        if (ring.submissions()!=expected_submissions) throw std::runtime_error("partial submit count changed");
+        std::puts("ok: 12 Vulkan presents with asynchronous partial flushes and acquire semaphore reuse");
     }
     SDL_DestroyWindow(window);SDL_Quit();return 0;
 } catch(const std::exception &e) {std::fprintf(stderr,"Vulkan presentation check failed: %s\n",e.what());return 1;}

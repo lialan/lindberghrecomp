@@ -286,6 +286,7 @@ static void h_glClampColorARB(CPU *c)
 }
 static void h_glCreateShaderObjectARB(CPU *c)  { RET(glCreateShader(A32(0))); }
 static void h_glAttachObjectARB(CPU *c)        { glAttachShader(A32(0), A32(1)); }
+static void h_glDetachObjectARB(CPU *c)        { glDetachShader(A32(0), A32(1)); }
 static void h_glUseProgramObjectARB(CPU *c)    { arb_use_glsl(A32(0)); glUseProgram(A32(0)); }
 /* NVIDIA linked a fragment shader that reads a varying its vertex shader
  * never writes, and left the value undefined; Apple refuses the link. The
@@ -905,6 +906,7 @@ void hle_register_gl(void)
     hle_bind("glClampColorARB", h_glClampColorARB); gl_bind_named("glClampColorARB", h_glClampColorARB);
     hle_bind("glCreateShaderObjectARB", h_glCreateShaderObjectARB); gl_bind_named("glCreateShaderObjectARB", h_glCreateShaderObjectARB);
     hle_bind("glAttachObjectARB", h_glAttachObjectARB); gl_bind_named("glAttachObjectARB", h_glAttachObjectARB);
+    hle_bind("glDetachObjectARB", h_glDetachObjectARB); gl_bind_named("glDetachObjectARB", h_glDetachObjectARB);
     hle_bind("glUseProgramObjectARB", h_glUseProgramObjectARB); gl_bind_named("glUseProgramObjectARB", h_glUseProgramObjectARB);
     hle_bind("glLinkProgramARB", h_glLinkProgramARB); gl_bind_named("glLinkProgramARB", h_glLinkProgramARB);
     hle_bind("glCompileShaderARB", h_glCompileShaderARB); gl_bind_named("glCompileShaderARB", h_glCompileShaderARB);

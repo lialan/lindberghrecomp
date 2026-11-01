@@ -73,7 +73,7 @@ Texture::Texture(Device &device, TextureInfo texture) : info(texture), device_(d
     block_width_ = 1;
     switch (info.format) {
     case VK_FORMAT_R8_UNORM: block_bytes_ = 1; break;
-    case VK_FORMAT_R8G8_UNORM: block_bytes_ = 2; break;
+    case VK_FORMAT_R8G8_UNORM: case VK_FORMAT_R5G6B5_UNORM_PACK16: case VK_FORMAT_R4G4B4A4_UNORM_PACK16: block_bytes_ = 2; break;
     case VK_FORMAT_D32_SFLOAT_S8_UINT: block_bytes_ = 4; break;
     case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB:
     case VK_FORMAT_B8G8R8A8_UNORM: block_bytes_ = 4; break;

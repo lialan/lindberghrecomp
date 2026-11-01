@@ -12,6 +12,8 @@ public:
     Window(const Window &) = delete;
     Window &operator=(const Window &) = delete;
     Target &acquire(FrameRing &ring);
+    // Submit before presentation (guest glFlush) without reacquiring the image.
+    Submission flush(FrameRing &ring);
     Submission present(FrameRing &ring);
 private:
     Device &device_;
@@ -19,7 +21,7 @@ private:
     std::vector<std::unique_ptr<Target>> targets_;
     std::vector<VkSemaphore> acquire_, present_;
     uint32_t image_ = 0, slot_ = 0;
-    bool acquired_ = false;
+    bool acquired_ = false, acquire_pending_ = false;
     void release();
 };
 } // namespace lindbergh::vk

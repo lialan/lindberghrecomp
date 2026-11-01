@@ -30,7 +30,8 @@ namespace {
 struct Shader {
   GLenum type;
   std::string source;
-  bool compiled = false;
+  bool compiled = false, delete_pending = false;
+  uint32_t attachments = 0;
 };
 struct UniformLocation {
   uint32_t block, field, first;
@@ -72,6 +73,7 @@ struct NativeProgram {
   std::map<std::string,std::unique_ptr<Renderer>> renderers;
 };
 struct Program {
+  bool delete_pending = false;
   std::shared_ptr<NativeProgram> native;
 
   std::vector<GLuint> shaders;
@@ -148,6 +150,7 @@ struct State {
   GuestState matrices;
   GuestArrays arrays;
   VkCommandBuffer cmd = VK_NULL_HANDLE;
+  std::optional<Submission> last_submission;
   Target *screen = nullptr;
   Renderer *active = nullptr;
   unsigned drawable = 0, next_drawable = 1, next_object = 1;
@@ -198,7 +201,7 @@ struct State {
   void frame() {
     if (!cmd) {
       cmd = ring->begin();
-      screen = &window->acquire(*ring);
+      if (!screen) screen = &window->acquire(*ring);
       if (materials[ring->recording_slot()].size()>2048) materials[ring->recording_slot()].clear();
     }
   }
@@ -344,8 +347,20 @@ extern "C" void lvk_host_present(void) {
   std::unique_ptr<FrameCapture> capture;
   if(shot && g_frame==unsigned(at?std::strtoul(at,nullptr,10):0)) capture=std::make_unique<FrameCapture>(*state.device,state.cmd,*state.screen);
   auto submitted=state.window->present(*state.ring);
+  state.last_submission=submitted;
   if(capture) {state.ring->wait(submitted);capture->write(shot,*state.screen);}
   state.cmd=VK_NULL_HANDLE;
+  state.screen=nullptr;
+}
+extern "C" void lvk_glFlush(void) {
+  if (!state.cmd) return;
+  state.flush();
+  state.last_submission=state.window->flush(*state.ring);
+  state.cmd=VK_NULL_HANDLE; // next draw continues on the same acquired image
+}
+extern "C" void lvk_glFinish(void) {
+  lvk_glFlush();
+  if (state.last_submission) state.ring->wait(*state.last_submission);
 }
 extern "C" unsigned lvk_create_drawable(int w, int h) {
   if (w <= 0 || h <= 0)
@@ -698,7 +713,28 @@ extern "C" void lvk_glCompileShader(GLuint id) {
   state.shaders.at(id).compiled = true;
 } // lookup is validated at guest link
 extern "C" void lvk_glAttachShader(GLuint p, GLuint s) {
-  state.programs.at(p).shaders.push_back(s);
+  auto &attached = state.programs.at(p).shaders;
+  if (std::find(attached.begin(), attached.end(), s) != attached.end())
+    gap("guest attached a shader twice");
+  ++state.shaders.at(s).attachments;
+  attached.push_back(s);
+}
+namespace {
+void release_shader(GLuint id) {
+  auto &shader = state.shaders.at(id);
+  if (!--shader.attachments && shader.delete_pending) state.shaders.erase(id);
+}
+void release_program(GLuint id) {
+  for (auto shader : state.programs.at(id).shaders) release_shader(shader);
+  state.programs.erase(id);
+}
+}
+extern "C" void lvk_glDetachShader(GLuint p, GLuint s) {
+  auto &attached = state.programs.at(p).shaders;
+  const auto it = std::find(attached.begin(), attached.end(), s);
+  if (it == attached.end()) gap("guest detached an unattached shader");
+  attached.erase(it);
+  release_shader(s);
 }
 extern "C" void lvk_glBindAttribLocation(GLuint p, GLuint index,
                                          const GLchar *name) {
@@ -718,6 +754,8 @@ extern "C" void lvk_glLinkProgram(GLuint id) {
     state.pack = std::make_unique<ShaderPack>(path);
   }
   auto &p = state.programs.at(id);
+  p.record = nullptr;
+  p.native.reset(); // submitted frames retain their previous native program
   SourceDigest vs{}, fs{};
   for (const auto shader : p.shaders) {
     const auto &s = state.shaders.at(shader);
@@ -779,12 +817,17 @@ extern "C" void lvk_glLinkProgram(GLuint id) {
 extern "C" void lvk_glUseProgram(GLuint id) {
   if (id && !state.programs.at(id).record)
     gap("guest selected an unlinked Vulkan program");
+  const auto previous = state.program;
   state.program = id;
+  if (previous && previous != id && state.programs.at(previous).delete_pending)
+    release_program(previous);
 }
 extern "C" void lvk_glGetShaderiv(GLuint id, GLenum p, GLint *out) {
   const auto &s = state.shaders.at(id);
   if (p == GL_SHADER_TYPE)
     *out = s.type;
+  else if (p == GL_DELETE_STATUS)
+    *out = s.delete_pending;
   else if (p == GL_COMPILE_STATUS)
     *out = s.compiled;
   else if (p == GL_SHADER_SOURCE_LENGTH)
@@ -800,6 +843,8 @@ extern "C" void lvk_glGetProgramiv(GLuint id, GLenum p, GLint *out) {
     *out = v.record != nullptr;
   else if (p == GL_INFO_LOG_LENGTH)
     *out = 1;
+  else if (p == GL_DELETE_STATUS)
+    *out = v.delete_pending;
   else if (p == GL_ATTACHED_SHADERS)
     *out = GLint(v.shaders.size());
   else
@@ -819,9 +864,17 @@ extern "C" void lvk_glGetProgramInfoLog(GLuint, GLsizei n, GLsizei *length,
   if (n > 0)
     *out = 0;
 }
-extern "C" void lvk_glDeleteShader(GLuint) {
-} // attached objects retain source until program retirement
-extern "C" void lvk_glDeleteProgram(GLuint id) { state.programs.erase(id); }
+extern "C" void lvk_glDeleteShader(GLuint id) {
+  const auto it = state.shaders.find(id);
+  if (it == state.shaders.end()) return;
+  if (it->second.attachments) it->second.delete_pending = true;
+  else state.shaders.erase(it);
+}
+extern "C" void lvk_glDeleteProgram(GLuint id) {
+  if (!state.programs.count(id)) return;
+  if (state.program == id) state.programs.at(id).delete_pending = true;
+  else release_program(id);
+}
 extern "C" GLint lvk_glGetAttribLocation(GLuint id, const GLchar *name) {
   const auto &p = state.programs.at(id);
   if (!p.record)
@@ -880,8 +933,11 @@ uint32_t guest_pointer(const void *p) {
       gap("guest VBO offset overflow");
     return uint32_t(value);
   }
-  if (value < base || value - base > UINT32_MAX)
+  if (!value) return 0; // a null client-array pointer is legal until used
+  if (value < base || value - base > UINT32_MAX) {
+    std::fprintf(stderr,"[vulkan] array pointer %p outside guest window %p (VBO %u)\n",p,g_guest_base,state.array_buffer);
     gap("host pointer has no guest vertex-array address");
+  }
   return uint32_t(value - base);
 }
 void uniform(GLint location, const void *data, size_t bytes, GLsizei count = 1,
@@ -915,8 +971,14 @@ extern "C" void lvk_glTexImage2D(GLenum target, GLint level, GLint internal,
                                  GLsizei w, GLsizei h, GLint border,
                                  GLenum format, GLenum type,
                                  const GLvoid *pointer) {
+  // Lindbergh's little-endian 8888_REV storage already matches native
+  // RGBA/BGRA byte order; retain it directly instead of repacking each pixel.
+  const bool packed_bytes = type == GL_UNSIGNED_INT_8_8_8_8_REV &&
+                            (format == GL_RGBA || format == GL_BGRA);
+  const bool packed_565 = type == GL_UNSIGNED_SHORT_5_6_5 && format == GL_RGB;
+  const bool packed_4444 = type == GL_UNSIGNED_SHORT_4_4_4_4_REV && format == GL_BGRA;
   if (w < 0 || h < 0 || level < 0 || border ||
-      (type != GL_UNSIGNED_BYTE &&
+      (type != GL_UNSIGNED_BYTE && !packed_bytes && !packed_565 && !packed_4444 &&
        !(format == GL_DEPTH_COMPONENT &&
          (type == GL_UNSIGNED_INT || type == GL_FLOAT)))) {
     std::fprintf(
@@ -929,7 +991,7 @@ extern "C" void lvk_glTexImage2D(GLenum target, GLint level, GLint internal,
   auto &v = object.levels[level];
   v = {internal, w, h, format, type, {}, false};
   const auto pixel_bytes =
-      components(format) * (type == GL_UNSIGNED_BYTE ? 1 : 4);
+      packed_bytes ? 4 : (packed_565 || packed_4444) ? 2 : components(format) * (type == GL_UNSIGNED_BYTE ? 1 : 4);
   const auto row = size_t(w) * pixel_bytes;
   v.bytes.resize(row * size_t(h));
   if (!pointer && !state.unpack_buffer)
@@ -1058,6 +1120,11 @@ extern "C" void lvk_glColorPointer(GLint size, GLenum type, GLsizei stride,
   state.arrays.pointer(3, size, type, type != GL_FLOAT, stride,
                        guest_pointer(pointer));
 }
+extern "C" void lvk_glSecondaryColorPointer(GLint size, GLenum type, GLsizei stride,
+                                            const GLvoid *pointer) {
+  if (stride < 0) gap("negative guest secondary color stride");
+  state.arrays.pointer(4, size, type, type != GL_FLOAT, stride, guest_pointer(pointer));
+}
 extern "C" void lvk_glTexCoordPointer(GLint size, GLenum type, GLsizei stride,
                                       const GLvoid *pointer) {
   if (stride < 0)
@@ -1086,10 +1153,14 @@ extern "C" void lvk_glEnableClientState(GLenum cap) {
     index = 2;
   else if (cap == GL_COLOR_ARRAY)
     index = 3;
+  else if (cap == GL_SECONDARY_COLOR_ARRAY)
+    index = 4;
   else if (cap == GL_TEXTURE_COORD_ARRAY)
     index = 8 + state.client_texture - GL_TEXTURE0;
-  else
+  else {
+    std::fprintf(stderr, "[vulkan] unknown client array %#x\n", cap);
     gap("unsupported guest client array");
+  }
   state.arrays.enable(index, true);
   state.enabled[cap] = true;
 }
@@ -1101,10 +1172,14 @@ extern "C" void lvk_glDisableClientState(GLenum cap) {
     index = 2;
   else if (cap == GL_COLOR_ARRAY)
     index = 3;
+  else if (cap == GL_SECONDARY_COLOR_ARRAY)
+    index = 4;
   else if (cap == GL_TEXTURE_COORD_ARRAY)
     index = 8 + state.client_texture - GL_TEXTURE0;
-  else
+  else {
+    std::fprintf(stderr, "[vulkan] unknown client array %#x\n", cap);
     gap("unsupported guest client array");
+  }
   state.arrays.enable(index, false);
   state.enabled[cap] = false;
 }
@@ -1178,6 +1253,12 @@ extern "C" void lvk_glUniform3fv(GLint l, GLsizei n, const GLfloat *v) {
 }
 extern "C" void lvk_glUniform4fv(GLint l, GLsizei n, const GLfloat *v) {
   uniform(l, v, size_t(n) * 16, n);
+}
+extern "C" void lvk_glUniformMatrix2fv(GLint l, GLsizei n, GLboolean transpose, const GLfloat *v) {
+  uniform(l, v, size_t(n) * 16, n, transpose);
+}
+extern "C" void lvk_glUniformMatrix3fv(GLint l, GLsizei n, GLboolean transpose, const GLfloat *v) {
+  uniform(l, v, size_t(n) * 36, n, transpose);
 }
 extern "C" void lvk_glUniformMatrix4fv(GLint l, GLsizei n, GLboolean transpose,
                                        const GLfloat *v) {
@@ -1305,6 +1386,10 @@ VkFormat texture_format(const TextureLevel &v) {
     case 0x83f3:return VK_FORMAT_BC3_UNORM_BLOCK;
     default:gap("unknown guest compressed texture format");
   }
+  if (v.format == GL_BGRA && v.type == GL_UNSIGNED_SHORT_4_4_4_4_REV)
+    return VK_FORMAT_R4G4B4A4_UNORM_PACK16;
+  if (v.format == GL_RGB && v.type == GL_UNSIGNED_SHORT_5_6_5)
+    return VK_FORMAT_R5G6B5_UNORM_PACK16;
   switch(v.format) {
     case GL_DEPTH_COMPONENT:return Target::depth_format;
     case GL_LUMINANCE:case GL_ALPHA:case GL_RED:return VK_FORMAT_R8_UNORM;
@@ -1325,6 +1410,8 @@ std::shared_ptr<Texture> native_image(TextureObject &o) {
   }
   const auto &base=o.levels.at(0);
   TextureInfo info{uint32_t(base.width),uint32_t(base.height),uint32_t(o.levels.rbegin()->first+1),1,texture_format(base)};
+  if(base.format==GL_BGRA && base.type==GL_UNSIGNED_SHORT_4_4_4_4_REV)
+    info.components={VK_COMPONENT_SWIZZLE_G,VK_COMPONENT_SWIZZLE_B,VK_COMPONENT_SWIZZLE_A,VK_COMPONENT_SWIZZLE_R};
   if(base.format==GL_LUMINANCE)info.components={VK_COMPONENT_SWIZZLE_R,VK_COMPONENT_SWIZZLE_R,VK_COMPONENT_SWIZZLE_R,VK_COMPONENT_SWIZZLE_ONE};
   if(base.format==GL_LUMINANCE_ALPHA)info.components={VK_COMPONENT_SWIZZLE_R,VK_COMPONENT_SWIZZLE_R,VK_COMPONENT_SWIZZLE_R,VK_COMPONENT_SWIZZLE_G};
   if(base.format==GL_ALPHA)info.components={VK_COMPONENT_SWIZZLE_ZERO,VK_COMPONENT_SWIZZLE_ZERO,VK_COMPONENT_SWIZZLE_ZERO,VK_COMPONENT_SWIZZLE_R};
@@ -1338,7 +1425,7 @@ std::shared_ptr<Texture> native_image(TextureObject &o) {
     for(const auto &[level,v]:o.levels) {
       if(texture_format(v)!=info.format)gap("mip texture formats disagree");
       const void *data=v.bytes.data();size_t bytes=v.bytes.size();std::vector<uint8_t> expanded;
-      if(v.format==GL_RGB&&!v.compressed) {
+      if(v.format==GL_RGB&&v.type==GL_UNSIGNED_BYTE&&!v.compressed) {
         expanded.resize(size_t(v.width)*v.height*4);
         for(size_t i=0;i<size_t(v.width)*v.height;++i) {std::memcpy(expanded.data()+4*i,v.bytes.data()+3*i,3);expanded[4*i+3]=255;}
         data=expanded.data();bytes=expanded.size();
@@ -1739,4 +1826,35 @@ extern "C" void lvk_glInterleavedArrays(GLenum format,GLsizei stride,const GLvoi
     state.arrays.enable(slot,a.size!=0);if(a.size)state.arrays.pointer(slot,a.size,a.type,normalized,uint32_t(stride),address+a.offset);
   };
   set(0,position,false);set(3,color,color.type!=GL_FLOAT);set(2,normal,false);set(8+state.client_texture-GL_TEXTURE0,uv,false);
+}
+
+// Vector entry points share the same current-attribute state as scalar calls.
+extern "C" void lvk_glColor4fv(const GLfloat *v) {lvk_glColor4f(v[0],v[1],v[2],v[3]);}
+extern "C" void lvk_glColor3fv(const GLfloat *v) {lvk_glColor3f(v[0],v[1],v[2]);}
+extern "C" void lvk_glColor4ubv(const GLubyte *v) {lvk_glColor4ub(v[0],v[1],v[2],v[3]);}
+extern "C" void lvk_glColor3ubv(const GLubyte *v) {lvk_glColor3ub(v[0],v[1],v[2]);}
+extern "C" void lvk_glNormal3fv(const GLfloat *v) {lvk_glNormal3f(v[0],v[1],v[2]);}
+extern "C" void lvk_glTexCoord2fv(const GLfloat *v) {lvk_glTexCoord2f(v[0],v[1]);}
+extern "C" void lvk_glTexCoord4fv(const GLfloat *v) {lvk_glTexCoord4f(v[0],v[1],v[2],v[3]);}
+extern "C" void lvk_glVertex2fv(const GLfloat *v) {immediate_vertex(v[0],v[1],0,1);}
+extern "C" void lvk_glVertex4fv(const GLfloat *v) {immediate_vertex(v[0],v[1],v[2],v[3]);}
+extern "C" void lvk_glVertexAttrib1fv(GLuint i,const GLfloat *v) {lvk_glVertexAttrib1f(i,v[0]);}
+extern "C" void lvk_glVertexAttrib2fv(GLuint i,const GLfloat *v) {lvk_glVertexAttrib2f(i,v[0],v[1]);}
+extern "C" void lvk_glVertexAttrib3fv(GLuint i,const GLfloat *v) {lvk_glVertexAttrib3f(i,v[0],v[1],v[2]);}
+extern "C" void lvk_glVertexAttrib4fv(GLuint i,const GLfloat *v) {lvk_glVertexAttrib4f(i,v[0],v[1],v[2],v[3]);}
+
+extern "C" void lvk_glSecondaryColor3f(GLfloat r,GLfloat g,GLfloat b) {state.arrays.current(4,{r,g,b,1});}
+extern "C" void lvk_glSecondaryColor3fv(const GLfloat *v) {lvk_glSecondaryColor3f(v[0],v[1],v[2]);}
+extern "C" void lvk_glSecondaryColor3ub(GLubyte r,GLubyte g,GLubyte b) {lvk_glSecondaryColor3f(r/255.f,g/255.f,b/255.f);}
+extern "C" void lvk_glSecondaryColor3ubv(const GLubyte *v) {lvk_glSecondaryColor3ub(v[0],v[1],v[2]);}
+
+// Expand only draw packets: all subdraws keep the enclosing pass/submission.
+extern "C" void lvk_glMultiDrawElements(GLenum mode,const GLsizei *counts,GLenum type,
+                                       const GLvoid *const *indices,GLsizei count) {
+  if (count < 0) gap("negative guest multidraw count");
+  for (GLsizei i=0;i<count;++i) lvk_glDrawElements(mode,counts[i],type,indices[i]);
+}
+extern "C" void lvk_glMultiDrawArrays(GLenum mode,const GLint *first,const GLsizei *counts,GLsizei count) {
+  if (count < 0) gap("negative guest multidraw count");
+  for (GLsizei i=0;i<count;++i) lvk_glDrawArrays(mode,first[i],counts[i]);
 }
