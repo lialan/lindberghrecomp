@@ -25,6 +25,11 @@ void xm_paint(unsigned char *rgba, const char *title, const XmItem *items, int n
 #define XM_LABEL_W 224
 #define XM_LABEL_H 48
 void xm_paint_label(unsigned char *rgba, const char *s);
+/* The stats panel: n left-aligned lines (up to 27 characters each) of light
+ * text on a dark box, rgba XM_STATS_W x XM_STATS_H x 4. */
+#define XM_STATS_W 480
+#define XM_STATS_H 160
+void xm_paint_lines(unsigned char *rgba, const char *const *lines, int n);
 /* A startup message (XM_W x XM_H x 4): a centred box with a title and a
  * second line, transparent around it. */
 #define XM_MESSAGE_H 170

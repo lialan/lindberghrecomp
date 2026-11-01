@@ -827,7 +827,7 @@ void State::panel_input(ControllerSample sample,int64_t time,bool focused)
   // measure elapsed host time rather than reporting that clock's fixed 60 Hz.
   int64_t readout_time=0;
 #ifndef LINDBERGH_VULKAN_XR
-  if(settings.show_fps)readout_time=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+  if(settings.show_stats)readout_time=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 #endif
   const unsigned effects=panel->update(settings,*stereo,*controllers,sample,time,focused,rates,readout_time);
   if(effects&XP_SAVE)xr_settings_save(&settings);

@@ -41,6 +41,7 @@ static void mac_activate(void)
 #include "host_settings.h"
 #ifdef LINDBERGH_VULKAN
 #include "vulkan_host.h"
+#include "host_stats.h"
 #endif
 
 #if defined(LINDBERGH_OPENXR)
@@ -1097,6 +1098,15 @@ static void host_frame_done(void)
             exit(0);
         }
     }
+#ifdef LINDBERGH_VULKAN
+    {   /* the game thread's CPU time per frame, smoothed, for the stats panel */
+        static double last, avg = -1;
+        struct timespec ts; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+        double cpu = ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+        if (last > 0) { double d = cpu - last; avg = avg < 0 ? d : avg * 0.9 + d * 0.1; lg_stats_set_game_ms((float)avg); }
+        last = cpu;
+    }
+#endif
     {   /* LINDBERGH_LATENCY: frames that took far longer than 1/60 s */
         static Uint64 prev; Uint64 now = SDL_GetPerformanceCounter();
         double ms = prev ? (now - prev) * 1000.0 / SDL_GetPerformanceFrequency() : 0; prev = now;

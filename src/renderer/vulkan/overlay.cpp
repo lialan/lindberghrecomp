@@ -39,7 +39,7 @@ Overlay::Overlay(Device &device,FrameRing &ring,PipelineCache &cache):device_(de
     sampling.u=sampling.v=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     panel_sampler_=std::make_unique<Sampler>(device,sampling);
     for(unsigned i=0;i<2;++i) {
-        panel_textures_[i]=std::make_unique<Texture>(device,TextureInfo{uint32_t(i?XM_LABEL_W:XM_W),uint32_t(i?XM_LABEL_H:XM_H)});
+        panel_textures_[i]=std::make_unique<Texture>(device,TextureInfo{uint32_t(i?XM_STATS_W:XM_W),uint32_t(i?XM_STATS_H:XM_H)});
         panel_sets_[i]=std::make_unique<SampledSet>(device,std::vector<SampledImage>{{0,panel_textures_[i]->view(),panel_sampler_->handle()}});
     }
     ring_.submit(); // queue-ordered once at initialization; no CPU wait

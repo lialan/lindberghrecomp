@@ -371,7 +371,7 @@ static void menu_place(void)
     xp_place(&menu,head,q);
 }
 
-/* ---- the frame rate readout (cfg.show_fps) ----
+/* ---- the frame rate readout (cfg.show_stats) ----
  * Frames shown in each half second, repainted when the number changes; drawn
  * low and to the left of where the head looks, a metre out, in both eyes. */
 static struct { float c[3], right[3], up[3], n[3], hw, hh; int shown; } fpsl = { .shown = -1 };
@@ -1152,7 +1152,7 @@ void xr_frame_begin(void)
         xo.gun_valid = xo.beam = xo.dot = xo.flash = 0; xo2.gun_valid = xo2.beam = xo2.dot = xo2.flash = 0;
         stereo_set_gun_ray(0, NULL, NULL, 0); stereo_set_gun_ray(1, NULL, NULL, 0);
     }
-    if (cfg.show_fps) fps_update(frame.predictedDisplayTime);
+    if (cfg.show_stats) fps_update(frame.predictedDisplayTime);
 }
 
 /* This frame's world depth, copied into each eye's depth swapchain image -
@@ -1318,7 +1318,7 @@ void xr_frame_end(void)
                 float eye_pos[3] = { views[i].pose.position.x, views[i].pose.position.y, views[i].pose.position.z };
                 xo_draw(&xo, vp, eye_pos, (int)e->w, (int)e->h);
                 if (xo2.gun_valid) xo_draw(&xo2, vp, eye_pos, (int)e->w, (int)e->h);
-                if (cfg.show_fps && fpsl.shown >= 0) {
+                if (cfg.show_stats && fpsl.shown >= 0) {
                     float pm[16], m[16];
                     memset(pm, 0, sizeof pm);
                     for (int k = 0; k < 3; k++) {

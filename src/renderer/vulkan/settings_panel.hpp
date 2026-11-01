@@ -17,7 +17,9 @@ public:
     bool open() const {return panel_.open;}
 private:
     XpPanel panel_{};int width_,height_,previous_menu_=0,previous_upper_[2]{},previous_trigger_[2]{};
-    int64_t held_=0,fps_since_=0;unsigned fps_frames_=0;int fps_=-1;
+    // "Show stats": counted here, sampled and repainted every half second
+    int64_t held_=0,stats_since_=0;unsigned stats_frames_=0,stats_samples_=0;bool stats_shown_=false;
+    std::string stats_text_;
     bool fake_,panel_dirty_=false,label_dirty_=false;
     std::string title_;std::vector<unsigned char> panel_pixels_,label_pixels_;
     std::array<PanelDraw,2> draws_{};std::array<XoFrame,2> guns_{};

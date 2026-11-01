@@ -54,6 +54,29 @@ void xm_paint_label(unsigned char *img, const char *s)
     }
 }
 
+void xm_paint_lines(unsigned char *img, const char *const *lines, int n)
+{
+    const unsigned char bg[4] = { 16, 16, 20, 190 }, fg[3] = { 140, 255, 140 };
+    const int pad = 12, line_h = 36;
+    for (int i = 0; i < XM_STATS_W * XM_STATS_H; i++) memcpy(img + (size_t)i * 4, bg, 4);
+    for (int l = 0; l < n; l++) {
+        const int y = pad + l * line_h;
+        int x = pad;
+        for (const char *s = lines[l]; *s && x + FONT_W <= XM_STATS_W - pad / 2; s++, x += FONT_W - 3) {
+            int ch = (unsigned char)*s - FONT_FIRST;
+            if (ch < 0 || ch >= FONT_COUNT) continue;
+            for (int j = 0; j < FONT_H && y + j < XM_STATS_H; j++)
+                for (int i = 0; i < FONT_W; i++) {
+                    unsigned a = FONT[ch][j * FONT_W + i];
+                    if (!a) continue;
+                    unsigned char *p = img + ((size_t)(y + j) * XM_STATS_W + x + i) * 4;
+                    for (int k = 0; k < 3; k++) p[k] = (unsigned char)((p[k] * (255 - a) + fg[k] * a) / 255);
+                    if (p[3] < a) p[3] = (unsigned char)a;
+                }
+        }
+    }
+}
+
 void xm_paint_message(unsigned char *img, const char *title, const char *line)
 {
     static const unsigned char clear[4] = { 0, 0, 0, 0 }, bg[4] = { 18, 22, 28, 235 }, edge[4] = { 70, 80, 90, 255 };

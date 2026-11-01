@@ -225,7 +225,7 @@ static void render_panels(Device &device,bool foveation=false)
     }
     require(overlay.panel_uploads()==1&&overlay.draw_count()==4,"unchanged panel was reuploaded or replayed per eye");
     require(overlay.render_pass_starts()==0,"panel added a render pass");
-    LgXrSettings cfg=LG_XR_SETTINGS_DEFAULT;cfg.show_fps=1;cfg.auto_coins=0;
+    LgXrSettings cfg=LG_XR_SETTINGS_DEFAULT;cfg.show_stats=1;cfg.auto_coins=0;
     ControllerSettings controls;controls.auto_coins=false;ControllerInput input(controls);
     SettingsPanel menu(cfg.width,cfg.resolution,"Test",true);ControllerSample sample;sample.valid={1,1};
     const std::vector<float> rates;Submission last{};
@@ -233,8 +233,8 @@ static void render_panels(Device &device,bool foveation=false)
         auto cmd=ring.begin();menu.upload(overlay,cmd);background.begin(cmd,{0,0,0,1});
         overlay.draw(cmd,target,scene.overlay_matrices(),scene.overlay_eyes(),menu.guns(),&background,true,menu.draws());last=ring.submit();}
     ring.wait(last);
-    require(menu.draws()[0].visible&&menu.draws()[1].visible,"native settings/FPS panel did not become visible");
-    require(overlay.panel_uploads()==3,"unchanged settings or FPS image was uploaded each frame");
+    require(menu.draws()[0].visible&&menu.draws()[1].visible,"native settings/stats panel did not become visible");
+    require(overlay.panel_uploads()==3,"unchanged settings or stats image was uploaded each frame");
     require(overlay.render_pass_starts()==0,"native UI controller added a final render pass");
     std::puts("ok: retained panel image, top-first UV, stereo alpha blending and shared final pass");
 }
@@ -290,11 +290,11 @@ static void test_settings_panel()
     sample.buttons={};step();require(!panel.draws()[0].visible,"closed panel retained draw");
     panel.update(settings,scene,input,sample,time,false,rates);require(!panel.draws()[0].visible&&!panel.guns()[0].gun_valid,"focus loss left UI visible");
     SettingsPanel clocked(settings.width,settings.resolution,"Clock");ControllerInput timed_input(controls);
-    settings.show_fps=1;sample={};sample.valid={1,1};
+    settings.show_stats=1;sample={};sample.valid={1,1};
     for(int i=0;i<45;++i)clocked.update(settings,scene,timed_input,sample,1000000000+int64_t(i)*16666667,true,rates,1000000000+int64_t(i)*8333333);
-    require(!clocked.draws()[1].visible,"FPS label used simulated input time instead of elapsed readout time");
+    require(!clocked.draws()[1].visible,"stats panel used simulated input time instead of elapsed readout time");
     for(int i=45;i<80;++i)clocked.update(settings,scene,timed_input,sample,1000000000+int64_t(i)*16666667,true,rates,1000000000+int64_t(i)*8333333);
-    require(clocked.draws()[1].visible,"FPS label ignored its elapsed readout clock");
+    require(clocked.draws()[1].visible,"stats panel ignored its elapsed readout clock");
     std::puts("ok: native menu actions, live camera settings, blocked game input and cabinet actions");
 }
 
