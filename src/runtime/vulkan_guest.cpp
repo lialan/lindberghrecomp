@@ -722,9 +722,9 @@ extern "C" void lvk_glLinkProgram(GLuint id) {
   for (const auto shader : p.shaders) {
     const auto &s = state.shaders.at(shader);
     if (s.type == GL_VERTEX_SHADER)
-      vs = source_digest(s.source);
+      vs = shader_source_digest(s.source);
     if (s.type == GL_FRAGMENT_SHADER)
-      fs = source_digest(s.source);
+      fs = shader_source_digest(s.source);
   }
   // Unbound active inputs may use the archive's deterministic assignment;
   // explicit guest bindings must match. GetAttribLocation returns that slot.

@@ -222,11 +222,19 @@ def compile_pair(row, root, output, validator, reflector):
             "spirv_sha256": {stage: hashlib.sha256((dest / (stage + ".spv")).read_bytes()).hexdigest()
                              for stage in ("vert", "frag")},
             "sources": {stage: hashlib.sha256(data).hexdigest() for stage, data in zip(("vert", "frag"), raw)},
-            "lookup_sources": {stage: hashlib.sha256((root / row.get("original_" + kind, row[kind])).read_bytes()).hexdigest()
+            "lookup_sources": {stage: shader_source_digest((root / row.get("original_" + kind, row[kind])).read_bytes())
                                for stage, kind in (("vert", "vertex"), ("frag", "fragment"))},
             "attributes": bound_attributes, "samplers": samplers, "reflection": reflection}
     (dest / "program.json").write_text(json.dumps(meta, indent=2) + "\n")
     return meta
+
+
+def shader_source_digest(source):
+    # Match runtime shader identity; preserve raw source/module integrity hashes.
+    source = source.replace(b"\r", b" ")
+    if source and not source.endswith(b"\n"):
+        source += b"\n"
+    return hashlib.sha256(source).hexdigest()
 
 
 def main():

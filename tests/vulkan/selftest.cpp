@@ -167,8 +167,11 @@ static void render_stereo(Device &device)
     std::puts("ok: guest matrices, quad/strip assembly and indexed Vulkan stereo rasterization");
 
     ShaderPack pack(std::string(LV_TEST_SHADER_DIR) + "/fixture.lvsp");
-    const auto vs_hash = source_digest(source(std::string(LV_TEST_SOURCE_DIR) + "/legacy.vert"));
-    const auto fs_hash = source_digest(source(std::string(LV_TEST_SOURCE_DIR) + "/legacy.frag"));
+    auto vertex_source = source(std::string(LV_TEST_SOURCE_DIR) + "/legacy.vert");
+    require(!vertex_source.empty() && vertex_source.back() == '\n', "fixture must exercise EOF newline normalization");
+    vertex_source.pop_back();
+    const auto vs_hash = shader_source_digest(vertex_source);
+    const auto fs_hash = shader_source_digest(source(std::string(LV_TEST_SOURCE_DIR) + "/legacy.frag"));
     const auto record = pack.find(vs_hash, fs_hash, {});
     require(record && pack.programs().size() == 1, "offline shader archive lookup failed");
     require(!pack.find(SourceDigest{}, fs_hash, {}), "unknown shader source silently accepted");
@@ -433,6 +436,12 @@ static void render_copy(Device &device)
 
 int main(int argc, char **argv)
 try {
+    require(shader_source_digest("a\r\n") == shader_source_digest("a \n"),
+            "shader identity differs from guest CR normalization");
+    require(shader_source_digest("a") == shader_source_digest("a\n"),
+            "shader identity depends on optional final newline");
+    require(shader_source_digest("a\n\n") != shader_source_digest("a\n"),
+            "shader identity discarded significant trailing source");
     require(hex(source_digest("")) == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
             "empty shader source hash mismatch");
     require(hex(source_digest("abc")) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",

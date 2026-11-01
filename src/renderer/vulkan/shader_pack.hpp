@@ -6,6 +6,9 @@ namespace lindbergh::vk {
 
 using SourceDigest = std::array<uint8_t, 32>;
 SourceDigest source_digest(std::string_view source);
+// Shader identity matches upload CR handling and tolerates a missing EOF newline.
+// Module integrity and arbitrary byte hashes must continue to use source_digest.
+SourceDigest shader_source_digest(std::string_view source);
 struct AttributeBinding { std::string name; uint32_t location; };
 struct ShaderInput { uint32_t location; std::string type; };
 struct UniformField {

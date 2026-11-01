@@ -112,6 +112,16 @@ SourceDigest source_digest(std::string_view source)
     return result;
 }
 
+SourceDigest shader_source_digest(std::string_view source)
+{
+    if (source.empty() || (source.back() == '\n' && source.find('\r') == std::string_view::npos))
+        return source_digest(source);
+    std::string normalized(source);
+    std::replace(normalized.begin(), normalized.end(), '\r', ' ');
+    if (normalized.back() != '\n') normalized.push_back('\n');
+    return source_digest(normalized);
+}
+
 ShaderPack::ShaderPack(const std::string &path)
 {
     Reader r(path);
