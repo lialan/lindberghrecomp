@@ -722,6 +722,13 @@ int host_window_open(const char *title)
 #ifdef LINDBERGH_VULKAN_OFFSCREEN
     SDL_SetMainReady();SDL_setenv("SDL_VIDEODRIVER","dummy",1);SDL_setenv("SDL_AUDIODRIVER","dummy",1);
 #endif
+#if defined(__ANDROID__)
+    /* SDL selects its Android event pump when the video device is created.
+     * Setting this after SDL_Init leaves the blocking pump installed, which
+     * can stop the game/render owner from polling OpenXR during an Activity
+     * pause. OpenXR session state remains responsible for XR frame delivery. */
+    SDL_SetHint(SDL_HINT_ANDROID_BLOCK_ON_PAUSE, "0");
+#endif
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0) {
         fprintf(stderr, "[window] SDL_Init: %s\n", SDL_GetError());
         return 0;
@@ -729,14 +736,10 @@ int host_window_open(const char *title)
     g_win.w = env_int("LINDBERGH_WIDTH", g_hint_w ? g_hint_w : DEFAULT_W);
     g_win.h = env_int("LINDBERGH_HEIGHT", g_hint_h ? g_hint_h : DEFAULT_H);
 
-#if defined(__ANDROID__)
-    SDL_SetHint(SDL_HINT_ANDROID_BLOCK_ON_PAUSE, "0");
-#endif
 #ifndef LINDBERGH_VULKAN
 #if defined(__ANDROID__)
     /* GLES 3 under gl4es, which plays the 2.1 context the game expects. The
      * headset keeps running while the activity is paused. */
-    SDL_SetHint(SDL_HINT_ANDROID_BLOCK_ON_PAUSE, "0");
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
