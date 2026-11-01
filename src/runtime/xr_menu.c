@@ -54,6 +54,19 @@ void xm_paint_label(unsigned char *img, const char *s)
     }
 }
 
+void xm_paint_message(unsigned char *img, const char *title, const char *line)
+{
+    static const unsigned char clear[4] = { 0, 0, 0, 0 }, bg[4] = { 18, 22, 28, 235 }, edge[4] = { 70, 80, 90, 255 };
+    static const unsigned char white[3] = { 235, 238, 240 }, green[3] = { 120, 230, 140 };
+    const int top = (XM_H - XM_MESSAGE_H) / 2, bottom = top + XM_MESSAGE_H;
+    fill(img, 0, 0, XM_W, XM_H, clear);
+    fill(img, 0, top, XM_W, bottom, bg);
+    fill(img, 0, top, XM_W, top + 3, edge);
+    fill(img, 0, bottom - 3, XM_W, bottom, edge);
+    text(img, (XM_W - text_w(title)) / 2, top + 36, title, white);
+    text(img, (XM_W - text_w(line)) / 2, top + 36 + FONT_H + 28, line, green);
+}
+
 void xm_paint(unsigned char *img, const char *title, const XmItem *items, int n, int hover, const char *hint)
 {
     static const unsigned char bg[4] = { 18, 22, 28, 235 }, bar[4] = { 40, 70, 52, 255 },

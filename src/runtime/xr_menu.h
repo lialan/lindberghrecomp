@@ -25,6 +25,10 @@ void xm_paint(unsigned char *rgba, const char *title, const XmItem *items, int n
 #define XM_LABEL_W 224
 #define XM_LABEL_H 48
 void xm_paint_label(unsigned char *rgba, const char *s);
+/* A startup message (XM_W x XM_H x 4): a centred box with a title and a
+ * second line, transparent around it. */
+#define XM_MESSAGE_H 170
+void xm_paint_message(unsigned char *rgba, const char *title, const char *line);
 /* The row under panel coordinates u, v (0..1 from the top left); -1 if none. */
 int  xm_row_at(float u, float v, int n);
 

@@ -265,7 +265,8 @@ PipelineRecipes::renderer(Target &target, const ShaderRecord &record,
             if (alive.expired())
                 return;
             base.raster = state;
-            if (recipes_.emplace(key(base, true), base).second)
+            // A stand-in's pipelines describe no real target: never catalogue them.
+            if (recording_ && recipes_.emplace(key(base, true), base).second)
                 dirty_ = true;
             if (preparing_)
                 ++prepared_;
@@ -283,7 +284,7 @@ PipelineRecipes::renderer(Target &target, const ShaderRecord &record,
         vkDestroyDescriptorSetLayout(device_.handles.device, layout, nullptr);
     return entry;
 }
-void PipelineRecipes::prepare(Target &target) {
+void PipelineRecipes::prepare(Target &target, const std::function<void()> &each) {
     const auto started = std::chrono::steady_clock::now();
     const auto compatible = target_class(target);
     const auto before = prepared_;
@@ -296,6 +297,8 @@ void PipelineRecipes::prepare(Target &target) {
     try {
         for (const auto &r : candidates) {
             renderer(target, *shaders_.at(r.shader), r.bindings, r.attributes)->prepare(r.raster);
+            if (each)
+                each();
         }
     } catch (...) {
         preparing_ = false;
@@ -308,6 +311,58 @@ void PipelineRecipes::prepare(Target &target) {
             prepared_ - before, target.info.width, target.info.height, target.info.layers,
             compatible[0], compatible[4], compatible[3],
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
+}
+void PipelineRecipes::precompile(const std::vector<Target *> &ready, VkImageView density,
+                                 const std::function<void(size_t, size_t)> &progress) {
+    const auto started = std::chrono::steady_clock::now();
+    std::set<std::array<uint32_t, 5>> real, standins;
+    for (auto *target : ready)
+        real.insert(target_class(*target));
+    for (const auto &entry : recipes_)
+        if (!real.count(entry.second.target) && (!entry.second.target[4] || density))
+            standins.insert(entry.second.target);
+    auto candidates = [&](const std::array<uint32_t, 5> &c) {
+        size_t n = 0;
+        for (const auto &entry : recipes_)
+            n += portable_target(entry.second.target, c);
+        return n;
+    };
+    size_t total = 0, done = 0;
+    for (auto *target : ready)
+        total += candidates(target_class(*target));
+    for (const auto &c : standins)
+        total += candidates(c);
+    const auto before = prepared_;
+    auto each = [&] {
+        ++done;
+        if (progress)
+            progress(done, total);
+    };
+    for (auto *target : ready)
+        prepare(*target, each);
+    recording_ = false;
+    try {
+        for (const auto &c : standins) {
+            TargetInfo info{16, 16, c[1]};
+            info.color_format = VkFormat(c[0]);
+            info.final_layout = VkImageLayout(c[2]);
+            info.guest_bottom_origin = c[3] != 0;
+            if (c[4])
+                info.density_map = density;
+            Target standin(device_, info);
+            prepare(standin, each);
+            retire(standin); // never recorded: its pipelines can go at once
+        }
+    } catch (...) {
+        recording_ = true;
+        throw;
+    }
+    recording_ = true;
+    std::fprintf(stderr,
+                 "[vulkan-recipes] precompiled %zu catalogue pipelines (%zu new) for %zu real targets and %zu "
+                 "stand-in classes, %.1f ms\n",
+                 total, prepared_ - before, ready.size(), standins.size(),
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
 }
 std::vector<std::shared_ptr<Renderer>> PipelineRecipes::retire(Target &target) {
     std::vector<std::shared_ptr<Renderer>> retired;

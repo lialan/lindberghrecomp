@@ -1,5 +1,6 @@
 #pragma once
 #include "shader_pack.hpp"
+#include <functional>
 #include <map>
 #include <set>
 
@@ -18,7 +19,14 @@ class PipelineRecipes {
     PipelineRecipes &operator=(const PipelineRecipes &) = delete;
     // Portable RGBA8 descriptions can rebuild for sRGB/FDM target variants;
     // every retained pipeline is created against the destination render pass.
-    void prepare(Target &);
+    void prepare(Target &target) { prepare(target, {}); }
+    // Compiles the whole catalogue before play: against each real target in
+    // `ready`, as prepare() does, and against a small stand-in for every other
+    // target class, so the driver's pipeline cache already holds what the game's
+    // own render targets create later. `progress(done, total)` runs after each
+    // pipeline. A foveated class is skipped when `density` is null.
+    void precompile(const std::vector<Target *> &ready, VkImageView density,
+                    const std::function<void(size_t, size_t)> &progress);
     std::shared_ptr<Renderer> renderer(Target &, const ShaderRecord &,
                                        const std::vector<VkVertexInputBindingDescription> &,
                                        const std::vector<VkVertexInputAttributeDescription> &);
@@ -45,11 +53,12 @@ class PipelineRecipes {
     std::map<std::string, Recipe> recipes_;
     std::map<std::pair<Target *, std::string>, std::shared_ptr<Renderer>> renderers_;
     std::shared_ptr<int> lifetime_ = std::make_shared<int>(0);
-    bool dirty_ = false, preparing_ = false;
+    bool dirty_ = false, preparing_ = false, recording_ = true;
     size_t first_uses_ = 0, prepared_ = 0;
     static std::array<uint32_t, 5> target_class(const Target &);
     static std::string key(const Recipe &, bool raster);
     void load(const std::string &);
+    void prepare(Target &, const std::function<void()> &each);
     void validate(const Recipe &) const;
 };
 } // namespace lindbergh::vk

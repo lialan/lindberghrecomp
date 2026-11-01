@@ -39,6 +39,7 @@ extern "C" {
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -866,6 +867,69 @@ extern "C" int lvk_host_thread_enter(void) {
   return 1;
 #endif
 }
+#ifdef LINDBERGH_VULKAN_XR
+// One headset frame during startup work: a "Compiling shaders" panel ahead of
+// the player. The frame loop has not started; keep the session's frames going.
+static void loading_frame(const char *line) {
+  Target *target=state.xr->begin_frame();
+  if(!target) {if(state.xr->frame_open())state.xr->end_frame(false);return;}
+  std::array<StereoPose,2> eyes;
+  for(unsigned i=0;i<2;++i) {
+    const auto &v=state.xr->views()[i];
+    eyes[i].orientation={v.pose.orientation.x,v.pose.orientation.y,v.pose.orientation.z,v.pose.orientation.w};
+    eyes[i].position={v.pose.position.x,v.pose.position.y,v.pose.position.z};
+    eyes[i].tangents={-std::tan(v.fov.angleLeft),std::tan(v.fov.angleRight),-std::tan(v.fov.angleDown),std::tan(v.fov.angleUp)};
+  }
+  state.stereo->publish(eyes);
+  static std::vector<unsigned char> pixels(size_t(XM_W)*XM_H*4);
+  xm_paint_message(pixels.data(),"Compiling shaders",line);
+  auto cmd=state.ring->begin();
+  state.overlay->upload_panel(cmd,0,pixels.data(),pixels.size());
+  XpPanel label{};label.hw=.55f;label.hh=label.hw*XM_H/XM_W;
+  const float x[]={1,0,0},y[]={0,1,0},z[]={0,0,1},at[]={0,0,-1.5f};float offset[3];
+  const auto &q=state.stereo->head_orientation();
+  lg_stereo_rotate(q.data(),x,label.right);lg_stereo_rotate(q.data(),y,label.up);lg_stereo_rotate(q.data(),z,label.n);lg_stereo_rotate(q.data(),at,offset);
+  for(int i=0;i<3;++i)label.c[i]=(eyes[0].position[i]+eyes[1].position[i])*.5f+offset[i];
+  std::array<PanelDraw,2> draws{};draws[0].visible=true;xp_matrix(&label,draws[0].model.data());
+  state.overlay->draw(cmd,*target,state.stereo->overlay_matrices(),state.stereo->overlay_eyes(),{},nullptr,false,draws);
+  state.ring->submit();
+  state.xr->end_frame(true);
+}
+#endif
+// Compile every catalogued pipeline before the game draws, so play never
+// waits on the driver's compiler. Later launches find them in the saved cache.
+static void precompile_pipelines() {
+  std::vector<Target *> ready;VkImageView density=VK_NULL_HANDLE;
+#ifdef LINDBERGH_VULKAN_XR
+  for(const auto &target:state.xr->render_targets())ready.push_back(target.get());
+  ready.push_back(state.unfocused.get());
+  if(!state.xr->density_maps().empty())density=state.xr->density_maps().front();
+#elif defined(LINDBERGH_VULKAN_OFFSCREEN)
+  ready.push_back(state.offscreen.get());density=state.offscreen->info.density_map;
+#else
+  for(const auto &target:state.window->render_targets())ready.push_back(target.get());
+#endif
+  const auto started=std::chrono::steady_clock::now();auto last=started;
+  std::function<void(size_t,size_t)> progress;
+#ifdef LINDBERGH_VULKAN_XR
+  if(state.overlay&&state.stereo) {
+    progress=[&](size_t done,size_t total) {
+      const auto now=std::chrono::steady_clock::now();
+      // A warm cache finishes in milliseconds: say nothing unless it is slow.
+      if(now-started<std::chrono::milliseconds(250))return;
+      if(now-last<std::chrono::milliseconds(40))return; // a frame while the compiler works
+      last=now;char text[48];std::snprintf(text,sizeof text,"%zu%%  -  slow only on the first launch",total?done*100/total:100);loading_frame(text);
+    };
+  }
+#endif
+  (void)last;
+  state.recipes->precompile(ready,density,progress);
+  // Keep the work even if the app is killed before a clean exit.
+  try {state.cache->save();}
+  catch(const std::exception &e){std::fprintf(stderr,"[vulkan] pipeline cache save: %s\n",e.what());}
+  try {state.recipes->save();}
+  catch(const std::exception &e){std::fprintf(stderr,"[vulkan-recipes] save: %s\n",e.what());}
+}
 extern "C" int lvk_host_init(SDL_Window *window, int w, int h) {
   if (state.ready)
     return 1;
@@ -997,14 +1061,6 @@ extern "C" int lvk_host_init(SDL_Window *window, int w, int h) {
         state.fixed_pack=std::make_unique<ShaderPack>(fixed&&*fixed?fixed:LINDBERGH_VULKAN_FIXED_ARCHIVE);
         state.recipes=std::make_unique<PipelineRecipes>(*state.device,*state.cache,
           std::vector<const ShaderPack *>{state.pack.get(),state.fixed_pack.get()},recipe_file,seed?seed:"");
-#ifdef LINDBERGH_VULKAN_XR
-        for(const auto &target:state.xr->render_targets())state.recipes->prepare(*target);
-        state.recipes->prepare(*state.unfocused);
-#elif defined(LINDBERGH_VULKAN_OFFSCREEN)
-        state.recipes->prepare(*state.offscreen);
-#else
-        for(const auto &target:state.window->render_targets())state.recipes->prepare(*target);
-#endif
       }
     }
     if(state.controllers) {
@@ -1021,6 +1077,7 @@ extern "C" int lvk_host_init(SDL_Window *window, int w, int h) {
 #endif
 #endif
     }
+    if(state.recipes)precompile_pipelines();
     state.game_width=w; state.game_height=h;
     if(state.stereo)watch_game_states();
     state.viewport = state.scissor = {0, 0, w, h};
