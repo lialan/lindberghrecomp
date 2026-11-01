@@ -896,6 +896,8 @@ extern "C" int lvk_host_init(SDL_Window *window, int w, int h) {
 #else
 #ifdef LINDBERGH_VULKAN_OFFSCREEN
     DeviceOptions options;options.require_foveation=std::getenv("LINDBERGH_VULKAN_OFFSCREEN_DENSITY")!=nullptr;
+    // A CPU rasterizer (lavapipe) only on request: correctness runs without a GPU
+    if(const auto *v=std::getenv("LINDBERGH_VULKAN_ALLOW_SOFTWARE"))options.allow_software=*v=='1';
     state.device=Device::create(options);
 #else
     state.device = Device::create(desktop_options(window));
