@@ -299,6 +299,7 @@ void Renderer::prepare(RasterState state)
     VkPipeline result;
     check(vkCreateGraphicsPipelines(device_.handles.device, cache_.handle(), 1, &pipeline, nullptr, &result), "prepare graphics pipeline");
     pipelines_.emplace(key, result);
+    if (pipeline_created) pipeline_created(state);
 }
 
 void Renderer::begin(VkCommandBuffer cmd, std::array<float, 4> color, bool preserve)

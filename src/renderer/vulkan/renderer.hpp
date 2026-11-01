@@ -91,6 +91,8 @@ public:
     Renderer(const Renderer &) = delete;
     Renderer &operator=(const Renderer &) = delete;
     void prepare(RasterState state);
+    // Called only when a new variant is created, never for a cached draw.
+    std::function<void(RasterState)> pipeline_created;
     void begin(VkCommandBuffer cmd, std::array<float, 4> clear, bool preserve = false);
     void viewport(float x, float y, float width, float height, VkRect2D scissor,float min_depth=0,float max_depth=1);
     void dynamic_state(uint32_t stencil_ref, uint32_t stencil_compare_mask, uint32_t stencil_write_mask,

@@ -7,6 +7,7 @@
 #include "../renderer/vulkan/overlay.hpp"
 #include "../renderer/vulkan/settings_panel.hpp"
 #include "../renderer/vulkan/shader_pack.hpp"
+#include "../renderer/vulkan/pipeline_recipes.hpp"
 #include "../renderer/vulkan/window.hpp"
 #include "../renderer/vulkan/resources.hpp"
 #include "../renderer/vulkan/uniforms.hpp"
@@ -91,7 +92,7 @@ struct NativeProgram {
   uint64_t legacy_version=0; uint32_t legacy_height=0;
   std::array<uint64_t,2> uniform_version{}, uniform_frame{};
   std::array<uint32_t,2> uniform_offset{};
-  std::map<std::string,std::unique_ptr<Renderer>> renderers;
+  std::map<std::string,std::shared_ptr<Renderer>> renderers;
 };
 struct Program {
   bool delete_pending = false;
@@ -186,12 +187,16 @@ struct ActivityRef {
     const auto directory=std::filesystem::path(storage)/"vulkan";
     std::filesystem::create_directories(directory);
     for (auto entry : {std::pair{"LINDBERGH_VULKAN_SHADERS","game.lvsp"},
-                       std::pair{"LINDBERGH_VULKAN_FIXED_SHADERS","fixed.lvsp"}}) {
+                       std::pair{"LINDBERGH_VULKAN_FIXED_SHADERS","fixed.lvsp"},
+                       std::pair{"LINDBERGH_VULKAN_RECIPES_SEED","pipelines.lvpr"}}) {
       const char *override=std::getenv(entry.first);
       if (override && *override) continue;
       const auto source=std::string("vulkan/")+entry.second;
       std::unique_ptr<AAsset,decltype(&AAsset_close)> asset(AAssetManager_open(manager,source.c_str(),AASSET_MODE_STREAMING),AAsset_close);
-      if (!asset) throw std::runtime_error("Missing packaged shader archive: "+source);
+      if (!asset) {
+        if(std::strcmp(entry.first,"LINDBERGH_VULKAN_RECIPES_SEED")==0)continue;
+        throw std::runtime_error("Missing packaged shader archive: "+source);
+      }
       const auto path=directory/entry.second;
       const auto temporary=path.string()+".tmp";
       try {
@@ -248,6 +253,7 @@ struct State {
   bool xr_rendering = false;
 #endif
   std::unique_ptr<PipelineCache> cache;
+  std::unique_ptr<PipelineRecipes> recipes;
   std::unique_ptr<FrameRing> ring;
   std::unique_ptr<ShaderPack> pack, fixed_pack;
   Program fixed_program;
@@ -306,6 +312,13 @@ struct State {
     for (auto &slot : materials) slot.clear();
     programs.clear();
     fixed_program.native.reset();
+    if(recipes) {
+      try {recipes->save();}
+      catch(const std::exception &e){std::fprintf(stderr,"[vulkan-recipes] save: %s\n",e.what());}
+      std::fprintf(stderr,"[vulkan-recipes] %zu retained before target use, %zu first-use pipelines; %zu catalogue entries\n",
+                   recipes->prepared_count(),recipes->first_use_count(),recipes->recipe_count());
+      recipes.reset();
+    }
     renderers.clear();overlay.reset();panel.reset();
     texture_objects.clear();
     buffers.clear();
@@ -660,6 +673,26 @@ extern "C" int lvk_host_init(SDL_Window *window, int w, int h) {
     std::fprintf(stderr,"[vulkan-offscreen] diagnostic %ux%u x2; constant density map %s; no OpenXR/compositor/display proof\n",
       offscreen.width,offscreen.height,offscreen.density_map?"enabled":"disabled");
 #endif
+    const auto *recipes_path=std::getenv("LINDBERGH_VULKAN_RECIPES");
+    const auto *seed=std::getenv("LINDBERGH_VULKAN_RECIPES_SEED");
+    const std::string recipe_file=recipes_path?recipes_path:(cache_path.empty()?"":cache_path+".recipes");
+    if(!recipe_file.empty()||(seed&&*seed)) {
+      const auto *game=std::getenv("LINDBERGH_VULKAN_SHADERS");
+      if(game&&*game) {
+        state.pack=std::make_unique<ShaderPack>(game);
+        const auto *fixed=std::getenv("LINDBERGH_VULKAN_FIXED_SHADERS");
+        state.fixed_pack=std::make_unique<ShaderPack>(fixed&&*fixed?fixed:LINDBERGH_VULKAN_FIXED_ARCHIVE);
+        state.recipes=std::make_unique<PipelineRecipes>(*state.device,*state.cache,
+          std::vector<const ShaderPack *>{state.pack.get(),state.fixed_pack.get()},recipe_file,seed?seed:"");
+#ifdef LINDBERGH_VULKAN_XR
+        for(const auto &target:state.xr->render_targets())state.recipes->prepare(*target);
+#elif defined(LINDBERGH_VULKAN_OFFSCREEN)
+        state.recipes->prepare(*state.offscreen);
+#else
+        for(const auto &target:state.window->render_targets())state.recipes->prepare(*target);
+#endif
+      }
+    }
     if(state.controllers) {
       const auto *fake=std::getenv("LINDBERGH_VULKAN_FAKE_MENU");
       state.panel=std::make_unique<SettingsPanel>(state.settings.width,state.settings.resolution,game_profile()->title,fake&&*fake=='1');
@@ -849,6 +882,7 @@ extern "C" unsigned lvk_create_drawable(int w, int h) {
   state.drawable_sizes[id]={w,h};
   info.guest_bottom_origin=true;
   state.drawables[id] = std::make_unique<Target>(*state.device, info);
+  if(state.recipes)state.recipes->prepare(*state.drawables[id]);
 #ifdef LINDBERGH_VULKAN_XR
   if(foveated_world) {
     auto &target=*state.drawables.at(id);
@@ -2142,9 +2176,9 @@ RasterState raster_state(bool fixed) {
 }
 Program &current_program() {
   if(state.program)return state.programs.at(state.program);
-  if(!state.fixed_pack) {
+  if(!state.fixed_program.record) {
     const auto *fixed=std::getenv("LINDBERGH_VULKAN_FIXED_SHADERS");
-    state.fixed_pack=std::make_unique<ShaderPack>(fixed && *fixed ? fixed : LINDBERGH_VULKAN_FIXED_ARCHIVE);
+    if(!state.fixed_pack)state.fixed_pack=std::make_unique<ShaderPack>(fixed && *fixed ? fixed : LINDBERGH_VULKAN_FIXED_ARCHIVE);
     auto &p=state.fixed_program;p.record=&state.fixed_pack->programs().at(0);
     for(const auto &u:p.record->uniforms)p.uniforms.push_back(std::make_unique<UniformData>(u));
     for(const auto &s:p.record->samplers) {
@@ -2407,8 +2441,11 @@ void draw_geometry(GLenum mode,GLint first,GLsizei count,const void *indices,GLe
   for(const auto &a:plan.attributes){key_word(key,a.location);key_word(key,a.binding);key_word(key,a.format);key_word(key,a.offset);}
   auto &renderer=p.native->renderers[key];
   if(!renderer) {
-    ProgramSource source{p.record->vertex.data(),p.record->fragment.data(),p.record->vertex.size()*4,p.record->fragment.size()*4,plan.bindings,plan.attributes,p.native->layouts};
-    renderer=std::make_unique<Renderer>(*state.device,*target,*state.cache,source);
+    if(state.recipes)renderer=state.recipes->renderer(*target,*p.record,plan.bindings,plan.attributes);
+    else {
+      ProgramSource source{p.record->vertex.data(),p.record->fragment.data(),p.record->vertex.size()*4,p.record->fragment.size()*4,plan.bindings,plan.attributes,p.native->layouts};
+      renderer=std::make_shared<Renderer>(*state.device,*target,*state.cache,source);
+    }
   }
   auto packet=packet_for(target,renderer.get());packet.raster=raster;packet.streams=std::move(plan.streams);packet.count=uint32_t(count);
   if(stereo_packet(packet,first,count,elements,immediate,immediate_stride,guest_indexed))return;

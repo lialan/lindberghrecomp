@@ -26,7 +26,7 @@ foreach(name overlay_gun.vert overlay_gun.frag overlay_beam.vert overlay_beam.fr
         DEPENDS "shaders/${name}" embed_spirv.py VERBATIM)
     list(APPEND shaders "${header}")
 endforeach()
-add_library(lindbergh_vulkan STATIC ../../runtime/xr_panel.c ../../runtime/xr_menu.c ../../runtime/xr_overlay_geometry.c ../../runtime/stereo_projection.c ../../runtime/xr_controls.c controller_input.cpp settings_panel.cpp overlay.cpp device.cpp frame_ring.cpp renderer.cpp guest_state.cpp stereo_scene.cpp uniforms.cpp resources.cpp guest_arrays.cpp guest_pixels.cpp shader_pack.cpp ${shaders})
+add_library(lindbergh_vulkan STATIC ../../runtime/xr_panel.c ../../runtime/xr_menu.c ../../runtime/xr_overlay_geometry.c ../../runtime/stereo_projection.c ../../runtime/xr_controls.c controller_input.cpp settings_panel.cpp overlay.cpp pipeline_recipes.cpp device.cpp frame_ring.cpp renderer.cpp guest_state.cpp stereo_scene.cpp uniforms.cpp resources.cpp guest_arrays.cpp guest_pixels.cpp shader_pack.cpp ${shaders})
 target_include_directories(lindbergh_vulkan PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 target_include_directories(lindbergh_vulkan PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 target_link_libraries(lindbergh_vulkan PUBLIC Vulkan::Vulkan)

@@ -14,6 +14,7 @@
 #include "uniforms.hpp"
 #include "resources.hpp"
 #include "shader_pack.hpp"
+#include "pipeline_recipes.hpp"
 #include <array>
 #include <algorithm>
 #include <chrono>
@@ -487,6 +488,53 @@ static void render_stereo(Device &device)
     pixel(0, 8, 16, 255); pixel(0, 24, 16, 0);
     pixel(1, 8, 16, 0); pixel(1, 24, 16, 255);
     std::puts("ok: converted GLSL 1.20 shaders preserve front-face color and multiview raster output");
+
+    // Capture a portable recipe, discard its pipeline object, then preload it
+    // without opaque driver-cache bytes. Actual GPU draws bind independently
+    // created runtime descriptor sets to the preloaded pipeline layout.
+    {
+        const auto path=(std::filesystem::temp_directory_path()/
+            ("lindbergh-recipes-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()))).string();
+        PipelineCache no_disk(device,"");
+        {
+            PipelineRecipes capture(device,no_disk,{&pack},path);
+            auto draw=capture.renderer(target,*record,legacy.bindings,legacy.attributes);
+            draw->prepare(state);
+            require(capture.recipe_count()==1&&capture.first_use_count()==1,"pipeline recipe capture missing");
+            capture.save();
+        }
+        PipelineRecipes loaded(device,no_disk,{&pack},"",path);
+        require(loaded.recipe_count()==1,"portable seed did not load without a writable cache");
+        loaded.prepare(target);
+        auto draw=loaded.renderer(target,*record,legacy.bindings,legacy.attributes);
+        require(draw==loaded.renderer(target,*record,legacy.bindings,legacy.attributes),"prepared renderer not retained");
+        require(loaded.prepared_count()==1&&loaded.first_use_count()==0,"pipeline was not prepared before target use");
+        draw->prepare(state);
+        require(loaded.first_use_count()==0,"cached draw created another pipeline");
+        cmd=ring.begin();draw->begin(cmd,{0,0,0,1});bind_legacy(*draw);
+        sampled=legacy_material.handle();draw->bind_descriptors(2,1,&sampled);
+        offset=uniforms.upload(0,guest_uniforms.bytes().data(),guest_uniforms.bytes().size());descriptors=uniforms.current_set();
+        draw->bind_descriptors(1,1,&descriptors,1,&offset);draw->draw(ring,triangle,3,matrices,state);draw->end();
+        vkCmdCopyImageToBuffer(cmd,target.color,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,output.buffer,1,&copy);
+        vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&barrier,0,nullptr);
+        ring.wait(ring.submit());pixel(0,8,16,255);pixel(0,24,16,0);pixel(1,8,16,0);pixel(1,24,16,255);
+        auto other_info=target.info;other_info.width=other_info.height=16;Target resized(device,other_info);
+        loaded.prepare(resized);require(loaded.prepared_count()==2,"recipe incorrectly depends on target resolution");
+        loaded.retire(resized);
+        other_info.guest_bottom_origin=!other_info.guest_bottom_origin;Target flipped(device,other_info);
+        loaded.prepare(flipped);require(loaded.prepared_count()==2,"incompatible target origin reused a pipeline");
+        std::ifstream input(path,std::ios::binary);std::string bytes{std::istreambuf_iterator<char>(input),{}};
+        bytes[12]^=1;{std::ofstream out(path,std::ios::binary|std::ios::trunc);out.write(bytes.data(),bytes.size());}
+        PipelineRecipes corrupt(device,no_disk,{&pack},path);
+        require(corrupt.recipe_count()==0,"corrupt recipe catalogue partially accepted");
+        const auto checksum=source_digest(std::string_view(bytes.data(),bytes.size()-32));
+        std::memcpy(bytes.data()+bytes.size()-32,checksum.data(),32);
+        {std::ofstream out(path,std::ios::binary|std::ios::trunc);out.write(bytes.data(),bytes.size());}
+        PipelineRecipes foreign_shader(device,no_disk,{&pack},path);
+        require(foreign_shader.recipe_count()==0,"unknown compiled shader identity reused a pipeline recipe");
+        std::filesystem::remove(path);
+    }
+    std::puts("ok: portable pipeline seeds preload retained stereo pipelines; compatible descriptors, resolution reuse and stale/corrupt rejection");
 
     // Game loading uses packed BGRA8888_REV and RGB565. Sample the original
     // guest byte order directly; checking channels catches a mistaken swizzle.
