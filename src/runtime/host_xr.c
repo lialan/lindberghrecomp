@@ -1,5 +1,7 @@
 #include "display_cadence.h"
 #include "xr_settings.h"
+#include "xr_controls.h"
+#include "xr_actions.h"
 #include "stereo_projection.h"
 /*
  * host_xr.c - the headset, through OpenXR (Android and Windows PC VR).
@@ -249,97 +251,23 @@ static PFN_xrEnumerateDisplayRefreshRatesFB enumerate_rates;
 
 /* ---- input ---- */
 enum { HAND_L, HAND_R };
-static XrActionSet set;
-static XrAction a_aim, a_trigger, a_grip, a_a, a_b, a_stick, a_menu, a_haptic;
-static XrSpace aim_space[2];
-static XrPath hand_path[2];
-static int gun_hand = HAND_R;
+static LgXrActions actions;
+#define aim_space actions.aim_space
+#define hand_path actions.hand_path
+#define a_trigger actions.action[LG_XR_TRIGGER]
+#define a_grip actions.action[LG_XR_GRIP]
+#define a_a actions.action[LG_XR_LOWER]
+#define a_b actions.action[LG_XR_UPPER]
+#define a_stick actions.action[LG_XR_STICK]
+#define a_menu actions.action[LG_XR_MENU]
+static LgXrControls controls=LG_XR_CONTROLS_DEFAULT;
+#define gun_hand controls.gun_hand
 static int prev[2][8];                 /* last state of each button, per hand */
 
-static int action(XrAction *out, const char *name, const char *label, XrActionType type)
-{
-    XrActionCreateInfo ai = { XR_TYPE_ACTION_CREATE_INFO };
-    ai.actionType = type;
-    strcpy(ai.actionName, name);
-    strcpy(ai.localizedActionName, label);
-    ai.countSubactionPaths = 2;
-    ai.subactionPaths = hand_path;
-    XRCHECK(xrCreateAction(set, &ai, out));
-    return 1;
-}
-
-static XrPath path(const char *s) { XrPath p = XR_NULL_PATH; xrStringToPath(instance, s, &p); return p; }
-
-static int input_init(void)
-{
-    hand_path[HAND_L] = path("/user/hand/left");
-    hand_path[HAND_R] = path("/user/hand/right");
-    XrActionSetCreateInfo si = { XR_TYPE_ACTION_SET_CREATE_INFO };
-    strcpy(si.actionSetName, "gun");
-    strcpy(si.localizedActionSetName, "Gun");
-    XRCHECK(xrCreateActionSet(instance, &si, &set));
-    if (!action(&a_aim, "aim", "Aim", XR_ACTION_TYPE_POSE_INPUT) ||
-        !action(&a_trigger, "trigger", "Trigger", XR_ACTION_TYPE_FLOAT_INPUT) ||
-        !action(&a_grip, "grip", "Grip", XR_ACTION_TYPE_FLOAT_INPUT) ||
-        !action(&a_a, "lower", "A / X", XR_ACTION_TYPE_BOOLEAN_INPUT) ||
-        !action(&a_b, "upper", "B / Y", XR_ACTION_TYPE_BOOLEAN_INPUT) ||
-        !action(&a_stick, "stick", "Thumbstick click", XR_ACTION_TYPE_BOOLEAN_INPUT) ||
-        !action(&a_menu, "menu", "Menu", XR_ACTION_TYPE_BOOLEAN_INPUT) ||
-        !action(&a_haptic, "recoil", "Recoil", XR_ACTION_TYPE_VIBRATION_OUTPUT)) return 0;
-
-    static const struct { XrAction *a; const char *p; } B[] = {
-        { &a_aim, "/user/hand/left/input/aim/pose" }, { &a_aim, "/user/hand/right/input/aim/pose" },
-        { &a_trigger, "/user/hand/left/input/trigger/value" }, { &a_trigger, "/user/hand/right/input/trigger/value" },
-        { &a_grip, "/user/hand/left/input/squeeze/value" }, { &a_grip, "/user/hand/right/input/squeeze/value" },
-        { &a_a, "/user/hand/left/input/x/click" }, { &a_a, "/user/hand/right/input/a/click" },
-        { &a_b, "/user/hand/left/input/y/click" }, { &a_b, "/user/hand/right/input/b/click" },
-        { &a_stick, "/user/hand/left/input/thumbstick/click" }, { &a_stick, "/user/hand/right/input/thumbstick/click" },
-        { &a_menu, "/user/hand/left/input/menu/click" },
-        { &a_haptic, "/user/hand/left/output/haptic" }, { &a_haptic, "/user/hand/right/output/haptic" },
-    };
-    XrActionSuggestedBinding sb[sizeof B / sizeof B[0]];
-    for (unsigned i = 0; i < sizeof B / sizeof B[0]; i++) { sb[i].action = *B[i].a; sb[i].binding = path(B[i].p); }
-    XrInteractionProfileSuggestedBinding ps = { XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING };
-    ps.interactionProfile = path("/interaction_profiles/oculus/touch_controller");
-    ps.countSuggestedBindings = sizeof B / sizeof B[0];
-    ps.suggestedBindings = sb;
-    XRCHECK(xrSuggestInteractionProfileBindings(instance, &ps));
-
-    for (int h = 0; h < 2; h++) {
-        XrActionSpaceCreateInfo ac = { XR_TYPE_ACTION_SPACE_CREATE_INFO };
-        ac.action = a_aim; ac.subactionPath = hand_path[h]; ac.poseInActionSpace.orientation.w = 1;
-        XRCHECK(xrCreateActionSpace(session, &ac, &aim_space[h]));
-    }
-    XrSessionActionSetsAttachInfo at = { XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO };
-    at.countActionSets = 1; at.actionSets = &set;
-    XRCHECK(xrAttachSessionActionSets(session, &at));
-    return 1;
-}
-
-static float get_float(XrAction a, int h)
-{
-    XrActionStateGetInfo gi = { XR_TYPE_ACTION_STATE_GET_INFO };
-    gi.action = a; gi.subactionPath = hand_path[h];
-    XrActionStateFloat s = { XR_TYPE_ACTION_STATE_FLOAT };
-    return XR_SUCCEEDED(xrGetActionStateFloat(session, &gi, &s)) && s.isActive ? s.currentState : 0;
-}
-
-static int get_bool(XrAction a, int h)
-{
-    XrActionStateGetInfo gi = { XR_TYPE_ACTION_STATE_GET_INFO };
-    gi.action = a; gi.subactionPath = hand_path[h];
-    XrActionStateBoolean s = { XR_TYPE_ACTION_STATE_BOOLEAN };
-    return XR_SUCCEEDED(xrGetActionStateBoolean(session, &gi, &s)) && s.isActive && s.currentState;
-}
-
-static void rumble(int h, float amp, int ms)
-{
-    XrHapticVibration v = { XR_TYPE_HAPTIC_VIBRATION };
-    v.amplitude = amp; v.duration = (XrDuration)ms * 1000000; v.frequency = XR_FREQUENCY_UNSPECIFIED;
-    XrHapticActionInfo hi = { XR_TYPE_HAPTIC_ACTION_INFO };
-    hi.action = a_haptic; hi.subactionPath = hand_path[h];
-    xrApplyHapticFeedback(session, &hi, (XrHapticBaseHeader *)&v);
-}
+static int input_init(void) { XRCHECK(lg_xr_actions_create(&actions,instance,session));return 1; }
+static float get_float(XrAction a,int h) {return lg_xr_action_float(&actions,a,h);}
+static int get_bool(XrAction a,int h) {return lg_xr_action_bool(&actions,a,h);}
+static void rumble(int h,float amp,int ms) {lg_xr_actions_rumble(&actions,h,amp,ms);}
 
 /* Rotate v by quaternion q. */
 static void qrot(XrQuaternionf q, const float v[3], float out[3])
@@ -752,10 +680,7 @@ static int gun_fire(int pl, int h, XrTime t, int trig, int aimed, XoFrame *x)
 
 static void input_frame(XrTime t)
 {
-    XrActiveActionSet as = { set, XR_NULL_PATH };
-    XrActionsSyncInfo sy = { XR_TYPE_ACTIONS_SYNC_INFO };
-    sy.countActiveActionSets = 1; sy.activeActionSets = &as;
-    if (XR_FAILED(xrSyncActions(session, &sy))) return;
+    if(XR_FAILED(lg_xr_actions_sync(&actions)))return;
 
     /* Dual wielding (cfg.dual): each hand its own gun - gun_hand player 1,
      * the other player 2. Otherwise one gun, in the hand last pulled with. */
@@ -765,9 +690,8 @@ static void input_frame(XrTime t)
         trig[h] = get_float(a_trigger, h) > 0.55f;
         grip[h] = get_float(a_grip, h) > 0.6f;
         btn_a[h] = get_bool(a_a, h); btn_b[h] = get_bool(a_b, h); stick[h] = get_bool(a_stick, h);
-        /* pulling the trigger on the other hand moves the gun there */
-        if (!dual && trig[h] && !prev[h][0] && h != gun_hand) gun_hand = h;
     }
+    lg_xr_controls_select(&controls,trig,dual);
     int menu_btn = get_bool(a_menu, HAND_L);
     if (fake_menu < 0) { const char *v = getenv("LINDBERGH_XR_FAKE_MENU"); fake_menu = v && *v == '1'; }
     if (fake_menu && !menu.open && views_ok) { menu.open = 1; menu_place(); menu.hover = -1; menu.dirty = 1; }
@@ -784,8 +708,8 @@ static void input_frame(XrTime t)
     else { xo2.gun_valid = xo2.beam = xo2.dot = xo2.flash = 0; stereo_set_gun_ray(1, NULL, NULL, 0); }
     if (menu.open && menu.dirty) menu_paint();
 
-    int firing = gun_fire(0, g, t, trig[g], aimed, &xo);
-    int firing2 = dual && gun_fire(1, off, t, trig[off], aimed2, &xo2);
+    int firing=gun_fire(0,g,t,trig[g],aimed,&xo);
+    int firing2=dual&&gun_fire(1,off,t,trig[off],aimed2,&xo2);
 
     /* the other hand's upper button (Y for the right-handed), held for a
      * second, opens and closes the settings panel too - not when that hand
@@ -835,64 +759,22 @@ static void input_frame(XrTime t)
                     aim_hit_t[pl] > 0 ? "read" : "assumed", stereo_flat_frame(), aim_on_box[pl] ? ", on a box" : "");
     }
 
-    /* each gun's buttons: player 1's, and with two guns player 2's (the same
-     * four, CAB_P2_SHIFT up) */
-    unsigned held = 0;
-    for (int pl = 0; pl < (dual ? 2 : 1); pl++) {
-        int h = pl ? off : g, on = pl ? aimed2 : aimed;
-        unsigned b = 0;
-        if (pl ? firing2 : firing) b |= CAB_P1_TRIGGER;
-        if (trig[h] && !on && !menu.open) b |= CAB_P1_RELOAD;  /* the arcade's reload: fire off the screen */
-        /* the grip reloads with a tap: a few frames from its squeeze, not for
-         * as long as it is held - a hand holding the controller squeezes it,
-         * and a gun forever reloading neither fires nor reloads */
-        static XrTime grip_at[2];
-        if (grip[h] && !prev[h][1]) grip_at[h] = t;
-        if (grip[h] && !menu.open && t - grip_at[h] < 120000000) b |= CAB_P1_RELOAD;
-        if (btn_a[h] && !menu.open) b |= CAB_P1_ACTION;
-        if (btn_b[h] && !menu.open) b |= CAB_P1_FIREMODE;
-        held |= pl ? b << CAB_P2_SHIFT : b;
+    LgXrControlFrame frame={0};frame.time=t;frame.dual=dual;frame.auto_coins=cfg.auto_coins;frame.blocked=menu.open;
+    for(int h=0;h<2;++h) {
+        frame.trigger[h]=trig[h];frame.grip[h]=grip[h];frame.lower[h]=btn_a[h];frame.upper[h]=btn_b[h];frame.stick[h]=stick[h];
     }
-    if (held & CAB_P1_RELOAD) reload_t = t;
-    stereo_game_gun_reloading(reload_t && t - reload_t < 1500000000);
-    /* the other hand's X/A: a capture of what is on screen now, for a report
-     * (with two guns that hand's A is player 2's action button) */
-    if (!dual && btn_a[off] && !prev[off][2] && !menu.open) { stereo_capture(); rumble(off, 0.4f, 30); }
-    if (menu.test_frames) { menu.test_frames--; held |= CAB_TEST; }
-    if (menu.service_frames) { menu.service_frames--; held |= CAB_SERVICE; }
-    /* Start: either stick's click; with two guns each hand's is its player's */
-    int start = (dual ? stick[g] : stick[0] || stick[1]) && !menu.open;
-    int start2 = dual && stick[off] && !menu.open;
-    /* Player 2 joins with its first shot: a game hands an unjoined player 2's
-     * trigger to player 1 (The House of the Dead 4 does), so pulling it before
-     * Start made player 1 fire. A pull presses player 2's Start too, at most
-     * every three seconds - Start does nothing to a player already in. */
-    static XrTime joined_at;
-    int join_coin = 0;
-    if (dual && trig[off] && !prev[off][0] && !menu.open && (!joined_at || t - joined_at > 3000000000LL)) {
-        joined_at = t;
-        join_coin = cfg.auto_coins;     /* the credit now, Start after it: a Start the game sees */
-    }                                   /* before the credit is refused, and held it is not pressed again */
-    int join_start = dual && joined_at && t - joined_at >= 150000000 && t - joined_at < 450000000;
-    /* the stand-in gun presses Start for a moment every ten seconds too (its
-     * second one, five seconds later) */
-    if (fake_gun() && fmod((double)t / 1e9, 10.0) < 0.2) start = 1;
-    if (dual && fake_gun() > 1 && fmod((double)t / 1e9 + 5.0, 10.0) < 0.2) start2 = 1;
-    if (start) held |= CAB_P1_START;
-    if (start2) held |= CAB_P2_START;
-    /* Coins: the left menu button, and with automatic coins one at start-up
-     * and one with every press of either Start - Start alone plays and continues. */
-    static unsigned frames;
-    int coin = menu.coin;
-    menu.coin = 0;
-    if (cfg.auto_coins) {
-        if (++frames == 240) coin++;
-        if (start && !prev[HAND_L][7]) coin++;
-        if (start2 && !prev[HAND_R][7]) coin++;
-    }
-    coin += join_coin;
-    if (join_start) held |= CAB_P2_START;
-    prev[HAND_L][7] = start; prev[HAND_R][7] = start2;
+    frame.aimed[0]=aimed;frame.aimed[1]=aimed2;
+    frame.fire_supplied=1;frame.firing[0]=firing;frame.firing[1]=firing2;
+    frame.start_override[0]=fake_gun()&&fmod((double)t/1e9,10.0)<.2;
+    frame.start_override[1]=dual&&fake_gun()>1&&fmod((double)t/1e9+5.0,10.0)<.2;
+    const LgXrCabinet cabinet=lg_xr_controls_update(&controls,&frame);
+    unsigned held=cabinet.held;
+    if(held&CAB_P1_RELOAD)reload_t=t;
+    stereo_game_gun_reloading(reload_t&&t-reload_t<1500000000);
+    if(!dual&&btn_a[off]&&!prev[off][2]&&!menu.open){stereo_capture();rumble(off,.4f,30);}
+    if(menu.test_frames){--menu.test_frames;held|=CAB_TEST;}
+    if(menu.service_frames){--menu.service_frames;held|=CAB_SERVICE;}
+    int coin=menu.coin+cabinet.coins;menu.coin=0;
     stereo_set_gun((int)gx, (int)gy);
     stereo_set_gun2((int)g2x, (int)g2y);
     host_vr_input((int)gx, (int)gy, held, coin);

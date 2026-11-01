@@ -156,6 +156,7 @@ void OpenXR::attach(Device &device)
         xr_check(xrCreateReferenceSpace(session_,&space,&space_),"OpenXR local space");
         if(config_.anchor_head)xr_check(xrCreateReferenceSpace(session_,&space,&base_space_),"OpenXR base local space");
         anchor_pending_=config_.anchor_head;
+        if(config_.enable_input)xr_check(lg_xr_actions_create(&actions_,instance_,session_),"shared controller bindings");
         uint32_t count=0;
         xr_check(xrEnumerateViewConfigurationViews(instance_,system_,XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,0,&count,nullptr),"OpenXR view count");
         if(count!=2) throw std::runtime_error("OpenXR backend requires two stereo views");
@@ -218,6 +219,19 @@ void OpenXR::attach(Device &device)
         std::fprintf(stderr,"[vulkan-xr] direct two-layer world targets; density-map attachments %s\n",foveation_?"configured":"disabled by desktop policy");
     } catch (...) { detach(); throw; }
 }
+bool OpenXR::input(LgXrActionSample &sample)
+{
+    sample={};
+    if(!config_.enable_input||!frame_open_||session_state_!=XR_SESSION_STATE_FOCUSED)return false;
+    const auto result=lg_xr_actions_sample(&actions_,space_,frame_.predictedDisplayTime,&sample);
+    if(result==XR_SESSION_NOT_FOCUSED)return false;
+    xr_check(result,"shared controller input");return result==XR_SUCCESS;
+}
+void OpenXR::rumble(int hand,float amplitude,int milliseconds)
+{
+    if(config_.enable_input&&session_state_==XR_SESSION_STATE_FOCUSED)
+        lg_xr_actions_rumble(&actions_,hand,amplitude,milliseconds);
+}
 void OpenXR::renderer_thread()
 {
 #ifdef __ANDROID__
@@ -237,6 +251,7 @@ void OpenXR::poll()
             const auto &change=*reinterpret_cast<XrEventDataSessionStateChanged *>(&event);
             if(change.session==session_) {
                 session_state_=change.state;
+                if(config_.anchor_head&&change.state==XR_SESSION_STATE_FOCUSED)anchor_pending_=true;
                 std::fprintf(stderr,"[vulkan-xr] session state %d\n",int(change.state));
                 if(change.state==XR_SESSION_STATE_READY && !running_) {
                     XrSessionBeginInfo begin{XR_TYPE_SESSION_BEGIN_INFO}; begin.primaryViewConfigurationType=XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
@@ -329,6 +344,7 @@ void OpenXR::detach()
     if(swapchain_) xrDestroySwapchain(swapchain_); swapchain_=XR_NULL_HANDLE;
     if(space_) xrDestroySpace(space_); space_=XR_NULL_HANDLE;
     if(base_space_)xrDestroySpace(base_space_);base_space_=XR_NULL_HANDLE;
+    lg_xr_actions_destroy(&actions_);
     if(session_) xrDestroySession(session_); session_=XR_NULL_HANDLE;
     renderer_tid_=0;
 #ifdef __ANDROID__

@@ -3052,14 +3052,7 @@ int stereo_ray_to_screen(const float o_[3], const float d_[3], float *x, float *
 {
     float o[3], d[3];
     from_level(o_, o); from_level(d_, d);
-    if (d[2] > -1e-4f) return 0;
-    float t = (-g_screen_dist - o[2]) / d[2];
-    if (t <= 0) return 0;
-    float hx = o[0] + t * d[0], hy = o[1] + t * d[1];
-    float u = hx * g_screen_lens[0] / g_screen_dist, v = hy * g_screen_lens[1] / g_screen_dist;
-    *x = GAME_W * 0.5f * (1 + u);
-    *y = GAME_H * 0.5f * (1 - v);
-    return 1;
+    return lg_stereo_ray_to_plane(o,d,g_screen_lens,g_screen_dist,GAME_W,GAME_H,x,y,NULL);
 }
 
 void stereo_game_size(int *w, int *h) { *w = GAME_W; *h = GAME_H; }
@@ -3107,14 +3100,7 @@ int stereo_ray_to_hud(const float o_[3], const float d_[3], int head, float *x, 
         d[0] = d_[0]; d[1] = cp * d_[1] + sp * d_[2]; d[2] = -sp * d_[1] + cp * d_[2];
     }
     else { from_level(o_, o); from_level(d_, d); }
-    if (d[2] > -1e-4f) return 0;
-    float t = (-g_screen_dist - o[2]) / d[2];
-    if (t <= 0) return 0;
-    float u = (o[0] + t * d[0]) * g_screen_lens[0] / g_screen_dist, v = (o[1] + t * d[1]) * g_screen_lens[1] / g_screen_dist;
-    *x = GAME_W * 0.5f * (1 + u);
-    *y = GAME_H * 0.5f * (1 - v);
-    *reach = t;
-    return 1;
+    return lg_stereo_ray_to_plane(o,d,g_screen_lens,g_screen_dist,GAME_W,GAME_H,x,y,reach);
 }
 
 

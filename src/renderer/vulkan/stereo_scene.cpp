@@ -14,7 +14,7 @@ StereoScene::StereoScene(StereoSettings settings):settings_(settings)
 void StereoScene::invalidate() { valid_=false;cache_.clear();last_=0;builds_=0; }
 void StereoScene::publish(const std::array<StereoPose,2> &eyes)
 {
-    invalidate();
+    invalidate();eyes_=eyes;
     const auto &head=eyes[0].orientation;
     const float inverse[]={-head[0],-head[1],-head[2],head[3]},unit[]={0,0,0,1};
     for(unsigned eye=0;eye<2;++eye) {
@@ -35,6 +35,31 @@ void StereoScene::publish(const std::array<StereoPose,2> &eyes)
         }
     }
     valid_=true;
+}
+bool StereoScene::aim(const StereoPose &controller,int width,int height,bool on_hud,float aim_distance,StereoRay &ray) const
+{
+    ray={};if(!valid_)return false;
+    const float forward[]={0,0,-1};lg_stereo_rotate(controller.orientation.data(),forward,ray.direction.data());
+    for(unsigned i=0;i<3;++i)ray.origin[i]=controller.position[i]*settings_.scale;
+    auto o=ray.origin,d=ray.direction;
+    if(on_hud && settings_.head_locked) {
+        const auto &head=eyes_[0].orientation;
+        const float inverse[]={-head[0],-head[1],-head[2],head[3]};
+        for(unsigned i=0;i<3;++i)o[i]-=.5f*(eyes_[0].position[i]+eyes_[1].position[i])*settings_.scale;
+        lg_stereo_rotate(inverse,o.data(),o.data());lg_stereo_rotate(inverse,d.data(),d.data());
+        const float a=settings_.hud_pitch*.017453292519943295f,c=std::cos(a),s=std::sin(a);
+        for(auto *v:{&o,&d}) {const float y=(*v)[1],z=(*v)[2];(*v)[1]=c*y+s*z;(*v)[2]=-s*y+c*z;}
+    }
+    float world_reach=0;
+    if(!on_hud) {
+        if(d[2]>-1e-4f)return false;
+        const float t=(-aim_distance*settings_.scale-o[2])/d[2];if(t<=0)return false;world_reach=t/settings_.scale;
+        for(unsigned i=0;i<3;++i)d[i]=o[i]+t*d[i];o={0,0,0};
+    }
+    float x,y,reach;
+    if(!lg_stereo_ray_to_plane(o.data(),d.data(),lens_.data(),settings_.screen*settings_.scale,width,height,&x,&y,&reach) ||
+       !std::isfinite(x)||!std::isfinite(y)||x<0||y<0||x>=width||y>=height)return false;
+    ray.x=int(x);ray.y=int(y);ray.reach=on_hud?reach/settings_.scale:world_reach;return true;
 }
 bool StereoScene::world_camera(const Matrix &p) const
 {

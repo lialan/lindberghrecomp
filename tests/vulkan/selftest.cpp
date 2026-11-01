@@ -1,4 +1,5 @@
 #include "stereo_scene.hpp"
+#include "controller_input.hpp"
 #include "../../src/runtime/stereo_projection.h"
 #include "device.hpp"
 #include "frame_ring.hpp"
@@ -615,6 +616,40 @@ static void render_stereo_depth_copy(Device &device)
     std::puts("ok: stereo GPU depth copies preserve each eye, mixed layouts and explicit layer routing");
 }
 
+static void test_controller_input()
+{
+    StereoSettings settings;settings.head_locked=true;StereoScene scene(settings);
+    std::array<StereoPose,2> eyes;eyes[0].position={-.032f,0,0};eyes[1].position={.032f,0,0};scene.publish(eyes);
+    StereoPose controller;controller.position={0,0,-.3f};StereoRay ray;
+    require(scene.aim(controller,1024,768,true,15,ray)&&ray.x==512&&ray.y==384,"center aim did not use cabinet input dimensions");
+    const float yaw=.4f;const std::array<float,4> q{0,std::sin(yaw/2),0,std::cos(yaw/2)};
+    for(auto &eye:eyes){auto old=eye.position;lg_stereo_rotate(q.data(),old.data(),eye.position.data());eye.orientation=q;}
+    auto old=controller.position;lg_stereo_rotate(q.data(),old.data(),controller.position.data());controller.orientation=q;scene.publish(eyes);
+    require(scene.aim(controller,1024,768,true,15,ray)&&std::abs(ray.x-512)<=1&&std::abs(ray.y-384)<=1,"head-locked HUD aim moved after a common head/controller turn");
+    ControllerSettings cfg;cfg.width=1024;cfg.height=768;cfg.dual=true;cfg.aim_on_hud=true;
+    ControllerInput input(cfg);ControllerSnapshot snapshot;
+    require(!input.consume(snapshot),"controller input invented an initial snapshot");
+    ControllerSample sample;sample.valid={1,1};sample.pose[0]=sample.pose[1]=controller;
+    sample.pose[0].position[0]-=.1f;sample.pose[1].position[0]+=.1f;
+    sample.buttons.trigger[0]=1;sample.buttons.trigger[1]=1;
+    const auto haptics=input.update(scene,sample,1000000000,true);
+    require(haptics[0].milliseconds==35&&haptics[1].milliseconds==35,"dual guns did not receive independent recoil haptics");
+    require(input.consume(snapshot)&&snapshot.dual&&snapshot.valid[0]&&snapshot.valid[1]&&snapshot.coins==1,"dual input/rays or P2 join credit were lost");
+    require(snapshot.ray[0].origin!=snapshot.ray[1].origin,"both player shot hooks received the same gun ray");
+    require((snapshot.held&((1<<4)|(1<<8)))==((1<<4)|(1<<8)),"dual triggers were not mapped to both cabinet players");
+    require(input.consume(snapshot)&&snapshot.coins==0,"input consumption duplicated a credit");
+    sample.buttons={};input.update(scene,sample,1010000000,true);
+    sample.buttons.trigger[1]=1;input.update(scene,sample,1020000000,true);
+    sample.buttons.trigger[1]=0;input.update(scene,sample,1030000000,true);
+    require(input.consume(snapshot)&&(snapshot.held&(1<<4)),"mailbox lost a trigger pulse between game-thread reads");
+    require(input.consume(snapshot)&&!(snapshot.held&(1<<4)),"mailbox replayed an already consumed trigger pulse");
+    input.update(scene,sample,1040000000,false);
+    require(input.consume(snapshot)&&snapshot.held==0&&!snapshot.valid[0]&&!snapshot.valid[1],"focus loss retained firing or old gun rays");
+    scene.invalidate();sample.buttons.trigger[1]=1;input.update(scene,sample,1050000000,true);
+    require(input.consume(snapshot)&&snapshot.held==0&&!snapshot.valid[0],"invalid tracking published active gun input");
+    std::puts("ok: shared controller policy, head-locked HUD aim, dual shot rays and game-thread input delivery");
+}
+
 static void test_live_stereo_scene()
 {
     StereoSettings settings;settings.head_locked=true;settings.hud_lens=1.8107f;
@@ -711,6 +746,7 @@ int main(int argc, char **argv)
 try {
     test_shared_projection();
     test_live_stereo_scene();
+    test_controller_input();
     require(shader_source_digest("a\r\n") == shader_source_digest("a \n"),
             "shader identity differs from guest CR normalization");
     require(shader_source_digest("a") == shader_source_digest("a\n"),

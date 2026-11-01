@@ -92,6 +92,7 @@ function(lindbergh_runtime target generated_dir)
             "${LINDBERGH_RUNTIME_DIR}/frame_timing.c"
             "${LINDBERGH_RUNTIME_DIR}/display_cadence.c"
             "${LINDBERGH_RUNTIME_DIR}/xr_settings.c"
+            "${LINDBERGH_RUNTIME_DIR}/xr_controls.c"
             "${LINDBERGH_RUNTIME_DIR}/host_settings.c"
             "${LINDBERGH_RUNTIME_DIR}/game_profile.c"
             "${LINDBERGH_RUNTIME_DIR}/hle_gl_posix.c"
@@ -110,7 +111,7 @@ function(lindbergh_runtime target generated_dir)
         target_compile_definitions(${target} PRIVATE RECOMP_GUEST_BASE=1)
     endif()
     if(LINDBERGH_RENDERER STREQUAL "VULKAN")
-        list(REMOVE_ITEM platform_sources "${LINDBERGH_RUNTIME_DIR}/stereo.c" "${LINDBERGH_RUNTIME_DIR}/stereo_projection.c")
+        list(REMOVE_ITEM platform_sources "${LINDBERGH_RUNTIME_DIR}/stereo.c" "${LINDBERGH_RUNTIME_DIR}/stereo_projection.c" "${LINDBERGH_RUNTIME_DIR}/xr_controls.c")
         set(abi "${CMAKE_CURRENT_BINARY_DIR}/vulkan-abi-${target}")
         set(abi_inputs "${LINDBERGH_RUNTIME_DIR}/hle_gl_posix.c"
             "${LINDBERGH_RUNTIME_DIR}/arbprog.c" "${LINDBERGH_RUNTIME_DIR}/host_sdl.c"
@@ -216,6 +217,7 @@ function(lindbergh_runtime target generated_dir)
             endforeach()
             if(NOT LINDBERGH_RENDERER STREQUAL "VULKAN")
                 target_sources(${target} PRIVATE "${LINDBERGH_RUNTIME_DIR}/host_xr.c"
+                    "${LINDBERGH_RUNTIME_DIR}/xr_actions.c"
                     "${LINDBERGH_RUNTIME_DIR}/xr_overlay.c" "${LINDBERGH_RUNTIME_DIR}/xr_menu.c")
                 target_compile_definitions(${target} PRIVATE LINDBERGH_GL4ES LINDBERGH_OPENXR)
                 target_include_directories(${target} PRIVATE "${GL4ES_DIR}/include" "${OPENXR_DIR}/include")
@@ -239,6 +241,7 @@ function(lindbergh_runtime target generated_dir)
             if(LINDBERGH_OPENXR)
                 find_package(OpenXR CONFIG REQUIRED)
                 target_sources(${target} PRIVATE "${LINDBERGH_RUNTIME_DIR}/host_xr.c"
+                    "${LINDBERGH_RUNTIME_DIR}/xr_actions.c"
                     "${LINDBERGH_RUNTIME_DIR}/xr_overlay.c" "${LINDBERGH_RUNTIME_DIR}/xr_menu.c")
                 target_compile_definitions(${target} PRIVATE LINDBERGH_OPENXR)
                 target_link_libraries(${target} PRIVATE OpenXR::openxr_loader)

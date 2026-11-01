@@ -8,6 +8,7 @@ struct StereoPose {
     std::array<float,3> position{};
     std::array<float,4> tangents{1,1,1,1};
 };
+struct StereoRay {std::array<float,3> origin{},direction{};int x=-100000,y=-100000;float reach=0;};
 struct StereoSettings {
     float scale=1,screen=3,hud_lens=0,hud_pitch=0,zoom_lens=8;
     bool head_locked=false;
@@ -20,6 +21,8 @@ public:
     explicit StereoScene(StereoSettings settings);
     void publish(const std::array<StereoPose,2> &eyes);
     void invalidate();
+    bool aim(const StereoPose &controller,int width,int height,bool on_hud,float aim_distance,StereoRay &ray) const;
+    bool tracking_valid() const { return valid_; }
     bool world_camera(const Matrix &projection) const;
     bool zoomed(const Matrix &projection) const;
     const Matrices &transforms(const Matrix &projection,int draw_class);
@@ -29,6 +32,7 @@ public:
     const std::array<float,2> &screen_lens() const { return lens_; }
 private:
     StereoSettings settings_;
+    std::array<StereoPose,2> eyes_;
     bool valid_=false;
     std::array<Matrix,2> view_,hud_view_;
     std::array<std::array<float,4>,2> tangents_;

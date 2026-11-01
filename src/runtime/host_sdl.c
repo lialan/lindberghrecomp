@@ -1070,6 +1070,9 @@ static void frame_gl(void *arg)
 /* The game thread's end of a frame. */
 static void host_frame_done(void)
 {
+#ifdef LINDBERGH_VULKAN
+    lvk_host_input();
+#endif
     {
         static int after = -1;
         if (after < 0) after = env_int("LINDBERGH_EXIT_AFTER", 0);

@@ -3,6 +3,7 @@
 #include "../renderer/vulkan/guest_arrays.hpp"
 #include "../renderer/vulkan/guest_state.hpp"
 #include "../renderer/vulkan/stereo_scene.hpp"
+#include "../renderer/vulkan/controller_input.hpp"
 #include "../renderer/vulkan/shader_pack.hpp"
 #include "../renderer/vulkan/window.hpp"
 #include "../renderer/vulkan/resources.hpp"
@@ -203,6 +204,9 @@ struct State {
   std::unique_ptr<Device> device;
   std::unique_ptr<Window> window;
   std::unique_ptr<StereoScene> stereo;
+  std::unique_ptr<ControllerInput> controllers;ControllerSnapshot game_input;
+  int fake_guns=0;
+  void fake_controllers();
   LgXrSettings settings=LG_XR_SETTINGS_DEFAULT;
   std::array<StereoPose,2> fake_eyes;
   std::unordered_map<unsigned,std::array<int,2>> drawable_sizes;
@@ -288,7 +292,7 @@ struct State {
     buffers.clear();
     samplers.clear();
     fallback.reset();
-    drawables.clear();drawable_sizes.clear();stereo.reset();
+    drawables.clear();drawable_sizes.clear();stereo.reset();controllers.reset();game_input={};
     initialized.clear();
     window.reset();
 #ifdef LINDBERGH_VULKAN_XR
@@ -323,10 +327,21 @@ struct State {
             eyes[i].tangents={-std::tan(v.fov.angleLeft),std::tan(v.fov.angleRight),-std::tan(v.fov.angleDown),std::tan(v.fov.angleUp)};
           }
           stereo->publish(eyes);
+          LgXrActionSample input{};ControllerSample sample;
+          const bool focused=xr->input(input);
+          for(unsigned h=0;h<2;++h) {
+            sample.valid[h]=input.valid[h];
+            sample.pose[h].position={input.pose[h].position.x,input.pose[h].position.y,input.pose[h].position.z};
+            sample.pose[h].orientation={input.pose[h].orientation.x,input.pose[h].orientation.y,input.pose[h].orientation.z,input.pose[h].orientation.w};
+            sample.buttons.trigger[h]=input.trigger[h]>.55f;sample.buttons.grip[h]=input.grip[h]>.6f;
+            sample.buttons.lower[h]=input.lower[h];sample.buttons.upper[h]=input.upper[h];sample.buttons.stick[h]=input.stick[h];
+          }
+          const auto haptics=controllers->update(*stereo,sample,xr->display_time(),focused);
+          for(int h=0;h<2;++h)if(haptics[h].milliseconds)xr->rumble(h,haptics[h].amplitude,haptics[h].milliseconds);
           for(auto &entry:drawables)if(entry.second->info.density_map)
             entry.second->select_density_map(screen->info.density_map);
         } else {
-          stereo->invalidate();
+          stereo->invalidate();controllers->update(*stereo,{},xr->display_time(),false);
           for(auto &entry:drawables)if(entry.second->info.density_map)
             entry.second->select_density_map(unfocused_density->view());
         }
@@ -342,7 +357,7 @@ struct State {
         }
 #else
         screen = &window->acquire(*ring);
-        if(stereo)stereo->publish(fake_eyes);
+        if(stereo) {stereo->publish(fake_eyes);if(fake_guns)fake_controllers();}
 #endif
       }
       if (materials[ring->recording_slot()].size()>2048) materials[ring->recording_slot()].clear();
@@ -418,6 +433,28 @@ struct State {
   }
 };
 State state;
+void State::fake_controllers()
+{
+  ControllerSample sample;const int64_t time=1000000000+int64_t(g_frame)*1000000000/60;
+  const double seconds=double(g_frame)/60;
+  for(int h=0;h<2;++h) {
+    sample.valid[h]=1;const bool reload=std::fmod(seconds,6.)>=5.;
+    const float yaw=.15f*std::sin(float(seconds)*.7f)*(h?1:-1),pitch=reload?-.9f:.03f;
+    const float cy=std::cos(yaw/2),sy=std::sin(yaw/2),cp=std::cos(pitch/2),sp=std::sin(pitch/2);
+    sample.pose[h].orientation={sp*cy,cp*sy,-sp*sy,cp*cy};sample.pose[h].position={h?.16f:-.16f,-.22f,-.28f};
+    sample.buttons.trigger[h]=(h==controllers->gun_hand()||fake_guns>1)&&(reload||std::fmod(seconds,1.)<.5);
+    sample.buttons.stick[h]=std::fmod(seconds+(h==controllers->gun_hand()?0:5),10.)<.2;
+  }
+  controllers->update(*stereo,sample,time,true);
+}
+ControllerSettings controller_settings(const LgXrSettings &settings,int width,int height)
+{
+  const auto *profile=game_profile();bool hud=profile->vr.aim_on_hud;
+  if(const auto *v=std::getenv("LINDBERGH_XR_AIM_HUD"))hud=*v=='1';
+  return {profile->vr.width?profile->vr.width:width,profile->vr.height?profile->vr.height:height,
+          bool(settings.dual),bool(settings.auto_coins),bool(settings.left_handed),hud,settings.aim};
+}
+
 void shutdown_vulkan() { state.shutdown(); }
 void queue_clear(GLbitfield mask);
 GLuint object() { return state.next_object++; }
@@ -427,6 +464,21 @@ void check_range(size_t size, GLintptr offset, GLsizeiptr bytes) {
     gap("guest buffer range exceeds storage");
 }
 } // namespace
+extern "C" void host_vr_input(int,int,unsigned,int);
+extern "C" void host_vr_input2(int,int,int);
+extern "C" void lvk_host_input(void)
+{
+  if(!state.controllers||!state.controllers->consume(state.game_input))return;
+  const auto &input=state.game_input;
+  host_vr_input(input.ray[0].x,input.ray[0].y,input.held,input.coins);
+  host_vr_input2(input.dual,input.ray[1].x,input.ray[1].y);
+}
+extern "C" int stereo_gun_ray(int player,float origin[3],float direction[3])
+{
+  if(player<0||player>1||!state.game_input.valid[player])return 0;
+  std::copy(state.game_input.ray[player].origin.begin(),state.game_input.ray[player].origin.end(),origin);
+  std::copy(state.game_input.ray[player].direction.begin(),state.game_input.ray[player].direction.end(),direction);return 1;
+}
 extern "C" int lvk_host_can_thread(void) { return state.ready; }
 extern "C" int lvk_host_thread_enter(void) {
 #ifdef LINDBERGH_VULKAN_XR
@@ -452,7 +504,9 @@ extern "C" int lvk_host_init(SDL_Window *window, int w, int h) {
     StereoSettings stereo{state.settings.scale,state.settings.screen,profile->vr.hud_lens,float(state.settings.hud_pitch),8,hud_lock};
     if(const auto *v=std::getenv("LINDBERGH_STEREO_2D_LENS"))stereo.hud_lens=std::atof(v);
     state.stereo=std::make_unique<StereoScene>(stereo);
+    state.controllers=std::make_unique<ControllerInput>(controller_settings(state.settings,w,h));
     OpenXRConfig config{true,true,true,true,uint32_t(state.settings.width),uint32_t(state.settings.resolution),float(state.settings.refresh)};
+    config.enable_input=true;
     if(const auto *v=std::getenv("LINDBERGH_CPU_BOOST"))config.cpu_boost=*v=='1';
     state.xr=std::make_unique<OpenXR>(config,state.activity->platform());
     state.device=Device::create(state.xr->device_options());
@@ -472,6 +526,12 @@ extern "C" int lvk_host_init(SDL_Window *window, int w, int h) {
     if(const auto *yaw=std::getenv("LINDBERGH_VULKAN_FAKE_YAW")) {
       const auto *profile=game_profile();
       StereoSettings settings;settings.scale=profile->vr.scale>0?profile->vr.scale:1;settings.hud_lens=profile->vr.hud_lens;settings.head_locked=profile->vr.hud_head_locked;
+      if(const auto *v=std::getenv("LINDBERGH_VULKAN_FAKE_GUN"))state.fake_guns=std::atoi(v);
+      if(state.fake_guns) {
+        xr_settings_load(&state.settings);state.settings.dual=state.fake_guns>1;
+        settings.scale=state.settings.scale;settings.screen=state.settings.screen;settings.hud_pitch=float(state.settings.hud_pitch);
+        state.controllers=std::make_unique<ControllerInput>(controller_settings(state.settings,w,h));
+      }
       state.stereo=std::make_unique<StereoScene>(settings);
       const float angle=std::atof(yaw)*.017453292519943295f;
       const std::array<float,4> q{0,std::sin(angle/2),0,std::cos(angle/2)};

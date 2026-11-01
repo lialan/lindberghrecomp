@@ -49,7 +49,9 @@ stereo = Path(sources[0]).parent / "stereo.h"
 text = re.sub(r"/\*.*?\*/", "", stereo.read_text(), flags=re.S)
 bridge = ['#include "stereo.h"', '#include <stdlib.h>', '#include <stdio.h>',
           'uint32_t stereo_state_lo = UINT32_MAX, stereo_state_hi = 0;', 'int stereo_glprof_on(void) { return 0; }']
+native_stereo = set(re.findall(r'extern\s+"C"\s+(?:void|int|unsigned)\s+(stereo_\w+)\s*\(', implementation_text))
 for ret, name, args in re.findall(r"\b(void|int|unsigned)\s+(stereo_\w+)\s*\((.*?)\);", text, re.S):
+    if name in native_stereo: continue
     if name in ("stereo_start", "stereo_start_wide"):
         body = 'fprintf(stderr, "[vulkan] legacy stereo replay is unavailable; use the Vulkan OpenXR host\\n"); abort();'
     else: body = "" if ret == "void" else "return 0;"

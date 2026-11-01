@@ -34,6 +34,14 @@ int lg_stereo_classify_draw(const LgStereoDrawFacts *d)
     if(hud && !d->perspective && d->multiview && d->fills_screen) return LG_STEREO_FILL;
     return hud ? LG_STEREO_HUD : LG_STEREO_WORLD;
 }
+int lg_stereo_ray_to_plane(const float *o,const float *d,const float *lens,float distance,
+                           int width,int height,float *x,float *y,float *reach)
+{
+    if(d[2]>-1e-4f)return 0;
+    const float t=(-distance-o[2])/d[2];if(t<=0)return 0;
+    const float u=(o[0]+t*d[0])*lens[0]/distance,v=(o[1]+t*d[1])*lens[1]/distance;
+    *x=width*.5f*(1+u);*y=height*.5f*(1-v);if(reach)*reach=t;return 1;
+}
 void lg_stereo_rotate(const float *q,const float *v,float *out)
 {
     const float x=q[0],y=q[1],z=q[2],w=q[3];

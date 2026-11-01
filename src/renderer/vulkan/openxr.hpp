@@ -1,5 +1,6 @@
 #pragma once
 #include "renderer.hpp"
+#include "../../runtime/xr_actions.h"
 #ifdef __ANDROID__
 #include <jni.h>
 #define XR_USE_PLATFORM_ANDROID
@@ -16,7 +17,7 @@ struct OpenXRConfig {
     bool require_foveation=false,transfer_source=false,anchor_head=false,symmetric_fov=false;
     uint32_t width=0,height=0; // zero: runtime recommendation; width-only zero: preserve recommended aspect
     float refresh=120; // request only; predicted runtime timing remains authoritative
-    bool sustained_cpu=true,cpu_boost=false;
+    bool sustained_cpu=true,cpu_boost=false,enable_input=false;
 };
 // Common Vulkan/OpenXR host, independent of SDL and the guest's graphics ABI.
 class OpenXR {
@@ -30,6 +31,8 @@ public:
     // The device must outlive the attached session; detach before destroying it.
     void attach(Device &device);
     void detach();
+    bool input(LgXrActionSample &sample);
+    void rumble(int hand,float amplitude,int milliseconds);
     void renderer_thread(); // call when the shared worker takes rendering ownership
     // A null target still requires end_frame(false): shouldRender can be false.
     // Returns null before READY without opening a frame.
@@ -50,6 +53,7 @@ public:
     const std::vector<VkImageView> &density_maps() const { return density_views_; }
     std::array<uint32_t,2> density_extent() const { return density_extent_; }
 private:
+    LgXrActions actions_{};
     XrInstance instance_ = XR_NULL_HANDLE;
     XrSystemId system_ = XR_NULL_SYSTEM_ID;
     XrSession session_ = XR_NULL_HANDLE;

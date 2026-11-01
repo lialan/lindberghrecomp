@@ -12,6 +12,8 @@ typedef struct {
 typedef struct {int game_w,game_h,world_w,world_h,eye_w,eye_h;} LgStereoTargetSize;
 void lg_stereo_target_scale(const LgStereoTargetSize *sizes,int width,int height,int rectangle,float *x,float *y);
 int lg_stereo_classify_draw(const LgStereoDrawFacts *draw);
+int lg_stereo_ray_to_plane(const float origin[3],const float direction[3],const float lens[2],
+                           float distance,int width,int height,float *x,float *y,float *reach);
 void lg_stereo_rotate(const float quaternion[4],const float point[3],float out[3]);
 void lg_stereo_pose_view(const float quaternion[4],const float position[3],float scale,float out[16]);
 /* Column-major guest-GL clip space. Vulkan's Y/depth conversion happens only
