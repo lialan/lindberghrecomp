@@ -3,6 +3,7 @@
 #include "renderer.hpp"
 #include "guest_state.hpp"
 #include "guest_arrays.hpp"
+#include "guest_pixels.hpp"
 #include "uniforms.hpp"
 #include "resources.hpp"
 #include "shader_pack.hpp"
@@ -438,6 +439,14 @@ static void render_copy(Device &device)
     TargetInfo info{16,16,1}; info.guest_bottom_origin=true;info.final_layout=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     Target target(device,info);PipelineCache cache(device,"");Renderer renderer(device,target,cache);
     RasterState raster;renderer.prepare(raster);
+    // Regression: the game's RGBA framebuffer-copy texture is allocated with
+    // LUMINANCE upload bytes. Storage must still accept subsequent full color.
+    std::vector<uint8_t> narrow(16*16,0);
+    require(guest::canonical_color_storage(guest::RGBA,guest::Luminance,guest::UnsignedByte,16,16,narrow)==guest::RGBA && narrow.size()==16*16*4,
+            "RGBA internal storage inherited luminance-only upload channels");
+    std::vector<uint8_t> alpha{32};
+    guest::canonical_color_storage(guest::RGB,guest::Alpha,guest::UnsignedByte,1,1,alpha);
+    require(alpha==std::vector<uint8_t>({0,0,0,255}), "RGB internal storage retained upload alpha");
     Texture color(device,{16,16}),depth(device,{16,16,1,1,Target::depth_format});
     Readback output(device,16*16*4*3);FrameRing ring(device);
     Matrices matrices{};for(auto &m:matrices.view_projection)for(unsigned i=0;i<4;++i)m[i*5]=1;

@@ -1,3 +1,4 @@
+#include "guest_pixels.hpp"
 // Guest GL ABI -> shared Vulkan state. No host GL entry is resolved or called.
 #include "../renderer/vulkan/guest_arrays.hpp"
 #include "../renderer/vulkan/guest_state.hpp"
@@ -921,6 +922,10 @@ int components(GLenum format) {
     gap("unsupported guest texture pixel format");
   }
 }
+void canonical_color_storage(TextureLevel &v) {
+  if (!v.compressed)
+    v.format=guest::canonical_color_storage(v.internal,v.format,v.type,uint32_t(v.width),uint32_t(v.height),v.bytes);
+}
 int integer(GLenum name, int fallback) {
   auto it = state.integers.find(name);
   return it == state.integers.end() ? fallback : it->second;
@@ -1016,8 +1021,10 @@ extern "C" void lvk_glTexImage2D(GLenum target, GLint level, GLint internal,
   v = {internal, w, h, format, type, {}, false};
   const auto row = size_t(w) * pixel_bytes;
   v.bytes.resize(row * size_t(h));
-  if (!pointer && !state.unpack_buffer)
+  if (!pointer && !state.unpack_buffer) {
+    canonical_color_storage(v);
     return;
+  }
   const auto layout = unpack_rows(w, h, pixel_bytes, type);
   const auto stride = layout.stride, skip = layout.skip;
   const auto source = pixels(pointer, layout.bytes);
@@ -1043,6 +1050,7 @@ extern "C" void lvk_glTexImage2D(GLenum target, GLint level, GLint internal,
     for (GLsizei y = 0; y < h; ++y)
       std::memcpy(v.bytes.data() + size_t(y) * row,
                   source + skip + size_t(y) * stride, row);
+  canonical_color_storage(v);
 }
 extern "C" void lvk_glTexSubImage2D(GLenum target, GLint level, GLint x, GLint y,
                                     GLsizei w, GLsizei h, GLenum format, GLenum type,
@@ -1437,7 +1445,7 @@ VkFormat texture_format(const TextureLevel &v) {
     default:gap("native texture format not implemented");
   }
 }
-std::shared_ptr<Texture> native_image(TextureObject &o) {
+std::shared_ptr<Texture> native_image(TextureObject &o, int overwritten_level = -1) {
   state.frame();state.end_pass();
   if(o.levels.empty() || !o.levels.count(0)) {
     if(!state.fallback) {
@@ -1462,6 +1470,9 @@ std::shared_ptr<Texture> native_image(TextureObject &o) {
       version.image=std::make_shared<Texture>(*state.device,info);
     for(const auto &[level,v]:o.levels) {
       if(texture_format(v)!=info.format)gap("mip texture formats disagree");
+      // A full GPU color/depth copy initializes this level directly. Never
+      // stage the obsolete CPU backing pixels before overwriting them.
+      if (level == overwritten_level) continue;
       const void *data=v.bytes.data();size_t bytes=v.bytes.size();std::vector<uint8_t> expanded;
       if(v.format==GL_RGB&&v.type==GL_UNSIGNED_BYTE&&!v.compressed) {
         expanded.resize(size_t(v.width)*v.height*4);
@@ -1568,7 +1579,9 @@ extern "C" void lvk_glCopyTexSubImage2D(GLenum target,GLint level,GLint dx,GLint
   auto &o=texture(target);if(!o.levels.count(level)||w<0||h<0)gap("invalid guest texture copy");
   auto *source=state.target();state.flush();
   if(!state.initialized.count(source)) {state.renderer();state.end_pass();}
-  changed(o);auto gpu=native_image(o);
+  const auto &v=o.levels.at(level);
+  const bool full_level=dx==0 && dy==0 && w==v.width && h==v.height;
+  changed(o);auto gpu=native_image(o,full_level?level:-1);
   gpu->copy_from(state.cmd,*source,uint32_t(level),dx,dy,x,y,uint32_t(w),uint32_t(h));
 }
 
