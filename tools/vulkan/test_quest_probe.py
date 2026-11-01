@@ -8,11 +8,36 @@ import argparse
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
 import time
 import uuid
+
+
+class FreshProbeLog:
+    """Retain a token-authenticated transcript across rolling logcat snapshots."""
+    def __init__(self, run_id):
+        self.marker="START "+run_id+":"
+        self.start_stamp=None
+        self.lines=[]
+        self.seen=set()
+
+    def observe(self, raw):
+        for line in raw.splitlines():
+            match=re.match(r"^(\d{2}-\d{2}) (\d{2}:\d{2}:\d{2}\.\d+)",line)
+            if not match:continue
+            stamp=match.groups()
+            if self.start_stamp is None:
+                if self.marker not in line:continue
+                self.start_stamp=stamp
+            # A later snapshot can include entries preceding START. PID reuse
+            # must not turn their historical PASS into this launch's verdict.
+            if stamp < self.start_stamp or line in self.seen:continue
+            self.seen.add(line)
+            self.lines.append(line)
+        return "\n".join(self.lines)
 
 
 def run_session(args):
@@ -70,13 +95,12 @@ def run_session(args):
         if not pid:raise RuntimeError("probe has no live PID after launch")
         (OUTPUT/"pid.txt").write_text(pid+"\n")
         final=""
+        transcript=FreshProbeLog(run_id)
         screenshot=False
         for _ in range(25):
-            raw=adb("logcat","-d","-t","4000","--pid="+pid).stdout
+            raw=adb("logcat","-d","-v","threadtime","-t","4000","--pid="+pid).stdout
             (OUTPUT/"logcat-raw.txt").write_text(raw)
-            marker="START "+run_id+":"
-            position=raw.find(marker)
-            final=raw[position:] if position >= 0 else ""
+            final=transcript.observe(raw)
             (OUTPUT/"logcat.txt").write_text(final)
             if not screenshot and "FIRST:" in final and "PASS:" not in final and "FAIL:" not in final:
                 with (OUTPUT/"screen-during.png").open("wb") as output:
