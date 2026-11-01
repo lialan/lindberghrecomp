@@ -13,11 +13,14 @@ spec.loader.exec_module(thunks)
 output, implementation, headers, *sources = sys.argv[1:]
 headers = headers.split(";")
 signatures = thunks.load(headers)
-required = set()
+implementation_text = Path(implementation).read_text()
+# Internal forwarding calls need the same remapping even when a small guest
+# (such as the runtime self-test) does not import their destination entry.
+required = set(re.findall(r"\b(gl[A-Z]\w*)\s*\(", implementation_text))
 for path in sources:
     required.update(re.findall(r"\b(gl[A-Z]\w*)\s*\(", Path(path).read_text()))
 required = sorted(n for n in required if not n.startswith("glX") and n in signatures)
-implemented = set(re.findall(r"\blvk_(gl[A-Z]\w*)\s*\(", Path(implementation).read_text()))
+implemented = set(re.findall(r"\blvk_(gl[A-Z]\w*)\s*\(", implementation_text))
 out = Path(output)
 out.mkdir(parents=True, exist_ok=True)
 h = ["/* Generated guest ABI declarations; no host OpenGL calls. */", "#pragma once"]
