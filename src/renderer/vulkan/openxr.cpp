@@ -184,7 +184,14 @@ void OpenXR::attach(Device &device)
         XrSwapchainCreateInfoFoveationFB fov{XR_TYPE_SWAPCHAIN_CREATE_INFO_FOVEATION_FB};
         fov.flags=XR_SWAPCHAIN_CREATE_FOVEATION_FRAGMENT_DENSITY_MAP_BIT_FB;
         XrSwapchainCreateInfo swap{XR_TYPE_SWAPCHAIN_CREATE_INFO}; swap.next=require_foveation_?&fov:nullptr;
-        swap.usageFlags=XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | (transfer_source_ ? XR_SWAPCHAIN_USAGE_TRANSFER_SRC_BIT : 0); swap.format=format;
+        // The guest writes sRGB-encoded colour, as on the cabinet. Like the GL
+        // host (GL_FRAMEBUFFER_SRGB off), store those bytes unchanged: render
+        // through a UNORM view of the sRGB swapchain, which the compositor then
+        // decodes once. An sRGB view would encode them again (washed out).
+        const VkFormat render_format=format==VK_FORMAT_R8G8B8A8_SRGB?VK_FORMAT_R8G8B8A8_UNORM:
+                                     format==VK_FORMAT_B8G8R8A8_SRGB?VK_FORMAT_B8G8R8A8_UNORM:format;
+        swap.usageFlags=XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | (transfer_source_ ? XR_SWAPCHAIN_USAGE_TRANSFER_SRC_BIT : 0) |
+                        (render_format!=format ? XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT : 0); swap.format=format;
         swap.sampleCount=1; swap.width=width_; swap.height=height_; swap.faceCount=1; swap.arraySize=2; swap.mipCount=1;
         xr_check(xrCreateSwapchain(session_,&swap,&swapchain_),"OpenXR stereo array swapchain");
         if(require_foveation_) {
@@ -216,11 +223,11 @@ void OpenXR::attach(Device &device)
                 check(vkCreateImageView(h.device,&view,nullptr,&map),"OpenXR density-map image view");
                 density_views_.push_back(map);
             }
-            TargetInfo info{width_,height_,2,format,images[i].image,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,map};
+            TargetInfo info{width_,height_,2,render_format,images[i].image,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,map};
             targets_.push_back(std::make_unique<Target>(device,info));
         }
         foveation_=require_foveation_;
-        std::fprintf(stderr,"[vulkan-xr] direct two-layer world targets; density-map attachments %s\n",foveation_?"configured":"disabled by desktop policy");
+        std::fprintf(stderr,"[vulkan-xr] direct two-layer world targets; density-map attachments %s; swapchain format %d rendered as %d\n",foveation_?"configured":"disabled by desktop policy",int(format),int(render_format));
     } catch (...) { detach(); throw; }
 }
 bool OpenXR::input(LgXrActionSample &sample)
