@@ -21,6 +21,18 @@ vec4 legacy_texture2DProjLod(sampler2DArray s, vec3 p, float lod) {
 vec4 legacy_texture2DProjLod(sampler2DArray s, vec4 p, float lod) {
     return legacy_texture2DLod(s, p.xy / p.w, lod);
 }
+// Rectangle textures are sampled in texels. ARB program translations scale
+// those by u_rect_scale for render targets drawn larger; dividing by the
+// image's own size gives the normalized lookup of its array view.
+vec4 legacy_texture2DRect(sampler2DArray s, vec2 p) {
+    return legacy_texture2D(s, p / vec2(textureSize(s, 0).xy));
+}
+vec4 legacy_texture2DRectProj(sampler2DArray s, vec3 p) {
+    return legacy_texture2DRect(s, p.xy / p.z);
+}
+vec4 legacy_texture2DRectProj(sampler2DArray s, vec4 p) {
+    return legacy_texture2DRect(s, p.xy / p.w);
+}
 vec4 legacy_shadow2D(sampler2DArrayShadow s, vec3 p) {
     return vec4(texture(s, vec4(p.xy, float(gl_ViewIndex), p.z)));
 }

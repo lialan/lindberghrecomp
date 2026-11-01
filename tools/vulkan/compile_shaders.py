@@ -102,8 +102,15 @@ def convert(source, stage, interface, attributes, samplers):
     replacements = dict(STATE)
     replacements.update({builtin: v[0] for builtin, v in LEGACY_VARYINGS.items()})
     if stage == "vert":
+        declared = {loc: n for n, loc in attributes.items() if re.search(r"\b" + n + r"\b", source)}
         for name, (typ, location) in BUILTIN_INPUTS.items():
             if re.search(r"\b" + name + r"\b", source) or (name == "gl_Vertex" and re.search(r"\bftransform\b", source)):
+                if location in declared:
+                    # NV vertex programs alias generic attribute N with a
+                    # conventional one (12 is texture coordinate 4); the
+                    # runtime feeds both from array slot N, so read that.
+                    replacements[name] = declared[location] if typ == "vec4" else f"{declared[location]}.{'xyz'[:int(typ[-1])]}"
+                    continue
                 replacement = "legacy_input_" + name[3:]
                 prefix.append(f"layout(location={location}) in {typ} {replacement};")
                 replacements[name] = replacement
@@ -114,6 +121,8 @@ def convert(source, stage, interface, attributes, samplers):
                              "gl_SecondaryColor": "(gl_FrontFacing ? legacy_front_secondary : legacy_back_secondary)",
                              "gl_FragColor": "legacy_frag_color", "gl_FragCoord": "legacy_frag_coord()"})
     replacements.update({"sampler2D": "sampler2DArray", "sampler2DShadow": "sampler2DArrayShadow",
+                         "sampler2DRect": "sampler2DArray", "texture2DRect": "legacy_texture2DRect",
+                         "texture2DRectProj": "legacy_texture2DRectProj",
                          "texture2D": "legacy_texture2D", "textureCube": "texture", "texture3D": "texture",
                          "texture2DProj": "legacy_texture2DProj", "texture2DLod": "legacy_texture2DLod",
                          "texture2DProjLod": "legacy_texture2DProjLod",

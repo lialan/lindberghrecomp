@@ -151,6 +151,12 @@ function(lindbergh_runtime target generated_dir)
             "${LINDBERGH_RUNTIME_DIR}/vulkan_guest.cpp" ${abi_inputs})
         target_sources(${target} PRIVATE "${LINDBERGH_RUNTIME_DIR}/vulkan_guest.cpp"
             "${abi}/vulkan_missing.cpp" "${abi}/vulkan_desktop_stereo.c")
+        # fixed.frag's text: the fragment stage of guest programs without one.
+        set(fixed_fragment "${LINDBERGH_RUNTIME_DIR}/../renderer/vulkan/shaders/fixed.frag")
+        file(READ "${fixed_fragment}" fixed_fragment_text)
+        file(CONFIGURE OUTPUT "${abi}/fixed_fragment_source.h"
+            CONTENT "static const char lvk_fixed_fragment_source[] = R\"lvkfixed(@fixed_fragment_text@)lvkfixed\";\n" @ONLY)
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${fixed_fragment}")
         target_include_directories(${target} PRIVATE "${abi}")
         target_compile_definitions(${target} PRIVATE LINDBERGH_VULKAN=1 LINDBERGH_VULKAN_FIXED_ARCHIVE="${LINDBERGH_VULKAN_FIXED_ARCHIVE}")
         if(LINDBERGH_VULKAN_OFFSCREEN)

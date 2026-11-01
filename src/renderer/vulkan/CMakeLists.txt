@@ -98,6 +98,10 @@ if(BUILD_TESTING AND LINDBERGH_VULKAN_GUEST_TEST)
         "${CMAKE_CURRENT_SOURCE_DIR}/../../runtime/hle_gl_posix.c" "${guest_test}" COMMAND_ERROR_IS_FATAL ANY)
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${guest_test}" "${CMAKE_CURRENT_SOURCE_DIR}/../../runtime/vulkan_guest.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/../../../tools/vulkan/gen_abi.py" "${CMAKE_CURRENT_SOURCE_DIR}/../../runtime/hle_gl_posix.c" ${LINDBERGH_GL_HEADERS})
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/shaders/fixed.frag" fixed_fragment_text)
+    file(CONFIGURE OUTPUT "${guest_abi}/fixed_fragment_source.h"
+        CONTENT "static const char lvk_fixed_fragment_source[] = R\"lvkfixed(@fixed_fragment_text@)lvkfixed\";\n" @ONLY)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/fixed.frag")
     add_executable(lindbergh_vulkan_guest_target_test "${guest_test}" ../../runtime/vulkan_guest.cpp)
     add_dependencies(lindbergh_vulkan_guest_target_test vulkan_legacy_fixture)
     target_include_directories(lindbergh_vulkan_guest_target_test PRIVATE "${guest_abi}" "${CMAKE_CURRENT_SOURCE_DIR}/../../runtime")

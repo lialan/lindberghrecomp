@@ -1,3 +1,4 @@
+#include <cstdio>
 #include "renderer.hpp"
 #include "colored_vert.hpp"
 #include "colored_frag.hpp"
@@ -348,7 +349,11 @@ void Renderer::prepare(RasterState state)
     pipeline.pColorBlendState = &blend; pipeline.pDynamicState = &dynamic;
     pipeline.layout = layout_; pipeline.renderPass = target_.render_pass;
     VkPipeline result;
-    check(vkCreateGraphicsPipelines(device_.handles.device, cache_.handle(), 1, &pipeline, nullptr, &result), "prepare graphics pipeline");
+    if (const VkResult created = vkCreateGraphicsPipelines(device_.handles.device, cache_.handle(), 1, &pipeline, nullptr, &result); created != VK_SUCCESS) {
+        std::fprintf(stderr, "[vulkan] pipeline creation failed (%d): topology %d, %ux%u x%u target\n", int(created), int(state.topology),
+                     target_.info.width, target_.info.height, target_.info.layers);
+        check(created, "prepare graphics pipeline");
+    }
     pipelines_.emplace(key, result);
     if (pipeline_created) pipeline_created(state);
 }

@@ -13,6 +13,7 @@
 #include "../renderer/vulkan/resources.hpp"
 #include "../renderer/vulkan/uniforms.hpp"
 #include "vulkan_abi.h"
+#include "fixed_fragment_source.h"
 #include "vulkan_host.h"
 #include <SDL.h>
 #ifdef LINDBERGH_VULKAN_XR
@@ -87,7 +88,9 @@ struct TextureObject {
   ImageVersion stable;
   std::array<ImageVersion,3> slots;
 
-  std::map<int, TextureLevel> levels;
+  std::map<int, TextureLevel> levels; // a cube map's +X face
+  bool cube=false, rect=false; // rect: bound as GL_TEXTURE_RECTANGLE (clamped, no mipmaps)
+  std::array<std::map<int, TextureLevel>,5> cube_faces; // -X, +Y, -Y, +Z, -Z
   std::unordered_map<GLenum, GLint> parameters;
   std::unordered_map<GLenum, std::array<float, 4>> float_parameters;
 };
@@ -102,6 +105,7 @@ struct NativeProgram {
 };
 struct Program {
   bool delete_pending = false;
+  bool fixed_fragment = false; // no guest fragment shader: fixed.frag follows its vertex program
   std::shared_ptr<NativeProgram> native;
 
   std::vector<GLuint> shaders;
@@ -151,6 +155,15 @@ struct DrawPacket {
   uint32_t clear_stencil = 0, stencil_ref=0, stencil_compare_mask=~0u, stencil_write_mask=~0u;
   float depth_bias_factor=0, depth_bias_units=0;
   std::array<float,4> blend_constants{};
+};
+// A guest framebuffer object draws into a drawable (a Target sized by the same
+// stereo rules as a pbuffer). Its attached textures take the drawable's colour
+// or depth by GPU copy the next time a draw samples them after it was drawn.
+struct Framebuffer {
+  GLuint color=0,depth=0,depth_renderbuffer=0;
+  bool rect=false,drawn=false;
+  unsigned drawable=0;
+  std::array<int,2> size{};
 };
 struct Material {
   std::shared_ptr<SampledSet> descriptors;
@@ -310,9 +323,11 @@ struct State {
   std::unique_ptr<FrameRing> ring;
   std::unique_ptr<ShaderPack> pack, fixed_pack;
   Program fixed_program;
-  std::array<bool,8> texture_enabled{};
+  std::array<bool,8> texture_enabled{}, rect_enabled{}; // fixed-function GL_TEXTURE_2D / GL_TEXTURE_RECTANGLE
+  bool unit_textured(unsigned i) const {return texture_enabled[i]||rect_enabled[i];}
   std::array<GLenum,8> texture_env{GL_MODULATE,GL_MODULATE,GL_MODULATE,GL_MODULATE,GL_MODULATE,GL_MODULATE,GL_MODULATE,GL_MODULATE};
   std::array<std::array<float,4>,8> env_color{};
+  std::array<std::unordered_map<GLenum,float>,8> env_params; // each unit's GL_TEXTURE_ENV parameters
   std::unordered_map<unsigned, std::unique_ptr<Target>> drawables;
   std::unordered_set<unsigned> deleted_drawables;
   std::unordered_map<Target *, std::unique_ptr<Renderer>> renderers;
@@ -362,7 +377,7 @@ struct State {
   }
   std::array<std::unordered_map<std::string,std::shared_ptr<Material>>,3> materials;
   std::unordered_map<std::string,std::shared_ptr<Sampler>> samplers;
-  std::shared_ptr<Texture> fallback;
+  std::shared_ptr<Texture> fallback, cube_fallback;
   Target *active_target = nullptr;
   int game_width = 640, game_height = 480;
   GuestState matrices;
@@ -382,8 +397,16 @@ struct State {
   std::unordered_map<GLenum, GLint> integers;
   std::unordered_map<GLenum, std::array<float, 4>> floats;
   std::unordered_map<GLenum, bool> enabled;
-  std::array<GLuint, 8> textures{};
+  std::array<GLuint, 8> textures{}, rect_textures{}, cube_textures{};
   std::unordered_map<GLuint, TextureObject> texture_objects;
+  std::unordered_map<GLuint, Framebuffer> framebuffers;
+  std::unordered_map<GLuint, std::array<int,2>> renderbuffers;
+  GLuint framebuffer = 0, renderbuffer = 0;
+  Framebuffer *bound_framebuffer = nullptr;
+  unsigned glx_drawable = 0; // the GLX drawable, under any bound framebuffer object
+  // Textures whose framebuffer was drawn since they last took its contents.
+  std::unordered_map<GLuint, unsigned> stale_textures;
+  std::unordered_set<GLuint> render_textures; // attached to a framebuffer object
   std::unordered_map<GLenum, std::vector<GLushort>> pixel_maps;
   std::array<GLint, 4> viewport{0, 0, 640, 480}, scissor{0, 0, 640, 480};
   std::array<float, 4> clear{0, 0, 0, 0};
@@ -430,10 +453,11 @@ struct State {
         std::fprintf(stderr,"[vulkan-commands] %s: %llu issued, %llu filtered\n",
           Renderer::command_name(Renderer::Command(i)),(unsigned long long)counts.issued[i],(unsigned long long)counts.filtered[i]);
     }
-    texture_objects.clear();
+    texture_objects.clear();framebuffers.clear();renderbuffers.clear();stale_textures.clear();render_textures.clear();
+    bound_framebuffer=nullptr;framebuffer=0;
     buffers.clear();
     samplers.clear();
-    fallback.reset();
+    fallback.reset();cube_fallback.reset();
     drawables.clear();drawable_sizes.clear();deleted_drawables.clear();stereo.reset();controllers.reset();game_input={};
     initialized.clear();
 #ifndef LINDBERGH_VULKAN_OFFSCREEN
@@ -1083,7 +1107,15 @@ extern "C" void lvk_glFinish(void) {
   lvk_glFlush();
   if (state.last_submission) state.ring->wait(*state.last_submission);
 }
-extern "C" unsigned lvk_create_drawable(int w, int h) {
+namespace {
+unsigned create_drawable(int w, int h, bool rect);
+void changed(TextureObject &o);
+std::shared_ptr<Texture> native_image(TextureObject &o, int overwritten_level, bool gpu_copy);
+}
+extern "C" unsigned lvk_create_drawable(int w, int h) { return create_drawable(w,h,false); }
+namespace {
+// rect: a rectangle texture's target, sampled in pixels, keeps the eyes' scale.
+unsigned create_drawable(int w, int h, bool rect) {
   if (w <= 0 || h <= 0)
     gap("invalid guest drawable dimensions");
   const auto id = state.next_drawable++;
@@ -1100,7 +1132,7 @@ extern "C" unsigned lvk_create_drawable(int w, int h) {
 #ifdef LINDBERGH_VULKAN_XR
   const auto *profile=game_profile();
   const LgStereoTargetSize sizes={state.game_width,state.game_height,profile->vr.world_w,profile->vr.world_h,int(state.xr->width()),int(state.xr->height())};
-  float sx,sy;lg_stereo_target_scale(&sizes,w,h,0,&sx,&sy);
+  float sx,sy;lg_stereo_target_scale(&sizes,w,h,rect,&sx,&sy);
   info.width=uint32_t(std::lround(w*sx));info.height=uint32_t(std::lround(h*sy));
   std::fprintf(stderr,"[vulkan-xr] pbuffer %u: %dx%d -> %ux%u, %u layers\n",id,w,h,info.width,info.height,info.layers);
   const bool foveated_world=state.picture_size(w,h) && info.width==state.xr->width() && info.height==state.xr->height();
@@ -1113,7 +1145,7 @@ extern "C" unsigned lvk_create_drawable(int w, int h) {
   const auto *profile=game_profile();
   const LgStereoTargetSize sizes={state.game_width,state.game_height,profile->vr.world_w,profile->vr.world_h,
       int(state.offscreen->info.width),int(state.offscreen->info.height)};
-  float sx,sy;lg_stereo_target_scale(&sizes,w,h,0,&sx,&sy);
+  float sx,sy;lg_stereo_target_scale(&sizes,w,h,rect,&sx,&sy);
   info.width=uint32_t(std::lround(w*sx));info.height=uint32_t(std::lround(h*sy));
   if(state.picture_size(w,h)&&info.width==state.offscreen->info.width&&info.height==state.offscreen->info.height)
     info.density_map=state.offscreen->info.density_map;
@@ -1134,7 +1166,6 @@ extern "C" unsigned lvk_create_drawable(int w, int h) {
 #endif
   return id;
 }
-namespace {
 void retire_drawable(unsigned id) {
   auto found=state.drawables.find(id);
   if(found==state.drawables.end())return;
@@ -1170,15 +1201,155 @@ void retire_drawable(unsigned id) {
 extern "C" void lvk_destroy_drawable(unsigned id) {
   if(!state.drawables.count(id))return;
   // GLX keeps a destroyed current pbuffer alive until it is unbound.
-  if(state.drawable==id)state.deleted_drawables.insert(id);
+  if(state.glx_drawable==id)state.deleted_drawables.insert(id);
   else retire_drawable(id);
 }
 extern "C" void lvk_bind_drawable(unsigned id) {
   if (id && !state.drawables.count(id))
     gap("unknown guest Vulkan drawable");
-  const auto previous=state.drawable;
-  state.drawable = id;
+  const auto previous=state.glx_drawable;
+  state.glx_drawable = id;
+  if(!state.framebuffer)state.drawable = id;
   if(previous!=id && state.deleted_drawables.count(previous))retire_drawable(previous);
+}
+
+namespace {
+TextureObject *texture_object(GLuint id) {
+  auto it=state.texture_objects.find(id);return it==state.texture_objects.end()?nullptr:&it->second;
+}
+// Leaving a drawn framebuffer: its textures take its contents when sampled.
+void framebuffer_finished(Framebuffer &f) {
+  if(!f.drawn||!f.drawable)return;
+  f.drawn=false;
+  for(auto id:{f.color,f.depth})if(id)state.stale_textures[id]=f.drawable;
+}
+void release_framebuffer_drawable(Framebuffer &f) {
+  if(!f.drawable)return;
+  for(auto it=state.stale_textures.begin();it!=state.stale_textures.end();)
+    it=it->second==f.drawable?state.stale_textures.erase(it):std::next(it);
+  if(state.drawable==f.drawable)state.drawable=state.glx_drawable;
+  retire_drawable(f.drawable);f.drawable=0;f.size={};
+}
+// The drawable follows the attachments' size: the colour texture's, else the
+// depth texture's or renderbuffer's.
+void sync_framebuffer(Framebuffer &f) {
+  std::array<int,2> size{};
+  for(auto id:{f.color,f.depth})if(!size[0]&&id)if(auto *o=texture_object(id);o&&o->levels.count(0))
+    size={o->levels.at(0).width,o->levels.at(0).height};
+  if(!size[0]&&f.depth_renderbuffer)if(auto it=state.renderbuffers.find(f.depth_renderbuffer);it!=state.renderbuffers.end())size=it->second;
+  if(size!=f.size)release_framebuffer_drawable(f);
+  if(!f.drawable&&size[0]>0&&size[1]>0) {
+    f.drawable=create_drawable(size[0],size[1],f.rect);f.size=size;
+    std::fprintf(stderr,"[vulkan] framebuffer drawable %u: %dx%d%s, colour texture %u, depth %s %u\n",f.drawable,size[0],size[1],
+      f.rect?" (rect)":"",f.color,f.depth?"texture":"renderbuffer",f.depth?f.depth:f.depth_renderbuffer);
+  }
+  if(&f==state.bound_framebuffer)state.drawable=f.drawable?f.drawable:state.glx_drawable;
+}
+void mark_drawn() {if(state.bound_framebuffer)state.bound_framebuffer->drawn=true;}
+// A draw sampling texture id: bring in its framebuffer's contents first.
+void resolve_texture(GLuint id) {
+  if(!id||state.stale_textures.empty())return;
+  if(auto *f=state.bound_framebuffer;f&&f->drawn&&(f->color==id||f->depth==id))framebuffer_finished(*f);
+  const auto found=state.stale_textures.find(id);
+  if(found==state.stale_textures.end())return;
+  const unsigned drawable=found->second;state.stale_textures.erase(found);
+  const auto source_it=state.drawables.find(drawable);auto *o=texture_object(id);
+  if(source_it==state.drawables.end()||!o||!o->levels.count(0))return;
+  Target *source=source_it->second.get();
+  state.frame();state.flush();
+  if(!state.initialized.count(source))return;
+  o->layers=source->info.layers;o->gpu_target=true;o->picture_view=true;
+  o->render_width=source->info.width;o->render_height=source->info.height;
+  changed(*o);auto gpu=native_image(*o,0,true);
+  const VkRect2D all{{0,0},{source->info.width,source->info.height}};state.materialize(source,&all);
+  gpu->copy_from(state.cmd,*source,0,0,0,0,0,source->info.width,source->info.height,0,0,o->layers);
+  state.pass_stamp("framebuffer copy "+std::to_string(source->info.width)+"x"+std::to_string(source->info.height)+
+                   (o->levels.at(0).format==GL_DEPTH_COMPONENT||o->levels.at(0).format==GL_DEPTH_STENCIL?" depth":" colour"));
+}
+void check_framebuffer_target(GLenum target) {
+  if(target!=GL_FRAMEBUFFER&&target!=GL_DRAW_FRAMEBUFFER&&target!=GL_READ_FRAMEBUFFER)gap("unsupported guest framebuffer target");
+}
+Framebuffer &attachment_framebuffer(GLenum target) {
+  check_framebuffer_target(target);
+  if(!state.bound_framebuffer)gap("framebuffer attachment on the default framebuffer");
+  return *state.bound_framebuffer;
+}
+}
+extern "C" void lvk_glGenFramebuffers(GLsizei n, GLuint *ids) {
+  for(GLsizei i=0;ids&&i<n;++i){ids[i]=object();state.framebuffers[ids[i]];}
+}
+extern "C" GLboolean lvk_glIsFramebuffer(GLuint id) {return state.framebuffers.count(id)?GL_TRUE:GL_FALSE;}
+extern "C" void lvk_glBindFramebuffer(GLenum target, GLuint id) {
+  check_framebuffer_target(target);
+  if(target==GL_READ_FRAMEBUFFER)return; // reads follow the draw framebuffer here
+  if(id==state.framebuffer)return;
+  if(state.bound_framebuffer)framebuffer_finished(*state.bound_framebuffer);
+  state.framebuffer=id;state.bound_framebuffer=id?&state.framebuffers[id]:nullptr;
+  if(state.bound_framebuffer)sync_framebuffer(*state.bound_framebuffer);
+  else state.drawable=state.glx_drawable;
+}
+extern "C" void lvk_glDeleteFramebuffers(GLsizei n, const GLuint *ids) {
+  for(GLsizei i=0;ids&&i<n;++i) {
+    auto it=state.framebuffers.find(ids[i]);if(!ids[i]||it==state.framebuffers.end())continue;
+    if(state.framebuffer==ids[i])lvk_glBindFramebuffer(GL_FRAMEBUFFER,0);
+    release_framebuffer_drawable(it->second);state.framebuffers.erase(it);
+  }
+}
+extern "C" void lvk_glFramebufferTexture2D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level) {
+  auto &f=attachment_framebuffer(target);
+  if(texture&&level)gap("framebuffer attachment of a texture mip level");
+  if(textarget!=GL_TEXTURE_2D&&textarget!=GL_TEXTURE_RECTANGLE_ARB)gap("unsupported framebuffer texture target");
+  framebuffer_finished(f);
+  if(attachment==GL_COLOR_ATTACHMENT0) {f.color=texture;f.rect=textarget==GL_TEXTURE_RECTANGLE_ARB;}
+  else if(attachment==GL_DEPTH_ATTACHMENT||attachment==GL_DEPTH_STENCIL_ATTACHMENT)f.depth=texture;
+  else if(attachment!=GL_STENCIL_ATTACHMENT)gap("unsupported framebuffer attachment");
+  if(texture)state.render_textures.insert(texture);
+  sync_framebuffer(f);
+}
+extern "C" void lvk_glFramebufferRenderbuffer(GLenum target, GLenum attachment, GLenum, GLuint renderbuffer) {
+  auto &f=attachment_framebuffer(target);
+  if(attachment==GL_DEPTH_ATTACHMENT||attachment==GL_DEPTH_STENCIL_ATTACHMENT||attachment==GL_STENCIL_ATTACHMENT)f.depth_renderbuffer=renderbuffer;
+  else gap("colour renderbuffer attachments are not implemented");
+  sync_framebuffer(f);
+}
+extern "C" GLenum lvk_glCheckFramebufferStatus(GLenum target) {
+  check_framebuffer_target(target);
+  if(!state.bound_framebuffer)return GL_FRAMEBUFFER_COMPLETE;
+  sync_framebuffer(*state.bound_framebuffer);
+  return state.bound_framebuffer->drawable?GL_FRAMEBUFFER_COMPLETE:GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT;
+}
+extern "C" void lvk_glGenRenderbuffers(GLsizei n, GLuint *ids) {
+  for(GLsizei i=0;ids&&i<n;++i){ids[i]=object();state.renderbuffers[ids[i]]={};}
+}
+extern "C" GLboolean lvk_glIsRenderbuffer(GLuint id) {return state.renderbuffers.count(id)?GL_TRUE:GL_FALSE;}
+extern "C" void lvk_glBindRenderbuffer(GLenum, GLuint id) {state.renderbuffer=id;}
+extern "C" void lvk_glRenderbufferStorage(GLenum, GLenum, GLsizei w, GLsizei h) {
+  if(!state.renderbuffer)gap("renderbuffer storage without a bound renderbuffer");
+  state.renderbuffers[state.renderbuffer]={w,h};
+}
+extern "C" void lvk_glDeleteRenderbuffers(GLsizei n, const GLuint *ids) {
+  for(GLsizei i=0;ids&&i<n;++i){state.renderbuffers.erase(ids[i]);if(state.renderbuffer==ids[i])state.renderbuffer=0;}
+}
+extern "C" void lvk_glDrawBuffer(GLenum) {}
+extern "C" void lvk_glReadBuffer(GLenum) {}
+// arbprog.c's rectangle lookups: render targets drawn larger are scaled to the
+// eyes' resolution (what a rectangle target keeps, lg_stereo_target_scale).
+// Vertex programs that do their own transform multiply by u_reproj (GL's
+// per-eye reprojection). Here the shader wrapper's eye transform does that.
+extern "C" void stereo_reproject(float out[16]) {for(int i=0;i<16;++i)out[i]=i%5==0?1.f:0.f;}
+extern "C" int stereo_is_render_target(unsigned texture) {return state.stereo&&state.render_textures.count(texture);}
+extern "C" void stereo_rect_scale(float *x, float *y) {
+  *x=*y=1;
+  if(!state.stereo)return;
+  int width=state.game_width,height=state.game_height;
+#ifdef LINDBERGH_VULKAN_XR
+  width=int(state.xr->width());height=int(state.xr->height());
+#elif defined(LINDBERGH_VULKAN_OFFSCREEN)
+  width=int(state.offscreen->info.width);height=int(state.offscreen->info.height);
+#endif
+  const auto *profile=game_profile();
+  const LgStereoTargetSize sizes={state.game_width,state.game_height,profile->vr.world_w,profile->vr.world_h,width,height};
+  lg_stereo_target_scale(&sizes,state.game_width,state.game_height,1,x,y);
 }
 
 extern "C" GLenum lvk_glGetError(void) { return state.matrices.error(); }
@@ -1285,8 +1456,13 @@ extern "C" void lvk_glGetIntegerv(GLenum what, GLint *out) {
   case GL_UNPACK_ROW_LENGTH:
   case GL_UNPACK_SKIP_PIXELS:
   case GL_UNPACK_SKIP_ROWS:
-  case GL_FRAMEBUFFER_BINDING:
     *out = 0;
+    break;
+  case GL_FRAMEBUFFER_BINDING:
+    *out = GLint(state.framebuffer);
+    break;
+  case GL_RENDERBUFFER_BINDING:
+    *out = GLint(state.renderbuffer);
     break;
   case GL_DEPTH_WRITEMASK:
     *out = 1;
@@ -1315,7 +1491,8 @@ extern "C" void lvk_glGetIntegerv(GLenum what, GLint *out) {
   case GL_BLEND_EQUATION: *out = GL_FUNC_ADD; break;
   case GL_LOGIC_OP_MODE: *out = GL_COPY; break;
   case GL_FOG_MODE: *out = GL_EXP; break;
-  case GL_TEXTURE_BINDING_RECTANGLE_ARB: *out = 0; break;
+  case GL_TEXTURE_BINDING_CUBE_MAP: *out = GLint(state.cube_textures[state.active_texture - GL_TEXTURE0]); break;
+  case GL_TEXTURE_BINDING_RECTANGLE_ARB: *out = GLint(state.rect_textures[state.active_texture - GL_TEXTURE0]); break;
   default: {
     // More of GL's initial state (values once set are stored and answered
     // above), and state the game set through a float call.
@@ -1329,7 +1506,7 @@ extern "C" void lvk_glGetIntegerv(GLenum what, GLint *out) {
       {GL_UNPACK_ROW_LENGTH,0},{GL_UNPACK_SKIP_ROWS,0},{GL_UNPACK_SKIP_PIXELS,0},{GL_PACK_ROW_LENGTH,0},
       {GL_PACK_SKIP_ROWS,0},{GL_PACK_SKIP_PIXELS,0},{GL_SUBPIXEL_BITS,4},{GL_AUX_BUFFERS,0},{GL_DOUBLEBUFFER,1},
       {GL_RENDER_MODE,GL_RENDER},{GL_LIST_BASE,0},{GL_FOG_COORD_SRC,GL_FRAGMENT_DEPTH},{GL_TEXTURE_BINDING_3D,0},
-      {GL_TEXTURE_BINDING_CUBE_MAP,0},{GL_DRAW_BUFFER,GL_BACK},{GL_READ_BUFFER,GL_BACK},{GL_SAMPLE_BUFFERS,0},
+      {GL_DRAW_BUFFER,GL_BACK},{GL_READ_BUFFER,GL_BACK},{GL_SAMPLE_BUFFERS,0},
       {GL_SAMPLES,0},{GL_MAX_PROGRAM_MATRICES_ARB,8},{GL_MAX_3D_TEXTURE_SIZE,2048},{GL_MAX_CUBE_MAP_TEXTURE_SIZE,4096},
       {GL_MAX_ELEMENTS_VERTICES,65536},{GL_MAX_ELEMENTS_INDICES,65536},{GL_ACCUM_RED_BITS,0},{GL_ACCUM_GREEN_BITS,0},
       {GL_ACCUM_BLUE_BITS,0},{GL_ACCUM_ALPHA_BITS,0},{GL_INDEX_BITS,0},{GL_STEREO,0}};
@@ -1440,6 +1617,7 @@ extern "C" void lvk_glClear(GLbitfield mask) { queue_clear(mask); }
 extern "C" void lvk_glEnable(GLenum cap) {
   state.enabled[cap] = true;
   if(cap==GL_TEXTURE_2D)state.texture_enabled[state.active_texture-GL_TEXTURE0]=true;
+  if(cap==GL_TEXTURE_RECTANGLE_ARB)state.rect_enabled[state.active_texture-GL_TEXTURE0]=true;
   if (cap == GL_DEPTH_TEST)
     state.raster.depth_test = true;
   if (cap == GL_BLEND)
@@ -1448,6 +1626,7 @@ extern "C" void lvk_glEnable(GLenum cap) {
 extern "C" void lvk_glDisable(GLenum cap) {
   state.enabled[cap] = false;
   if(cap==GL_TEXTURE_2D)state.texture_enabled[state.active_texture-GL_TEXTURE0]=false;
+  if(cap==GL_TEXTURE_RECTANGLE_ARB)state.rect_enabled[state.active_texture-GL_TEXTURE0]=false;
   if (cap == GL_DEPTH_TEST)
     state.raster.depth_test = false;
   if (cap == GL_BLEND)
@@ -1538,9 +1717,10 @@ extern "C" void lvk_glGenTextures(GLsizei n, GLuint *out) {
     out[i] = object();
 }
 extern "C" void lvk_glBindTexture(GLenum target, GLuint texture) {
-  if (target != GL_TEXTURE_2D)
-    gap("unsupported guest texture target");
-  state.textures[state.active_texture - GL_TEXTURE0] = texture;
+  auto &slots=target==GL_TEXTURE_2D?state.textures:target==GL_TEXTURE_RECTANGLE_ARB?state.rect_textures:
+              target==GL_TEXTURE_CUBE_MAP?state.cube_textures:(std::fprintf(stderr,"[vulkan] texture target %#x\n",target),gap("unsupported guest texture target"),state.textures);
+  slots[state.active_texture - GL_TEXTURE0] = texture;
+  if (texture && target == GL_TEXTURE_RECTANGLE_ARB) state.texture_objects[texture].rect = true;
 }
 extern "C" GLuint lvk_glCreateShader(GLenum type) {
   auto id = object();
@@ -1604,6 +1784,42 @@ extern "C" void lvk_glBindAttribLocation(GLuint p, GLuint index,
     }
   a.push_back({name, index});
 }
+namespace {
+// GL runs a program without a vertex shader through fixed-function vertex
+// processing. Its stand-in is this generated GLSL stage, derived only from the
+// fragment source, so harvested packs and the runtime lookup agree on it.
+std::string fixed_vertex_stage(const std::string &fragment) {
+  auto uses=[&](const std::string &name){return fragment.find(name)!=std::string::npos;};
+  std::string v="#version 120\nvoid main() {\n  gl_Position = ftransform();\n  gl_FrontColor = gl_Color;\n  gl_BackColor = gl_Color;\n";
+  if(uses("gl_SecondaryColor"))v+="  gl_FrontSecondaryColor = gl_SecondaryColor;\n  gl_BackSecondaryColor = gl_SecondaryColor;\n";
+  for(int i=0;i<8;++i)if(uses("gl_TexCoord["+std::to_string(i)+"]"))
+    v+="  gl_TexCoord["+std::to_string(i)+"] = gl_TextureMatrix["+std::to_string(i)+"] * gl_MultiTexCoord"+std::to_string(i)+";\n";
+  if(uses("gl_FogFragCoord"))v+="  gl_FogFragCoord = abs((gl_ModelViewMatrix * gl_Vertex).z);\n";
+  return v+"}\n";
+}
+// LINDBERGH_VULKAN_SHADER_HARVEST=dir: programs missing from the pack are
+// written there as a compile_shaders.py manifest (programs.jsonl), and draws
+// with them are skipped, so one run collects every missing program.
+const char *harvest_directory() {static const char *d=[]{const auto *v=std::getenv("LINDBERGH_VULKAN_SHADER_HARVEST");return v&&*v?v:nullptr;}();return d;}
+void harvest_program(GLuint id,const Program &p,const std::string &vertex,const std::string &fragment) {
+  static std::set<std::string> seen;
+  std::string key=vertex+'\0'+fragment;for(const auto &a:p.attributes)key+=a.name+'='+std::to_string(a.location)+';';
+  if(!seen.insert(key).second)return;
+  const std::filesystem::path directory=harvest_directory();std::filesystem::create_directories(directory);
+  // Named by content (FNV-1a), so runs appending to one directory agree.
+  uint32_t hash=2166136261u;for(unsigned char c:key)hash=(hash^c)*16777619u;
+  if(std::filesystem::exists(directory/("fs_h"+std::to_string(hash)+".glsl")))return;
+  const auto n=std::to_string(hash);
+  for(auto [name,text]:{std::pair{"vs_h"+n+".glsl",&vertex},std::pair{"fs_h"+n+".glsl",&fragment}}) {
+    std::ofstream out(directory/name,std::ios::binary);out<<*text;
+  }
+  std::ofstream rows(directory/"programs.jsonl",std::ios::app);
+  rows<<"{\"program\":"<<hash<<",\"vertex\":\"vs_h"<<n<<".glsl\",\"fragment\":\"fs_h"<<n<<".glsl\",\"attributes\":[";
+  for(size_t i=0;i<p.attributes.size();++i)rows<<(i?",":"")<<"{\"name\":\""<<p.attributes[i].name<<"\",\"location\":"<<p.attributes[i].location<<"}";
+  rows<<"]}\n";
+  std::fprintf(stderr,"[vulkan-harvest] program %u recorded as %s/vs_h%s.glsl + fs_h%s.glsl\n",id,directory.c_str(),n.c_str(),n.c_str());
+}
+}
 extern "C" void lvk_glLinkProgram(GLuint id) {
   if (!state.pack) {
     const auto path = std::getenv("LINDBERGH_VULKAN_SHADERS");
@@ -1615,13 +1831,20 @@ extern "C" void lvk_glLinkProgram(GLuint id) {
   p.record = nullptr;
   p.native.reset(); // submitted frames retain their previous native program
   SourceDigest vs{}, fs{};
+  std::string vertex_source, fragment_source;
   for (const auto shader : p.shaders) {
     const auto &s = state.shaders.at(shader);
     if (s.type == GL_VERTEX_SHADER)
-      vs = shader_source_digest(s.source);
+      vertex_source = s.source;
     if (s.type == GL_FRAGMENT_SHADER)
-      fs = shader_source_digest(s.source);
+      fragment_source = s.source;
   }
+  if (vertex_source.empty() && !fragment_source.empty())
+    vertex_source = fixed_vertex_stage(fragment_source);
+  p.fixed_fragment = fragment_source.empty() && !vertex_source.empty();
+  if (p.fixed_fragment) fragment_source = lvk_fixed_fragment_source;
+  if (!vertex_source.empty()) vs = shader_source_digest(vertex_source);
+  if (!fragment_source.empty()) fs = shader_source_digest(fragment_source);
   // Unbound active inputs may use the archive's deterministic assignment;
   // explicit guest bindings must match. GetAttribLocation returns that slot.
   for (const auto &record : state.pack->programs()) {
@@ -1654,6 +1877,10 @@ extern "C" void lvk_glLinkProgram(GLuint id) {
     p.sampler_units.clear(); // successful GL relink resets all guest uniforms
     for (const auto &layout : p.record->uniforms)
       p.uniforms.push_back(std::make_unique<UniformData>(layout));
+    if (p.fixed_fragment)
+      for (const auto &sampler : p.record->samplers)
+        if (sampler.name.rfind("fixed_texture", 0) == 0)
+          p.sampler_units[int(sampler.binding)] = GLint(std::strtoul(sampler.name.c_str() + 13, nullptr, 10));
   }
   if (!p.record) {
     if (const auto directory = std::getenv("LINDBERGH_VULKAN_SHADER_MISS")) {
@@ -1667,6 +1894,10 @@ extern "C" void lvk_glLinkProgram(GLuint id) {
         out.write(s.source.data(), s.source.size());
       }
     }
+    if (harvest_directory()) {
+      harvest_program(id, p, vertex_source, fragment_source);
+      return; // its draws are skipped
+    }
     std::fprintf(stderr,
                  "[vulkan] missing offline shader pair for guest program %u\n",
                  id);
@@ -1674,7 +1905,7 @@ extern "C" void lvk_glLinkProgram(GLuint id) {
   }
 }
 extern "C" void lvk_glUseProgram(GLuint id) {
-  if (id && !state.programs.at(id).record)
+  if (id && !state.programs.at(id).record && !harvest_directory())
     gap("guest selected an unlinked Vulkan program");
   const auto previous = state.program;
   state.program = id;
@@ -1699,15 +1930,20 @@ extern "C" void lvk_glGetShaderiv(GLuint id, GLenum p, GLint *out) {
 extern "C" void lvk_glGetProgramiv(GLuint id, GLenum p, GLint *out) {
   const auto &v = state.programs.at(id);
   if (p == GL_LINK_STATUS || p == GL_VALIDATE_STATUS)
-    *out = v.record != nullptr;
+    *out = v.record != nullptr || harvest_directory() != nullptr;
   else if (p == GL_INFO_LOG_LENGTH)
     *out = 1;
   else if (p == GL_DELETE_STATUS)
     *out = v.delete_pending;
   else if (p == GL_ATTACHED_SHADERS)
     *out = GLint(v.shaders.size());
+  // Offline uniform blocks keep every array at its declared length; nothing
+  // is enumerable, so arbprog.c's array_len() keeps the length it declared.
+  else if (p == GL_ACTIVE_UNIFORMS || p == GL_ACTIVE_UNIFORM_MAX_LENGTH ||
+           p == GL_ACTIVE_ATTRIBUTES || p == GL_ACTIVE_ATTRIBUTE_MAX_LENGTH)
+    *out = 0;
   else
-    gap("unknown guest program query");
+    {std::fprintf(stderr,"[vulkan] program query %#x\n",p);gap("unknown guest program query");}
 }
 extern "C" void lvk_glGetShaderInfoLog(GLuint, GLsizei n, GLsizei *length,
                                        GLchar *out) {
@@ -1745,15 +1981,25 @@ extern "C" GLint lvk_glGetAttribLocation(GLuint id, const GLchar *name) {
 }
 
 namespace {
+bool cube_face(GLenum target) {return target>=GL_TEXTURE_CUBE_MAP_POSITIVE_X&&target<=GL_TEXTURE_CUBE_MAP_NEGATIVE_Z;}
 TextureObject &texture(GLenum target) {
-  if (target != GL_TEXTURE_2D)
-    gap("unsupported guest texture target");
-  return state
-      .texture_objects[state.textures[state.active_texture - GL_TEXTURE0]];
+  const auto unit = state.active_texture - GL_TEXTURE0;
+  if (target == GL_TEXTURE_2D) return state.texture_objects[state.textures[unit]];
+  if (target == GL_TEXTURE_RECTANGLE_ARB) return state.texture_objects[state.rect_textures[unit]];
+  if (target == GL_TEXTURE_CUBE_MAP || cube_face(target)) return state.texture_objects[state.cube_textures[unit]];
+  std::fprintf(stderr,"[vulkan] texture target %#x\n",target);gap("unsupported guest texture target");
+}
+// The image levels a TexImage call addresses: a cube face's own, else the texture's.
+std::map<int, TextureLevel> &target_levels(TextureObject &o, GLenum target) {
+  if (!cube_face(target)) return o.levels;
+  o.cube = true;
+  const auto face = target - GL_TEXTURE_CUBE_MAP_POSITIVE_X;
+  return face ? o.cube_faces[face - 1] : o.levels;
 }
 int components(GLenum format) {
   switch (format) {
   case GL_DEPTH_COMPONENT:
+  case GL_DEPTH_STENCIL:
   case GL_COLOR_INDEX:
   case GL_LUMINANCE:
   case GL_ALPHA:
@@ -1782,6 +2028,7 @@ int integer(GLenum name, int fallback) {
 size_t pixel_size(GLenum format, GLenum type) {
   if (type == GL_UNSIGNED_BYTE) return size_t(components(format));
   if (format == GL_DEPTH_COMPONENT && (type == GL_UNSIGNED_INT || type == GL_FLOAT)) return 4;
+  if (format == GL_DEPTH_STENCIL && type == GL_UNSIGNED_INT_24_8) return 4;
   if ((format == GL_RGBA || format == GL_BGRA) && type == GL_UNSIGNED_INT_8_8_8_8_REV) return 4;
   if ((format == GL_RGB && type == GL_UNSIGNED_SHORT_5_6_5) ||
       (format == GL_BGRA && type == GL_UNSIGNED_SHORT_4_4_4_4_REV)) return 2;
@@ -1867,7 +2114,7 @@ extern "C" void lvk_glTexImage2D(GLenum target, GLint level, GLint internal,
   }
   auto &object=texture(target); ++object.revision; object.dynamic=object.dynamic || bool(object.stable.image);
   if(level==0) {object.gpu_target=false;object.layers=1;object.render_width=object.render_height=0;object.picture_view=false;}
-  auto &v = object.levels[level];
+  auto &v = target_levels(object, target)[level];
   v = {internal, w, h, format, type, {}, false};
   const auto row = size_t(w) * pixel_bytes;
   v.bytes.resize(row * size_t(h));
@@ -1907,8 +2154,9 @@ extern "C" void lvk_glTexSubImage2D(GLenum target, GLint level, GLint x, GLint y
                                     const GLvoid *pointer) {
   auto &object = texture(target);
   if(format==GL_LUMINANCE && int64_t(w)*h>=256*256)object.movie=true;
-  const auto it = object.levels.find(level);
-  if (it == object.levels.end()) gap("guest texture subimage has no allocated level");
+  auto &levels = target_levels(object, target);
+  const auto it = levels.find(level);
+  if (it == levels.end()) gap("guest texture subimage has no allocated level");
   auto &v = it->second;
   if (x < 0 || y < 0 || w < 0 || h < 0 || x > v.width || w > v.width - x ||
       y > v.height || h > v.height - y || v.compressed)
@@ -1933,19 +2181,22 @@ extern "C" void lvk_glCompressedTexImage2D(GLenum target, GLint level,
   if (w < 0 || h < 0 || level < 0 || border || bytes < 0)
     gap("invalid guest compressed texture dimensions");
   auto &object=texture(target); ++object.revision; object.dynamic=object.dynamic || bool(object.stable.image);
-  auto &v = object.levels[level];
+  auto &v = target_levels(object, target)[level];
   v = {GLint(internal), w, h, 0, 0, {}, true};
   v.bytes.resize(size_t(bytes));
   if (data || state.unpack_buffer)
     std::memcpy(v.bytes.data(), pixels(data, size_t(bytes)), size_t(bytes));
 }
 extern "C" void lvk_glDeleteTextures(GLsizei n, const GLuint *ids) {
-  for (GLsizei i = 0; i < n; ++i)
-    state.texture_objects.erase(ids[i]);
+  for (GLsizei i = 0; i < n; ++i) {
+    state.texture_objects.erase(ids[i]);state.stale_textures.erase(ids[i]);state.render_textures.erase(ids[i]);
+  }
 }
 extern "C" void lvk_glTexEnvf(GLenum target, GLenum name, GLfloat value) {
-  state.floats[(target << 16) | name] = {value, 0, 0, 0};
-  if(target==GL_TEXTURE_ENV&&name==GL_TEXTURE_ENV_MODE)state.texture_env[state.active_texture-GL_TEXTURE0]=GLenum(value);
+  const unsigned unit=state.active_texture-GL_TEXTURE0;
+  if(target==GL_TEXTURE_ENV)state.env_params[unit][name]=value; // per texture unit, as in GL
+  else state.floats[(target << 16) | name] = {value, 0, 0, 0};
+  if(target==GL_TEXTURE_ENV&&name==GL_TEXTURE_ENV_MODE)state.texture_env[unit]=GLenum(value);
 }
 extern "C" void lvk_glHint(GLenum target, GLenum mode) {
   state.integers[target] = mode;
@@ -1978,6 +2229,14 @@ extern "C" void lvk_glLightfv(GLenum light, GLenum name, const GLfloat *v) { ++s
                ? 4
                : 1;
   std::copy(v, v + n, out.begin());
+  // GL keeps a light's position and spot direction in eye coordinates: they
+  // are transformed by the modelview matrix current when they are specified.
+  if (name == GL_POSITION || name == GL_SPOT_DIRECTION) {
+    const auto &m = state.matrices.matrix(GL_MODELVIEW);
+    const std::array<float,4> in{out[0], out[1], out[2], name == GL_POSITION ? out[3] : 0.f};
+    for (unsigned i = 0; i < (name == GL_POSITION ? 4u : 3u); ++i)
+      out[i] = m[i] * in[0] + m[4 + i] * in[1] + m[8 + i] * in[2] + m[12 + i] * in[3];
+  }
 }
 extern "C" void lvk_glMaterialfv(GLenum face, GLenum name, const GLfloat *v) { ++state.legacy_version;
   if (face == GL_FRONT_AND_BACK) {
@@ -2044,6 +2303,9 @@ extern "C" void lvk_glDisableVertexAttribArray(GLuint index) {
   state.arrays.enable(index, false);
 }
 extern "C" void lvk_glEnableClientState(GLenum cap) {
+  // Colour-index and edge-flag arrays do nothing in RGBA mode with filled
+  // polygons; only their enable state is kept.
+  if(cap==GL_INDEX_ARRAY||cap==GL_EDGE_FLAG_ARRAY) {state.enabled[cap]=true;return;}
   if(cap==GL_VERTEX_ARRAY)state.legacy_bounds_arrays.enable(0,true);
   unsigned index;
   if (cap == GL_VERTEX_ARRAY)
@@ -2064,6 +2326,7 @@ extern "C" void lvk_glEnableClientState(GLenum cap) {
   state.enabled[cap] = true;
 }
 extern "C" void lvk_glDisableClientState(GLenum cap) {
+  if(cap==GL_INDEX_ARRAY||cap==GL_EDGE_FLAG_ARRAY||cap==GL_FOG_COORD_ARRAY) {state.enabled[cap]=false;return;}
   if(cap==GL_VERTEX_ARRAY)state.legacy_bounds_arrays.enable(0,false);
   unsigned index;
   if (cap == GL_VERTEX_ARRAY)
@@ -2330,6 +2593,17 @@ extern "C" void lvk_glAlphaFunc(GLenum compare, GLclampf reference) { ++state.le
 extern "C" void lvk_glPointSize(GLfloat size) {
   state.floats[GL_POINT_SIZE] = {size, 0, 0, 0};
 }
+// Point size attenuation and fade are fixed-function point state; programs
+// that write gl_PointSize (GSE's particle vertex programs) set the size. Kept
+// for queries.
+extern "C" void lvk_glPointParameterfv(GLenum name, const GLfloat *v) {
+  if(!v)return;
+  auto &value=state.floats[name];value={v[0],0,0,0};
+  if(name==GL_POINT_DISTANCE_ATTENUATION)value={v[0],v[1],v[2],0};
+}
+extern "C" void lvk_glPointParameterf(GLenum name, GLfloat v) {const GLfloat a[3]={v,0,0};lvk_glPointParameterfv(name,a);}
+extern "C" void lvk_glPointParameteri(GLenum name, GLint v) {lvk_glPointParameterf(name,GLfloat(v));}
+extern "C" void lvk_glPointParameteriv(GLenum name, const GLint *v) {if(v){const GLfloat a[3]={GLfloat(v[0]),GLfloat(v[1]),GLfloat(v[2])};lvk_glPointParameterfv(name,a);}}
 extern "C" void lvk_glLineWidth(GLfloat width) {
   state.floats[GL_LINE_WIDTH] = {width, 0, 0, 0};
 }
@@ -2368,7 +2642,7 @@ VkFormat texture_format(const TextureLevel &v) {
   if (v.format == GL_RGB && v.type == GL_UNSIGNED_SHORT_5_6_5)
     return VK_FORMAT_R5G6B5_UNORM_PACK16;
   switch(v.format) {
-    case GL_DEPTH_COMPONENT:return Target::depth_format;
+    case GL_DEPTH_COMPONENT:case GL_DEPTH_STENCIL:return Target::depth_format;
     case GL_LUMINANCE:case GL_ALPHA:case GL_RED:return VK_FORMAT_R8_UNORM;
     case GL_LUMINANCE_ALPHA:return VK_FORMAT_R8G8_UNORM;
     case GL_BGRA:return VK_FORMAT_B8G8R8A8_UNORM;
@@ -2387,6 +2661,7 @@ std::shared_ptr<Texture> native_image(TextureObject &o, int overwritten_level = 
   }
   const auto &base=o.levels.at(0);
   TextureInfo info{o.render_width?o.render_width:uint32_t(base.width),o.render_height?o.render_height:uint32_t(base.height),uint32_t(o.levels.rbegin()->first+1),o.layers,texture_format(base)};
+  if(o.cube) {info.layers=6;info.cube=true;}
   if(base.format==GL_BGRA && base.type==GL_UNSIGNED_SHORT_4_4_4_4_REV)
     info.components={VK_COMPONENT_SWIZZLE_G,VK_COMPONENT_SWIZZLE_B,VK_COMPONENT_SWIZZLE_A,VK_COMPONENT_SWIZZLE_R};
   if(base.format==GL_LUMINANCE)info.components={VK_COMPONENT_SWIZZLE_R,VK_COMPONENT_SWIZZLE_R,VK_COMPONENT_SWIZZLE_R,VK_COMPONENT_SWIZZLE_ONE};
@@ -2402,7 +2677,8 @@ std::shared_ptr<Texture> native_image(TextureObject &o, int overwritten_level = 
         version.image->info.levels!=info.levels || version.image->info.layers!=info.layers || version.image->info.format!=info.format ||
         std::memcmp(&version.image->info.components,&info.components,sizeof info.components);
     if(allocate)version.image=std::make_shared<Texture>(*state.device,info);
-    for(const auto &[level,v]:o.levels) {
+    for(uint32_t face=0;face<(o.cube?6u:1u);++face)
+    for(const auto &[level,v]:face?o.cube_faces[face-1]:o.levels) {
       if(gpu_copy && !allocate)continue; // preserve the last GPU contents for partial copies
 
       if(texture_format(v)!=info.format)gap("mip texture formats disagree");
@@ -2416,12 +2692,14 @@ std::shared_ptr<Texture> native_image(TextureObject &o, int overwritten_level = 
         expanded.resize(size_t(v.width)*v.height*4);
         for(size_t i=0;i<size_t(v.width)*v.height;++i) {std::memcpy(expanded.data()+4*i,v.bytes.data()+3*i,3);expanded[4*i+3]=255;}
         data=expanded.data();bytes=expanded.size();
-      } else if(v.format==GL_DEPTH_COMPONENT&&v.type==GL_UNSIGNED_INT) {
-        expanded.resize(bytes);
-        for(size_t i=0;i<bytes;i+=4) {uint32_t d;std::memcpy(&d,v.bytes.data()+i,4);const float f=float(double(d)/4294967295.0);std::memcpy(expanded.data()+i,&f,4);}
+      } else if((v.format==GL_DEPTH_COMPONENT&&v.type==GL_UNSIGNED_INT)||(v.format==GL_DEPTH_STENCIL&&v.type==GL_UNSIGNED_INT_24_8)) {
+        expanded.resize(bytes);const bool packed=v.format==GL_DEPTH_STENCIL;
+        for(size_t i=0;i<bytes;i+=4) {uint32_t d;std::memcpy(&d,v.bytes.data()+i,4);
+          const float f=packed?float(double(d>>8)/16777215.0):float(double(d)/4294967295.0);std::memcpy(expanded.data()+i,&f,4);}
         data=expanded.data();
       }
-      for(uint32_t layer=0;layer<info.layers;++layer)
+      if(o.cube)version.image->upload(state.cmd,*state.ring,uint32_t(level),face,data,bytes);
+      else for(uint32_t layer=0;layer<info.layers;++layer)
         version.image->upload(state.cmd,*state.ring,uint32_t(level),layer,data,bytes);
     }
     version.revision=o.revision;
@@ -2452,12 +2730,14 @@ VkSamplerAddressMode wrap_mode(GLint value) {
 std::shared_ptr<Sampler> native_sampler(TextureObject &o,uint32_t levels,bool shadow) {
   auto param=[&](GLenum name,GLint fallback){const auto it=o.parameters.find(name);return it==o.parameters.end()?fallback:it->second;};
   SamplerInfo info;
-  const auto min=param(GL_TEXTURE_MIN_FILTER,GL_NEAREST_MIPMAP_LINEAR),mag=param(GL_TEXTURE_MAG_FILTER,GL_LINEAR);
+  // Rectangle textures default to GL_LINEAR and GL_CLAMP_TO_EDGE and cannot repeat.
+  const auto min=param(GL_TEXTURE_MIN_FILTER,o.rect?GL_LINEAR:GL_NEAREST_MIPMAP_LINEAR),mag=param(GL_TEXTURE_MAG_FILTER,GL_LINEAR);
   info.mag_filter=mag==GL_NEAREST?VK_FILTER_NEAREST:VK_FILTER_LINEAR;
   info.min_filter=min==GL_NEAREST||min==GL_NEAREST_MIPMAP_NEAREST||min==GL_NEAREST_MIPMAP_LINEAR?VK_FILTER_NEAREST:VK_FILTER_LINEAR;
   info.mip_filter=min==GL_NEAREST_MIPMAP_LINEAR||min==GL_LINEAR_MIPMAP_LINEAR?VK_SAMPLER_MIPMAP_MODE_LINEAR:VK_SAMPLER_MIPMAP_MODE_NEAREST;
   info.max_lod=min==GL_NEAREST||min==GL_LINEAR?0:float(levels-1);
-  info.u=wrap_mode(param(GL_TEXTURE_WRAP_S,GL_REPEAT));info.v=wrap_mode(param(GL_TEXTURE_WRAP_T,GL_REPEAT));
+  const GLint wrap=o.rect?GL_CLAMP_TO_EDGE:GL_REPEAT;
+  info.u=wrap_mode(param(GL_TEXTURE_WRAP_S,wrap));info.v=wrap_mode(param(GL_TEXTURE_WRAP_T,wrap));
   info.compare=shadow;info.compare_op=VkCompareOp(param(GL_TEXTURE_COMPARE_FUNC,GL_LEQUAL)-GL_NEVER);
   const auto color=o.float_parameters.find(GL_TEXTURE_BORDER_COLOR);
   if(color!=o.float_parameters.end()) {
@@ -2488,7 +2768,7 @@ DrawPacket packet_for(Target *target,Renderer *renderer) {
 }
 void queue_clear(GLbitfield mask) {
   if(mask&~(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT|GL_STENCIL_BUFFER_BIT))gap("invalid guest clear mask");
-  auto *target=state.target();auto &renderer=state.renderers[target];
+  auto *target=state.target();auto &renderer=state.renderers[target];mark_drawn();
   if(!renderer)renderer=std::make_unique<Renderer>(*state.device,*target,*state.cache);
   auto p=packet_for(target,renderer.get());
   const auto write=state.floats.find(GL_COLOR_WRITEMASK);
@@ -2579,6 +2859,42 @@ VkBlendOp blend_op(GLenum v) {
   case GL_FUNC_REVERSE_SUBTRACT:return VK_BLEND_OP_REVERSE_SUBTRACT;case GL_MIN:return VK_BLEND_OP_MIN;case GL_MAX:return VK_BLEND_OP_MAX;
   default:gap("unsupported guest blend equation");}
 }
+// A unit's GL_COMBINE parameter, or GL's initial value.
+GLenum env_param(unsigned unit,GLenum name) {
+  if(auto it=state.env_params[unit].find(name);it!=state.env_params[unit].end())return GLenum(it->second);
+  switch(name) {
+  case GL_COMBINE_RGB:case GL_COMBINE_ALPHA:return GL_MODULATE;
+  case GL_SOURCE0_RGB:case GL_SOURCE0_ALPHA:return GL_TEXTURE;
+  case GL_SOURCE1_RGB:case GL_SOURCE1_ALPHA:return GL_PREVIOUS;
+  case GL_SOURCE2_RGB:case GL_SOURCE2_ALPHA:return GL_CONSTANT;
+  case GL_OPERAND0_RGB:case GL_OPERAND1_RGB:return GL_SRC_COLOR;
+  default:return GL_SRC_ALPHA; // the other operands
+  }
+}
+// fixed.frag's packed GL_COMBINE description; false when the unit reads a
+// disabled unit's texture, which GL treats as texture blending disabled.
+bool combine_words(unsigned unit,std::array<int32_t,4> &d) {
+  auto function=[](GLenum f,bool rgb){
+    switch(f){case GL_REPLACE:return 0;case GL_MODULATE:return 1;case GL_ADD:return 2;case GL_ADD_SIGNED:return 3;
+    case GL_INTERPOLATE:return 4;case GL_SUBTRACT:return 5;case GL_DOT3_RGB:if(rgb)return 6;break;case GL_DOT3_RGBA:if(rgb)return 7;break;}
+    gap("unsupported GL_COMBINE function");};
+  bool usable=true;
+  auto source=[&](GLenum s){
+    switch(s){case GL_TEXTURE:return 0;case GL_CONSTANT:return 1;case GL_PRIMARY_COLOR:return 2;case GL_PREVIOUS:return 3;}
+    if(s>=GL_TEXTURE0&&s<GL_TEXTURE0+8){if(!state.unit_textured(s-GL_TEXTURE0))usable=false;return int(8+s-GL_TEXTURE0);}
+    gap("unsupported GL_COMBINE source");};
+  auto operand=[](GLenum o){if(o<GL_SRC_COLOR||o>GL_ONE_MINUS_SRC_ALPHA)gap("unsupported GL_COMBINE operand");return int(o-GL_SRC_COLOR);};
+  auto scale=[](float v){return v==2?2:v==4?4:1;};
+  d={};
+  d[0]=function(env_param(unit,GL_COMBINE_RGB),true)|function(env_param(unit,GL_COMBINE_ALPHA),false)<<4;
+  for(int i=0;i<3;++i) {
+    d[1]|=source(env_param(unit,GL_SOURCE0_RGB+i))<<(4*i)|source(env_param(unit,GL_SOURCE0_ALPHA+i))<<(12+4*i);
+    d[2]|=operand(env_param(unit,GL_OPERAND0_RGB+i))<<(2*i)|operand(env_param(unit,GL_OPERAND0_ALPHA+i))<<(6+2*i);
+  }
+  auto stored=[&](GLenum name){auto it=state.env_params[unit].find(name);return it==state.env_params[unit].end()?1.f:it->second;};
+  d[3]=scale(stored(GL_RGB_SCALE))|scale(stored(GL_ALPHA_SCALE))<<4;
+  return usable;
+}
 RasterState raster_state(bool fixed) {
   auto r=state.raster;
   if(state.enabled[GL_CULL_FACE]) {
@@ -2595,10 +2911,12 @@ RasterState raster_state(bool fixed) {
   r.stencil_fail=stencil_op(integer(GL_STENCIL_FAIL,GL_KEEP));r.stencil_depth_fail=stencil_op(integer(GL_STENCIL_PASS_DEPTH_FAIL,GL_KEEP));r.stencil_pass=stencil_op(integer(GL_STENCIL_PASS_DEPTH_PASS,GL_KEEP));
   r.depth_bias=state.enabled[GL_POLYGON_OFFSET_FILL];
   if(fixed) {
-    if(state.enabled[GL_LIGHTING])gap("fixed-function lighting draw needs implementation");
     for(unsigned i=0;i<8;++i) {
-      if(state.texture_enabled[i])r.fixed_texture|=1u<<i;
-      unsigned mode=0;switch(state.texture_env[i]) {case GL_MODULATE:break;case GL_REPLACE:mode=1;break;case GL_ADD:mode=2;break;case GL_DECAL:mode=3;break;case GL_BLEND:mode=4;break;default:gap("fixed-function texture combine mode needs implementation");}
+      if(!state.unit_textured(i))continue; // a disabled unit's environment has no effect
+      r.fixed_texture|=1u<<i;
+      unsigned mode=0;switch(state.texture_env[i]) {case GL_MODULATE:break;case GL_REPLACE:mode=1;break;case GL_ADD:mode=2;break;case GL_DECAL:mode=3;break;case GL_BLEND:mode=4;break;
+      case GL_COMBINE: {std::array<int32_t,4> d;if(!combine_words(i,d)){r.fixed_texture&=~(1u<<i);continue;}mode=5;break;}
+      default:gap("unsupported fixed-function texture environment mode");}
       r.fixed_env|=mode<<(3*i);
     }
     if(state.enabled[GL_FOG]) {auto mode=GLenum(value(GL_FOG_MODE,{GL_EXP,0,0,0})[0]);r.fog_mode=mode==GL_LINEAR?1:mode==GL_EXP?2:3;}
@@ -2697,11 +3015,26 @@ std::shared_ptr<Material> material(Program &p) {
   for(const auto &s:p.record->samplers) {
     if(s.count!=1)gap("sampler arrays need descriptor-array binding");
     const auto unit=p.sampler_units[int(s.binding)];if(unit<0||unit>=8)gap("guest sampler texture unit outside supported range");
-    auto &object=state.texture_objects[state.textures[unsigned(unit)]];
-    auto image=native_image(object);auto sampler=native_sampler(object,image->info.levels,s.type.find("Shadow")!=std::string::npos);
+    // arbprog.c names its rectangle samplers sr_<unit>: those read the unit's rectangle binding.
+    const bool cube=s.type.find("Cube")!=std::string::npos;
+    // fixed_texture<N>: a fixed-function unit, whose rectangle target wins over 2D when enabled.
+    const bool rect=s.name.rfind("sr_",0)==0||(s.name.rfind("fixed_texture",0)==0&&state.rect_enabled[unsigned(unit)]);
+    const GLuint id=(cube?state.cube_textures:rect?state.rect_textures:state.textures)[unsigned(unit)];
+    resolve_texture(id);
+    auto &object=state.texture_objects[id];
+    auto image=native_image(object);
+    if(cube&&image==state.fallback) {
+      if(!state.cube_fallback) {
+        TextureInfo info{1,1,1,6};info.cube=true;state.cube_fallback=std::make_shared<Texture>(*state.device,info);
+        const uint8_t black[]={0,0,0,255};for(uint32_t face=0;face<6;++face)state.cube_fallback->upload(state.cmd,*state.ring,0,face,black,4);
+      }
+      image=state.cube_fallback;
+    }
+    auto sampler=native_sampler(object,image->info.levels,s.type.find("Shadow")!=std::string::npos);
     const bool array=s.type.find("2DArray")!=std::string::npos;
-    if(image->info.layers>1 && !array)gap("stereo texture requires a rebuilt offline shader archive with array samplers");
-    const auto view=array?image->array_view():image->view();
+    if(cube&&!image->info.cube)gap("cube sampler bound to a 2D texture");
+    if(image->info.layers>1 && !array && !cube)gap("stereo texture requires a rebuilt offline shader archive with array samplers");
+    const auto view=array&&!image->info.cube?image->array_view():image->view();
     bindings.push_back({s.binding,view,sampler->handle()});key_word(key,(uint64_t)(uintptr_t)view);key_word(key,(uint64_t)(uintptr_t)sampler->handle());
     images.push_back(image);samplers.push_back(sampler);
   }
@@ -2758,7 +3091,7 @@ bool stereo_packet(DrawPacket &packet,GLint first,GLsizei count,const std::vecto
   facts.offscreen=state.drawable && !state.eye_pbuffer(size[0],size[1]);
   facts.hud_target=state.drawable==state.hud_target;facts.multiview=1;
   facts.zoom=state.stereo->zoomed(p);
-  const auto texture=state.texture_objects.find(state.textures[0]);
+  const auto texture=state.texture_objects.find(!state.program&&state.rect_enabled[0]?state.rect_textures[0]:state.textures[0]);
   if(texture!=state.texture_objects.end())facts.texture_view=texture->second.picture_view;
   const auto *profile=game_profile();
   facts.picture_target=profile->vr.world_w>0 && size[0]==profile->vr.world_w && size[1]==profile->vr.world_h;
@@ -2848,11 +3181,54 @@ bool stereo_packet(DrawPacket &packet,GLint first,GLsizei count,const std::vecto
 void draw_geometry(GLenum mode,GLint first,GLsizei count,const void *indices,GLenum index_type,bool indexed,
                    const void *immediate=nullptr,uint32_t immediate_stride=0) {
   if(count<=0)return;if(first<0)gap("negative guest first vertex");
-  const bool guest_indexed=indexed;
+  if(state.program&&!state.programs.at(state.program).record)return; // harvesting: not converted yet
+  // LINDBERGH_VULKAN_DEBUG_DRAWS=drawable:k keeps the first k draws into that
+  // drawable each frame (bisecting a diagnostic capture); the rest are dropped.
+  static const auto debug_draws=[]{std::array<unsigned,2> r{~0u,~0u};if(const auto *v=std::getenv("LINDBERGH_VULKAN_DEBUG_DRAWS"))std::sscanf(v,"%u:%u",&r[0],&r[1]);return r;}();
+  if(debug_draws[0]==state.drawable) {
+    static unsigned frame=~0u,n=0;if(frame!=g_frame){frame=g_frame;n=0;}
+    if(n++>=debug_draws[1])return;
+    if(g_frame==unsigned(std::atoi(std::getenv("LINDBERGH_SHOT_FRAME")?std::getenv("LINDBERGH_SHOT_FRAME"):"0")))
+      std::fprintf(stderr,"[vulkan-debug-draw] %u: program %u textures %u %u %u %u fixed %d mode %#x count %d\n",n,state.program,state.textures[0],state.textures[1],state.textures[2],state.textures[3],!state.program,mode,count);
+  }
+  const bool guest_indexed=indexed;mark_drawn();
   auto *target=state.target();auto &p=current_program();native_program(p);legacy_uniforms(p,*target);
-  const bool fixed=!state.program;
+  const bool fixed=!state.program||p.fixed_fragment; // fixed-function fragment state applies
   if(fixed)for(size_t block=0;block<p.record->uniforms.size();++block) {
     auto field=p.uniforms[block]->find("fixed_env_color");if(field>=0)p.uniforms[block]->write(uint32_t(field),state.env_color.data(),sizeof state.env_color,0,8);
+    if(const auto lighting=p.uniforms[block]->find("fixed_lighting");lighting>=0) {
+      std::array<int32_t,4> l{};
+      if(state.enabled[GL_LIGHTING]) {
+        for(unsigned i=0;i<8;++i)if(state.enabled[GL_LIGHT0+i])l[0]|=1<<i;
+        if(state.enabled[GL_COLOR_MATERIAL])switch(integer(GL_COLOR_MATERIAL_PARAMETER,GL_AMBIENT_AND_DIFFUSE)) {
+          case GL_AMBIENT:l[1]=1;break;case GL_DIFFUSE:l[1]=2;break;case GL_AMBIENT_AND_DIFFUSE:l[1]=3;break;
+          case GL_SPECULAR:l[1]=4;break;case GL_EMISSION:l[1]=5;break;}
+        l[2]=(integer(GL_LIGHT_MODEL_LOCAL_VIEWER,0)!=0)|(integer(GL_LIGHT_MODEL_TWO_SIDE,0)!=0)<<1;l[3]=state.enabled[GL_NORMALIZE]||state.enabled[GL_RESCALE_NORMAL];
+      }
+      p.uniforms[block]->write(uint32_t(lighting),l.data(),sizeof l,0,1);
+    }
+    if(const auto ambient=p.uniforms[block]->find("fixed_light_model_ambient");ambient>=0) {
+      const auto a=value(GL_LIGHT_MODEL_AMBIENT,{.2f,.2f,.2f,1});p.uniforms[block]->write(uint32_t(ambient),a.data(),sizeof a,0,1);
+    }
+    if(const auto rect=p.uniforms[block]->find("fixed_rect");rect>=0) {
+      // A rectangle unit's texel coordinates, normalized by its logical size
+      // (a render target drawn larger keeps the same normalized lookup).
+      std::array<std::array<float,4>,8> scale{};
+      for(unsigned i=0;i<8;++i) {
+        scale[i]={1,1,0,0};
+        if(!state.rect_enabled[i])continue;
+        auto it=state.texture_objects.find(state.rect_textures[i]);
+        if(it!=state.texture_objects.end()&&it->second.levels.count(0)&&it->second.levels.at(0).width>0&&it->second.levels.at(0).height>0)
+          scale[i]={1.f/it->second.levels.at(0).width,1.f/it->second.levels.at(0).height,0,0};
+      }
+      p.uniforms[block]->write(uint32_t(rect),scale.data(),sizeof scale,0,8);
+    }
+    field=p.uniforms[block]->find("fixed_combine");
+    if(field>=0) {
+      std::array<std::array<int32_t,4>,8> words{};
+      for(unsigned i=0;i<8;++i)if(state.unit_textured(i)&&state.texture_env[i]==GL_COMBINE)combine_words(i,words[i]);
+      p.uniforms[block]->write(uint32_t(field),words.data(),sizeof words,0,8);
+    }
   }
   auto images=material(p);p.native->layouts[2]=images->descriptors->layout();
   std::vector<uint32_t> locations;for(const auto &input:p.record->inputs)locations.push_back(input.location);
@@ -2880,10 +3256,23 @@ void draw_geometry(GLenum mode,GLint first,GLsizei count,const void *indices,GLe
       for(size_t i=0;i<size_t(count);++i) {uint32_t v=0;std::memcpy(&v,data+i*bytes,bytes);elements[i]=v;if(v==UINT32_MAX)gap("guest index range overflow");vertices=std::max(vertices,v+1);}
     }
   }
+  // Mesa KosmicKrisp (Mac) cannot build a layered Metal pipeline (our shaders
+  // select the eye layer) for points or for the fans it emulates
+  // ("inputPrimitiveTopology is not specified"). There, fans become triangle
+  // lists and points are skipped; other drivers (Quest) draw both natively.
+  static const bool metal_layers=std::strncmp(state.device->capabilities.properties.deviceName,"Apple",5)==0;
+  if(metal_layers&&mode==GL_TRIANGLE_FAN)mode=GL_POLYGON; // the same triangles
   auto raster=raster_state(fixed);raster.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
   if(mode==GL_TRIANGLE_STRIP)raster.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
   else if(mode==GL_TRIANGLE_FAN)raster.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
-  else if(mode==GL_POINTS)raster.topology=VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+  else if(mode==GL_POINTS) {
+    if(metal_layers) {
+      static bool warned=false;
+      if(!warned){warned=true;std::fprintf(stderr,"[vulkan] point draws skipped on this Apple GPU driver (KosmicKrisp layered points); particles missing in Mac runs only\n");}
+      return;
+    }
+    raster.topology=VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+  }
   else if(mode==GL_LINES) {raster.topology=VK_PRIMITIVE_TOPOLOGY_LINE_LIST;count-=count%2;}
   else if(mode==GL_LINE_STRIP)raster.topology=VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
   else if(mode==GL_TRIANGLES)count-=count%3;
@@ -2960,7 +3349,8 @@ extern "C" void lvk_glGetTexEnvfv(GLenum target,GLenum name,GLfloat *v) {
   const unsigned unit=state.active_texture-GL_TEXTURE0;
   if(target==GL_TEXTURE_ENV&&name==GL_TEXTURE_ENV_COLOR){std::copy(state.env_color[unit].begin(),state.env_color[unit].end(),v);return;}
   if(target==GL_TEXTURE_ENV&&name==GL_TEXTURE_ENV_MODE){v[0]=GLfloat(state.texture_env[unit]);return;}
-  if(auto it=state.floats.find((target<<16)|name);it!=state.floats.end()){v[0]=it->second[0];return;}
+  if(target==GL_TEXTURE_ENV){if(auto it=state.env_params[unit].find(name);it!=state.env_params[unit].end()){v[0]=it->second;return;}}
+  else if(auto it=state.floats.find((target<<16)|name);it!=state.floats.end()){v[0]=it->second[0];return;}
   // GL's initial texture environment
   switch(name){
   case GL_COMBINE_RGB: case GL_COMBINE_ALPHA: v[0]=GL_MODULATE; return;

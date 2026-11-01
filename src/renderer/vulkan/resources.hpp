@@ -44,6 +44,7 @@ struct TextureInfo {
     uint32_t levels = 1, layers = 1;
     VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
     VkComponentMapping components{};
+    bool cube = false; // six layers, sampled through a cube view
 };
 
 class Texture {

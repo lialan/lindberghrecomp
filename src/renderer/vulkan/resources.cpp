@@ -122,7 +122,8 @@ Texture::Texture(Device &device, TextureInfo texture) : info(texture), device_(d
     if (!info.width || !info.height || !info.levels || !info.layers ||
         info.width > device.capabilities.properties.limits.maxImageDimension2D ||
         info.height > device.capabilities.properties.limits.maxImageDimension2D ||
-        info.layers > device.capabilities.properties.limits.maxImageArrayLayers)
+        info.layers > device.capabilities.properties.limits.maxImageArrayLayers ||
+        (info.cube && (info.layers != 6 || info.width != info.height)))
         throw std::invalid_argument("Invalid Vulkan texture dimensions");
     uint32_t max_levels = 1;
     for (uint32_t side = std::max(info.width, info.height); side > 1; side >>= 1) ++max_levels;
@@ -161,6 +162,7 @@ Texture::Texture(Device &device, TextureInfo texture) : info(texture), device_(d
     try {
         VkImageCreateInfo create{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         create.imageType = VK_IMAGE_TYPE_2D; create.format = info.format;
+        if (info.cube) create.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
         create.extent = {info.width, info.height, 1};
         create.mipLevels = info.levels; create.arrayLayers = info.layers;
         create.samples = VK_SAMPLE_COUNT_1_BIT; create.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -175,7 +177,7 @@ Texture::Texture(Device &device, TextureInfo texture) : info(texture), device_(d
         check(vkBindImageMemory(d, image_, memory_, 0), "bind texture memory");
         VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         view.image = image_; view.format = info.format; view.components = info.components;
-        view.viewType = info.layers == 1 ? VK_IMAGE_VIEW_TYPE_2D : VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+        view.viewType = info.cube ? VK_IMAGE_VIEW_TYPE_CUBE : info.layers == 1 ? VK_IMAGE_VIEW_TYPE_2D : VK_IMAGE_VIEW_TYPE_2D_ARRAY;
         view.subresourceRange = {info.format == Target::depth_format ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, info.levels, 0, info.layers};
         check(vkCreateImageView(d, &view, nullptr, &view_), "sampled texture view");
     } catch (...) { release(); throw; }
