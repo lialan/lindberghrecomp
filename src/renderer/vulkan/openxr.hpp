@@ -82,6 +82,9 @@ private:
     PFN_xrCreateVulkanDeviceKHR create_device_ = nullptr;
     PFN_xrGetVulkanGraphicsDevice2KHR get_device_ = nullptr;
     bool refresh_control_ = false,performance_control_=false,thread_control_=false;
+    // XR_META_foveation_eye_tracked: the density map follows the gaze
+    // (Steam Frame); otherwise the FB level profile is fixed.
+    bool eye_tracked_foveation_=false;
     uint32_t renderer_tid_=0;
 #ifdef __ANDROID__
     PFN_xrSetAndroidApplicationThreadKHR set_thread_=nullptr;

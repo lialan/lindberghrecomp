@@ -16,6 +16,9 @@
  * dies and a debugger still gets its turn. Nothing here allocates.
  */
 
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE     /* glibc: dladdr and Dl_info */
+#endif
 #include <signal.h>
 #include <string.h>
 #include <stdlib.h>

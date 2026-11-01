@@ -2,6 +2,7 @@
 #include "../../runtime/stereo_projection.h"
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <stdexcept>
@@ -56,6 +57,18 @@ OpenXR::OpenXR(OpenXRConfig config,OpenXRPlatform platform)
                 if (!has(name)) throw std::runtime_error(std::string("Required OpenXR foveation extension unavailable: ")+name);
                 extensions.push_back(name);
             }
+            // Eye-tracked foveation where the headset has it: by default on
+            // desktop OpenXR (Steam Frame), off on Android (Quest 3 has no eye
+            // tracking). LINDBERGH_XR_EYE_FOVEATION=0|1 overrides.
+#ifdef __ANDROID__
+            bool want_eye=false;
+#else
+            bool want_eye=true;
+#endif
+            if(const char *v=std::getenv("LINDBERGH_XR_EYE_FOVEATION");v&&*v)want_eye=*v!='0';
+            if(want_eye&&has(XR_META_FOVEATION_EYE_TRACKED_EXTENSION_NAME)) {
+                extensions.push_back(XR_META_FOVEATION_EYE_TRACKED_EXTENSION_NAME);eye_tracked_foveation_=true;
+            } else if(want_eye) std::fprintf(stderr,"[vulkan-xr] runtime has no XR_META_foveation_eye_tracked: fixed foveation\n");
         }
         performance_control_=has(XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME);
         if(performance_control_)extensions.push_back(XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME);
@@ -80,6 +93,14 @@ OpenXR::OpenXR(OpenXRConfig config,OpenXRPlatform platform)
         xr_check(xrCreateInstance(&create,&instance_),"create OpenXR instance");
         XrSystemGetInfo system{XR_TYPE_SYSTEM_GET_INFO}; system.formFactor=XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
         xr_check(xrGetSystem(instance_,&system,&system_),"OpenXR HMD system");
+        if(eye_tracked_foveation_) {
+            XrSystemFoveationEyeTrackedPropertiesMETA eye{XR_TYPE_SYSTEM_FOVEATION_EYE_TRACKED_PROPERTIES_META};
+            XrSystemProperties props{XR_TYPE_SYSTEM_PROPERTIES};props.next=&eye;
+            if(XR_FAILED(xrGetSystemProperties(instance_,system_,&props))||!eye.supportsFoveationEyeTracked) {
+                eye_tracked_foveation_=false;
+                std::fprintf(stderr,"[vulkan-xr] headset does not support eye-tracked foveation: fixed foveation\n");
+            }
+        }
         create_instance_=function<PFN_xrCreateVulkanInstanceKHR>(instance_,"xrCreateVulkanInstanceKHR");
         create_device_=function<PFN_xrCreateVulkanDeviceKHR>(instance_,"xrCreateVulkanDeviceKHR");
         get_device_=function<PFN_xrGetVulkanGraphicsDevice2KHR>(instance_,"xrGetVulkanGraphicsDevice2KHR");
@@ -330,6 +351,10 @@ void OpenXR::set_foveation(int level)
     static const XrFoveationLevelFB levels[]={XR_FOVEATION_LEVEL_NONE_FB,XR_FOVEATION_LEVEL_LOW_FB,XR_FOVEATION_LEVEL_MEDIUM_FB,XR_FOVEATION_LEVEL_HIGH_FB};
     XrFoveationLevelProfileCreateInfoFB info{XR_TYPE_FOVEATION_LEVEL_PROFILE_CREATE_INFO_FB};
     info.level=levels[level<0||level>3?2:level]; info.dynamic=XR_FOVEATION_DYNAMIC_DISABLED_FB;
+    // The level sets how far the periphery drops; with eye tracking its
+    // centre is where the player looks rather than the lens centre.
+    XrFoveationEyeTrackedProfileCreateInfoMETA eye{XR_TYPE_FOVEATION_EYE_TRACKED_PROFILE_CREATE_INFO_META};
+    if(eye_tracked_foveation_&&level>0)info.next=&eye;
     XrFoveationProfileCreateInfoFB profile{XR_TYPE_FOVEATION_PROFILE_CREATE_INFO_FB}; profile.next=&info;
     XrFoveationProfileFB created=XR_NULL_HANDLE;
     xr_check(create_profile_(session_,&profile,&created),"OpenXR foveation profile");
@@ -337,7 +362,7 @@ void OpenXR::set_foveation(int level)
     xr_check(update_swapchain_(swapchain_,reinterpret_cast<XrSwapchainStateBaseHeaderFB *>(&state)),"OpenXR foveation swapchain state");
     if(profile_&&destroy_profile_)destroy_profile_(profile_);
     profile_=created;
-    std::fprintf(stderr,"[vulkan-xr] foveation level %d\n",level);
+    std::fprintf(stderr,"[vulkan-xr] foveation level %d%s\n",level,info.next?", eye-tracked":"");
 }
 void OpenXR::request_refresh(float hz)
 {

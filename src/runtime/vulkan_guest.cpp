@@ -19,7 +19,12 @@
 #ifdef LINDBERGH_VULKAN_XR
 #include "../renderer/vulkan/openxr.hpp"
 #include <SDL_system.h>
+#ifdef __ANDROID__
 #include <android/asset_manager_jni.h>
+#else
+#include <cerrno>
+#include <unistd.h>
+#endif
 #endif
 extern "C" {
 #include "game_profile.h"
@@ -35,6 +40,7 @@ extern "C" {
 #include <fstream>
 #include <map>
 #include <memory>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 #include <cmath>
@@ -171,7 +177,7 @@ struct Material {
   std::vector<std::shared_ptr<Texture>> images;
   std::vector<std::shared_ptr<Sampler>> samplers;
 };
-#ifdef LINDBERGH_VULKAN_XR
+#if defined(LINDBERGH_VULKAN_XR) && defined(__ANDROID__)
 // SDL supplies a local Activity reference. Keep a global reference until the
 // XR session and instance have been destroyed, including failure teardown.
 struct ActivityRef {
@@ -233,6 +239,46 @@ struct ActivityRef {
     }
   }
   OpenXRPlatform platform() const { return {vm,activity}; }
+};
+#elif defined(LINDBERGH_VULKAN_XR)
+// Desktop OpenXR (native Linux, e.g. Steam Frame): no Activity. The shader
+// archives ship next to the executable, in vulkan/ (or LINDBERGH_VULKAN_DIR).
+struct ActivityRef {
+  void restart() {
+    // Same process image, same arguments: what the Quest's restartGame does.
+    std::fprintf(stderr,"[vulkan-xr] restarting the game\n");std::fflush(nullptr);
+    char exe[4096];const auto n=readlink("/proc/self/exe",exe,sizeof exe-1);
+    if(n<=0){std::fprintf(stderr,"[vulkan-xr] game restart failed: no /proc/self/exe\n");return;}
+    exe[n]=0;
+    std::vector<std::string> args;
+    if(std::ifstream cmdline{"/proc/self/cmdline",std::ios::binary}) {
+      std::string arg;while(std::getline(cmdline,arg,'\0'))args.push_back(arg);
+    }
+    if(args.empty())args.push_back(exe);
+    std::vector<char *> argv;for(auto &a:args)argv.push_back(a.data());argv.push_back(nullptr);
+    execv(exe,argv.data());
+    std::fprintf(stderr,"[vulkan-xr] game restart failed: %s\n",std::strerror(errno));
+  }
+  void shader_defaults() {
+    std::filesystem::path directory;
+    if(const char *v=std::getenv("LINDBERGH_VULKAN_DIR");v&&*v)directory=v;
+    else if(char *base=SDL_GetBasePath()){directory=std::filesystem::path(base)/"vulkan";SDL_free(base);}
+    else directory="vulkan";
+    for (auto entry : {std::pair{"LINDBERGH_VULKAN_SHADERS","game.lvsp"},
+                       std::pair{"LINDBERGH_VULKAN_FIXED_SHADERS","fixed.lvsp"},
+                       std::pair{"LINDBERGH_VULKAN_RECIPES_SEED","pipelines.lvpr"}}) {
+      const char *override=std::getenv(entry.first);
+      if (override && *override) continue;
+      const auto path=directory/entry.second;
+      std::error_code ignored;
+      if(!std::filesystem::is_regular_file(path,ignored)) {
+        if(std::strcmp(entry.first,"LINDBERGH_VULKAN_RECIPES_SEED")==0)continue;
+        throw std::runtime_error("Missing packaged shader archive: "+path.string());
+      }
+      SDL_setenv(entry.first,path.c_str(),1);
+    }
+  }
+  OpenXRPlatform platform() const { return {}; }
 };
 #endif
 struct State {
@@ -808,8 +854,10 @@ extern "C" int stereo_gun_ray(int player,float origin[3],float direction[3])
 extern "C" int lvk_host_can_thread(void) { return state.ready; }
 extern "C" int lvk_host_thread_enter(void) {
 #ifdef LINDBERGH_VULKAN_XR
+#ifdef __ANDROID__
   // SDL attaches this pthread once and detaches it through its TLS destructor.
   if(!SDL_AndroidGetJNIEnv())return 0;
+#endif
   if(state.xr)state.xr->renderer_thread();
   return 1;
 #else

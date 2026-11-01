@@ -783,8 +783,13 @@ int host_window_open(const char *title)
                                  dw, dh,
 #if defined(LINDBERGH_VULKAN_OFFSCREEN)
                                  0 |
-#elif defined(LINDBERGH_VULKAN_XR)
+#elif defined(LINDBERGH_VULKAN_XR) && defined(__ANDROID__)
                                  SDL_WINDOW_FULLSCREEN |
+#elif defined(LINDBERGH_VULKAN_XR)
+                                 /* desktop OpenXR (Linux, Steam Frame): the
+                                  * headset is the display; the window only
+                                  * carries SDL's events */
+                                 SDL_WINDOW_HIDDEN |
 #elif defined(LINDBERGH_VULKAN)
                                  SDL_WINDOW_VULKAN |
 #else

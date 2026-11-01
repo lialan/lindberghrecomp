@@ -1,6 +1,7 @@
 #include "resources.hpp"
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <stdexcept>
 
 namespace lindbergh::vk {
