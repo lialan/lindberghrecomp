@@ -82,10 +82,12 @@ unsigned SettingsPanel::update(LgXrSettings &cfg,StereoScene &scene,ControllerIn
             stats_shown_=true;
         }
         if(stats_shown_){
-            // Head-locked in the top-right corner, about 1 m out: centre
-            // 0.30 m right and 0.22 m up (about 17 and 12 degrees).
-            XpPanel label{};label.hw=.11f;label.hh=label.hw*XM_STATS_H/XM_STATS_W;
-            const float x[]={1,0,0},y[]={0,1,0},z[]={0,0,1},at[]={.30f,.22f,-1};float offset[3];const auto &q=scene.head_orientation();
+            // Head-locked in the top-right corner, about 1 m out, 0.286 m
+            // wide. Its outer (top-right) corner stays at 0.41 m right and
+            // 0.257 m up (about 22 and 14 degrees) so a bigger panel grows
+            // inward, away from the more heavily foveated edge.
+            XpPanel label{};label.hw=.143f;label.hh=label.hw*XM_STATS_H/XM_STATS_W;
+            const float x[]={1,0,0},y[]={0,1,0},z[]={0,0,1},at[]={.41f-label.hw,.2567f-label.hh,-1};float offset[3];const auto &q=scene.head_orientation();
             lg_stereo_rotate(q.data(),x,label.right);lg_stereo_rotate(q.data(),y,label.up);lg_stereo_rotate(q.data(),z,label.n);lg_stereo_rotate(q.data(),at,offset);
             for(int i=0;i<3;++i)label.c[i]=head[i]+offset[i];draws_[1].visible=true;xp_matrix(&label,draws_[1].model.data());}
     }else{stats_since_=stats_frames_=0;}
