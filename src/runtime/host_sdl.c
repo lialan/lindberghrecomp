@@ -1,3 +1,4 @@
+#include "frame_timing.h"
 #include <pthread.h>
 /*
  * host_sdl.c - the host window on a POSIX host, through SDL2.
@@ -802,6 +803,15 @@ int host_window_open(const char *title)
             ""
 #endif
             );
+    // Register exit output before worker shutdown, so LIFO teardown drains
+    // all renderer records before writing the capture. No per-frame file I/O.
+#if defined(LINDBERGH_VULKAN)
+    frame_timing_init("vulkan");
+#elif defined(LINDBERGH_OPENXR)
+    frame_timing_init("opengl-openxr");
+#else
+    frame_timing_init("opengl");
+#endif
     return 1;
 }
 
@@ -960,6 +970,7 @@ static void pace(void)
 
 /* Shared worker: guest ABI snapshots, state filtering, one-frame overlap. */
 #include "render_queue.h"
+
 #ifndef LINDBERGH_VULKAN
 static int gl_release(void) { return SDL_GL_MakeCurrent(g_win.win, NULL) == 0; }
 static int gl_take(void) { return SDL_GL_MakeCurrent(g_win.win, g_win.gl) == 0; }
@@ -1006,6 +1017,7 @@ static void frame_gl(void *arg)
     (void)arg;
 #ifdef LINDBERGH_VULKAN
     lvk_host_present();
+    if (frame_timing_on) frame_timing_record(g_frame,SDL_GetPerformanceCounter(),SDL_GetPerformanceFrequency());
     maybe_peek();
     ++g_frame;
     return;
@@ -1015,6 +1027,7 @@ static void frame_gl(void *arg)
     stereo_frame_end();                 /* the second eye, then both to the headset */
     g_t_eye2 += since_mark();
     xr_frame_end();
+    if (frame_timing_on) frame_timing_record(g_frame,SDL_GetPerformanceCounter(),SDL_GetPerformanceFrequency());
     g_t_submit += since_mark();
 #else
     if (stereo_enabled()) {             /* draw the second eye, show both */
@@ -1041,6 +1054,9 @@ static void frame_gl(void *arg)
         SDL_GL_SwapWindow(g_win.win);
         if (fb) glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)fb);
     }
+#if !defined(LINDBERGH_OPENXR)
+    if (frame_timing_on) frame_timing_record(g_frame-1,SDL_GetPerformanceCounter(),SDL_GetPerformanceFrequency());
+#endif
     stereo_frame_begin();
 }
 

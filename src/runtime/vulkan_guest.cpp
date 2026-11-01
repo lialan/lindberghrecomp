@@ -24,9 +24,11 @@ extern "C" {
 #include <unordered_set>
 #include <cmath>
 #include <sstream>
+#include <chrono>
 
 using namespace lindbergh::vk;
 extern "C" unsigned char *g_guest_base;
+extern "C" unsigned g_frame;
 namespace {
 [[noreturn]] void gap(const char *what) {
   std::fprintf(stderr, "[vulkan] %s\n", what);
@@ -223,7 +225,18 @@ struct State {
   Target *target() { frame(); return drawable ? drawables.at(drawable).get() : screen; }
   void flush() {
     end_pass();
-    for (auto &p : packets) if (p.count) p.renderer->prepare(p.raster);
+    static const bool profile_prepare=[] {const auto *v=std::getenv("LINDBERGH_VULKAN_PREPARE_TIMING");return v && *v=='1';}();
+    if (profile_prepare) {
+      const auto start=std::chrono::steady_clock::now();
+      size_t created=0;
+      for (auto &p : packets) if (p.count) {
+        const auto before=p.renderer->pipeline_count();
+        p.renderer->prepare(p.raster);
+        created+=p.renderer->pipeline_count()-before;
+      }
+      const auto ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
+      if (created || ms>2) std::fprintf(stderr,"[vulkan-prepare] frame %u: %zu packets, %zu new pipelines, %.3f ms\n",g_frame,packets.size(),created,ms);
+    } else for (auto &p : packets) if (p.count) p.renderer->prepare(p.raster);
     for (auto &p : packets) {
       if (active_target != p.target) {
         end_pass(); p.renderer->begin(cmd,p.color,initialized.count(p.target)!=0);
