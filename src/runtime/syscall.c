@@ -108,7 +108,7 @@ void linux_syscall(CPU *c)
         if (a) {
             uint32_t *tv = (uint32_t *)gp(a);
             struct timespec ts;
-            timespec_get(&ts, TIME_UTC);
+            clock_gettime(CLOCK_REALTIME, &ts);   /* timespec_get is missing from MSVCRT (MSYS2 MINGW64) */
             tv[0] = (uint32_t)ts.tv_sec;
             tv[1] = (uint32_t)(ts.tv_nsec / 1000);
         }
