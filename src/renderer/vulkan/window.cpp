@@ -56,6 +56,7 @@ Window::Window(Device &device, SDL_Window *window, uint32_t frames) : device_(de
         check(vkGetSwapchainImagesKHR(h.device, swapchain_, &count, images.data()), "swapchain images");
         for (const auto image : images) {
             TargetInfo info{extent.width, extent.height, 1, format.format, image, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR};
+            info.frame_depth = true;
             targets_.push_back(std::make_unique<Target>(device, info));
         }
         acquire_.resize(frames); present_.resize(count);

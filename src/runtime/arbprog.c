@@ -18,7 +18,8 @@
  * the GL matrix stacks and uploaded as rows, so nothing depends on GLSL's
  * compatibility built-ins for them. Programs with control flow (NV BRA, CAL,
  * RET) become a loop over basic blocks with a program counter and a call
- * stack, which keeps the original's arbitrary jumps exact.
+ * stack, which keeps the original's arbitrary jumps exact; the entry block
+ * runs once ahead of that loop.
  *
  * Anything the translator does not understand fails the translation with a
  * reason, once, and that program falls back to the driver's own path.
@@ -145,6 +146,7 @@ typedef struct {
     int     nlabel;
     int     has_flow;
     int     block;                     /* current block number when has_flow */
+    int     loop_open;                 /* the block loop has begun (after the hoisted entry) */
     /* literals inside a constant array that otherwise is program.env as it
      * is: written into the program's copy of env when it is uploaded */
     int     nlit;
@@ -679,7 +681,13 @@ static void block_split(Tr *t)
 {
     if (!t->has_flow) return;
     t->block++;
-    bput(&t->body, "    } else if (pc == %d) {\n", t->block);
+    if (!t->loop_open) {
+        /* The entry block, which nothing branches back to, ran once before the
+         * loop: a vertex position it writes then never depends on the loop, so
+         * the GPU's position-only (binning) shader can leave the loop out. */
+        t->loop_open = 1;
+        bput(&t->body, "  for (int it = 0; it < 4096; it++) {\n    if (pc < 0) break;\n    if (pc == %d) {\n", t->block);
+    } else bput(&t->body, "    } else if (pc == %d) {\n", t->block);
 }
 
 static int label_index(Tr *t, const char *name)
@@ -769,7 +777,7 @@ static int emit_instr(Tr *t, char *stmt)
         int next = t->block + 1;
         if (!t->has_flow) return 1;     /* the final RET of a program without branches */
         if (!strcmp(op, "RET")) {
-            bput(&t->body, "      if (any(%s)) { if (sp > 0) { sp--; pc = stk[sp]; } else pc = -1; } else pc = %d;\n",
+            bput(&t->body, "      if (any(%s)) { if (sp > 0) { sp--; pc = sp == 0 ? stk0 : sp == 1 ? stk1 : sp == 2 ? stk2 : stk3; } else pc = -1; } else pc = %d;\n",
                  test, next);
         } else {
             int li = label_index(t, lab);
@@ -777,8 +785,11 @@ static int emit_instr(Tr *t, char *stmt)
             if (!strcmp(op, "BRA"))
                 bput(&t->body, "      if (any(%s)) pc = %d; else pc = %d;\n", test, g_label_block[li], next);
             else
-                bput(&t->body, "      if (any(%s)) { stk[sp] = %d; sp++; pc = %d; } else pc = %d;\n",
-                     test, next, g_label_block[li], next);
+                /* Return blocks in four scalars, not an indexed array (which
+                 * spills to memory on mobile GPUs); the Lindbergh programs
+                 * nest calls once at most. */
+                bput(&t->body, "      if (any(%s)) { if (sp == 0) stk0 = %d; else if (sp == 1) stk1 = %d; else if (sp == 2) stk2 = %d; else stk3 = %d; sp = sp < 4 ? sp + 1 : 4; pc = %d; } else pc = %d;\n",
+                     test, next, next, next, next, g_label_block[li], next);
         }
         block_split(t);
         return 1;
@@ -1126,7 +1137,15 @@ static char *translate(int stage, const char *src_in, Tr *t)
     if (t->err[0]) goto out;
 
     /* pass 2: instructions */
-    if (t->has_flow) bput(&t->body, "  for (int it = 0; it < 4096; it++) {\n    if (pc < 0) break;\n    if (pc == 0) {\n");
+    if (t->has_flow) {
+        /* a branch back to the entry block keeps it inside the loop */
+        int entry_target = 0;
+        for (int l = 0; l < t->nlabel; l++) if (g_label_block[l] == 0) entry_target = 1;
+        if (entry_target) {
+            t->loop_open = 1;
+            bput(&t->body, "  for (int it = 0; it < 4096; it++) {\n    if (pc < 0) break;\n    if (pc == 0) {\n");
+        }
+    }
     for (int i = 0; i < n; i++) {
         char *s = st[i].text;
         if (st[i].nl && t->has_flow) {
@@ -1187,7 +1206,7 @@ static char *translate(int stage, const char *src_in, Tr *t)
          * that line a global, never the end of a function like arb_lit. */
         bput(&g, "const float arb_one = 1.0;\n");
         bput(&g, "void main() {\n  vec4 r = vec4(0.0), cc = vec4(0.0);\n  bvec4 m = bvec4(false);\n");
-        if (t->has_flow) bput(&g, "  int pc = 0, sp = 0;\n  int stk[16];\n");
+        if (t->has_flow) bput(&g, "  int pc = 0, sp = 0, stk0 = 0, stk1 = 0, stk2 = 0, stk3 = 0;\n");
         if (stage == 0) {
             bput(&g, "  vec4 o_fog = vec4(0.0), o_psize = vec4(1.0);\n");
             bput(&g, "  gl_FrontColor = vec4(0.0); gl_FrontSecondaryColor = vec4(0.0);\n");
@@ -1297,6 +1316,14 @@ static Linked g_linked[MAX_LINKED];
 static int g_nlinked;
 
 static int g_dump = -1;
+
+/* The GLSL a program's text translates to (freed by the caller), or NULL:
+ * for the runtime self-check. */
+char *arb_translate_text(int stage, const char *src)
+{
+    static Tr t;
+    return translate(stage, src, &t);
+}
 
 static GLuint compile(GLenum type, const char *src, int stage, GLuint id)
 {

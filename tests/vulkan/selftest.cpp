@@ -129,6 +129,34 @@ static void render_density_reuse(Device &device)
     std::puts("ok: two density maps reuse prepared world framebuffers across asynchronous stereo draws");
 }
 
+// A frame's last pass stores no depth on a swapchain-like (frame_depth) target
+// only: on any other target a later pass must still be depth-tested against it.
+// Render passes for each load/store combination are created once and reused.
+static void render_last_pass(Device &device)
+{
+    for(bool frame_depth:{false,true}) {
+        FrameRing ring(device);TargetInfo info{32,32,1};info.final_layout=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;info.frame_depth=frame_depth;
+        Target target(device,info);PipelineCache cache(device,"");Renderer renderer(device,target,cache);RasterState raster;renderer.prepare(raster);
+        const Target::PassOps load{true,VK_ATTACHMENT_LOAD_OP_LOAD,VK_ATTACHMENT_LOAD_OP_LOAD};
+        require(target.pass(load)==target.load_pass&&target.pass({})==target.render_pass,"render passes were not reused");
+        Readback output(device,32*32*4);Matrices matrices{};
+        for(auto &m:matrices.view_projection)for(unsigned i=0;i<4;++i)m[i*5]=1;
+        Vertex near[]={{{-.9f,-.9f,.2f,1},{1,0,0,1}},{{.9f,-.9f,.2f,1},{1,0,0,1}},{{0,.9f,.2f,1},{1,0,0,1}}};
+        Vertex far[]={{{-.9f,-.9f,.5f,1},{0,1,0,1}},{{.9f,-.9f,.5f,1},{0,1,0,1}},{{0,.9f,.5f,1},{0,1,0,1}}};
+        auto cmd=ring.begin();
+        renderer.begin(cmd,{0,0,0,1},false,1,0,nullptr,false,true);renderer.draw(ring,near,3,matrices,raster);renderer.end();
+        if(!frame_depth){renderer.begin(cmd,{0,0,0,1},true);renderer.draw(ring,far,3,matrices,raster);renderer.end();}
+        VkBufferImageCopy copy{};copy.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};copy.imageExtent={32,32,1};
+        vkCmdCopyImageToBuffer(cmd,target.color,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,output.buffer,1,&copy);
+        VkBufferMemoryBarrier b{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};b.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;b.dstAccessMask=VK_ACCESS_HOST_READ_BIT;
+        b.srcQueueFamilyIndex=b.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;b.buffer=output.buffer;b.size=VK_WHOLE_SIZE;
+        vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&b,0,nullptr);
+        ring.wait(ring.submit());const auto *p=static_cast<const uint8_t *>(output.mapped)+(16*32+16)*4;
+        require(p[0]==255&&p[1]==0&&p[2]==0,frame_depth?"a last pass lost its colour":"a last pass discarded depth a later pass needed");
+    }
+    std::puts("ok: last passes discard only frame-local depth; render passes reused per load/store combination");
+}
+
 static void render_overlay(Device &device,bool foveation=false)
 {
     FrameRing ring(device);std::unique_ptr<ConstantDensityMap> density;
@@ -1279,6 +1307,7 @@ try {
     render_overlay(*device);
     if(device->capabilities.density_map&&device->capabilities.density_map_non_subsampled){render_overlay(*device,true);render_panels(*device,true);}
     render_density_reuse(*device);
+    render_last_pass(*device);
     render_copy(*device);
     render_stereo_depth_copy(*device);
     if (argc == 2) {

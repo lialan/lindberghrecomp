@@ -10,6 +10,7 @@
 #include "display_cadence.h"
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "lindbergh_rt.h"
@@ -103,8 +104,41 @@ static void test_display_cadence(void)
     CHECK(host_frame_period_ms() == 0);
 }
 
+char *arb_translate_text(int stage, const char *src);
+
+/* NV_vertex_program2 branches run as a block loop. The entry block, which
+ * nothing branches back to, runs once ahead of it, so a position it writes
+ * never depends on the loop (the GPU's position-only binning shader can drop
+ * the loop); calls keep their return blocks in scalars, not an indexed array. */
+static void test_arb_flow(void)
+{
+    char *g = arb_translate_text(0,
+        "!!ARBvp1.0\nOPTION NV_vertex_program2;\nTEMP R0;\n"
+        "MOV result.position, vertex.position;\nMOVC R0.x, program.env[0].x;\nBRA done (LE.x);\n"
+        "loop:\nCAL light (GT.x);\nADDC R0.x, R0.x, -1;\nBRA loop (GT.x);\n"
+        "done:\nMOV result.color, R0;\nRET;\nlight:\nADD R0.y, R0.y, 1;\nRET;\nEND\n");
+    CHECK(g != NULL);
+    if (g) {
+        const char *pos = strstr(g, "gl_Position"), *loop = strstr(g, "for (int it");
+        CHECK(pos && loop && pos < loop);
+        CHECK(!strstr(g, "stk["));
+        free(g);
+    }
+    /* A branch back to the first instruction keeps it inside the loop. */
+    g = arb_translate_text(0,
+        "!!ARBvp1.0\nOPTION NV_vertex_program2;\nTEMP R0;\n"
+        "top:\nMOV result.position, vertex.position;\nADDC R0.x, R0.x, -1;\nBRA top (GT.x);\nEND\n");
+    CHECK(g != NULL);
+    if (g) {
+        const char *pos = strstr(g, "gl_Position"), *loop = strstr(g, "for (int it");
+        CHECK(pos && loop && loop < pos);
+        free(g);
+    }
+}
+
 int main(void)
 {
+    test_arb_flow();
     test_display_cadence();
     test_dispatch();
     test_syscall_write();
@@ -113,6 +147,6 @@ int main(void)
     int test_runtime_abis(void);
     fails += test_runtime_abis();
     if (fails) { fprintf(stderr, "%d check(s) failed\n", fails); return 1; }
-    printf("ok: dispatch table, syscall layer, import names\n");
+    printf("ok: dispatch table, syscall layer, import names, assembly-program flow\n");
     return 0;
 }

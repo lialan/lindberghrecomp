@@ -41,6 +41,9 @@ public:
     // Bounded HUD/viewport classification reads CPU guest shadows only.
     bool position(uint32_t index,const GuestMemoryView &memory,const CpuBufferLookup &buffers,
                   std::array<float,4> &out) const;
+    // Whether every value of the attribute lies in [0,1]: an unsigned
+    // normalized array, or a current value in that range.
+    bool unit_range(uint32_t location) const;
     const ArrayPlan &prepare(Device &device, FrameRing &ring, uint32_t first, uint32_t count,
                              const GuestMemoryView &memory, const BufferLookup &buffers);
 private:

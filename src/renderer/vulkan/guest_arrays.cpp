@@ -1,3 +1,4 @@
+#include <algorithm>
 #include "guest_arrays.hpp"
 #include <limits>
 #include <cstring>
@@ -49,6 +50,13 @@ bool GuestArrays::position(uint32_t index,const GuestMemoryView &memory,const Cp
     const auto source=a.buffer?buffers(a.buffer):memory;
     out={0,0,0,1};std::memcpy(out.data(),source.read(uint32_t(address),a.components*4),a.components*4);
     return true;
+}
+
+bool GuestArrays::unit_range(uint32_t location) const
+{
+    const auto &a=arrays_.at(location);
+    if(a.enabled)return a.normalized&&(a.type==0x1401||a.type==0x1403||a.type==0x1405); // GL_UNSIGNED_BYTE, _SHORT, _INT
+    return std::all_of(a.value.begin(),a.value.end(),[](float v){return v>=0&&v<=1;});
 }
 
 void GuestArrays::pointer(uint32_t location, uint32_t components, uint32_t type,

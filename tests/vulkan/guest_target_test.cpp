@@ -68,6 +68,14 @@ static void layered_pixels(const std::string &path) {
         require(pixel(x,y)==std::array<unsigned,3>{0,255,0},"full-screen movie lost its screen or layer depth");
     require(pixel(32,32)==std::array<unsigned,3>{255,255,255},"foreground HUD text fell behind the movie");
 }
+// The centre texel of a size x size readback.
+static std::array<unsigned,3> centre(const std::string &path,unsigned size) {
+    std::ifstream in(path,std::ios::binary);std::string magic;unsigned w,h,maximum;
+    in>>magic>>w>>h>>maximum;in.get();
+    require(in&&magic=="P6"&&w==size&&h==size&&maximum==255,"missing combiner readback");
+    std::vector<unsigned char> rgb(size_t(w)*h*3);in.read(reinterpret_cast<char *>(rgb.data()),rgb.size());
+    const auto *q=&rgb[(size_t(h/2)*w+w/2)*3];return {q[0],q[1],q[2]};
+}
 static void triangle(unsigned size) {
     glViewport(0,0,size,size);glClearColor(0,0,0,1);glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
     glColor4f(0,1,0,1);glBegin(GL_TRIANGLES);
@@ -144,10 +152,40 @@ int main() {
         SDL_setenv("LINDBERGH_VULKAN_SHOT_DRAWABLE",std::to_string(movie).c_str(),1);
         lvk_host_present();layered_pixels(directory+"/frame.ppm");layered_pixels(directory+"/frame.right.ppm");
         lvk_bind_drawable(0);lvk_destroy_drawable(movie);++g_frame;
-        glMatrixMode(GL_PROJECTION);glLoadIdentity();
+        glMatrixMode(GL_PROJECTION);glLoadIdentity();glMatrixMode(GL_MODELVIEW);glLoadIdentity();glDisable(GL_DEPTH_TEST);
+        {
+            // GL_COMBINE clamps each unit's result. A MODULATE combiner may take
+            // the one-multiply path only when its inputs are already in [0,1]:
+            // a colour of 4 x a half texel is 1 after unit 0, and half after a
+            // second half texel (not 1, as an unclamped 2 x half would give).
+            const auto target=lvk_create_drawable(32,32);lvk_bind_drawable(target);
+            glViewport(0,0,32,32);glClearColor(0,0,0,1);glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
+            const unsigned char half[4]={128,128,128,255};GLuint tex[2];glGenTextures(2,tex);
+            for(unsigned u=0;u<2;++u) {
+                glActiveTexture(GL_TEXTURE0+u);glBindTexture(GL_TEXTURE_2D,tex[u]);glEnable(GL_TEXTURE_2D);
+                glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
+                glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,1,1,0,GL_RGBA,GL_UNSIGNED_BYTE,half);
+                glTexEnvi(GL_TEXTURE_ENV,GL_TEXTURE_ENV_MODE,u==0?GL_COMBINE:GL_MODULATE);
+            }
+            glActiveTexture(GL_TEXTURE0);
+            glTexEnvi(GL_TEXTURE_ENV,GL_COMBINE_RGB,GL_MODULATE);glTexEnvi(GL_TEXTURE_ENV,GL_COMBINE_ALPHA,GL_MODULATE);
+            glColor4f(4,4,4,1);
+            glBegin(GL_QUADS);glVertex3f(-1,-1,0);glVertex3f(1,-1,0);glVertex3f(1,1,0);glVertex3f(-1,1,0);glEnd();
+            for(unsigned u=0;u<2;++u){glActiveTexture(GL_TEXTURE0+u);glDisable(GL_TEXTURE_2D);glTexEnvi(GL_TEXTURE_ENV,GL_TEXTURE_ENV_MODE,GL_MODULATE);}
+            glActiveTexture(GL_TEXTURE0);glColor4f(1,1,1,1);
+            std::filesystem::remove(directory+"/frame.ppm");std::filesystem::remove(directory+"/frame.right.ppm");
+            SDL_setenv("LINDBERGH_SHOT_FRAME",std::to_string(g_frame).c_str(),1);
+            SDL_setenv("LINDBERGH_VULKAN_SHOT_DRAWABLE",std::to_string(target).c_str(),1);
+            lvk_host_present();
+            for(const char *eye:{"/frame.ppm","/frame.right.ppm"}) {
+                const auto c=centre(directory+eye,32);
+                require(c[0]>=126&&c[0]<=130&&c[1]>=126&&c[1]<=130&&c[2]>=126&&c[2]<=130,"a GL_COMBINE unit's result was not clamped");
+            }
+            lvk_bind_drawable(0);lvk_destroy_drawable(target);glDeleteTextures(2,tex);++g_frame;
+        }
         const auto unfinished=lvk_create_drawable(32,32);lvk_bind_drawable(unfinished);
         triangle(32);lvk_destroy_drawable(unfinished);lvk_bind_drawable(0);
-        std::puts("ok: real guest ABI pbuffer lifetime, perspective HUD bounds, on-screen layered movie/text depth, stereo readback and unfinished shutdown");
+        std::puts("ok: real guest ABI pbuffer lifetime, perspective HUD bounds, on-screen layered movie/text depth, clamped GL_COMBINE results, stereo readback and unfinished shutdown");
         return 0; // production atexit drain runs before fixture cleanup
     } catch(const std::exception &error) {std::cerr<<error.what()<<'\n';return 1;}
 }

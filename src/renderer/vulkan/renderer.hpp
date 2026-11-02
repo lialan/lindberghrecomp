@@ -54,6 +54,9 @@ struct TargetInfo {
     // buffer: draws there disable depth and stencil, and the attachment is never
     // loaded or stored (a tiler keeps it on chip).
     bool transient_depth = false;
+    // Depth/stencil live for one frame only: a swapchain image comes back
+    // frames later, so the frame's last pass need not store them.
+    bool frame_depth = false;
 };
 
 class Target {
@@ -68,6 +71,15 @@ public:
     // Loads and stores colour only: depth/stencil are left untouched (no memory
     // traffic) for a pass none of whose draws use them. Null when unsupported.
     VkRenderPass color_pass = VK_NULL_HANDLE;
+    // What a pass does with each attachment. render_pass, load_pass and
+    // color_pass are three of these; others are created on first use. All are
+    // compatible with render_pass (pipelines and framebuffers are shared).
+    struct PassOps {
+        bool load_color = false;
+        VkAttachmentLoadOp depth_load = VK_ATTACHMENT_LOAD_OP_CLEAR, stencil_load = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        VkAttachmentStoreOp depth_store = VK_ATTACHMENT_STORE_OP_STORE, stencil_store = VK_ATTACHMENT_STORE_OP_STORE;
+    };
+    VkRenderPass pass(const PassOps &ops);
     VkImage depth_image() const { return depth_; }
     static constexpr VkFormat depth_format = VK_FORMAT_D32_SFLOAT_S8_UINT;
     VkFramebuffer framebuffer = VK_NULL_HANDLE;
@@ -83,6 +95,7 @@ private:
     VkImageView color_view_ = VK_NULL_HANDLE, depth_view_ = VK_NULL_HANDLE;
     VkDeviceMemory color_memory_ = VK_NULL_HANDLE, depth_memory_ = VK_NULL_HANDLE;
     std::vector<std::pair<VkImageView,VkFramebuffer>> density_framebuffers_;
+    std::unordered_map<uint64_t,VkRenderPass> passes_;
     VkFramebuffer make_framebuffer(VkImageView density_map);
     void release();
 };
@@ -105,7 +118,9 @@ public:
     // Called only when a new variant is created, never for a cached draw.
     std::function<void(RasterState)> pipeline_created;
     void begin(VkCommandBuffer cmd, std::array<float, 4> clear, bool preserve = false, float depth = 1, uint32_t stencil = 0,
-               const VkRect2D *area = nullptr, bool color_only = false);
+               const VkRect2D *area = nullptr, bool color_only = false, bool last = false);
+    // last: the frame's last pass on a frame_depth target (its depth and
+    // stencil are not stored).
     void viewport(float x, float y, float width, float height, VkRect2D scissor,float min_depth=0,float max_depth=1);
     void dynamic_state(uint32_t stencil_ref, uint32_t stencil_compare_mask, uint32_t stencil_write_mask,
                        float depth_bias_factor, float depth_bias_units, const float blend_constants[4]);

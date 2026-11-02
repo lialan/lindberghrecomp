@@ -91,94 +91,102 @@ Target::Target(Device &device, TargetInfo target) : info(target), device_(device
         image(device, create, depth_, depth_memory_);
         depth_view_ = view(device, depth_, create.format, info.layers, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
 
-        VkAttachmentDescription attachments[3]{};
-        attachments[0].format = info.color_format;
-        attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
-        attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-        attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        attachments[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-        attachments[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        attachments[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        attachments[0].finalLayout = info.final_layout;
-        attachments[1] = attachments[0];
-        attachments[1].format = Target::depth_format;
-        attachments[1].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        attachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-        attachments[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
-        attachments[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-        if (info.transient_depth) {
-            attachments[1].loadOp = attachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-            attachments[1].storeOp = attachments[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        }
-        VkAttachmentReference col{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
-        VkAttachmentReference depth{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
-        VkSubpassDescription subpass{};
-        subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-        subpass.colorAttachmentCount = 1;
-        subpass.pColorAttachments = &col;
-        subpass.pDepthStencilAttachment = &depth;
-        VkSubpassDependency dependencies[2]{};
-        dependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
-        dependencies[0].dstSubpass = 0;
-        // FRAGMENT_SHADER: draws that sampled this target finish before it is drawn again.
-        dependencies[0].srcStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-                                       VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-        dependencies[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
-        dependencies[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
-                                       VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-        dependencies[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-        dependencies[1].srcSubpass = 0;
-        dependencies[1].dstSubpass = VK_SUBPASS_EXTERNAL;
-        dependencies[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-        dependencies[1].dstStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-        dependencies[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-        dependencies[1].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
-        uint32_t mask = info.layers == 2 ? 3 : 1;
-        VkRenderPassMultiviewCreateInfo multiview{VK_STRUCTURE_TYPE_RENDER_PASS_MULTIVIEW_CREATE_INFO};
-        multiview.subpassCount = 1;
-        multiview.pViewMasks = &mask;
-        multiview.correlationMaskCount = 1;
-        multiview.pCorrelationMasks = &mask;
-        VkRenderPassFragmentDensityMapCreateInfoEXT foveation{VK_STRUCTURE_TYPE_RENDER_PASS_FRAGMENT_DENSITY_MAP_CREATE_INFO_EXT};
-        if (info.density_map) {
-            attachments[2].format = VK_FORMAT_R8G8_UNORM;
-            attachments[2].samples = VK_SAMPLE_COUNT_1_BIT;
-            attachments[2].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-            attachments[2].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-            attachments[2].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-            attachments[2].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-            attachments[2].initialLayout = attachments[2].finalLayout = VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT;
-            foveation.fragmentDensityMapAttachment = {2, VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT};
-            multiview.pNext = &foveation;
-            dependencies[0].srcStageMask |= VK_PIPELINE_STAGE_FRAGMENT_DENSITY_PROCESS_BIT_EXT;
-            dependencies[0].dstStageMask |= VK_PIPELINE_STAGE_FRAGMENT_DENSITY_PROCESS_BIT_EXT;
-            dependencies[0].srcAccessMask |= VK_ACCESS_FRAGMENT_DENSITY_MAP_READ_BIT_EXT;
-            dependencies[0].dstAccessMask |= VK_ACCESS_FRAGMENT_DENSITY_MAP_READ_BIT_EXT;
-        }
-        VkRenderPassCreateInfo pass{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
-        pass.pNext = &multiview;
-        pass.attachmentCount = info.density_map ? 3 : 2;
-        pass.pAttachments = attachments;
-        pass.subpassCount = 1;
-        pass.pSubpasses = &subpass;
-        pass.dependencyCount = 2;
-        pass.pDependencies = dependencies;
-        check(vkCreateRenderPass(device.handles.device, &pass, nullptr, &render_pass), "Vulkan world render pass");
-        attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-        attachments[0].initialLayout = info.final_layout;
-        if (!info.transient_depth) {
-            attachments[1].loadOp = attachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-            attachments[1].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-        }
-        check(vkCreateRenderPass(device.handles.device, &pass, nullptr, &load_pass), "Vulkan preserving render pass");
-        if (device.capabilities.load_store_none && !info.transient_depth) {
-            attachments[1].loadOp = attachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_NONE_EXT;
-            attachments[1].storeOp = attachments[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_NONE_EXT;
-            check(vkCreateRenderPass(device.handles.device, &pass, nullptr, &color_pass), "Vulkan colour-only render pass");
-        }
+        render_pass = pass({});
+        load_pass = pass({true, VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_LOAD_OP_LOAD});
+        if (device.capabilities.load_store_none && !info.transient_depth)
+            color_pass = pass({true, VK_ATTACHMENT_LOAD_OP_NONE_EXT, VK_ATTACHMENT_LOAD_OP_NONE_EXT,
+                               VK_ATTACHMENT_STORE_OP_NONE_EXT, VK_ATTACHMENT_STORE_OP_NONE_EXT});
         framebuffer=make_framebuffer(info.density_map);
         if(info.density_map)density_framebuffers_.push_back({info.density_map,framebuffer});
     } catch (...) { release(); throw; }
+}
+
+VkRenderPass Target::pass(const PassOps &requested)
+{
+    PassOps ops = requested;
+    if (info.transient_depth) { // never loaded or stored
+        ops.depth_load = ops.stencil_load = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        ops.depth_store = ops.stencil_store = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    }
+    const uint64_t key = uint64_t(ops.load_color) | uint64_t(uint32_t(ops.depth_load) & 0xff) << 8 | uint64_t(uint32_t(ops.stencil_load) & 0xff) << 16 |
+                         uint64_t(uint32_t(ops.depth_store) & 0xff) << 24 | uint64_t(uint32_t(ops.stencil_store) & 0xff) << 32;
+    if (const auto found = passes_.find(key); found != passes_.end()) return found->second;
+    VkAttachmentDescription attachments[3]{};
+    attachments[0].format = info.color_format;
+    attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
+    attachments[0].loadOp = ops.load_color ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
+    attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    attachments[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attachments[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachments[0].initialLayout = ops.load_color ? info.final_layout : VK_IMAGE_LAYOUT_UNDEFINED;
+    attachments[0].finalLayout = info.final_layout;
+    attachments[1] = attachments[0];
+    attachments[1].format = Target::depth_format;
+    attachments[1].loadOp = ops.depth_load;
+    attachments[1].storeOp = ops.depth_store;
+    attachments[1].stencilLoadOp = ops.stencil_load;
+    attachments[1].stencilStoreOp = ops.stencil_store;
+    // Contents are kept unless both aspects are cleared or discarded on load.
+    const auto kept = [](VkAttachmentLoadOp op) { return op == VK_ATTACHMENT_LOAD_OP_LOAD || op == VK_ATTACHMENT_LOAD_OP_NONE_EXT; };
+    attachments[1].initialLayout = kept(ops.depth_load) || kept(ops.stencil_load) ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
+    attachments[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    VkAttachmentReference col{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkAttachmentReference depth{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription subpass{};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = 1;
+    subpass.pColorAttachments = &col;
+    subpass.pDepthStencilAttachment = &depth;
+    VkSubpassDependency dependencies[2]{};
+    dependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+    dependencies[0].dstSubpass = 0;
+    // FRAGMENT_SHADER: draws that sampled this target finish before it is drawn again.
+    dependencies[0].srcStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                   VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    dependencies[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+    dependencies[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                   VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    dependencies[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    dependencies[1].srcSubpass = 0;
+    dependencies[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+    dependencies[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    dependencies[1].dstStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    dependencies[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    dependencies[1].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+    uint32_t mask = info.layers == 2 ? 3 : 1;
+    VkRenderPassMultiviewCreateInfo multiview{VK_STRUCTURE_TYPE_RENDER_PASS_MULTIVIEW_CREATE_INFO};
+    multiview.subpassCount = 1;
+    multiview.pViewMasks = &mask;
+    multiview.correlationMaskCount = 1;
+    multiview.pCorrelationMasks = &mask;
+    VkRenderPassFragmentDensityMapCreateInfoEXT foveation{VK_STRUCTURE_TYPE_RENDER_PASS_FRAGMENT_DENSITY_MAP_CREATE_INFO_EXT};
+    if (info.density_map) {
+        attachments[2].format = VK_FORMAT_R8G8_UNORM;
+        attachments[2].samples = VK_SAMPLE_COUNT_1_BIT;
+        attachments[2].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        attachments[2].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        attachments[2].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        attachments[2].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        attachments[2].initialLayout = attachments[2].finalLayout = VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT;
+        foveation.fragmentDensityMapAttachment = {2, VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT};
+        multiview.pNext = &foveation;
+        dependencies[0].srcStageMask |= VK_PIPELINE_STAGE_FRAGMENT_DENSITY_PROCESS_BIT_EXT;
+        dependencies[0].dstStageMask |= VK_PIPELINE_STAGE_FRAGMENT_DENSITY_PROCESS_BIT_EXT;
+        dependencies[0].srcAccessMask |= VK_ACCESS_FRAGMENT_DENSITY_MAP_READ_BIT_EXT;
+        dependencies[0].dstAccessMask |= VK_ACCESS_FRAGMENT_DENSITY_MAP_READ_BIT_EXT;
+    }
+    VkRenderPassCreateInfo create{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    create.pNext = &multiview;
+    create.attachmentCount = info.density_map ? 3 : 2;
+    create.pAttachments = attachments;
+    create.subpassCount = 1;
+    create.pSubpasses = &subpass;
+    create.dependencyCount = 2;
+    create.pDependencies = dependencies;
+    VkRenderPass result;
+    check(vkCreateRenderPass(device_.handles.device, &create, nullptr, &result), "Vulkan render pass");
+    passes_.emplace(key, result);
+    return result;
 }
 
 VkFramebuffer Target::make_framebuffer(VkImageView map)
@@ -214,9 +222,8 @@ void Target::release()
     if(density_framebuffers_.empty()) {
         if(framebuffer)vkDestroyFramebuffer(d,framebuffer,nullptr);
     } else for(const auto &entry:density_framebuffers_)vkDestroyFramebuffer(d,entry.second,nullptr);
-    if (color_pass) vkDestroyRenderPass(d, color_pass, nullptr);
-    if (load_pass) vkDestroyRenderPass(d, load_pass, nullptr);
-    if (render_pass) vkDestroyRenderPass(d, render_pass, nullptr);
+    for (const auto &entry : passes_) vkDestroyRenderPass(d, entry.second, nullptr); // render, load and colour passes too
+    passes_.clear();
     if (depth_view_) vkDestroyImageView(d, depth_view_, nullptr);
     if (color_view_) vkDestroyImageView(d, color_view_, nullptr);
     if (depth_) vkDestroyImage(d, depth_, nullptr);
@@ -373,7 +380,7 @@ void Renderer::prepare(RasterState state)
 }
 
 void Renderer::begin(VkCommandBuffer cmd, std::array<float, 4> color, bool preserve, float depth, uint32_t stencil,
-                     const VkRect2D *area, bool color_only)
+                     const VkRect2D *area, bool color_only, bool last)
 {
     if (cmd_ || !cmd) throw std::logic_error("Invalid Vulkan render pass begin");
     VkClearValue clear[2]{};
@@ -381,7 +388,18 @@ void Renderer::begin(VkCommandBuffer cmd, std::array<float, 4> color, bool prese
     clear[1].depthStencil = {depth, stencil};
     VkRenderPassBeginInfo pass{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     // color_only: the caller records no depth/stencil use in this pass.
-    pass.renderPass = preserve ? (color_only && target_.color_pass ? target_.color_pass : target_.load_pass) : target_.render_pass; pass.framebuffer = target_.framebuffer;
+    Target::PassOps ops;
+    ops.load_color = preserve;
+    if (preserve && color_only && target_.color_pass) {
+        pass.renderPass = target_.color_pass;
+    } else {
+        ops.depth_load = preserve ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
+        ops.stencil_load = ops.depth_load;
+        const bool frame_end = last && target_.info.frame_depth;
+        ops.depth_store = ops.stencil_store = frame_end ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE;
+        pass.renderPass = target_.pass(ops);
+    }
+    pass.framebuffer = target_.framebuffer;
     pass.renderArea.extent = {target_.info.width, target_.info.height};
     if (area) pass.renderArea = *area; // the caller guarantees nothing is drawn outside it
     pass.clearValueCount = 2; pass.pClearValues = clear;

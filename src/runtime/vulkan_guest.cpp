@@ -411,9 +411,11 @@ struct State {
   }
   // Begin a pass on t, applying its pending clear: a clear begin when none of
   // it has been applied, else a load with the remaining area cleared.
-  void begin_pending(Renderer &r,Target *t,const PendingClear &c) {
-    if(!c.done.extent.width) {r.begin(cmd,c.color,false,c.depth,c.stencil);stencil_bits[t]=c.stencil;return;}
-    r.begin(cmd,c.color,true);
+  std::string pass_note; // profile label: what the open pass skips
+  void begin_pending(Renderer &r,Target *t,const PendingClear &c,bool last=false) {
+    pass_note=last?" last":"";
+    if(!c.done.extent.width) {r.begin(cmd,c.color,false,c.depth,c.stencil,nullptr,false,last);stencil_bits[t]=c.stencil;return;}
+    r.begin(cmd,c.color,true,1,0,nullptr,false,last);
     const int W=int(t->info.width),H=int(t->info.height),x0=c.done.offset.x,y0=c.done.offset.y;
     const int x1=x0+int(c.done.extent.width),y1=y0+int(c.done.extent.height);
     for(auto rect:{VkRect2D{{0,0},{uint32_t(W),uint32_t(y0)}},VkRect2D{{0,y1},{uint32_t(W),uint32_t(H-y1)}},
@@ -593,6 +595,10 @@ struct State {
 #endif
         if(stereo) {stereo->publish(fake_eyes);if(fake_guns)fake_controllers();}
 #endif
+        // A swapchain image: a buffer swap leaves the guest's back buffer
+        // undefined (GLX), and the image itself comes back frames later. The
+        // frame's first pass on it begins cleared rather than loading it.
+        if(screen->info.frame_depth){initialized.erase(screen);pending_clears.erase(screen);stencil_bits.erase(screen);}
       }
       if(panel&&overlay)panel->upload(*overlay,cmd);
       if (materials[ring->recording_slot()].size()>2048) materials[ring->recording_slot()].clear();
@@ -611,7 +617,7 @@ struct State {
         unsigned id=0;for(const auto &d:drawables)if(d.second.get()==active_target)id=d.first;
         pass_stamp("pass "+std::string(id?"pbuffer "+std::to_string(id):"eye")+" "+std::to_string(active_target->info.width)+"x"+
                    std::to_string(active_target->info.height)+" draws "+std::to_string(pass_profile.draws)+
-                   (active_target->info.density_map?" foveated":""));
+                   (active_target->info.density_map?" foveated":"")+pass_note);
         pass_profile.draws=0;
       }
       active = nullptr; active_target = nullptr;
@@ -664,6 +670,11 @@ struct State {
       if (active_target==p.target&&active_color_only&&uses_depth(p))end_pass(); // depth is needed after all
       if (active_target != p.target) {
         end_pass();
+        // The frame's last pass on a frame-depth target (the eye): every later
+        // packet of the frame draws here, and the overlay ends this pass.
+        bool last=keep_last&&n==packets.size()&&p.target->info.frame_depth;
+        for(size_t k=index+1;last&&k<n;++k)last=packets[k].target==p.target;
+        pass_note.clear();
         bool preserve=initialized.count(p.target)!=0;
         float depth=1;uint32_t stencil=0;
         // A pass that starts by clearing everything begins cleared instead of
@@ -680,8 +691,10 @@ struct State {
           // This pass clears everything itself, or begins with the deferred clear.
           const auto c=pending->second;pending_clears.erase(pending);
           if(!cleared_on_begin) {
-            if(!c.done.extent.width) {depth=c.depth;stencil=c.stencil;stencil_bits[p.target]=stencil;p.renderer->begin(cmd,c.color,false,depth,stencil);}
-            else begin_pending(*p.renderer,p.target,c);
+            if(!c.done.extent.width) {
+              depth=c.depth;stencil=c.stencil;stencil_bits[p.target]=stencil;
+              p.renderer->begin(cmd,c.color,false,depth,stencil,nullptr,false,last);pass_note=last?" last":"";
+            } else begin_pending(*p.renderer,p.target,c,last);
             begun=true;
           }
         }
@@ -729,8 +742,9 @@ struct State {
           // stores only colour). A depth user arriving later restarts the pass.
           bool color_only=preserve&&p.target->color_pass;
           for(size_t k=index;color_only&&k<n&&packets[k].target==p.target;++k)color_only=!uses_depth(packets[k]);
-          p.renderer->begin(cmd,p.color,preserve,depth,stencil,nullptr,color_only);
+          p.renderer->begin(cmd,p.color,preserve,depth,stencil,nullptr,color_only,last);
           active_color_only=color_only;
+          pass_note=color_only?" colour-only":last?" last":"";
         }
         initialized.insert(p.target); active=p.renderer; active_target=p.target;
       } else if (active != p.renderer) {
@@ -1185,7 +1199,7 @@ extern "C" void lvk_host_present(void) {
     if(state.active&&!previous)state.end_pass();
     state.overlay->draw(state.cmd,*state.screen,state.stereo->overlay_matrices(),state.stereo->overlay_eyes(),state.panel->guns(),previous,true,state.panel->draws());
     state.pass_stamp("pass eye "+std::to_string(state.screen->info.width)+"x"+std::to_string(state.screen->info.height)+
-                     " draws "+std::to_string(state.pass_profile.draws)+" + overlay");
+                     " draws "+std::to_string(state.pass_profile.draws)+" + overlay"+(previous?state.pass_note:std::string(" own pass")));
     state.pass_profile.draws=0;
     state.active=nullptr;state.active_target=nullptr;
     static const bool overlay_log=std::getenv("LINDBERGH_VULKAN_OVERLAY_LOG")!=nullptr;
@@ -3108,6 +3122,26 @@ bool combine_words(unsigned unit,std::array<int32_t,4> &d) {
   d[3]=scale(stored(GL_RGB_SCALE))|scale(stored(GL_ALPHA_SCALE))<<4;
   return usable;
 }
+// The classic environment mode (0 GL_MODULATE, 1 GL_REPLACE) a GL_COMBINE
+// unit computes exactly, else -1. Those run fixed.frag's one-line paths
+// instead of its general combiner. first: no enabled unit before this one, so
+// the primary colour is also the previous unit's output. in_range: that
+// output lies in [0,1], so the combiner's clamp of a product changes nothing.
+int classic_combine(unsigned unit,const std::array<int32_t,4> &d,bool first,bool in_range) {
+  if(d[3]!=(1|1<<4))return -1; // RGB and alpha scales 1
+  auto texture=[&](int s){return s==0||s==int(8+unit);};
+  auto previous=[&](int s){return s==3||(first&&s==2);};
+  auto src=[&](int word,int i){return (d[1]>>(word+4*i))&15;};
+  auto op=[&](int shift,int i){return (d[2]>>(shift+2*i))&3;};
+  const int frgb=d[0]&15,falpha=(d[0]>>4)&15;
+  // MODULATE: texture x previous, colours and alphas as they are (either order).
+  if(in_range&&frgb==1&&falpha==1&&op(0,0)==0&&op(0,1)==0&&op(6,0)==2&&op(6,1)==2&&
+     ((texture(src(0,0))&&previous(src(0,1)))||(previous(src(0,0))&&texture(src(0,1))))&&
+     ((texture(src(12,0))&&previous(src(12,1)))||(previous(src(12,0))&&texture(src(12,1)))))return 0;
+  // REPLACE: the texture's colour and alpha.
+  if(frgb==0&&falpha==0&&op(0,0)==0&&op(6,0)==2&&texture(src(0,0))&&texture(src(12,0)))return 1;
+  return -1;
+}
 RasterState raster_state(bool fixed) {
   auto r=state.raster;
   if(state.enabled[GL_CULL_FACE]) {
@@ -3124,13 +3158,21 @@ RasterState raster_state(bool fixed) {
   r.stencil_fail=stencil_op(integer(GL_STENCIL_FAIL,GL_KEEP));r.stencil_depth_fail=stencil_op(integer(GL_STENCIL_PASS_DEPTH_FAIL,GL_KEEP));r.stencil_pass=stencil_op(integer(GL_STENCIL_PASS_DEPTH_PASS,GL_KEEP));
   r.depth_bias=state.enabled[GL_POLYGON_OFFSET_FILL];
   if(fixed) {
+    // The colour each unit starts from lies in [0,1]: fixed-function vertex
+    // colours (lit ones are clamped), then each unit's output in turn.
+    bool in_range=!state.program&&(state.enabled[GL_LIGHTING]||state.arrays.unit_range(3));
     for(unsigned i=0;i<8;++i) {
       if(!state.unit_textured(i))continue; // a disabled unit's environment has no effect
+      const bool first=!r.fixed_texture;
       r.fixed_texture|=1u<<i;
       unsigned mode=0;switch(state.texture_env[i]) {case GL_MODULATE:break;case GL_REPLACE:mode=1;break;case GL_ADD:mode=2;break;case GL_DECAL:mode=3;break;case GL_BLEND:mode=4;break;
-      case GL_COMBINE: {std::array<int32_t,4> d;if(!combine_words(i,d)){r.fixed_texture&=~(1u<<i);continue;}mode=5;break;}
+      case GL_COMBINE: {
+        std::array<int32_t,4> d;if(!combine_words(i,d)){r.fixed_texture&=~(1u<<i);continue;}
+        const int classic=classic_combine(i,d,first,in_range);mode=classic<0?5:unsigned(classic);break;
+      }
       default:gap("unsupported fixed-function texture environment mode");}
       r.fixed_env|=mode<<(3*i);
+      in_range=mode==1||mode==5||(mode!=2&&in_range); // REPLACE and GL_COMBINE end in range; GL_ADD may not
     }
     if(state.enabled[GL_FOG]) {auto mode=GLenum(value(GL_FOG_MODE,{GL_EXP,0,0,0})[0]);r.fog_mode=mode==GL_LINEAR?1:mode==GL_EXP?2:3;}
   }
@@ -3407,6 +3449,18 @@ void draw_geometry(GLenum mode,GLint first,GLsizei count,const void *indices,GLe
     if(g_frame==unsigned(std::atoi(std::getenv("LINDBERGH_SHOT_FRAME")?std::getenv("LINDBERGH_SHOT_FRAME"):"0")))
       std::fprintf(stderr,"[vulkan-debug-draw] %u: program %u textures %u %u %u %u fixed %d mode %#x count %d\n",n,state.program,state.textures[0],state.textures[1],state.textures[2],state.textures[3],!state.program,mode,count);
   }
+  {static unsigned dn;if(std::getenv("LINDBERGH_DIAG_GLOWZ")&&state.drawable==2&&!state.program&&mode==GL_QUADS&&count==4&&state.rect_textures[0]&&g_frame>=1200&&dn++<3) { // DIAGNOSTIC ONLY
+    std::fprintf(stderr,"[diag-glowz] frame %u depth test %d write %d compare %d blend %d immediate %d\n",g_frame,state.raster.depth_test,state.raster.depth_write,int(state.raster.depth_compare),int(state.raster.blend),immediate!=nullptr);
+    for(int i=0;i<4;++i){std::array<float,4> v{};bool ok=true;if(immediate)std::memcpy(v.data(),static_cast<const uint8_t *>(immediate)+size_t(first+i)*immediate_stride,16);
+      else ok=state.arrays.position(uint32_t(first+i),{g_guest_base,uint64_t(1)<<32},[](uint32_t id){const auto &b=state.buffers.at(id);return GuestMemoryView{b.bytes.data(),b.bytes.size()};},v);
+      std::fprintf(stderr,"  v%d ok %d %.4f %.4f %.6f %.4f\n",i,ok,v[0],v[1],v[2],v[3]);}}}
+  {static unsigned sn;if(std::getenv("LINDBERGH_DIAG_GLOWZ")&&state.drawable==0&&mode==GL_QUADS&&count==4&&g_frame>=1200&&sn++<2) { // DIAGNOSTIC ONLY
+    const auto c=state.arrays.current_value(3);
+    std::fprintf(stderr,"[diag-screen] frame %u program %u rect %u tex %u env %#x unit1 rect %u tex %u env %#x color %.3f %.3f %.3f %.3f blend %d depth %d/%d stencil %d textured0 %d textured1 %d\n",g_frame,state.program,state.rect_textures[0],state.textures[0],state.texture_env[0],state.rect_textures[1],state.textures[1],state.texture_env[1],c[0],c[1],c[2],c[3],int(state.raster.blend),state.raster.depth_test,state.raster.depth_write,int(state.raster.stencil),int(state.unit_textured(0)),int(state.unit_textured(1)));
+    for(auto &e:state.env_params[0])std::fprintf(stderr,"   env0 %#x=%g\n",e.first,e.second);
+    for(int i=0;i<4;++i){std::array<float,4> v{};bool ok=true;if(immediate)std::memcpy(v.data(),static_cast<const uint8_t *>(immediate)+size_t(first+i)*immediate_stride,16);
+      else ok=state.arrays.position(uint32_t(first+i),{g_guest_base,uint64_t(1)<<32},[](uint32_t id){const auto &b=state.buffers.at(id);return GuestMemoryView{b.bytes.data(),b.bytes.size()};},v);
+      std::fprintf(stderr,"  v%d ok %d %.4f %.4f %.6f %.4f\n",i,ok,v[0],v[1],v[2],v[3]);}}}
   const bool guest_indexed=indexed;mark_drawn();
   auto *target=state.target();auto &p=current_program();native_program(p);legacy_uniforms(p,*target);
   const bool fixed=!state.program||p.fixed_fragment; // fixed-function fragment state applies

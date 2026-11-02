@@ -80,7 +80,8 @@ void Overlay::draw(VkCommandBuffer cmd,Target &target,const Matrices &views,cons
     if(!any){if(previous)previous->end();return;}
     Renderer *active;
     if(previous){previous->detach();bundle.gun->attach(cmd);active=bundle.gun.get();}
-    else{bundle.gun->begin(cmd,{0,0,0,1},preserve);active=bundle.gun.get();++pass_starts_;}
+    // The overlay is the last thing drawn on its target in a frame.
+    else{bundle.gun->begin(cmd,{0,0,0,1},preserve,1,0,nullptr,false,true);active=bundle.gun.get();++pass_starts_;}
     const VkRect2D rect{{0,0},{target.info.width,target.info.height}};
     active->viewport(0,0,float(target.info.width),float(target.info.height),rect);bool forced_depth=false;
     auto select=[&](Renderer &renderer,bool force) {

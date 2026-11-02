@@ -251,6 +251,7 @@ void OpenXR::attach(Device &device)
                 density_views_.push_back(map);
             }
             TargetInfo info{width_,height_,2,render_format,images[i].image,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,map};
+            info.frame_depth=true;
             targets_.push_back(std::make_unique<Target>(device,info));
         }
         foveation_=require_foveation_;
