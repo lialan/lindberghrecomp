@@ -18,6 +18,9 @@ void xr_settings_load(LgXrSettings *p) {*p=LgXrSettings LG_XR_SETTINGS_DEFAULT;p
 void xr_settings_save(const LgXrSettings *) {}
 void host_vr_input(int,int,unsigned,int) {}
 void host_vr_input2(int,int,int) {}
+// No guest code: no state functions to watch.
+uint32_t stereo_state_lo=~0u,stereo_state_hi=0;
+uint32_t guest_symbol(const char *) {return 0;}
 }
 #include <chrono>
 #include <filesystem>
