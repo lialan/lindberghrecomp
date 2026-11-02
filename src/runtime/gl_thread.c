@@ -256,10 +256,17 @@ static const struct { const char *name; uint8_t kind, a, b, c; } T[] = {
 /* Names for glGen*, from a host whose names are never handed out twice (the
  * native Vulkan one): taken here, so the call needs no answer from the worker.
  * A buffer's name is then adopted on the worker, in queue order, as its glGen
- * would have made it. Absent (weak), glGen* waits as before. */
-__attribute__((weak)) uint32_t lvk_reserve_names(uint32_t n);
-__attribute__((weak)) void lvk_adopt_buffer_names(uint32_t n, const uint32_t *names);
-static void adopt_buffers(CPU *c) { lvk_adopt_buffer_names(A32(0), (const uint32_t *)GP(A32(1))); }
+ * would have made it. Unregistered (the OpenGL hosts), glGen* waits as before.
+ * Registered rather than weak-linked: macOS's linker refuses an undefined
+ * weak reference, so the OpenGL build would not link. */
+static uint32_t (*g_reserve_names)(uint32_t n);
+static void (*g_adopt_buffer_names)(uint32_t n, const uint32_t *names);
+void glq_set_name_source(uint32_t (*reserve)(uint32_t n), void (*adopt_buffers)(uint32_t n, const uint32_t *names))
+{
+    g_reserve_names = reserve;
+    g_adopt_buffer_names = adopt_buffers;
+}
+static void adopt_buffers(CPU *c) { g_adopt_buffer_names(A32(0), (const uint32_t *)GP(A32(1))); }
 
 /* bytes of the pixels a glTex(Sub)Image2D reads, 0 if not sure. Unpack row
  * length and skips are taken as 0 unless the game ever set them otherwise,
@@ -1077,8 +1084,8 @@ static void glq_hook(CPU *c, HleId id, HleHandler fn)
         break;
     case C_GEN: {
         int32_t n = (int32_t)A32(0);
-        if (!lvk_reserve_names || (k->b && !lvk_adopt_buffer_names) || n <= 0 || n > 4096 || !A32(1)) { async = 0; break; }
-        uint32_t first = lvk_reserve_names((uint32_t)n);
+        if (!g_reserve_names || (k->b && !g_adopt_buffer_names) || n <= 0 || n > 4096 || !A32(1)) { async = 0; break; }
+        uint32_t first = g_reserve_names((uint32_t)n);
         for (int32_t i = 0; i < n; i++) wr32(A32(1) + 4u * (uint32_t)i, first + (uint32_t)i);
         g_n_named += (unsigned)n;
         if (!k->b) return;                          /* a texture's name is all its glGen made */

@@ -1016,7 +1016,11 @@ void host_swap(void)
         if (want < 0) want = env_int("LINDBERGH_GL_THREAD", 0);   /* or the game's profile: vr.gl_thread */
         if (want == 1) {
 #ifdef LINDBERGH_VULKAN
-            if (lvk_host_can_thread()) { want = 2; glq_start(NULL, lvk_host_thread_enter); }
+            if (lvk_host_can_thread()) {
+                want = 2;
+                glq_set_name_source(lvk_reserve_names, lvk_adopt_buffer_names);
+                glq_start(NULL, lvk_host_thread_enter);
+            }
 #else
             if (g_win.gl) { want = 2; glq_start(gl_release, gl_take); }
 #endif

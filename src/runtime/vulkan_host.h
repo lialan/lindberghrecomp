@@ -12,6 +12,8 @@ void lvk_host_input(void); // consume renderer-published input on the game threa
 unsigned lvk_create_drawable(int width, int height);
 void lvk_destroy_drawable(unsigned id);
 void lvk_bind_drawable(unsigned id);
+uint32_t lvk_reserve_names(uint32_t n);                             // object names, from any thread
+void lvk_adopt_buffer_names(uint32_t n, const uint32_t *names);     // make reserved names empty buffers
 #ifdef __cplusplus
 }
 #endif
