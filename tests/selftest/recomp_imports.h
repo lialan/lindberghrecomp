@@ -21,4 +21,5 @@
     X(HLE_snd_pcm_drop, "snd_pcm_drop") \
     X(HLE_snd_pcm_avail_update, "snd_pcm_avail_update") \
     X(HLE_snd_pcm_writei, "snd_pcm_writei") \
+    X(HLE_sprintf, "sprintf") \
     X(HLE_test_solib_function, "test_solib_function")

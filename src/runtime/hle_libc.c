@@ -499,6 +499,31 @@ static int guest_format(char *out, size_t cap, const char *fmt, uint32_t argbase
         }
 
         char piece[512];
+        /* Wide characters (%C, %lc) and strings (%S, %ls): glibc's wint_t and
+         * wchar_t are 4 bytes on the guest. Ghost Squad Evolution names every
+         * voice file with %C ("media/voice/%C%03d_%03d%C.adx"). The guest
+         * runs in the C locale, where only ASCII converts; anything else
+         * becomes '?'. */
+        const int wide = conv == 67 || conv == 83 || ((conv == 99 || conv == 115) && strchr(spec, 108));  /* C S lc ls */
+        if (wide) {
+            char *l = strchr(spec, 108);                 /* drop the l: the host formats a narrow char or string */
+            if (l) memmove(l, l + 1, strlen(l));
+            spec[strlen(spec) - 1] = conv == 67 || conv == 99 ? 99 : 115;
+            if (spec[strlen(spec) - 1] == 99) {
+                const uint32_t wc = rd32(argbase + 4u * argi++);
+                snprintf(piece, sizeof piece, spec, wc < 0x80 ? (int)wc : 63);
+            } else {
+                const uint32_t at = rd32(argbase + 4u * argi++);
+                char narrow[512];
+                size_t k = 0;
+                if (at) for (uint32_t wc; k + 1 < sizeof narrow && (wc = rd32(at + 4u * (uint32_t)k)) != 0; k++)
+                    narrow[k] = wc < 0x80 ? (char)wc : 63;
+                narrow[k] = 0;
+                snprintf(piece, sizeof piece, spec, at ? narrow : "(null)");
+            }
+            APPEND(piece);
+            continue;
+        }
         switch (conv) {
         case 'd': case 'i': case 'u': case 'o': case 'x': case 'X': case 'c':
             if (longlong) {

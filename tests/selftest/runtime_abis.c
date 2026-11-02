@@ -171,6 +171,18 @@ int test_runtime_abis(void)
     shader("// half\n#define half float\nmyhalf half_var;\nvec4 c=texture2D(s,uv);",
            "// half\n#define half float\nmyhalf half_var;\nvec4 c=texture2D(s,uv);");
 
+    {   /* GSE's voice file names use %C; a wide string uses %S */
+        char *dst = guest_alloc(64, 16), *fmt = guest_alloc(64, 16);
+        uint32_t *ws = guest_alloc(16, 16);
+        strcpy(fmt, "media/voice/%C%03d_%03d%C.adx");
+        CHECK(CALL(HLE_sprintf, H2G(dst), H2G(fmt), 'X', 250, 83, 'B') == 25);
+        CHECK(!strcmp(dst, "media/voice/X250_083B.adx"));
+        ws[0] = 'O'; ws[1] = 'K'; ws[2] = 0x3042; ws[3] = 0;
+        strcpy(fmt, "[%3lc|%S|%-4ls]");
+        CALL(HLE_sprintf, H2G(dst), H2G(fmt), 'w', H2G(ws), H2G(ws));
+        CHECK(!strcmp(dst, "[  w|OK?|OK? ]"));
+    }
+
     wr32(out, 0x12345678);
     CHECK(CALL(HLE_posix_memalign, out, 3, 32) == 22);
     CHECK(rd32(out) == 0x12345678);
