@@ -165,6 +165,7 @@ struct Attributes {
 // The game's sniping / close-quarters events, from the game thread
 // (hle_sega.c): what stereo.c's flat frames and screen aiming follow.
 std::atomic<unsigned> g_snipe_events{0},g_cqc_events{0};
+bool menu_state(); // a menu state ran this frame or the last (game_states.h)
 struct DrawPacket {
   Renderer *renderer;
   Target *target;
@@ -413,8 +414,10 @@ struct State {
     if(stereo) {
       const unsigned snipe=g_snipe_events.load(std::memory_order_relaxed),cqc=g_cqc_events.load(std::memory_order_relaxed);
       const bool was=stereo->flat();
-      stereo->finish_frame(snipe!=snipe_seen,cqc!=cqc_seen);snipe_seen=snipe;cqc_seen=cqc;
-      if(stereo->flat()!=was)std::fprintf(stderr,"[vulkan-xr] frame %u: scope %s\n",g_frame,was?"put down":"held: the frame is the arcade's picture on the screen");
+      // As stereo.c's g_flat: a menu state having run this frame or the
+      // last makes the next frame flat, as does a scope held.
+      stereo->finish_frame(snipe!=snipe_seen,cqc!=cqc_seen,menu_state());snipe_seen=snipe;cqc_seen=cqc;
+      if(stereo->flat()!=was)std::fprintf(stderr,"[vulkan-xr] frame %u: %s\n",g_frame,was?"flat frames end":"flat (a menu or a scope held): the arcade's picture on the screen");
     }
     world_draws=hud_sequence=0;hud_target=hud_target_next;hud_target_next=~0u;
   }
@@ -1355,6 +1358,11 @@ extern "C" void lvk_host_present(void) {
   if(state.active_target!=state.screen)state.materialize(state.screen);
   if (!state.initialized.count(state.screen)) {
     const auto old=state.drawable;state.drawable=0;state.renderer();state.end_pass();state.drawable=old;
+  }
+  if(show_overlay&&state.stereo->flat()) {
+    if(state.active)state.end_pass();
+    state.overlay->draw_picture(state.cmd,*state.screen,state.stereo->transforms(identity(),LG_STEREO_HUD));
+    state.pass_stamp("flat picture on the screen");
   }
   if(show_overlay) {
     Renderer *previous=state.active_target==state.screen?state.active:nullptr;
@@ -3619,6 +3627,10 @@ bool stereo_packet(DrawPacket &packet,GLint first,GLsizei count,const std::vecto
   facts.hud_target=state.drawable==state.hud_target;facts.multiview=1;
   facts.zoom=state.stereo->zoomed(p);
   facts.menu=facts.perspective&&menu_state();
+  // A flat frame keeps every draw's own projection (LG_STEREO_PASS): the eyes
+  // hold the arcade's picture, clipped at its edges, which present shows on
+  // the screen.
+  facts.flat=state.stereo->flat();
   const auto texture=state.texture_objects.find(!state.program&&state.rect_enabled[0]?state.rect_textures[0]:state.textures[0]);
   if(texture!=state.texture_objects.end())facts.texture_view=texture->second.picture_view;
   const auto *profile=game_profile();

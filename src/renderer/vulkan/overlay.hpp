@@ -15,6 +15,12 @@ public:
     void draw(VkCommandBuffer cmd,Target &target,const Matrices &views,
               const std::array<std::array<float,3>,2> &eyes,const std::array<XoFrame,2> &frames,
               Renderer *previous=nullptr,bool preserve=true,const std::array<PanelDraw,2> &panels={});
+    // A flat frame (a menu, a scope held): the target's picture - the game's
+    // own, across each eye - copied and shown on the screen quad, the rest of
+    // the eye black (host_xr.c's xo_draw_screen). `screen` maps guest clip
+    // space onto the screen per eye. Opens and ends its own pass.
+    void draw_picture(VkCommandBuffer cmd,Target &target,const Matrices &screen);
+    uint64_t picture_draws() const {return picture_draws_;}
     // Slot 0: settings; slot 1: FPS. Upload only dirty pictures before game passes.
     void upload_panel(VkCommandBuffer cmd,unsigned slot,const void *rgba,size_t bytes);
     uint64_t panel_uploads() const {return panel_uploads_;}
@@ -34,6 +40,10 @@ private:
     std::array<bool,2> panel_ready_{};
     uint64_t panel_uploads_=0;
     std::unordered_map<Target *,Bundle> targets_;
-    uint64_t pass_starts_=0;
+    uint64_t pass_starts_=0,picture_draws_=0;
+    // The flat frame's picture (one eye's layer), and its descriptor set:
+    // replaced together, retired through the ring while frames use them.
+    std::shared_ptr<Texture> picture_;
+    std::shared_ptr<SampledSet> picture_set_;
 };
 }

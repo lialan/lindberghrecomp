@@ -34,6 +34,9 @@ public:
     // frames running. The whole frame is then the arcade's picture on the
     // screen, as with stereo.c's flat frames.
     bool zoomed(const Matrix &projection) const;
+    // A flat frame (stereo.c's g_flat): a menu, or a scope held. Every draw
+    // keeps the game's own projection, so the eyes hold the arcade's picture,
+    // and the host shows that picture on the screen.
     bool flat() const {return flat_;}
     // Ghost Squad Evolution's close-quarters event: its markers are 2D on the
     // screen, so the gun aims on the screen's plane.
@@ -41,7 +44,8 @@ public:
     const Matrices &transforms(const Matrix &projection,int draw_class);
     void observe(const Matrix &projection,int draw_class);
     // sniping/cqc: the game ran its sniping or close-quarters event this frame.
-    void finish_frame(bool sniping=false,bool cqc=false);
+    // menu: a menu state ran this frame or the last; the next frame is flat.
+    void finish_frame(bool sniping=false,bool cqc=false,bool menu=false);
     size_t transform_builds() const { return builds_; }
     // A flat frame is the arcade's whole monitor: the screen at the size it
     // has in play (lens 1.73), whatever lens the scope ramped through.

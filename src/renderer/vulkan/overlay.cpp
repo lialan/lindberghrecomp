@@ -22,6 +22,7 @@ RasterState beam_state() {
 }
 RasterState glass_state() {auto r=beam_state();r.depth_test=r.depth_write=true;r.depth_compare=VK_COMPARE_OP_ALWAYS;return r;}
 RasterState reticle_state() {auto r=beam_state();r.depth_test=true;r.depth_compare=VK_COMPARE_OP_EQUAL;return r;}
+RasterState picture_state() {RasterState r;r.depth_test=r.depth_write=false;r.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;return r;}
 }
 Overlay::Overlay(Device &device,FrameRing &ring,PipelineCache &cache):device_(device),ring_(ring),cache_(cache),uniforms_(device,ring,{{0,sizeof(Parameters)}})
 {
@@ -65,7 +66,51 @@ void Overlay::prepare(Target &target)
         {{0,8,VK_VERTEX_INPUT_RATE_VERTEX}},{{0,0,VK_FORMAT_R32G32_SFLOAT,0}},{panel_sets_[0]->layout()}};
     bundle.panel=std::make_unique<Renderer>(device_,target,cache_,panel);
     auto panel_state=beam_state();panel_state.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;bundle.panel->prepare(panel_state);
+    bundle.panel->prepare(picture_state());
     bundle.gun->prepare(gun_state());bundle.beam->prepare(beam_state());bundle.beam->prepare(glass_state());bundle.beam->prepare(reticle_state());
+}
+void Overlay::draw_picture(VkCommandBuffer cmd,Target &target,const Matrices &screen)
+{
+    auto found=targets_.find(&target);if(found==targets_.end())throw std::logic_error("Overlay target was not prepared");
+    auto &panel=*found->second.panel;
+    const auto &t=target.info;
+    if(!picture_||picture_->info.width!=t.width||picture_->info.height!=t.height||picture_->info.format!=t.color_format) {
+        if(picture_){ring_.retire(picture_set_);ring_.retire(picture_);}
+        TextureInfo info{t.width,t.height};info.format=t.color_format;
+        picture_=std::make_shared<Texture>(device_,info);
+        picture_set_=std::make_shared<SampledSet>(device_,std::vector<SampledImage>{{0,picture_->view(),panel_sampler_->handle()}});
+    }
+    ring_.keep_alive(picture_);ring_.keep_alive(picture_set_);
+    // The picture is the same in both eyes (every draw kept the game's own
+    // projection): the first layer is shown to both. A raw copy, row for row:
+    // an XR swapchain image is sRGB seen through a UNORM view, and a blit
+    // would decode it. Texture::copy_from is glCopyTexSubImage's (GL rows).
+    VkImageMemoryBarrier to_copy[2]{};
+    for(auto &b:to_copy){b.sType=VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;b.srcQueueFamilyIndex=b.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
+        b.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};}
+    to_copy[0].image=target.color;to_copy[0].oldLayout=t.final_layout;to_copy[0].newLayout=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    to_copy[0].srcAccessMask=VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;to_copy[0].dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT;
+    to_copy[1].image=picture_->image();to_copy[1].oldLayout=VK_IMAGE_LAYOUT_UNDEFINED;to_copy[1].newLayout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    to_copy[1].srcAccessMask=VK_ACCESS_SHADER_READ_BIT;to_copy[1].dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT|VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0,0,nullptr,0,nullptr,2,to_copy);
+    VkImageCopy copy{};copy.srcSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};copy.dstSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};
+    copy.extent={t.width,t.height,1};
+    vkCmdCopyImage(cmd,target.color,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,picture_->image(),VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&copy);
+    VkImageMemoryBarrier after[2]{to_copy[0],to_copy[1]};
+    std::swap(after[0].oldLayout,after[0].newLayout);
+    after[0].srcAccessMask=VK_ACCESS_TRANSFER_READ_BIT;after[0].dstAccessMask=VK_ACCESS_COLOR_ATTACHMENT_READ_BIT|VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    after[1].oldLayout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;after[1].newLayout=VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    after[1].srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;after[1].dstAccessMask=VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT|VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                         0,0,nullptr,0,nullptr,2,after);
+    panel.begin(cmd,{0,0,0,1});++pass_starts_;
+    const VkRect2D rect{{0,0},{t.width,t.height}};
+    panel.viewport(0,0,float(t.width),float(t.height),rect);
+    const auto set=picture_set_->handle();panel.bind_descriptors(0,1,&set);
+    const Upload stream{quad_->handle(),0};
+    panel.draw_buffers(&stream,1,4,screen,picture_state());
+    panel.end();++picture_draws_;
 }
 uint64_t Overlay::draw_count() const {
     uint64_t count=0;for(const auto &entry:targets_)count+=entry.second.gun->draw_count()+entry.second.beam->draw_count()+entry.second.panel->draw_count();return count;

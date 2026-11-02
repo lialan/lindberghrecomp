@@ -111,7 +111,7 @@ void StereoScene::observe(const Matrix &p,int kind)
     for(auto &l:tally_)if(l.draws && std::fabs(l.projection[0]-p[0])<.002f && std::fabs(l.projection[5]-p[5])<.002f) {++l.draws;return;}
     for(auto &l:tally_)if(!l.draws) {l.projection=p;l.draws=1;return;}
 }
-void StereoScene::finish_frame(bool sniping,bool cqc)
+void StereoScene::finish_frame(bool sniping,bool cqc,bool menu)
 {
     if(sniping)snipe_=3;
     if(cqc)cqc_=3;
@@ -121,7 +121,7 @@ void StereoScene::finish_frame(bool sniping,bool cqc)
     for(auto &l:tally_)l.draws=0;
     // a scope is held; a lens passing through on a camera move is not one
     zoom_frames_=longest_>limit?zoom_frames_+1:0;longest_=0;
-    flat_=zoom_frames_>=6;
+    flat_=menu||zoom_frames_>=6;
     if(snipe_)--snipe_;
     if(cqc_)--cqc_;
     cache_.clear();last_=0;

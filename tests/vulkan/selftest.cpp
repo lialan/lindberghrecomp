@@ -228,6 +228,47 @@ static void render_overlay(Device &device,bool foveation=false)
     std::puts(foveation?"ok: shared gun/laser/sight overlay runs inside a density-map render pass":"ok: persistent gun meshes, stereo lasers/sight masks, preserved alpha and shared final render pass");
 }
 
+// A flat frame (a menu, a scope held): the eye's picture - the game's own,
+// across the eye - goes onto the screen quad, row for row and colour for
+// colour, the rest of the eye black. Identity screen matrices put the quad
+// over the whole eye, so the picture must come back unchanged (top red,
+// bottom blue in both eyes); a half-size screen leaves black around it.
+static void render_flat_picture(Device &device)
+{
+    FrameRing ring(device);
+    TargetInfo info{64,64,2};info.final_layout=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    Target target(device,info);PipelineCache cache(device,"");
+    Renderer background(device,target,cache);Overlay overlay(device,ring,cache);overlay.prepare(target);
+    RasterState raster;raster.depth_test=raster.depth_write=false;background.prepare(raster);
+    Matrices whole{};for(auto &m:whole.view_projection)for(int i=0;i<4;++i)m[i*5]=1;
+    Matrices half=whole;for(auto &m:half.view_projection){m[0]=.5f;m[5]=.5f;}
+    Readback output(device,2*64*64*4*2);Submission last{};
+    for(unsigned pass=0;pass<2;++pass) {
+        auto cmd=ring.begin();background.begin(cmd,{0,0,1,1});
+        // Guest clip space is GL's (Y up): the upper half red.
+        Vertex v[6]{};const float corners[6][2]={{-1,0},{1,0},{1,1},{-1,0},{1,1},{-1,1}};
+        for(int i=0;i<6;++i){v[i].position[0]=corners[i][0];v[i].position[1]=corners[i][1];v[i].position[3]=1;v[i].color[0]=v[i].color[3]=1;}
+        background.draw(ring,v,6,whole,raster);background.end();
+        overlay.draw_picture(cmd,target,pass?half:whole);
+        VkBufferImageCopy copy{};copy.bufferOffset=pass*64*64*4*2;copy.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,2};copy.imageExtent={64,64,1};
+        vkCmdCopyImageToBuffer(cmd,target.color,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,output.buffer,1,&copy);
+        VkBufferMemoryBarrier b{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};b.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;b.dstAccessMask=VK_ACCESS_HOST_READ_BIT;
+        b.srcQueueFamilyIndex=b.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;b.buffer=output.buffer;b.size=VK_WHOLE_SIZE;
+        vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&b,0,nullptr);last=ring.submit();
+    }
+    ring.wait(last);const auto *pixels=static_cast<const uint8_t *>(output.mapped);
+    auto at=[&](unsigned pass,unsigned eye,unsigned x,unsigned y){return pixels+((pass*2+eye)*64*64+y*64+x)*4;};
+    for(unsigned eye=0;eye<2;++eye) {
+        const auto *top=at(0,eye,32,8),*bottom=at(0,eye,32,56);
+        require(top[0]>240&&top[2]<15&&bottom[2]>240&&bottom[0]<15,"a flat frame's picture came back flipped or recoloured");
+        const auto *inside=at(1,eye,32,24),*outside=at(1,eye,4,4);
+        require(inside[0]>240&&inside[2]<15,"a flat frame's picture missing from the screen");
+        require(outside[0]<15&&outside[1]<15&&outside[2]<15,"a flat frame left the game's picture around the screen");
+    }
+    require(overlay.picture_draws()==2,"flat pictures not drawn once per frame");
+    std::puts("ok: a flat frame's picture goes onto the screen quad unflipped, black around it");
+}
+
 static void render_panels(Device &device,bool foveation=false)
 {
     FrameRing ring(device);std::unique_ptr<ConstantDensityMap> density;
@@ -1225,6 +1266,19 @@ static void test_live_stereo_scene()
     require(std::fabs(scene.screen_lens()[0]-1.732f)<1e-4f&&std::fabs(scene.screen_lens()[1]-2.3093f)<1e-3f,"a scope frame's screen kept the game camera's lens");
     scene.observe(camera,LG_STEREO_WORLD);scene.finish_frame();
     require(!scene.flat()&&!scene.zoomed(zoom)&&scene.screen_lens()[0]==camera[0],"the scope did not end with its lens");
+    // A menu state makes the next frame flat (stereo.c's g_flat): every draw
+    // keeps its own projection - classified as a pass - and the screen takes
+    // the arcade monitor's lens; the frame after the menu is not flat.
+    scene.observe(camera,LG_STEREO_WORLD);scene.finish_frame(false,false,true);
+    require(scene.flat()&&std::fabs(scene.screen_lens()[0]-1.732f)<1e-4f,"a menu frame was not flat on the arcade's screen");
+    {
+        LgStereoDrawFacts facts{};facts.perspective=1;facts.menu=1;facts.multiview=1;facts.flat=scene.flat();
+        require(lg_stereo_classify_draw(&facts)==LG_STEREO_PASS,"a flat frame's 3D left the game's projection");
+        facts.perspective=0;facts.menu=0;facts.texture_view=1;facts.covers_viewport=facts.fills_screen=1;
+        require(lg_stereo_classify_draw(&facts)==LG_STEREO_PASS,"a flat frame's full-screen picture left the game's projection");
+    }
+    scene.observe(camera,LG_STEREO_WORLD);scene.finish_frame();
+    require(!scene.flat()&&scene.screen_lens()[0]==camera[0],"flat frames outlasted the menu");
     // Sniping zooms in steps below the zoom limit: past 3.2, held, it is the
     // scope while the game's sniping event runs - and only then.
     auto step=camera;step[0]=4;step[5]=5.3333f;
@@ -1432,6 +1486,7 @@ try {
     test_sight_policy();
     test_settings_panel();
     render_panels(*device);
+    render_flat_picture(*device);
     render_overlay(*device);
     if(device->capabilities.density_map&&device->capabilities.density_map_non_subsampled){render_overlay(*device,true);render_panels(*device,true);}
     render_density_reuse(*device);
