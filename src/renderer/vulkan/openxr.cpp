@@ -1,6 +1,7 @@
 #include "openxr.hpp"
 #include "../../runtime/stereo_projection.h"
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -313,12 +314,28 @@ void OpenXR::poll()
     }
     if(result!=XR_EVENT_UNAVAILABLE) xr_check(result,"poll OpenXR events");
 }
+// LINDBERGH_XR_TIMING=1: where the render thread waits on the runtime, every 300 frames.
+static void xr_time(int what,std::chrono::steady_clock::time_point a,std::chrono::steady_clock::time_point b)
+{
+    static const bool on=[]{const auto *v=std::getenv("LINDBERGH_XR_TIMING");return v&&*v=='1';}();
+    if(!on)return;
+    static double sum[4];static unsigned n;
+    sum[what]+=std::chrono::duration<double,std::milli>(b-a).count();
+    if(what==3&&++n==300) {
+        std::fprintf(stderr,"[xr-timing] ms per frame: xrWaitFrame %.2f, xrBeginFrame %.2f, xrWaitSwapchainImage %.2f, xrEndFrame %.2f\n",
+                     sum[0]/n,sum[1]/n,sum[2]/n,sum[3]/n);
+        sum[0]=sum[1]=sum[2]=sum[3]=0;n=0;
+    }
+}
 Target *OpenXR::begin_frame()
 {
     if(!session_||frame_open_) throw std::logic_error("Invalid OpenXR frame begin");
     poll(); if(!running_||exiting_) return nullptr;
+    const auto t0=std::chrono::steady_clock::now();
     XrFrameWaitInfo wait{XR_TYPE_FRAME_WAIT_INFO}; xr_check(xrWaitFrame(session_,&wait,&frame_),"wait OpenXR frame");
+    const auto t1=std::chrono::steady_clock::now();
     XrFrameBeginInfo begin{XR_TYPE_FRAME_BEGIN_INFO}; xr_check(xrBeginFrame(session_,&begin),"begin OpenXR frame"); frame_open_=true;
+    xr_time(0,t0,t1);xr_time(1,t1,std::chrono::steady_clock::now());
     if(!frame_.shouldRender) return nullptr;
     XrViewLocateInfo locate{XR_TYPE_VIEW_LOCATE_INFO}; locate.viewConfigurationType=XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
     locate.displayTime=frame_.predictedDisplayTime;locate.space=anchor_pending_?base_space_:space_;
@@ -352,7 +369,9 @@ Target *OpenXR::begin_frame()
     XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
     xr_check(xrAcquireSwapchainImage(swapchain_,&acquire,&image_),"acquire OpenXR eye array"); acquired_=true;
     XrSwapchainImageWaitInfo ready{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO}; ready.timeout=XR_INFINITE_DURATION;
+    const auto t2=std::chrono::steady_clock::now();
     xr_check(xrWaitSwapchainImage(swapchain_,&ready),"wait OpenXR eye array");
+    xr_time(2,t2,std::chrono::steady_clock::now());
     return targets_.at(image_).get();
 }
 void OpenXR::set_foveation(int level)
@@ -394,7 +413,9 @@ void OpenXR::end_frame(bool rendered)
     const auto layer=reinterpret_cast<const XrCompositionLayerBaseHeader *>(&projection);
     XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO}; end.displayTime=frame_.predictedDisplayTime;
     end.environmentBlendMode=XR_ENVIRONMENT_BLEND_MODE_OPAQUE; end.layerCount=rendered?1:0; end.layers=&layer;
+    const auto t3=std::chrono::steady_clock::now();
     xr_check(xrEndFrame(session_,&end),"submit OpenXR frame"); frame_open_=false;
+    xr_time(3,t3,std::chrono::steady_clock::now());
 }
 void OpenXR::detach()
 {
