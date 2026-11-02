@@ -15,7 +15,7 @@ void xr_settings_save(const LgXrSettings *c)
             c->scale, c->screen, c->aim, c->resolution, c->width, c->refresh, c->left_handed ? "left" : "right",
             LASER_NAME[c->laser], c->auto_coins ? "auto" : "manual",
             SIGHT_NAME[c->sight], c->crosshair ? "on" : "off", c->show_gun ? "on" : "off", c->hud_pitch, c->dual ? "on" : "off", c->show_stats ? "on" : "off",
-            FOVEATION_NAME[c->foveation < 0 || c->foveation > 3 ? 2 : c->foveation]);
+            FOVEATION_NAME[c->foveation < 0 || c->foveation > 3 ? 3 : c->foveation]);
     fclose(f);
 }
 

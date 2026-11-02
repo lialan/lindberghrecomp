@@ -18,7 +18,7 @@ struct OpenXRConfig {
     uint32_t width=0,height=0; // zero: runtime recommendation; width-only zero: preserve recommended aspect
     float refresh=120; // request only; predicted runtime timing remains authoritative
     bool sustained_cpu=true,cpu_boost=false,enable_input=false;
-    int foveation_level=2; // 0 off, 1 low, 2 medium, 3 high (keep last: positional initializers)
+    int foveation_level=3; // 0 off, 1 low, 2 medium, 3 high (keep last: positional initializers)
 };
 // Common Vulkan/OpenXR host, independent of SDL and the guest's graphics ABI.
 class OpenXR {

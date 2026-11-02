@@ -32,7 +32,7 @@ void xp_items(const XpPanel *menu,const LgXrSettings *cfg,int hand,int hud_locke
     if (cfg->resolution == running_resolution && cfg->width == running_width) snprintf(it[XP_RES].value, 40, "%s", res);
     else snprintf(it[XP_RES].value, 40, "%s (on restart)", res);
     static const char *const foveation[] = { "Off", "Low", "Medium", "High" };
-    snprintf(it[XP_FOVEATION].value, 40, "%s", foveation[cfg->foveation < 0 || cfg->foveation > 3 ? 2 : cfg->foveation]);
+    snprintf(it[XP_FOVEATION].value, 40, "%s", foveation[cfg->foveation < 0 || cfg->foveation > 3 ? 3 : cfg->foveation]);
     snprintf(it[XP_COINS].value, 40, "%s", cfg->auto_coins ? "Automatic" : "By menu");
     if (menu->reset_armed) snprintf(it[XP_RESET].value, 40, "Pull again to reset");
 }

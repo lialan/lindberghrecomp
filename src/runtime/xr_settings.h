@@ -24,7 +24,7 @@ typedef struct {
 #define LG_XR_NATIVE_HEIGHT 2280
 #endif
 /* ... dual off, stats panel on (vr.cfg "stats off" hides it), medium foveation */
-#define LG_XR_SETTINGS_DEFAULT {1.0f,3.0f,15.0f,LG_XR_NATIVE_HEIGHT,LG_XR_NATIVE_WIDTH,120,0,LASER_ON,1,0,1,1,0,0,1,2}
+#define LG_XR_SETTINGS_DEFAULT {1.0f,3.0f,15.0f,LG_XR_NATIVE_HEIGHT,LG_XR_NATIVE_WIDTH,120,0,LASER_ON,1,0,1,1,0,0,1,3}
 void xr_settings_load(LgXrSettings *settings);
 void xr_settings_set(LgXrSettings *settings,const char *key,const char *value);
 void xr_settings_save(const LgXrSettings *settings);
