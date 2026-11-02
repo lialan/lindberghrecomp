@@ -262,6 +262,7 @@ void PipelineCache::save()
 
 PipelineCache::~PipelineCache()
 {
+    for (const auto &entry : shared_) vkDestroyPipeline(device_.handles.device, entry.second, nullptr);
     if (cache_) vkDestroyPipelineCache(device_.handles.device, cache_, nullptr);
 }
 

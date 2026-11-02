@@ -310,6 +310,17 @@ Renderer::Renderer(Device &device, Target &target, PipelineCache &cache, const P
         info.setLayoutCount = static_cast<uint32_t>(program.descriptor_layouts.size());
         info.pSetLayouts = program.descriptor_layouts.data();
         check(vkCreatePipelineLayout(device.handles.device, &info, nullptr, &layout_), "draw pipeline layout");
+        // Pipelines are shared across targets of one render-pass compatibility
+        // class (colour format, eye layers, density map) and row origin. The
+        // descriptor layouts follow from the program's own reflection.
+        auto put=[&](const void *p,size_t n){share_prefix_.append(static_cast<const char *>(p),n);};
+        const uintptr_t sources[]={uintptr_t(program.vertex),uintptr_t(program.fragment)};
+        const size_t sizes[]={program.vertex_bytes,program.fragment_bytes};
+        const uint32_t target_class[]={uint32_t(target.info.color_format),target.info.layers,uint32_t(target.info.density_map!=VK_NULL_HANDLE),
+                                       uint32_t(target.info.guest_bottom_origin),descriptor_count_};
+        put(sources,sizeof sources);put(sizes,sizeof sizes);put(target_class,sizeof target_class);
+        for(const auto &b:bindings_)put(&b,sizeof b);
+        for(const auto &a:attributes_)put(&a,sizeof a);
     } catch (...) { release(); throw; }
 }
 
@@ -320,6 +331,9 @@ void Renderer::prepare(RasterState state)
         throw std::runtime_error("Offline vertex shader predates full-screen HUD depth support; rebuild the shader pack");
     const auto key = state.key();
     if (pipelines_.count(key)) return;
+    std::string shared = share_prefix_;
+    shared.append(reinterpret_cast<const char *>(&key), sizeof key);
+    if (const auto existing = cache_.shared(shared)) { pipelines_.emplace(key, existing); return; }
     VkPipelineShaderStageCreateInfo stages[2]{};
     for (auto &s : stages) { s.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; s.pName = "main"; }
     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT; stages[0].module = vertex_;
@@ -376,6 +390,7 @@ void Renderer::prepare(RasterState state)
         check(created, "prepare graphics pipeline");
     }
     pipelines_.emplace(key, result);
+    cache_.share(shared, result);
     if (pipeline_created) pipeline_created(state);
 }
 
@@ -553,7 +568,6 @@ void Renderer::end()
 void Renderer::release()
 {
     const auto d = device_.handles.device;
-    for (auto &[key, p] : pipelines_) vkDestroyPipeline(d, p, nullptr);
     if (layout_) vkDestroyPipelineLayout(d, layout_, nullptr);
     if (vertex_) vkDestroyShaderModule(d, vertex_, nullptr);
     if (fragment_) vkDestroyShaderModule(d, fragment_, nullptr);

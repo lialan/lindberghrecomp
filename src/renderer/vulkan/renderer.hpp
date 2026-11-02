@@ -1,6 +1,7 @@
 #pragma once
 #include "frame_ring.hpp"
 #include <array>
+#include <string>
 #include <unordered_map>
 
 namespace lindbergh::vk {
@@ -142,6 +143,7 @@ public:
     void end();
     uint64_t draw_count() const { return draws_; }
     size_t pipeline_count() const { return pipelines_.size(); }
+    VkPipeline pipeline(const RasterState &state) const { auto it = pipelines_.find(state.key()); return it == pipelines_.end() ? VK_NULL_HANDLE : it->second; }
     Target &target() const { return target_; }
     void filter_state(bool enabled);
     void collect_command_stats(bool enabled) { count_commands_=enabled; }
@@ -158,7 +160,8 @@ private:
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
     VkCommandBuffer cmd_ = VK_NULL_HANDLE;
     VkPipeline bound_ = VK_NULL_HANDLE;
-    std::unordered_map<RasterKey, VkPipeline, RasterHash> pipelines_;
+    std::unordered_map<RasterKey, VkPipeline, RasterHash> pipelines_; // owned by cache_'s shared set
+    std::string share_prefix_; // the program, vertex input and target class
     uint64_t draws_ = 0;
     std::vector<VkVertexInputBindingDescription> bindings_;
     std::vector<VkVertexInputAttributeDescription> attributes_;

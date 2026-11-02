@@ -4,6 +4,7 @@
 #include <memory>
 #include <functional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace lindbergh::vk {
@@ -74,11 +75,18 @@ public:
     VkPipelineCache handle() const { return cache_; }
     bool loaded() const { return loaded_; }
     void save();
+    // Pipelines shared by every renderer of one program on render-pass
+    // compatible targets: a new render target reuses them rather than
+    // creating its own. They live until the cache does.
+    VkPipeline shared(const std::string &key) const { auto it = shared_.find(key); return it == shared_.end() ? VK_NULL_HANDLE : it->second; }
+    void share(const std::string &key, VkPipeline pipeline) { shared_.emplace(key, pipeline); }
+    size_t shared_count() const { return shared_.size(); }
 
 private:
     Device &device_;
     std::string path_;
     VkPipelineCache cache_ = VK_NULL_HANDLE;
+    std::unordered_map<std::string, VkPipeline> shared_;
     bool loaded_ = false;
 };
 

@@ -668,7 +668,8 @@ static void render_stereo(Device &device)
             ("lindbergh-recipes-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()))).string();
         PipelineCache no_disk(device,"");
         {
-            PipelineRecipes capture(device,no_disk,{&pack},path);
+            PipelineCache capture_cache(device,""); // its pipelines go with it
+            PipelineRecipes capture(device,capture_cache,{&pack},path);
             auto draw=capture.renderer(target,*record,legacy.bindings,legacy.attributes);
             draw->prepare(state);
             require(capture.recipe_count()==1&&capture.first_use_count()==1,"pipeline recipe capture missing");
@@ -686,7 +687,8 @@ static void render_stereo(Device &device)
         require(!(full_state.key()==state.key()),"full-screen HUD mode was dropped from the pipeline key");
         const auto full_path=path+"-full";
         {
-            PipelineRecipes capture_full(device,no_disk,{&pack},full_path);
+            PipelineCache capture_cache(device,"");
+            PipelineRecipes capture_full(device,capture_cache,{&pack},full_path);
             capture_full.renderer(target,*record,legacy.bindings,legacy.attributes)->prepare(full_state);
             capture_full.save();
         }
@@ -726,20 +728,31 @@ static void render_stereo(Device &device)
         vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&barrier,0,nullptr);
         ring.wait(ring.submit());pixel(0,8,16,255);pixel(0,24,16,0);pixel(1,8,16,0);pixel(1,24,16,255);
         auto other_info=target.info;other_info.width=other_info.height=16;Target resized(device,other_info);
-        loaded.prepare(resized);require(loaded.prepared_count()==2,"recipe incorrectly depends on target resolution");
+        // Another resolution of the same target class shares the pipeline
+        // already made: nothing new is created, and nothing at first draw.
+        const auto shared=no_disk.shared_count();
+        loaded.prepare(resized);auto same=loaded.renderer(resized,*record,legacy.bindings,legacy.attributes);same->prepare(state);
+        require(loaded.first_use_count()==0&&no_disk.shared_count()==shared&&same->pipeline(state)==draw->pipeline(state),
+                "recipe incorrectly depends on target resolution");
         loaded.retire(resized);
+        // The other row origin is another class: the catalogue prepares nothing
+        // for it, and its first draw makes a pipeline of its own.
         other_info.guest_bottom_origin=!other_info.guest_bottom_origin;Target flipped(device,other_info);
-        loaded.prepare(flipped);require(loaded.prepared_count()==2,"incompatible target origin reused a pipeline");
+        loaded.prepare(flipped);require(loaded.prepared_count()==1&&no_disk.shared_count()==shared,"incompatible target origin reused a recipe");
+        auto other=loaded.renderer(flipped,*record,legacy.bindings,legacy.attributes);other->prepare(state);
+        require(other->pipeline(state)&&other->pipeline(state)!=draw->pipeline(state)&&no_disk.shared_count()==shared+1,
+                "incompatible target origin reused a pipeline");
+        loaded.retire(flipped);
         auto variant_draw = [&](PipelineRecipes &catalogue, TargetInfo variant_info, bool srgb) {
             auto retirement=std::make_shared<RetiredTarget>();
             retirement->target=std::make_unique<Target>(device,variant_info);
             auto &variant=*retirement->target;
-            const auto prepared_before=catalogue.prepared_count();
+            const auto prepared_before=catalogue.prepared_count(),first_before=catalogue.first_use_count();
             catalogue.prepare(variant);
             require(catalogue.prepared_count()==prepared_before+1,"portable color/FDM target variant was not prepared");
             auto pipeline=catalogue.renderer(variant,*record,legacy.bindings,legacy.attributes);
             pipeline->prepare(state);
-            require(catalogue.first_use_count()==0,"target variant compiled on first draw");
+            require(catalogue.first_use_count()==first_before,"target variant compiled on first draw");
             const float half_tint[]={.5f,.5f,.5f,1};
             guest_uniforms.write(uint32_t(tint_location),half_tint,sizeof half_tint);
             cmd=ring.begin();pipeline->begin(cmd,{0,0,0,1});bind_legacy(*pipeline);
