@@ -627,7 +627,7 @@ static void h_region(CPU *c) { RET(region_value()); }
  * frames per game frame). Pacing by the display alone was tried: the game
  * then begins a frame only when the headset releases it, too late to finish
  * in two display frames. The same constant elsewhere (main_loop_func's frame
- * ratios) is untouched. LINDBERGH_GAME_PACING=1 keeps the game's own. */
+ * ratios) is untouched. */
 #define FRAME_TARGET_VA 0x081c1d40u
 static void (*g_idle_wait)(CPU *);
 static void h_idle_wait(CPU *c)
@@ -655,8 +655,6 @@ static void h_idle_wait(CPU *c)
 }
 static int pace_by_display(void)
 {
-    const char *v = getenv("LINDBERGH_GAME_PACING");
-    if (v && *v == '1') return 0;
     uint32_t va = guest_symbol("_Z14idle_wait_funcv");
     extern void (*dispatch_lifted(uint32_t va))(CPU *);
     uint32_t bits = va ? rd32(FRAME_TARGET_VA) : 0;

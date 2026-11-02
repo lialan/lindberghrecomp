@@ -120,15 +120,9 @@ static unsigned g_client_unit;
  * are these, and each costs a queue record here and gl4es's handling on the
  * GL thread. Only while the state is known: the game set it here since the
  * last glPopClientAttrib or context switch (the runtime's own GL on the
- * worker puts back what it changes). LINDBERGH_GLQ_NODEDUP=1: all queued. */
+ * worker puts back what it changes). */
 static uint8_t g_slot_known[S_N], g_unit_known, g_buf_known[2];
 static unsigned g_n_dropped;
-static int dedup_on(void)
-{
-    static int on = -1;
-    if (on < 0) { const char *v = getenv("LINDBERGH_GLQ_NODEDUP"); on = !(v && *v == '1'); }
-    return on;
-}
 /* LINDBERGH_GLQ_DEDUP_CHECK=1: each call that would be dropped is queued as
  * a check instead - the worker asks GL, in queue order, whether the state
  * really is already that, and the report counts the times it was not */
@@ -162,7 +156,6 @@ void glq_wait(uint32_t seq);
 /* a call found redundant: dropped, or (checking) a check in its place */
 static int drop(unsigned what, unsigned on, unsigned v)
 {
-    if (!dedup_on()) return 0;
     g_n_dropped++;
     if (dedup_check()) { glq_job(dedup_verify, (void *)((uintptr_t)what << 40 | (uintptr_t)on << 32 | v)); return 1; }
     return 1;
@@ -290,8 +283,8 @@ static uint32_t pixel_bytes(uint32_t w, uint32_t h, uint32_t fmt, uint32_t type)
  * glDepthMask, glDepthFunc, glShadeModel, glAlphaFunc, glBlendFunc and
  * glFogf: a call setting what the game thread last set is not queued. The
  * record is a small table, emptied by glPopAttrib, any glX call, another
- * glFog* or a texture deleted. LINDBERGH_GLQ_NODEDUP=1 and
- * LINDBERGH_GLQ_DEDUP_CHECK=1 cover these as well. */
+ * glFog* or a texture deleted. LINDBERGH_GLQ_DEDUP_CHECK=1 covers these as
+ * well. */
 enum { ST_NONE, ST_ENABLE, ST_DISABLE, ST_MATRIXMODE, ST_ACTIVETEX, ST_BINDTEX, ST_DEPTHMASK,
        ST_DEPTHFUNC, ST_SHADE, ST_ALPHAFUNC, ST_BLENDFUNC, ST_FOGF, ST_FRONTFACE, ST_POLYOFFSET };
 #define SRV_N 1024
@@ -415,12 +408,8 @@ static const Cls *cls(HleId id)
     for (unsigned i = 0; i < sizeof T / sizeof T[0]; i++)
         if (!strcmp(n, T[i].name)) { k.kind = T[i].kind; k.a = T[i].a; k.b = T[i].b; k.c = T[i].c; break; }
     if (!strncmp(n, "glX", 3)) k.kind = strcmp(n, "glXSwapBuffers") ? C_RAW : C_DIRECT;
-    {   /* LINDBERGH_GLQ_NOSHADOW=1: every read waits, as before */
-        const char *v = getenv("LINDBERGH_GLQ_NOSHADOW");
-        k.sh = !(v && *v == '1') && (!strcmp(n, "glViewport") || !strcmp(n, "glScissor") ||
-                                     !strcmp(n, "glPopAttrib") || !strcmp(n, "glGetIntegerv") ||
-                                     !strcmp(n, "glGetFloatv"));
-    }
+    k.sh = !strcmp(n, "glViewport") || !strcmp(n, "glScissor") || !strcmp(n, "glPopAttrib") ||
+           !strcmp(n, "glGetIntegerv") || !strcmp(n, "glGetFloatv");
     k.mirror = !strncmp(n, "glMapBuffer", 11) || !strncmp(n, "glUnmapBuffer", 13) || !strncmp(n, "glBufferData", 12) ||
                !strncmp(n, "glBufferSubData", 15) || !strncmp(n, "glDeleteBuffers", 15);
     g_cls[id] = k;
@@ -713,16 +702,10 @@ static int shadow_state(CPU *c, HleId id)
  * the worker as copies instead of making the game wait (twice a frame in The
  * House of the Dead 4: an offscreen pass of 423 vertices). The copies live in
  * three buffers used a frame each - the game is never more than a frame
- * ahead. LINDBERGH_GLQ_NOCOPY=1: such a batch waits, as before. */
+ * ahead. */
 #define ARENA_SIZE (8u << 20)
 static uint8_t *g_arena[3];
 static uint32_t g_arena_used, g_arena_frame = ~0u;
-static int copy_on(void)
-{
-    static int on = -1;
-    if (on < 0) { const char *v = getenv("LINDBERGH_GLQ_NOCOPY"); on = !(v && *v == '1'); }
-    return on;
-}
 static uint8_t *arena_take(uint32_t n)
 {
     if (g_arena_frame != g_frame) { g_arena_frame = g_frame; g_arena_used = 0; }
@@ -832,7 +815,6 @@ static int srv_redundant(CPU *c, int st)
     default: val = a0; break;           /* matrix mode, depth mask and func, shade model */
     }
     if (!srv_same(key, val)) return 0;
-    if (!dedup_on()) return 0;
     g_n_dropped++;
     if (dedup_check()) {
         static uint64_t ring[65536][2]; static unsigned at;
@@ -878,15 +860,9 @@ static void srv_verify(void *arg)
  * sends a snapshot of it to the worker, which writes it into the buffer.
  * The mirror follows glBufferData/glBufferSubData of that buffer and is
  * dropped by a delete. A partial write keeps the rest, as GSE's smoke needs
- * (hle_gl_posix.c, h_glMapBufferARB). LINDBERGH_GLQ_NOMIRROR=1: maps wait. */
+ * (hle_gl_posix.c, h_glMapBufferARB). */
 static struct { uint32_t buffer, size, va, target; uint8_t *host; int valid, mapped; } g_mirror[64];
 static unsigned g_n_mirrored;
-static int mirror_on(void)
-{
-    static int on = -1;
-    if (on < 0) { const char *v = getenv("LINDBERGH_GLQ_NOMIRROR"); on = !(v && *v == '1') && copy_on(); }
-    return on;
-}
 static int is_id(HleId id, const HleId *ids) { return id && (id == ids[0] || id == ids[1]); }
 static uint32_t bound_buffer(uint32_t target)
 {
@@ -906,7 +882,6 @@ static void mirror_write_job(void *a) { struct MirrorIo *io = a; glBufferSubData
 /* 1: the call was handled here (its answer in eax) */
 static int mirror_call(CPU *c, HleId id)
 {
-    if (!mirror_on()) return 0;
     if (is_id(id, g_id_map)) {
         uint32_t target = A32(0), buffer = bound_buffer(target);
         if (!buffer) return 0;
@@ -991,14 +966,14 @@ static void glq_hook(CPU *c, HleId id, HleHandler fn)
          * framebuffer and succeeds (the window is up by then) - queued, and
          * answered here. Twice a frame in The House of the Dead 4, around a
          * pass into a pbuffer; each made the game wait for the whole queue. */
-        if (id == g_id_makecurrent && g_id_makecurrent && A32(2) && copy_on()) {
+        if (id == g_id_makecurrent && g_id_makecurrent && A32(2)) {
             if (glx_drawable_answer) { g_draw_answer = glx_drawable_answer(A32(1)); g_draw_known = 1; }
             c->eax = 1; break;
         }
         /* where the game is drawing, asked twice a frame by Let's Go Jungle!:
          * answered here, as the worker will have it */
-        if (id == g_id_getctx && g_id_getctx && glx_current_context && copy_on()) { c->eax = glx_current_context(); return; }
-        if (id == g_id_getdraw && g_id_getdraw && g_draw_known && copy_on()) { c->eax = g_draw_answer; return; }
+        if (id == g_id_getctx && g_id_getctx && glx_current_context) { c->eax = glx_current_context(); return; }
+        if (id == g_id_getdraw && g_id_getdraw && g_draw_known) { c->eax = g_draw_answer; return; }
         if (id == g_id_getdraw && g_id_getdraw) {       /* asked the worker once: kept until the next glXMakeCurrent */
             call_sync(c, id, fn); g_draw_answer = c->eax; g_draw_known = 1; return;
         }
@@ -1059,21 +1034,21 @@ static void glq_hook(CPU *c, HleId id, HleHandler fn)
         /* the pointer is the game's memory: keep in step - unless the copies
          * at a lock take care of it (a draw from it otherwise still waits),
          * or it points at nothing */
-        if (g_array_buf == 0 && ptr != 0 && !(copy_on() && s >= 0)) async = 0;
+        if (g_array_buf == 0 && ptr != 0 && s < 0) async = 0;
         break; }
     case C_DRAW:
         /* vertices in the game's memory, unlocked: the range this draw reads
          * [first, first+count) goes along as a copy, the arrays pointed back
          * after it (draw_copied) - instead of waiting for the worker (~70 times a
          * frame in Ghost Squad Evolution, each a stall when the worker is
-         * waiting on the GPU). LINDBERGH_GLQ_NOCOPY=1: such a draw waits. */
+         * waiting on the GPU). */
         if (client_arrays_live()) {
-            if (copy_on() && lock_copy(A32(1), A32(2))) { draw_copied = 1; g_n_draw_copies++; }
+            if (lock_copy(A32(1), A32(2))) { draw_copied = 1; g_n_draw_copies++; }
             else async = 0;
         }
         break;
     case C_LOCK:
-        if (client_arrays_live() && !(copy_on() && lock_copy(A32(0), A32(1)))) async = 0;
+        if (client_arrays_live() && !lock_copy(A32(0), A32(1))) async = 0;
         break;
     case C_UNLOCK: unlock_restore(); break;
     case C_PSTORE:
@@ -1081,14 +1056,14 @@ static void glq_hook(CPU *c, HleId id, HleHandler fn)
         break;
     case C_TEXIMG:
         if (!A32(k->a)) break;                      /* no pixels: storage only */
-        if (g_unpack_odd || !copy_on() || !(extra = pixel_bytes(A32(k->b), A32(k->b + 1u), A32(6), A32(7)))) async = 0;
+        if (g_unpack_odd || !(extra = pixel_bytes(A32(k->b), A32(k->b + 1u), A32(6), A32(7)))) async = 0;
         break;
     case C_DRAW_EL: if (client_arrays_live() || !g_element_buf) async = 0; break;
     case C_MULTI_EL: {
         int32_t n = (int32_t)A32(4);
         if (client_arrays_live() || n <= 0 || n > 4096 || !A32(1) || !A32(3)) async = 0;
         else if (g_element_buf) extra = 8u * (uint32_t)n;
-        else if (!copy_on() || !type_size(A32(2))) async = 0;
+        else if (!type_size(A32(2))) async = 0;
         else {      /* index lists in the game's memory: they go along too */
             extra = 8u * (uint32_t)n;
             for (int32_t i = 0; i < n; i++) extra += ((uint32_t)rd32(A32(1) + 4u * (uint32_t)i) * type_size(A32(2)) + 15u) & ~15u;

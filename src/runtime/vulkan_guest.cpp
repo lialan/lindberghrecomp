@@ -91,7 +91,7 @@ struct BufferVersion {
 struct TextureObject {
   uint32_t layers = 1,render_width=0,render_height=0;
   bool picture_view=false,movie=false,gpu_target=false;
-  // Sampling its framebuffer's drawable directly (render_to_texture()).
+  // Sampling its framebuffer's drawable directly (GL's render-to-texture).
   std::shared_ptr<Texture> alias; Target *alias_target=nullptr;
   uint64_t revision = 1;
   bool dynamic = false;
@@ -642,8 +642,6 @@ struct State {
       if (created || ms>2) std::fprintf(stderr,"[vulkan-prepare] frame %u: %zu packets, %zu new pipelines, %.3f ms\n",g_frame,packets.size(),created,ms);
     } else for (size_t i=0;i<n;++i) if (packets[i].count) packets[i].renderer->prepare(packets[i].raster);
     constexpr VkImageAspectFlags color_depth=VK_IMAGE_ASPECT_COLOR_BIT|VK_IMAGE_ASPECT_DEPTH_BIT;
-    static const bool defer_clears=[]{const auto *v=std::getenv("LINDBERGH_VULKAN_DEFER_CLEAR");return !v||*v!='0';}();
-    static const bool limit_area=[]{const auto *v=std::getenv("LINDBERGH_VULKAN_LIMIT_AREA");return !v||*v!='0';}();
     auto full_clear=[&](const DrawPacket &q) {
       if(q.count||!covers(q.scissor,q.target)||(q.clear_aspects&color_depth)!=color_depth)return false;
       return (q.clear_aspects&VK_IMAGE_ASPECT_STENCIL_BIT)||(stencil_bits.count(q.target)&&!stencil_bits[q.target]);
@@ -651,13 +649,11 @@ struct State {
     for (size_t index=0;index<n;++index) {
       auto &p=packets[index];
       bool cleared_on_begin=false;
-      if (active_target != p.target && defer_clears && full_clear(p)) {
+      if (active_target != p.target && full_clear(p)) {
         // A run on this target of whole-target clears only: defer it.
         size_t end=index;while(end<n&&packets[end].target==p.target&&full_clear(packets[end]))++end;
         if(end==packets.size()?!keep_last:packets[end].target!=p.target) {
           // Deferring records nothing: an open pass on another target goes on.
-          static const bool keep_open=[]{const auto *v=std::getenv("LINDBERGH_VULKAN_DEFER_KEEPS_PASS");return !v||*v!='0';}();
-          if(!keep_open)end_pass();
           const auto &last=packets[end-1];
           const uint32_t stencil=(last.clear_aspects&VK_IMAGE_ASPECT_STENCIL_BIT)?last.clear_stencil&255:0;
           pending_clears[p.target]={last.color,last.clear_depth,stencil};
@@ -674,8 +670,7 @@ struct State {
         // loading what it is about to overwrite. Without a stencil clear, the
         // stencil must already be known to be all zero (the begin clear value).
         const bool stencil_zero=stencil_bits.count(p.target)&&!stencil_bits[p.target];
-        static const bool begin_clears=[]{const auto *v=std::getenv("LINDBERGH_VULKAN_BEGIN_CLEAR");return !v||*v!='0';}();
-        if(begin_clears&&preserve&&covers(p.scissor,p.target)&&(p.clear_aspects&color_depth)==color_depth&&
+        if(preserve&&covers(p.scissor,p.target)&&(p.clear_aspects&color_depth)==color_depth&&
            ((p.clear_aspects&VK_IMAGE_ASPECT_STENCIL_BIT)||stencil_zero)) {
           preserve=false;depth=p.clear_depth;cleared_on_begin=true;
           stencil=(p.clear_aspects&VK_IMAGE_ASPECT_STENCIL_BIT)?p.clear_stencil&255:0;
@@ -690,7 +685,7 @@ struct State {
             begun=true;
           }
         }
-        if(!begun&&cleared_on_begin&&limit_area) {
+        if(!begun&&cleared_on_begin) {
           // Begins with a whole-target clear but draws only part of it: limit
           // the pass to that part; the rest of the clear stays pending.
           VkRect2D area{};
@@ -732,8 +727,7 @@ struct State {
           // A preserving pass whose queued draws never touch depth or stencil
           // leaves them in memory untouched (a full-target composite loads and
           // stores only colour). A depth user arriving later restarts the pass.
-          static const bool color_only_passes=[]{const auto *v=std::getenv("LINDBERGH_VULKAN_COLOR_ONLY");return !v||*v!='0';}();
-          bool color_only=preserve&&color_only_passes&&p.target->color_pass;
+          bool color_only=preserve&&p.target->color_pass;
           for(size_t k=index;color_only&&k<n&&packets[k].target==p.target;++k)color_only=!uses_depth(packets[k]);
           p.renderer->begin(cmd,p.color,preserve,depth,stencil,nullptr,color_only);
           active_color_only=color_only;
@@ -1270,11 +1264,7 @@ namespace {
 // rect: a rectangle texture's target, sampled in pixels, keeps the eyes' scale.
 // depthless: a framebuffer object without depth or stencil attachments.
 // A framebuffer object's colour texture samples its drawable's own image (GL's
-// render-to-texture) instead of a copy. LINDBERGH_VULKAN_RENDER_TO_TEXTURE=0: copies.
-bool render_to_texture() {
-  static const bool on=[]{const auto *v=std::getenv("LINDBERGH_VULKAN_RENDER_TO_TEXTURE");return !v||*v!='0';}();
-  return on;
-}
+// render-to-texture) instead of a copy.
 unsigned create_drawable(int w, int h, bool rect, bool depthless) {
   if (w <= 0 || h <= 0)
     gap("invalid guest drawable dimensions");
@@ -1316,7 +1306,7 @@ unsigned create_drawable(int w, int h, bool rect, bool depthless) {
   info.guest_bottom_origin=true;info.transient_depth=depthless;
   // A drawable's colour is only ever read back (copied, or sampled by its
   // framebuffer object's texture): its passes end ready to be sampled.
-  if(render_to_texture())info.final_layout=VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  info.final_layout=VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
   state.drawables[id] = std::make_unique<Target>(*state.device, info);
   if(state.recipes)state.recipes->prepare(*state.drawables[id]);
 #ifdef LINDBERGH_VULKAN_XR
@@ -1425,8 +1415,7 @@ void resolve_texture(GLuint id) {
   // Record what was queued up to the source's last packet; packets after it
   // (the consumer's) stay queued, so the copy does not split their pass.
   size_t upto=0;for(size_t i=0;i<state.packets.size();++i)if(state.packets[i].target==source)upto=i+1;
-  static const bool whole=[]{const auto *v=std::getenv("LINDBERGH_VULKAN_COPY_SPLITS");return v&&*v=='1';}();
-  state.frame();state.flush(false,whole?SIZE_MAX:upto);
+  state.frame();state.flush(false,upto);
   state.pass_stamp("resolve texture "+std::to_string(id)+" from drawable "+std::to_string(drawable)+", "+std::to_string(upto)+" packets recorded");
   if(!state.initialized.count(source))return;
   const bool depth=o->levels.at(0).format==GL_DEPTH_COMPONENT||o->levels.at(0).format==GL_DEPTH_STENCIL;
@@ -3005,8 +2994,7 @@ void queue_clear(GLbitfield mask) {
     // Bits outside the write mask known to be zero and cleared to zero: the
     // masked clear equals a full one, so no clear quad is needed.
     const uint32_t masked=p.stencil_write_mask&255;
-    static const bool widen=[]{const auto *v=std::getenv("LINDBERGH_VULKAN_WIDEN_STENCIL_CLEAR");return !v||*v!='0';}();
-    if(widen&&masked!=255&&p.clear_stencil==(p.clear_stencil&masked)&&!(state.stencil_known(target)&~masked&255))p.stencil_write_mask|=255;
+    if(masked!=255&&p.clear_stencil==(p.clear_stencil&masked)&&!(state.stencil_known(target)&~masked&255))p.stencil_write_mask|=255;
   }
   p.clear_depth=state.floats.count(GL_DEPTH_CLEAR_VALUE)?state.floats[GL_DEPTH_CLEAR_VALUE][0]:1;
   p.clear_stencil=uint32_t(integer(GL_STENCIL_CLEAR_VALUE,0));
@@ -3346,11 +3334,8 @@ bool stereo_packet(DrawPacket &packet,GLint first,GLsizei count,const std::vecto
   // Movie/HUD layers hide their black backing with depth, so they take the
   // HUD transform (Z/W and XY): the 4:3 picture sits on the virtual screen at
   // the same size as the HUD drawn over it. Stretching it across the whole eye
-  // magnified it about twice. LINDBERGH_VULKAN_FULL_EYE_MOVIE=1 restores that
-  // full-eye XY (vertex specialization 5) for comparison.
+  // magnified it about twice.
   const bool full_hud=kind==LG_STEREO_FILL&&raw_perspective&&(!state.world_draws||movie);
-  static const bool full_eye=[]{const auto *v=std::getenv("LINDBERGH_VULKAN_FULL_EYE_MOVIE");return v&&*v=='1';}();
-  packet.raster.full_hud=full_hud&&full_eye;
   packet.matrices=state.stereo->transforms(p,full_hud?LG_STEREO_HUD:kind);
   state.stereo->observe(p,kind);
   if(kind==LG_STEREO_WORLD && facts.perspective)++state.world_draws;
@@ -3380,7 +3365,7 @@ bool stereo_packet(DrawPacket &packet,GLint first,GLsizei count,const std::vecto
     std::fprintf(stderr,"; depth test %d write %d func %d\n",packet.raster.depth_test,packet.raster.depth_write,int(packet.raster.depth_compare));
     if(kind==LG_STEREO_FILL) {
       std::fprintf(stderr,"[vulkan-fill] frame %u program %u texture %u movie %d full-hud %d; depth bias %d %.3f %.3f blend %d src %u dst %u color-mask %u; bounds %d %.4f %.4f %.4f %.4f\n",
-        g_frame,state.program,state.textures[0],texture!=state.texture_objects.end()&&texture->second.movie,packet.raster.full_hud,
+        g_frame,state.program,state.textures[0],texture!=state.texture_objects.end()&&texture->second.movie,full_hud,
         packet.raster.depth_bias,packet.depth_bias_factor,packet.depth_bias_units,packet.raster.blend,unsigned(packet.raster.src_rgb),unsigned(packet.raster.dst_rgb),packet.raster.color_mask,
         bounded,box[0],box[1],box[2],box[3]);
       auto &program=current_program();

@@ -1220,9 +1220,7 @@ static int copy_from_eyes(CPU *c, int k)
     float sx = g_side ? 1 : g_sx, sy = g_side ? 1 : g_sy;
     int X0 = (int)lroundf(x * sx), Y0 = (int)lroundf(y * sy);
     int X1 = (int)lroundf((x + w) * sx), Y1 = (int)lroundf((y + h) * sy);
-    static int off = -1;
-    if (off < 0) { const char *v = getenv("LINDBERGH_EYE_COPY"); off = v && *v == '0'; }
-    if (!off) gl4es_multiview_copy(g_side ? g_side_tex[0] : g_eye_tex[0], 0, X0, Y0, X1, Y1, (GLuint)tex, level, xo, yo, xo + w, yo + h);
+    gl4es_multiview_copy(g_side ? g_side_tex[0] : g_eye_tex[0], 0, X0, Y0, X1, Y1, (GLuint)tex, level, xo, yo, xo + w, yo + h);
     if (!g_side && w >= GAME_W * 9 / 10 && h >= GAME_H * 9 / 10 && !screen_copy((GLuint)tex) && g_nscreen_copy < MAX_SCREEN_COPIES) {
         g_screen_copy[g_nscreen_copy++] = (GLuint)tex;
         fprintf(stderr, "[stereo] frame %u: texture %d is a copy of the whole screen\n", g_frame, tex);
@@ -1529,9 +1527,7 @@ static int transform_call(CPU *c, HleId id, const char *n)
             snprintf(how, sizeof how, "%s, format %#x", APTR(8) ? "uploaded" : "allocated", A32(6)); tex_hist((GLuint)bt, how, AI32(3), AI32(4)); }
         GLenum ifmt = A32(2);
         int is_float = ifmt == 0x881A || ifmt == 0x881B || ifmt == 0x8814 || ifmt == 0x8815;   /* RGBA/RGB 16F, 32F */
-        static int rt8 = -1;           /* LINDBERGH_RT_8BIT=1: not kept (a debugging aid) */
-        if (rt8 < 0) { const char *v = getenv("LINDBERGH_RT_8BIT"); rt8 = v && *v == '1'; }
-        if (A32(0) == GL_TEXTURE_2D && A32(1) == 0 && is_float && !rt8) {
+        if (A32(0) == GL_TEXTURE_2D && A32(1) == 0 && is_float) {
             GLint tex = 0;
             glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
             int i = texfmt_find((GLuint)tex);
@@ -2262,7 +2258,7 @@ static void stereo_gl_call(CPU *c, HleId id, HleHandler fn)
             GLint vp[4]; glGetIntegerv(GL_VIEWPORT, vp);
             GLuint ct = 0;
             for (unsigned i = 0; i < g_nfb_color; i++) if (g_fb_color[i].fb == g_game_fb) ct = g_fb_color[i].tex;
-            if (g_game_fb && ct) {  /* an offscreen target (8-bit, LINDBERGH_RT_8BIT): its centre and lower middle */
+            if (g_game_fb && ct) {  /* an offscreen target: its centre and lower middle */
                 static unsigned char *buf;
                 if (!buf) buf = malloc(4096u * 4096u * 4u);
                 int tw = vp[0] + vp[2], th = vp[1] + vp[3];
@@ -2811,20 +2807,18 @@ void stereo_frame_begin(void)
     g_2d_seq = 0;
     g_3d_draws = 0;
     {
-        static int flat_env = -1;
-        if (flat_env < 0) { const char *v = getenv("LINDBERGH_FLAT_MENUS"); flat_env = !v || *v != '0'; }
         static int flat_all = -1;       /* LINDBERGH_FLAT_ALL=1: everything flat, the arcade's picture - for comparing */
         if (flat_all < 0) { const char *v = getenv("LINDBERGH_FLAT_ALL"); flat_all = v && *v == '1'; }
         /* A scope held up is a flat picture too: the arcade's own image on
          * the screen, nothing around it. Put on the screen as 3D, the game's
          * full-screen haze passes ran over the empty room and turned it a
          * flat lavender. */
-        g_flat = flat_all || (flat_env && (menu_state() || g_zoom_frames >= 6));
+        g_flat = flat_all || menu_state() || g_zoom_frames >= 6;
         /* Widescreen: a sniping event is the arcade's 4:3 from its start - the
          * scope's mask is drawn for the 4:3 screen, and waiting for its lens
          * to hold left the first frames wide, the mask's corners at the edges
          * and the world around them */
-        if (g_wide && flat_env && g_snipe_frame != ~0u && g_frame - g_snipe_frame <= 2) g_flat = 1;
+        if (g_wide && g_snipe_frame != ~0u && g_frame - g_snipe_frame <= 2) g_flat = 1;
     }
     /* A flat picture is the arcade's whole monitor: the screen at the size
      * it has in play (lens 1.73). Kept as last followed, a scope coming up -

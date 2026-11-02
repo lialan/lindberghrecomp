@@ -893,9 +893,7 @@ int xr_init(void)
     XRCHECK(xrEnumerateSwapchainFormats(session, 0, &nf, NULL));
     int64_t *fmts = calloc(nf ? nf : 1, sizeof *fmts);
     xrEnumerateSwapchainFormats(session, nf, &nf, fmts);
-    const char *want = getenv("LINDBERGH_XR_SWAPCHAIN");     /* "rgba8": the plain one, for comparing */
-    if (!(want && !strcmp(want, "rgba8")))
-        for (uint32_t i = 0; i < nf; i++) if (fmts[i] == GL_SRGB8_ALPHA8) color_format = GL_SRGB8_ALPHA8;
+    for (uint32_t i = 0; i < nf; i++) if (fmts[i] == GL_SRGB8_ALPHA8) color_format = GL_SRGB8_ALPHA8;
     if (!color_format) for (uint32_t i = 0; i < nf; i++) if (fmts[i] == GL_RGBA8) color_format = GL_RGBA8;
     if (have_depth_layer) {
         static const int64_t pref[] = { GL_DEPTH24_STENCIL8, GL_DEPTH_COMPONENT24, GL_DEPTH_COMPONENT32F, GL_DEPTH_COMPONENT16 };   /* the first is what gl4es' eye layers hold: a plain blit */
@@ -971,7 +969,7 @@ int xr_init(void)
     gl.GenFramebuffers(1, &read_fb);
 
     overlay_ok = xo_init();
-    { const char *v = getenv("LINDBERGH_AIM_PROBE"); if (!v || *v != '0') stereo_set_aim_hook(aim_probe); }   /* =0: aim at cfg.aim */
+    stereo_set_aim_hook(aim_probe);
     stereo_eye_size((int)w, (int)h);
     stereo_set_screen_distance(cfg.screen * cfg.scale);
     stereo_set_hud_pitch((float)cfg.hud_pitch);
