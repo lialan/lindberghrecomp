@@ -66,7 +66,7 @@ namespace {
 bool index_reuse_enabled() {
   static const bool enabled=[] {const auto *v=std::getenv("LINDBERGH_VULKAN_INDEX_REUSE");return !v||*v!='0';}();return enabled;
 }
-std::shared_ptr<GeometryBuffer> native_buffer(GLuint id,bool dedicated_staging=false);
+const std::shared_ptr<GeometryBuffer> &native_buffer(GLuint id,bool dedicated_staging=false);
 struct Shader {
   GLenum type;
   std::string source;
@@ -87,11 +87,13 @@ struct TextureLevel {
 struct ImageVersion {
   std::shared_ptr<Texture> image;
   uint64_t revision = 0, use_frame = 0;
+  const void *kept = nullptr; // image retained for the use_frame recording
 };
 struct BufferVersion {
   std::shared_ptr<GeometryBuffer> buffer;
   size_t bytes = 0;
   uint64_t revision = 0, use_frame = 0;
+  const void *kept = nullptr; // buffer retained for the use_frame recording
 };
 struct TextureObject {
   uint32_t layers = 1,render_width=0,render_height=0;
@@ -131,6 +133,13 @@ struct Program {
   std::vector<UniformLocation> locations;
   std::unordered_map<std::string, GLint> location_names;
   std::unordered_map<int, GLint> sampler_units;
+  // What each draw needs from `record`, derived once (see program_meta).
+  struct SamplerMeta { uint32_t binding; bool cube, rect_name, fixed, shadow, array; };
+  struct FixedFields { int env_color=-1, lighting=-1, ambient=-1, rect=-1, combine=-1; };
+  const ShaderRecord *meta_record = nullptr;
+  std::vector<SamplerMeta> sampler_meta;
+  std::vector<uint32_t> input_locations;
+  std::vector<FixedFields> fixed_fields; // per uniform block
 };
 struct Buffer {
   uint64_t revision = 1;
@@ -165,7 +174,8 @@ struct DrawPacket {
   Matrices matrices{};
   RasterState raster;
   std::array<VkDescriptorSet,3> descriptors{};
-  std::array<std::vector<uint32_t>,2> offsets;
+  std::array<std::array<uint32_t,4>,2> offsets{}; // dynamic offsets of sets 0 and 1
+  std::array<uint8_t,2> offset_counts{};
   std::array<float,4> viewport;
   VkRect2D scissor;
   VkImageAspectFlags clear_aspects = 0;
@@ -184,7 +194,32 @@ struct Framebuffer {
   unsigned drawable=0;
   std::array<int,2> size{};
 };
+// A material: a program's record and each sampler's image view and sampler.
+struct MaterialKey {
+  static constexpr unsigned max_samplers = 16;
+  const ShaderRecord *record = nullptr;
+  uint32_t count = 0;
+  std::array<uint64_t, 2 * max_samplers> handles{};
+  bool operator==(const MaterialKey &o) const {
+    return record == o.record && count == o.count && std::equal(handles.begin(), handles.begin() + 2 * count, o.handles.begin());
+  }
+};
+inline uint64_t mix_word(uint64_t h, uint64_t v) { h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2); return h; }
+struct MaterialKeyHash {
+  size_t operator()(const MaterialKey &k) const {
+    uint64_t h = mix_word(uint64_t(uintptr_t(k.record)), k.count);
+    for (uint32_t i = 0; i < 2 * k.count; ++i) h = mix_word(h, k.handles[i]);
+    return size_t(h);
+  }
+};
+using SamplerKey = std::array<int32_t, 9>; // the SamplerInfo fields GL parameters choose
+struct SamplerKeyHash {
+  size_t operator()(const SamplerKey &k) const {
+    uint64_t h = 0; for (auto v : k) h = mix_word(h, uint32_t(v)); return size_t(h);
+  }
+};
 struct Material {
+  uint64_t kept_frame = 0; // retained for this recording already
   std::shared_ptr<SampledSet> descriptors;
   std::vector<std::shared_ptr<Texture>> images;
   std::vector<std::shared_ptr<Sampler>> samplers;
@@ -502,8 +537,8 @@ struct State {
   static bool covers(const VkRect2D &r,const Target *t) {
     return r.offset.x<=0&&r.offset.y<=0&&int64_t(r.offset.x)+r.extent.width>=t->info.width&&int64_t(r.offset.y)+r.extent.height>=t->info.height;
   }
-  std::array<std::unordered_map<std::string,std::shared_ptr<Material>>,3> materials;
-  std::unordered_map<std::string,std::shared_ptr<Sampler>> samplers;
+  std::array<std::unordered_map<MaterialKey,std::shared_ptr<Material>,MaterialKeyHash>,3> materials;
+  std::unordered_map<SamplerKey,std::shared_ptr<Sampler>,SamplerKeyHash> samplers;
   std::shared_ptr<Texture> fallback, cube_fallback;
   std::unordered_map<Target *,std::shared_ptr<Texture>> target_views; // a drawable's colour, as a texture
   Target *active_target = nullptr;
@@ -852,7 +887,7 @@ struct State {
         ++pass_profile.draws;
         active->dynamic_state(p.stencil_ref,p.stencil_compare_mask,p.stencil_write_mask,p.depth_bias_factor,p.depth_bias_units,p.blend_constants.data());
         for (unsigned set=0;set<3;++set) if (p.descriptors[set])
-          active->bind_descriptors(set,1,&p.descriptors[set],set<2?uint32_t(p.offsets[set].size()):0,set<2?p.offsets[set].data():nullptr);
+          active->bind_descriptors(set,1,&p.descriptors[set],set<2?uint32_t(p.offset_counts[set]):0,set<2?p.offsets[set].data():nullptr);
         active->draw_buffers(p.streams.data(),uint32_t(p.streams.size()),p.count,p.matrices,p.raster,p.index.buffer?&p.index:nullptr);
       }
     }
@@ -1398,7 +1433,7 @@ extern "C" void lvk_glFinish(void) {
 namespace {
 unsigned create_drawable(int w, int h, bool rect, bool depthless = false);
 void changed(TextureObject &o);
-std::shared_ptr<Texture> native_image(TextureObject &o, int overwritten_level, bool gpu_copy);
+const std::shared_ptr<Texture> &native_image(TextureObject &o, int overwritten_level, bool gpu_copy);
 }
 extern "C" unsigned lvk_create_drawable(int w, int h) { return create_drawable(w,h,false); }
 namespace {
@@ -3071,7 +3106,7 @@ VkFormat texture_format(const TextureLevel &v) {
     default:gap("native texture format not implemented");
   }
 }
-std::shared_ptr<Texture> native_image(TextureObject &o, int overwritten_level = -1, bool gpu_copy = false) {
+const std::shared_ptr<Texture> &native_image(TextureObject &o, int overwritten_level = -1, bool gpu_copy = false) {
   state.frame();state.end_pass();
   if(o.levels.empty() || !o.levels.count(0)) {
     if(!state.fallback) {
@@ -3125,9 +3160,11 @@ std::shared_ptr<Texture> native_image(TextureObject &o, int overwritten_level = 
     }
     version.revision=o.revision;
   }
-  version.use_frame=frame;state.ring->keep_alive(version.image);return version.image;
+  // Retained once per recording: later uses in the same recording are covered.
+  if(version.use_frame!=frame||version.kept!=version.image.get()){state.ring->keep_alive(version.image);version.kept=version.image.get();}
+  version.use_frame=frame;return version.image;
 }
-std::shared_ptr<GeometryBuffer> native_buffer(GLuint id,bool dedicated_staging) {
+const std::shared_ptr<GeometryBuffer> &native_buffer(GLuint id,bool dedicated_staging) {
   auto &o=state.buffers.at(id);state.frame();state.end_pass();
   auto &version=o.dynamic?o.slots[state.ring->recording_slot()]:o.stable;
   const auto frame=state.ring->submissions()+1;
@@ -3141,14 +3178,15 @@ std::shared_ptr<GeometryBuffer> native_buffer(GLuint id,bool dedicated_staging) 
     else {auto copy=o.bytes;copy.resize(bytes);version.buffer->upload(state.cmd,*state.ring,copy.data(),bytes,0,dedicated_staging);}
     version.revision=o.revision;
   }
-  version.use_frame=frame;state.ring->keep_alive(version.buffer);return version.buffer;
+  if(version.use_frame!=frame||version.kept!=version.buffer.get()){state.ring->keep_alive(version.buffer);version.kept=version.buffer.get();}
+  version.use_frame=frame;return version.buffer;
 }
 VkSamplerAddressMode wrap_mode(GLint value) {
   switch(value) {case GL_REPEAT:return VK_SAMPLER_ADDRESS_MODE_REPEAT;case GL_MIRRORED_REPEAT:return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
   case GL_CLAMP_TO_EDGE:return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;case GL_CLAMP:case GL_CLAMP_TO_BORDER:return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
   default:gap("guest texture wrap mode not implemented");}
 }
-std::shared_ptr<Sampler> native_sampler(TextureObject &o,uint32_t levels,bool shadow) {
+const std::shared_ptr<Sampler> &native_sampler(TextureObject &o,uint32_t levels,bool shadow) {
   auto param=[&](GLenum name,GLint fallback){const auto it=o.parameters.find(name);return it==o.parameters.end()?fallback:it->second;};
   SamplerInfo info;
   // Rectangle textures default to GL_LINEAR and GL_CLAMP_TO_EDGE and cannot repeat.
@@ -3166,8 +3204,7 @@ std::shared_ptr<Sampler> native_sampler(TextureObject &o,uint32_t levels,bool sh
     else if(color->second==std::array<float,4>{0,0,0,1})info.border=VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
     else if(color->second!=std::array<float,4>{0,0,0,0})gap("custom sampler border color requires device feature support");
   }
-  std::string key;
-  for(auto value:{int(info.min_filter),int(info.mag_filter),int(info.mip_filter),int(info.u),int(info.v),int(info.max_lod),int(info.compare),int(info.compare_op),int(info.border)})key_word(key,uint64_t(value));
+  const SamplerKey key{int(info.min_filter),int(info.mag_filter),int(info.mip_filter),int(info.u),int(info.v),int(info.max_lod),int(info.compare),int(info.compare_op),int(info.border)};
   auto &sampler=state.samplers[key];if(!sampler)sampler=std::make_shared<Sampler>(*state.device,info);return sampler;
 }
 DrawPacket packet_for(Target *target,Renderer *renderer) {
@@ -3459,38 +3496,78 @@ void native_program(Program &p) {
   p.native->empty_images=std::make_unique<SampledSet>(*state.device,std::vector<SampledImage>{});
   p.native->layouts.push_back(p.native->empty_images->layout());
 }
-std::shared_ptr<Material> material(Program &p) {
-  std::vector<std::shared_ptr<Texture>> images;std::vector<std::shared_ptr<Sampler>> samplers;std::vector<SampledImage> bindings;
-  std::string key(reinterpret_cast<const char *>(p.record->key.data()),p.record->key.size());
+// What each draw needs from the program's record, derived once per record
+// rather than from its names and type strings on every draw.
+Program &program_meta(Program &p) {
+  if(p.meta_record==p.record)return p;
+  p.sampler_meta.clear();p.input_locations.clear();p.fixed_fields.clear();
   for(const auto &s:p.record->samplers) {
     if(s.count!=1)gap("sampler arrays need descriptor-array binding");
-    const auto unit=p.sampler_units[int(s.binding)];if(unit<0||unit>=8)gap("guest sampler texture unit outside supported range");
     // arbprog.c names its rectangle samplers sr_<unit>: those read the unit's rectangle binding.
-    const bool cube=s.type.find("Cube")!=std::string::npos;
     // fixed_texture<N>: a fixed-function unit, whose rectangle target wins over 2D when enabled.
-    const bool rect=s.name.rfind("sr_",0)==0||(s.name.rfind("fixed_texture",0)==0&&state.rect_enabled[unsigned(unit)]);
-    const GLuint id=(cube?state.cube_textures:rect?state.rect_textures:state.textures)[unsigned(unit)];
-    resolve_texture(id);
-    auto &object=state.texture_objects[id];
-    auto image=object.alias?object.alias:native_image(object);
-    if(cube&&image==state.fallback) {
+    p.sampler_meta.push_back({s.binding,s.type.find("Cube")!=std::string::npos,s.name.rfind("sr_",0)==0,
+                              s.name.rfind("fixed_texture",0)==0,s.type.find("Shadow")!=std::string::npos,
+                              s.type.find("2DArray")!=std::string::npos});
+  }
+  if(p.sampler_meta.size()>MaterialKey::max_samplers)gap("more guest samplers than a material key holds");
+  for(const auto &input:p.record->inputs)p.input_locations.push_back(input.location);
+  for(const auto &block:p.record->uniforms) {
+    UniformData data(block);Program::FixedFields f;
+    f.env_color=data.find("fixed_env_color");f.lighting=data.find("fixed_lighting");
+    f.ambient=data.find("fixed_light_model_ambient");f.rect=data.find("fixed_rect");f.combine=data.find("fixed_combine");
+    p.fixed_fields.push_back(f);
+  }
+  p.meta_record=p.record;
+  return p;
+}
+std::shared_ptr<Material> material(Program &p) {
+  const auto &meta=program_meta(p).sampler_meta;
+  const unsigned n=unsigned(meta.size());
+  // Pending GPU copies first: a resolve can copy into any texture attached to
+  // the bound framebuffer, so the images gathered below stay current.
+  std::array<GLuint,MaterialKey::max_samplers> ids{};
+  for(unsigned i=0;i<n;++i) {
+    const auto &s=meta[i];
+    const auto unit=p.sampler_units[int(s.binding)];if(unit<0||unit>=8)gap("guest sampler texture unit outside supported range");
+    const bool rect=s.rect_name||(s.fixed&&state.rect_enabled[unsigned(unit)]);
+    ids[i]=(s.cube?state.cube_textures:rect?state.rect_textures:state.textures)[unsigned(unit)];
+    resolve_texture(ids[i]);
+  }
+  MaterialKey key;key.record=p.record;key.count=n;
+  std::array<const std::shared_ptr<Texture> *,MaterialKey::max_samplers> images{};
+  std::array<const std::shared_ptr<Sampler> *,MaterialKey::max_samplers> samplers{};
+  std::array<SampledImage,MaterialKey::max_samplers> bindings{};
+  for(unsigned i=0;i<n;++i) {
+    const auto &s=meta[i];
+    auto &object=state.texture_objects[ids[i]];
+    const std::shared_ptr<Texture> *image=object.alias?&object.alias:&native_image(object);
+    if(s.cube&&*image==state.fallback) {
       if(!state.cube_fallback) {
         TextureInfo info{1,1,1,6};info.cube=true;state.cube_fallback=std::make_shared<Texture>(*state.device,info);
         const uint8_t black[]={0,0,0,255};for(uint32_t face=0;face<6;++face)state.cube_fallback->upload(state.cmd,*state.ring,0,face,black,4);
       }
-      image=state.cube_fallback;
+      image=&state.cube_fallback;
     }
-    auto sampler=native_sampler(object,image->info.levels,s.type.find("Shadow")!=std::string::npos);
-    const bool array=s.type.find("2DArray")!=std::string::npos;
-    if(cube&&!image->info.cube)gap("cube sampler bound to a 2D texture");
-    if(image->info.layers>1 && !array && !cube)gap("stereo texture requires a rebuilt offline shader archive with array samplers");
-    const auto view=array&&!image->info.cube?image->array_view():image->view();
-    bindings.push_back({s.binding,view,sampler->handle()});key_word(key,(uint64_t)(uintptr_t)view);key_word(key,(uint64_t)(uintptr_t)sampler->handle());
-    images.push_back(image);samplers.push_back(sampler);
+    auto &texture=**image;
+    const auto &sampler=native_sampler(object,texture.info.levels,s.shadow);
+    if(s.cube&&!texture.info.cube)gap("cube sampler bound to a 2D texture");
+    if(texture.info.layers>1 && !s.array && !s.cube)gap("stereo texture requires a rebuilt offline shader archive with array samplers");
+    const auto view=s.array&&!texture.info.cube?texture.array_view():texture.view();
+    bindings[i]={s.binding,view,sampler->handle()};
+    key.handles[2*i]=uint64_t(uintptr_t(view));key.handles[2*i+1]=uint64_t(uintptr_t(sampler->handle()));
+    images[i]=image;samplers[i]=&sampler;
   }
   auto &entry=state.materials[state.ring->recording_slot()][key];
-  if(!entry) {entry=std::make_shared<Material>();entry->descriptors=std::make_shared<SampledSet>(*state.device,bindings);entry->images=std::move(images);entry->samplers=std::move(samplers);}
-  state.ring->keep_alive(entry);return entry;
+  if(!entry) {
+    entry=std::make_shared<Material>();
+    entry->descriptors=std::make_shared<SampledSet>(*state.device,std::vector<SampledImage>(bindings.begin(),bindings.begin()+n));
+    for(unsigned i=0;i<n;++i){entry->images.push_back(*images[i]);entry->samplers.push_back(*samplers[i]);}
+  }
+  // Retained once per recording: the cache keeps it across frames, and this
+  // keeps a cleared cache's entry alive while this recording uses it.
+  const auto frame=state.ring->submissions()+1;
+  if(entry->kept_frame!=frame){state.ring->keep_alive(entry);entry->kept_frame=frame;}
+  return entry;
 }
 bool stereo_bounds(const Matrix &p,GLint first,GLsizei count,const std::vector<uint32_t> &elements,
                    const void *immediate,uint32_t stride,bool guest_indexed,std::array<float,4> &box)
@@ -3648,8 +3725,9 @@ void draw_geometry(GLenum mode,GLint first,GLsizei count,const void *indices,GLe
   auto *target=state.target();auto &p=current_program();native_program(p);legacy_uniforms(p,*target);
   const bool fixed=!state.program||p.fixed_fragment; // fixed-function fragment state applies
   if(fixed)for(size_t block=0;block<p.record->uniforms.size();++block) {
-    auto field=p.uniforms[block]->find("fixed_env_color");if(field>=0)p.uniforms[block]->write(uint32_t(field),state.env_color.data(),sizeof state.env_color,0,8);
-    if(const auto lighting=p.uniforms[block]->find("fixed_lighting");lighting>=0) {
+    const auto &fields=program_meta(p).fixed_fields[block];
+    auto field=fields.env_color;if(field>=0)p.uniforms[block]->write(uint32_t(field),state.env_color.data(),sizeof state.env_color,0,8);
+    if(const auto lighting=fields.lighting;lighting>=0) {
       std::array<int32_t,4> l{};
       if(state.enabled[GL_LIGHTING]) {
         for(unsigned i=0;i<8;++i)if(state.enabled[GL_LIGHT0+i])l[0]|=1<<i;
@@ -3660,10 +3738,10 @@ void draw_geometry(GLenum mode,GLint first,GLsizei count,const void *indices,GLe
       }
       p.uniforms[block]->write(uint32_t(lighting),l.data(),sizeof l,0,1);
     }
-    if(const auto ambient=p.uniforms[block]->find("fixed_light_model_ambient");ambient>=0) {
+    if(const auto ambient=fields.ambient;ambient>=0) {
       const auto a=value(GL_LIGHT_MODEL_AMBIENT,{.2f,.2f,.2f,1});p.uniforms[block]->write(uint32_t(ambient),a.data(),sizeof a,0,1);
     }
-    if(const auto rect=p.uniforms[block]->find("fixed_rect");rect>=0) {
+    if(const auto rect=fields.rect;rect>=0) {
       // A rectangle unit's texel coordinates, normalized by its logical size
       // (a render target drawn larger keeps the same normalized lookup).
       std::array<std::array<float,4>,8> scale{};
@@ -3676,7 +3754,7 @@ void draw_geometry(GLenum mode,GLint first,GLsizei count,const void *indices,GLe
       }
       p.uniforms[block]->write(uint32_t(rect),scale.data(),sizeof scale,0,8);
     }
-    field=p.uniforms[block]->find("fixed_combine");
+    field=fields.combine;
     if(field>=0) {
       std::array<std::array<int32_t,4>,8> words{};
       for(unsigned i=0;i<8;++i)if(state.unit_textured(i)&&state.texture_env[i]==GL_COMBINE)combine_words(i,words[i]);
@@ -3684,7 +3762,7 @@ void draw_geometry(GLenum mode,GLint first,GLsizei count,const void *indices,GLe
     }
   }
   auto images=material(p);p.native->layouts[2]=images->descriptors->layout();
-  std::vector<uint32_t> locations;for(const auto &input:p.record->inputs)locations.push_back(input.location);
+  const auto &locations=p.input_locations; // material() derived them (program_meta)
   uint32_t vertices=uint32_t(count);std::vector<uint32_t> elements;
   bool direct_indices=false;VkDeviceSize index_offset=0;
   if(indexed) {
@@ -3740,17 +3818,22 @@ void draw_geometry(GLenum mode,GLint first,GLsizei count,const void *indices,GLe
     count=GLsizei(elements.size());indexed=true;
   } else gap("unsupported guest primitive topology");
   if(!count)return;
-  ArrayPlan plan;
+  // The arrays' plan is their reused storage, read in place (valid until the
+  // next prepare); an immediate draw builds its own.
+  static thread_local ArrayPlan immediate_plan;
+  const ArrayPlan *planned=&immediate_plan;
   if(immediate) {
     auto stream=state.ring->upload(immediate,size_t(vertices)*immediate_stride);
-    for(uint32_t i=0;i<locations.size();++i) {plan.bindings.push_back({i,immediate_stride,VK_VERTEX_INPUT_RATE_VERTEX});plan.attributes.push_back({locations[i],i,VK_FORMAT_R32G32B32A32_SFLOAT,locations[i]*16});plan.streams.push_back(stream);}
+    immediate_plan.bindings.clear();immediate_plan.attributes.clear();immediate_plan.streams.clear();
+    for(uint32_t i=0;i<locations.size();++i) {immediate_plan.bindings.push_back({i,immediate_stride,VK_VERTEX_INPUT_RATE_VERTEX});immediate_plan.attributes.push_back({locations[i],i,VK_FORMAT_R32G32B32A32_SFLOAT,locations[i]*16});immediate_plan.streams.push_back(stream);}
   } else {
     state.arrays.inputs(locations);
-    const auto &prepared=state.arrays.prepare(*state.device,*state.ring,uint32_t(first),vertices,{g_guest_base,uint64_t(1)<<32},
-      [&](uint32_t id){auto gpu=native_buffer(id);return GuestBufferView{gpu->handle(),state.buffers.at(id).bytes.size()};});
-    plan=prepared;
+    planned=&state.arrays.prepare(*state.device,*state.ring,uint32_t(first),vertices,{g_guest_base,uint64_t(1)<<32},
+      [&](uint32_t id){const auto &gpu=native_buffer(id);return GuestBufferView{gpu->handle(),state.buffers.at(id).bytes.size()};});
   }
-  std::string key;key_word(key,(uint64_t)(uintptr_t)target);
+  const ArrayPlan &plan=*planned;
+  static thread_local std::string key;key.clear(); // its storage is reused across draws
+  key_word(key,(uint64_t)(uintptr_t)target);
   for(const auto &b:plan.bindings){key_word(key,b.binding);key_word(key,b.stride);}
   for(const auto &a:plan.attributes){key_word(key,a.location);key_word(key,a.binding);key_word(key,a.format);key_word(key,a.offset);}
   auto &renderer=p.native->renderers[key];
@@ -3761,10 +3844,10 @@ void draw_geometry(GLenum mode,GLint first,GLsizei count,const void *indices,GLe
       renderer=std::make_shared<Renderer>(*state.device,*target,*state.cache,source);
     }
   }
-  auto packet=packet_for(target,renderer.get());packet.raster=raster;packet.streams=std::move(plan.streams);packet.count=uint32_t(count);
+  auto packet=packet_for(target,renderer.get());packet.raster=raster;packet.streams=plan.streams;packet.count=uint32_t(count);
   if(stereo_packet(packet,first,count,elements,immediate,immediate_stride,guest_indexed))return;
   if(direct_indices) {
-    auto gpu=native_buffer(state.element_buffer,true);
+    const auto &gpu=native_buffer(state.element_buffer,true);
     packet.index={gpu->handle(),index_offset,index_type==GL_UNSIGNED_SHORT?VK_INDEX_TYPE_UINT16:VK_INDEX_TYPE_UINT32};
     if(state.index_stats)++state.direct_index_draws;
   } else if(indexed) {
@@ -3778,7 +3861,9 @@ void draw_geometry(GLenum mode,GLint first,GLsizei count,const void *indices,GLe
       const auto &bytes=p.uniforms[block]->bytes();p.native->uniform_offset[set]=p.native->uniform_sets[set]->upload(0,bytes.data(),bytes.size());
       p.native->uniform_version[set]=version;p.native->uniform_frame[set]=frame;
     }
-    packet.descriptors[set]=p.native->uniform_sets[set]->current_set();packet.offsets[set].push_back(p.native->uniform_offset[set]);
+    packet.descriptors[set]=p.native->uniform_sets[set]->current_set();
+    if(packet.offset_counts[set]>=packet.offsets[set].size())gap("more uniform blocks in one descriptor set than a draw packet holds");
+    packet.offsets[set][packet.offset_counts[set]++]=p.native->uniform_offset[set];
   }
   if(!p.record->samplers.empty())packet.descriptors[2]=images->descriptors->handle();
   state.ring->keep_alive(p.native);state.packets.push_back(std::move(packet));

@@ -81,13 +81,14 @@ static std::array<std::array<unsigned,3>,2> sides(const std::string &path) {
     return {at(8),at(24)};
 }
 // The centre texel of a size x size readback.
-static std::array<unsigned,3> centre(const std::string &path,unsigned size) {
+static std::array<unsigned,3> sample(const std::string &path,unsigned size,unsigned x,unsigned y) {
     std::ifstream in(path,std::ios::binary);std::string magic;unsigned w,h,maximum;
     in>>magic>>w>>h>>maximum;in.get();
-    require(in&&magic=="P6"&&w==size&&h==size&&maximum==255,"missing combiner readback");
+    require(in&&magic=="P6"&&w==size&&h==size&&maximum==255,"missing target readback");
     std::vector<unsigned char> rgb(size_t(w)*h*3);in.read(reinterpret_cast<char *>(rgb.data()),rgb.size());
-    const auto *q=&rgb[(size_t(h/2)*w+w/2)*3];return {q[0],q[1],q[2]};
+    const auto *q=&rgb[(size_t(y)*w+x)*3];return {q[0],q[1],q[2]};
 }
+static std::array<unsigned,3> centre(const std::string &path,unsigned size) {return sample(path,size,size/2,size/2);}
 static void triangle(unsigned size) {
     glViewport(0,0,size,size);glClearColor(0,0,0,1);glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
     glColor4f(0,1,0,1);glBegin(GL_TRIANGLES);
@@ -208,6 +209,37 @@ int main() {
                 require(c[0]>=126&&c[0]<=130&&c[1]>=126&&c[1]<=130&&c[2]>=126&&c[2]<=130,"a GL_COMBINE unit's result was not clamped");
             }
             lvk_bind_drawable(0);lvk_destroy_drawable(target);glDeleteTextures(2,tex);++g_frame;
+        }
+        {
+            // One program, two textures, two draws in one frame: each draw's
+            // material (descriptor set) is its own. A cache that matched a
+            // material on the program alone would paint both halves red.
+            const auto target=lvk_create_drawable(32,32);lvk_bind_drawable(target);
+            glViewport(0,0,32,32);glClearColor(0,0,0,1);glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
+            const unsigned char texels[2][4]={{255,0,0,255},{0,0,255,255}};GLuint tex[2];glGenTextures(2,tex);
+            glActiveTexture(GL_TEXTURE0);glEnable(GL_TEXTURE_2D);glColor4f(1,1,1,1);
+            for(unsigned i=0;i<2;++i) {
+                glBindTexture(GL_TEXTURE_2D,tex[i]);
+                glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
+                glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,1,1,0,GL_RGBA,GL_UNSIGNED_BYTE,texels[i]);
+            }
+            for(unsigned frame=0;frame<2;++frame) { // the second frame reuses both cached materials
+                glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
+                for(unsigned i=0;i<2;++i) {
+                    const float x0=i?0.f:-1.f,x1=i?1.f:0.f;glBindTexture(GL_TEXTURE_2D,tex[i]);
+                    glBegin(GL_QUADS);glVertex3f(x0,-1,0);glVertex3f(x1,-1,0);glVertex3f(x1,1,0);glVertex3f(x0,1,0);glEnd();
+                }
+                std::filesystem::remove(directory+"/frame.ppm");std::filesystem::remove(directory+"/frame.right.ppm");
+                SDL_setenv("LINDBERGH_SHOT_FRAME",std::to_string(g_frame).c_str(),1);
+                SDL_setenv("LINDBERGH_VULKAN_SHOT_DRAWABLE",std::to_string(target).c_str(),1);
+                lvk_host_present();
+                for(const char *eye:{"/frame.ppm","/frame.right.ppm"}) {
+                    require(sample(directory+eye,32,8,16)==std::array<unsigned,3>{255,0,0},"left draw's texture lost to another draw's material");
+                    require(sample(directory+eye,32,24,16)==std::array<unsigned,3>{0,0,255},"right draw sampled another draw's texture");
+                }
+                ++g_frame;
+            }
+            glDisable(GL_TEXTURE_2D);lvk_bind_drawable(0);lvk_destroy_drawable(target);glDeleteTextures(2,tex);
         }
         {
             // Frame-local depth: a target that clears its depth at the start of
