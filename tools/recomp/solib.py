@@ -262,9 +262,29 @@ def main():
             cur = list(header)
     if len(cur) > len(header):
         chunks.append(cur)
+    # The main ELF's passes (driver.py): direct calls between the functions
+    # lifted here, dead flags dropped, registers in locals. Without them the
+    # sound libraries' decoders ran several times slower on the game thread.
+    from .flags import strip_dead_flags
+    from .regcache import cache_registers, PRELUDE as REGCACHE_PRELUDE
+    lifted = set(done)
+    lit = re.compile(r"\bdispatch\(c, 0x([0-9A-F]{8})u\);")
+
+    def direct(m):
+        va = int(m.group(1), 16)
+        return "DISPATCH_TO(c, 0x%su, L_%s);" % (m.group(1), m.group(1)) if va in lifted else m.group(0)
+
+    flags_dropped = 0
     for i, chunk in enumerate(chunks):
+        body = lit.sub(direct, "\n".join(chunk[len(header):]))
+        body, n = strip_dead_flags(body)
+        flags_dropped += n
+        body, _ = cache_registers(body)
+        protos = sorted(set(re.findall(r"DISPATCH_TO\(c, 0x[0-9A-F]{8}u, (L_[0-9A-F]{8})\)", body)))
         with open(os.path.join(outdir, "recomp_solib_funcs_%04d.c" % i), "w") as f:
-            f.write("\n".join(chunk))
+            f.write("\n".join(header) + "\n" + REGCACHE_PRELUDE)
+            f.write("".join("void %s(CPU *c);\n" % p for p in protos) + "\n")
+            f.write(body)
 
     new_imports = sorted(n for n in tokens if n not in main_imports)
     with open(os.path.join(outdir, "recomp_solib.h"), "w") as f:
@@ -299,8 +319,8 @@ def main():
                        lib.base + lib.init if lib.init else 0,
                        lib.base + ia if ia else 0, isz // 4))
         f.write("};\nconst int g_solib_count = %d;\n" % len(libs))
-    print("[solib] lifted %d functions in %d units, %d new imports: %s"
-          % (len(done), len(chunks), len(new_imports), " ".join(new_imports)), file=sys.stderr)
+    print("[solib] lifted %d functions in %d units, %d new imports: %s; %d instructions' flags dropped as dead"
+          % (len(done), len(chunks), len(new_imports), " ".join(new_imports), flags_dropped), file=sys.stderr)
 
 
 if __name__ == "__main__":
