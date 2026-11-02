@@ -3533,18 +3533,6 @@ void draw_geometry(GLenum mode,GLint first,GLsizei count,const void *indices,GLe
     if(g_frame==unsigned(std::atoi(std::getenv("LINDBERGH_SHOT_FRAME")?std::getenv("LINDBERGH_SHOT_FRAME"):"0")))
       std::fprintf(stderr,"[vulkan-debug-draw] %u: program %u textures %u %u %u %u fixed %d mode %#x count %d\n",n,state.program,state.textures[0],state.textures[1],state.textures[2],state.textures[3],!state.program,mode,count);
   }
-  {static unsigned dn;if(std::getenv("LINDBERGH_DIAG_GLOWZ")&&state.drawable==2&&!state.program&&mode==GL_QUADS&&count==4&&state.rect_textures[0]&&g_frame>=1200&&dn++<3) { // DIAGNOSTIC ONLY
-    std::fprintf(stderr,"[diag-glowz] frame %u depth test %d write %d compare %d blend %d immediate %d\n",g_frame,state.raster.depth_test,state.raster.depth_write,int(state.raster.depth_compare),int(state.raster.blend),immediate!=nullptr);
-    for(int i=0;i<4;++i){std::array<float,4> v{};bool ok=true;if(immediate)std::memcpy(v.data(),static_cast<const uint8_t *>(immediate)+size_t(first+i)*immediate_stride,16);
-      else ok=state.arrays.position(uint32_t(first+i),{g_guest_base,uint64_t(1)<<32},[](uint32_t id){const auto &b=state.buffers.at(id);return GuestMemoryView{b.bytes.data(),b.bytes.size()};},v);
-      std::fprintf(stderr,"  v%d ok %d %.4f %.4f %.6f %.4f\n",i,ok,v[0],v[1],v[2],v[3]);}}}
-  {static unsigned sn;if(std::getenv("LINDBERGH_DIAG_GLOWZ")&&state.drawable==0&&mode==GL_QUADS&&count==4&&g_frame>=1200&&sn++<2) { // DIAGNOSTIC ONLY
-    const auto c=state.arrays.current_value(3);
-    std::fprintf(stderr,"[diag-screen] frame %u program %u rect %u tex %u env %#x unit1 rect %u tex %u env %#x color %.3f %.3f %.3f %.3f blend %d depth %d/%d stencil %d textured0 %d textured1 %d\n",g_frame,state.program,state.rect_textures[0],state.textures[0],state.texture_env[0],state.rect_textures[1],state.textures[1],state.texture_env[1],c[0],c[1],c[2],c[3],int(state.raster.blend),state.raster.depth_test,state.raster.depth_write,int(state.raster.stencil),int(state.unit_textured(0)),int(state.unit_textured(1)));
-    for(auto &e:state.env_params[0])std::fprintf(stderr,"   env0 %#x=%g\n",e.first,e.second);
-    for(int i=0;i<4;++i){std::array<float,4> v{};bool ok=true;if(immediate)std::memcpy(v.data(),static_cast<const uint8_t *>(immediate)+size_t(first+i)*immediate_stride,16);
-      else ok=state.arrays.position(uint32_t(first+i),{g_guest_base,uint64_t(1)<<32},[](uint32_t id){const auto &b=state.buffers.at(id);return GuestMemoryView{b.bytes.data(),b.bytes.size()};},v);
-      std::fprintf(stderr,"  v%d ok %d %.4f %.4f %.6f %.4f\n",i,ok,v[0],v[1],v[2],v[3]);}}}
   const bool guest_indexed=indexed;mark_drawn();
   auto *target=state.target();auto &p=current_program();native_program(p);legacy_uniforms(p,*target);
   const bool fixed=!state.program||p.fixed_fragment; // fixed-function fragment state applies
