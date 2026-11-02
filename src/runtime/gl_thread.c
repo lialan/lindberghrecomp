@@ -201,6 +201,9 @@ static const struct { const char *name; uint8_t kind, a, b, c; } T[] = {
     { "glCopyTexSubImage2D", C_VAL }, { "glPixelStorei", C_PSTORE }, { "glTexGeni", C_VAL },
     { "glBindFramebufferEXT", C_VAL }, { "glBindFramebuffer", C_VAL }, { "glBindRenderbufferEXT", C_VAL },
     { "glFlush", C_VAL }, { "glUnlockArraysEXT", C_UNLOCK },
+    /* projections from doubles on the stack (at most 12 dwords): they return
+     * nothing (8 waits a frame in Ghost Squad Evolution) */
+    { "gluOrtho2D", C_VAL }, { "gluPerspective", C_VAL }, { "glOrtho", C_VAL }, { "glFrustum", C_VAL },
     /* one array, its size fixed by the call */
     /* Let's Go Jungle!: NV program constants and a few more that return
      * nothing - each waited, about 370 times a frame */
@@ -312,7 +315,7 @@ static int srv_same(uint64_t key, uint64_t val)
     return 0;
 }
 /* 1: the record holds key's value (put in *val) */
-static unsigned g_n_answered;
+static unsigned g_n_answered, g_n_draw_copies;
 static int srv_get(uint64_t key, uint64_t *val)
 {
     uint32_t i = srv_slot(key);
@@ -697,7 +700,7 @@ static int shadow_state(CPU *c, HleId id)
  * House of the Dead 4: an offscreen pass of 423 vertices). The copies live in
  * three buffers used a frame each - the game is never more than a frame
  * ahead. LINDBERGH_GLQ_NOCOPY=1: such a batch waits, as before. */
-#define ARENA_SIZE (2u << 20)
+#define ARENA_SIZE (8u << 20)
 static uint8_t *g_arena[3];
 static uint32_t g_arena_used, g_arena_frame = ~0u;
 static int copy_on(void)
@@ -860,7 +863,7 @@ static void glq_hook(CPU *c, HleId id, HleHandler fn)
     if (__builtin_expect(k->inv, 0)) client_state_unknown();
     if (__builtin_expect(k->sinv, 0)) srv_unknown();
     if (k->st && srv_redundant(c, k->st)) return;
-    int async = 1;
+    int async = 1, draw_copied = 0;
     uint32_t extra = 0;                /* bytes of arrays after the arguments */
     switch (k->kind) {
     case C_SYNC: async = 0; break;
@@ -939,7 +942,17 @@ static void glq_hook(CPU *c, HleId id, HleHandler fn)
          * or it points at nothing */
         if (g_array_buf == 0 && ptr != 0 && !(copy_on() && s >= 0)) async = 0;
         break; }
-    case C_DRAW: if (client_arrays_live()) async = 0; break;
+    case C_DRAW:
+        /* vertices in the game's memory, unlocked: the range this draw reads
+         * [first, first+count) goes along as a copy, the arrays pointed back
+         * after it (draw_copied) - instead of waiting for the worker (~70 times a
+         * frame in Ghost Squad Evolution, each a stall when the worker is
+         * waiting on the GPU). LINDBERGH_GLQ_NOCOPY=1: such a draw waits. */
+        if (client_arrays_live()) {
+            if (copy_on() && lock_copy(A32(1), A32(2))) { draw_copied = 1; g_n_draw_copies++; }
+            else async = 0;
+        }
+        break;
     case C_LOCK:
         if (client_arrays_live() && !(copy_on() && lock_copy(A32(0), A32(1)))) async = 0;
         break;
@@ -996,6 +1009,7 @@ static void glq_hook(CPU *c, HleId id, HleHandler fn)
     }
     ring_put();
     g_n_async++;
+    if (draw_copied) unlock_restore();
 }
 
 /* A job for the worker; host_swap's end of frame. Returns its number, for
@@ -1027,7 +1041,7 @@ void glq_report(unsigned frames)
     fprintf(stderr, "[glq] ms per frame: game thread %.1f (waiting %.1f), GL thread %.1f; ",
             game0 ? (game - game0) / frames : 0, g_wait_ms / frames, work0 ? (work - work0) / frames : 0);
     game0 = game; work0 = work; g_wait_ms = 0;
-    fprintf(stderr, "per frame: %u queued, %u dropped as redundant, %u reads answered here, %u waited for", g_n_async / frames, g_n_dropped / frames, g_n_answered / frames, g_n_sync / frames);
+    fprintf(stderr, "per frame: %u queued, %u dropped as redundant, %u reads answered here, %u draws copied, %u waited for", g_n_async / frames, g_n_dropped / frames, g_n_answered / frames, g_n_draw_copies / frames, g_n_sync / frames);
     if (dedup_check()) fprintf(stderr, " (dedup check: %u wrong so far)", atomic_load(&g_dedup_wrong));
     for (int k = 0; k < 10; k++) {
         unsigned best = 0;
@@ -1038,7 +1052,7 @@ void glq_report(unsigned frames)
     }
     fputc('\n', stderr);
     memset(g_sync_by_id, 0, sizeof g_sync_by_id);
-    g_n_async = g_n_sync = g_n_dropped = g_n_answered = 0;
+    g_n_async = g_n_sync = g_n_dropped = g_n_answered = g_n_draw_copies = 0;
 }
 
 /* Start, from the game thread at its first swap. release() lets go of the GL
