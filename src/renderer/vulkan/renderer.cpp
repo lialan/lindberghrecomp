@@ -395,7 +395,7 @@ void Renderer::prepare(RasterState state)
 }
 
 void Renderer::begin(VkCommandBuffer cmd, std::array<float, 4> color, bool preserve, float depth, uint32_t stencil,
-                     const VkRect2D *area, bool color_only, bool last)
+                     const VkRect2D *area, bool color_only, bool last, bool discard_depth)
 {
     if (cmd_ || !cmd) throw std::logic_error("Invalid Vulkan render pass begin");
     VkClearValue clear[2]{};
@@ -410,7 +410,7 @@ void Renderer::begin(VkCommandBuffer cmd, std::array<float, 4> color, bool prese
     } else {
         ops.depth_load = preserve ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
         ops.stencil_load = ops.depth_load;
-        const bool frame_end = last && target_.info.frame_depth;
+        const bool frame_end = (last && target_.info.frame_depth) || discard_depth;
         ops.depth_store = ops.stencil_store = frame_end ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE;
         pass.renderPass = target_.pass(ops);
     }

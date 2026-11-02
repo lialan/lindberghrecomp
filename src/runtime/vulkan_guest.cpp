@@ -412,9 +412,56 @@ struct State {
   // Begin a pass on t, applying its pending clear: a clear begin when none of
   // it has been applied, else a load with the remaining area cleared.
   std::string pass_note; // profile label: what the open pass skips
-  void begin_pending(Renderer &r,Target *t,const PendingClear &c,bool last=false) {
+  // Frame-local depth. A render target whose depth every frame begins by
+  // clearing needs none kept after the frame's last pass that uses it.
+  // Within a frame that is known exactly: the frame's final flush holds every
+  // pass left, and only a pass recorded there with no later depth use of its
+  // target qualifies. Across frames it is learned, not proven (GL keeps a
+  // framebuffer's depth from frame to frame): 120 frames in a row must start
+  // by clearing, and a pass that loads depth which was not kept - or a copy
+  // of it - ends it for that target for good (that one frame read stale depth).
+  struct DepthFrames {
+    unsigned streak=0;
+    bool touched=false,first_clear=false,lost=false,off=false;
+  };
+  std::unordered_map<Target *,DepthFrames> depth_frames;
+  // A pass on t that uses depth begins (cleared: with its depth cleared);
+  // frame_last: nothing later in the frame uses t's depth. Returns whether
+  // the pass may leave its depth unstored.
+  bool depth_pass(Target *t,bool cleared,bool frame_last=false) {
+    if(t->info.frame_depth||t->info.transient_depth)return false; // never kept anyway
+    auto &d=depth_frames[t];
+    if(!d.touched){d.touched=true;d.first_clear=cleared;}
+    if(cleared)d.lost=false;
+    else if(d.lost)depth_lost(d);
+    const bool discard=frame_last&&!d.off&&d.streak>=120;
+    if(discard)d.lost=true;
+    return discard;
+  }
+  void depth_lost(DepthFrames &d) {
+    if(!d.off)std::fprintf(stderr,"[vulkan] frame %u: a render target's depth was read after it was not kept; it is kept from now on\n",g_frame);
+    d.off=true;d.lost=false;
+  }
+  // A copy reads t's stored depth: never leave it unstored.
+  void depth_read(Target *t) {
+    auto &d=depth_frames[t];
+    if(d.lost)depth_lost(d);
+    d.off=true;
+  }
+  void depth_frame_end() {
+    for(auto &[t,d]:depth_frames) {
+      if(!d.touched)continue;
+      d.streak=d.first_clear?d.streak+1:0;
+      d.touched=false;
+    }
+  }
+  void begin_pending(Renderer &r,Target *t,const PendingClear &c,bool last=false,bool frame_last=false) {
     pass_note=last?" last":"";
-    if(!c.done.extent.width) {r.begin(cmd,c.color,false,c.depth,c.stencil,nullptr,false,last);stencil_bits[t]=c.stencil;return;}
+    if(!c.done.extent.width) {
+      const bool discard=depth_pass(t,true,frame_last);if(discard)pass_note+=" no-depth-kept";
+      r.begin(cmd,c.color,false,c.depth,c.stencil,nullptr,false,last,discard);stencil_bits[t]=c.stencil;return;
+    }
+    depth_pass(t,false);
     r.begin(cmd,c.color,true,1,0,nullptr,false,last);
     const int W=int(t->info.width),H=int(t->info.height),x0=c.done.offset.x,y0=c.done.offset.y;
     const int x1=x0+int(c.done.extent.width),y1=y0+int(c.done.extent.height);
@@ -675,6 +722,21 @@ struct State {
         bool last=keep_last&&n==packets.size()&&p.target->info.frame_depth;
         for(size_t k=index+1;last&&k<n;++k)last=packets[k].target==p.target;
         pass_note.clear();
+        // No later packet of the frame uses this target's depth (the final
+        // flush holds the rest of the frame). The pass runs on through this
+        // target's packets and over other targets' clear-only runs, which are
+        // deferred (as below) rather than recorded.
+        bool frame_last=keep_last&&n==packets.size();
+        if(frame_last) {
+          size_t k=index+1;
+          while(k<n) {
+            if(packets[k].target==p.target){++k;continue;}
+            size_t e=k;while(e<n&&packets[e].target==packets[k].target&&full_clear(packets[e]))++e;
+            if(e>k&&(e==packets.size()?!keep_last:packets[e].target!=packets[k].target)){k=e;continue;}
+            break;
+          }
+          for(;frame_last&&k<n;++k)frame_last=!(packets[k].target==p.target&&uses_depth(packets[k]));
+        }
         bool preserve=initialized.count(p.target)!=0;
         float depth=1;uint32_t stencil=0;
         // A pass that starts by clearing everything begins cleared instead of
@@ -693,8 +755,10 @@ struct State {
           if(!cleared_on_begin) {
             if(!c.done.extent.width) {
               depth=c.depth;stencil=c.stencil;stencil_bits[p.target]=stencil;
-              p.renderer->begin(cmd,c.color,false,depth,stencil,nullptr,false,last);pass_note=last?" last":"";
-            } else begin_pending(*p.renderer,p.target,c,last);
+              const bool discard=depth_pass(p.target,true,frame_last);
+              p.renderer->begin(cmd,c.color,false,depth,stencil,nullptr,false,last,discard);
+              pass_note=std::string(last?" last":"")+(discard?" no-depth-kept":"");
+            } else begin_pending(*p.renderer,p.target,c,last,frame_last);
             begun=true;
           }
         }
@@ -730,6 +794,7 @@ struct State {
             const int y1=std::min<int>(int(p.target->info.height),(int(area.offset.y+area.extent.height)+63)/32*32);
             area={{x0,y0},{uint32_t(x1-x0),uint32_t(y1-y0)}};
             stencil_bits[p.target]=stencil;
+            depth_pass(p.target,false); // only part is cleared: not a frame-local start
             p.renderer->begin(cmd,p.color,false,depth,stencil,&area);
             pending_clears[p.target]={p.color,depth,stencil,area};
             begun=true;
@@ -742,9 +807,10 @@ struct State {
           // stores only colour). A depth user arriving later restarts the pass.
           bool color_only=preserve&&p.target->color_pass;
           for(size_t k=index;color_only&&k<n&&packets[k].target==p.target;++k)color_only=!uses_depth(packets[k]);
-          p.renderer->begin(cmd,p.color,preserve,depth,stencil,nullptr,color_only,last);
+          const bool discard=!color_only&&depth_pass(p.target,!preserve,frame_last);
+          p.renderer->begin(cmd,p.color,preserve,depth,stencil,nullptr,color_only,last,discard);
           active_color_only=color_only;
-          pass_note=color_only?" colour-only":last?" last":"";
+          pass_note=color_only?" colour-only":std::string(last?" last":"")+(discard?" no-depth-kept":"");
         }
         initialized.insert(p.target); active=p.renderer; active_target=p.target;
       } else if (active != p.renderer) {
@@ -780,7 +846,11 @@ struct State {
       renderer->prepare(raster);
       if(auto pending=pending_clears.find(target);pending!=pending_clears.end()) {
         const auto c=pending->second;pending_clears.erase(pending);begin_pending(*renderer,target,c);
-      } else renderer->begin(cmd, clear, initialized.count(target)!=0);
+      } else {
+        const bool preserve=initialized.count(target)!=0;
+        depth_pass(target,!preserve);
+        renderer->begin(cmd, clear, preserve);
+      }
       initialized.insert(target);
       active = renderer.get(); active_target = target;
     }
@@ -1190,6 +1260,7 @@ extern "C" void lvk_host_present(void) {
   show_overlay=show_overlay&&state.xr_rendering;
 #endif
   state.flush(show_overlay);
+  state.depth_frame_end(); // every pass of this frame has begun
   if(state.active_target!=state.screen)state.materialize(state.screen);
   if (!state.initialized.count(state.screen)) {
     const auto old=state.drawable;state.drawable=0;state.renderer();state.end_pass();state.drawable=old;
@@ -1360,7 +1431,7 @@ void retire_drawable(unsigned id) {
   if(auto clear=state.renderers.find(target);clear!=state.renderers.end()) {
     retired->renderers.push_back(std::move(clear->second));state.renderers.erase(clear);
   }
-  state.initialized.erase(target);state.stencil_bits.erase(target);state.pending_clears.erase(target);
+  state.initialized.erase(target);state.stencil_bits.erase(target);state.pending_clears.erase(target);state.depth_frames.erase(target);
   state.drawables.erase(found);state.drawable_sizes.erase(id);state.deleted_drawables.erase(id);
   if(state.hud_target==id)state.hud_target=~0u;
   if(state.hud_target_next==id)state.hud_target_next=~0u;
@@ -1426,18 +1497,29 @@ void resolve_texture(GLuint id) {
   const auto source_it=state.drawables.find(drawable);auto *o=texture_object(id);
   if(source_it==state.drawables.end()||!o||!o->levels.count(0))return;
   Target *source=source_it->second.get();
-  // Record what was queued up to the source's last packet; packets after it
-  // (the consumer's) stay queued, so the copy does not split their pass.
-  size_t upto=0;for(size_t i=0;i<state.packets.size();++i)if(state.packets[i].target==source)upto=i+1;
-  state.frame();state.flush(false,upto);
-  state.pass_stamp("resolve texture "+std::to_string(id)+" from drawable "+std::to_string(drawable)+", "+std::to_string(upto)+" packets recorded");
-  if(!state.initialized.count(source))return;
   const bool depth=o->levels.at(0).format==GL_DEPTH_COMPONENT||o->levels.at(0).format==GL_DEPTH_STENCIL;
   const VkRect2D all{{0,0},{source->info.width,source->info.height}};
   // The drawing target cannot also be sampled: a draw into its own source copies.
   Target *drawing=state.drawable?state.drawables.at(state.drawable).get():state.screen;
-  if(!depth&&source->info.final_layout==VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL&&source!=drawing) {
-    state.materialize(source,&all);state.end_pass();
+  const bool in_place=!depth&&source->info.final_layout==VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL&&source!=drawing;
+  size_t upto=0;for(size_t i=0;i<state.packets.size();++i)if(state.packets[i].target==source)upto=i+1;
+  // Sampled in place, the source's queued passes are recorded ahead of its
+  // consumer's anyway: nothing is flushed, so a frame is recorded whole and a
+  // pass can know it is the frame's last on its target. A copy, or a pending
+  // clear to apply, records what was queued up to the source's last packet;
+  // packets after it (the consumer's) stay queued, so the copy does not split
+  // their pass.
+  // Only when its last queued packet draws: a trailing clear-only run is
+  // deferred at the flush, so nothing would render it before it is sampled.
+  const bool defer=in_place&&!state.pending_clears.count(source)&&(upto?state.packets[upto-1].count!=0:state.initialized.count(source)!=0);
+  if(!defer) {
+    state.frame();state.flush(false,upto);
+    state.pass_stamp("resolve texture "+std::to_string(id)+" from drawable "+std::to_string(drawable)+", "+std::to_string(upto)+" packets recorded");
+    if(!state.initialized.count(source))return;
+  }
+  if(in_place) {
+    if(!defer){state.materialize(source,&all);state.end_pass();}
+    else if(state.active_target==source)state.end_pass();
     auto &view=state.target_views[source];
     if(!view)view=std::make_shared<Texture>(*state.device,TextureInfo{source->info.width,source->info.height,1,source->info.layers,source->info.color_format},source->color);
     const bool first=o->alias_target!=source;
@@ -1451,6 +1533,7 @@ void resolve_texture(GLuint id) {
   o->render_width=source->info.width;o->render_height=source->info.height;
   changed(*o);auto gpu=native_image(*o,0,true);
   state.materialize(source,&all);
+  if(gpu->info.format==Target::depth_format)state.depth_read(source);
   gpu->copy_from(state.cmd,*source,0,0,0,0,0,source->info.width,source->info.height,0,0,o->layers);
   state.pass_stamp("framebuffer copy "+std::to_string(source->info.width)+"x"+std::to_string(source->info.height)+
                    (o->levels.at(0).format==GL_DEPTH_COMPONENT||o->levels.at(0).format==GL_DEPTH_STENCIL?" depth":" colour"));
@@ -3052,6 +3135,7 @@ extern "C" void lvk_glCopyTexSubImage2D(GLenum target,GLint level,GLint dx,GLint
   const auto px=int32_t(std::lround(x*sx)),py=int32_t(std::lround(y*sy));
   const auto pw=uint32_t(std::lround((x+w)*sx)-px),ph=uint32_t(std::lround((y+h)*sy)-py);
   const VkRect2D read{{px,py},{pw,ph}};state.materialize(source,&read);
+  if(gpu->info.format==Target::depth_format)state.depth_read(source);
   gpu->copy_from(state.cmd,*source,uint32_t(level),int32_t(std::lround(dx*sx)),int32_t(std::lround(dy*sy)),px,py,pw,ph,0,0,o.layers);
   state.pass_stamp("copy "+std::to_string(pw)+"x"+std::to_string(ph)+" x"+std::to_string(o.layers));
   static const auto copy_log=[] {std::array<unsigned,2> r{};if(const auto *v=std::getenv("LINDBERGH_VULKAN_CLASSIFY")){r[0]=r[1]=unsigned(std::strtoul(v,nullptr,10));if(const auto *end=std::strchr(v,'-'))r[1]=unsigned(std::strtoul(end+1,nullptr,10));}return r;}();

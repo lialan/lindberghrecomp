@@ -68,6 +68,15 @@ static void layered_pixels(const std::string &path) {
         require(pixel(x,y)==std::array<unsigned,3>{0,255,0},"full-screen movie lost its screen or layer depth");
     require(pixel(32,32)==std::array<unsigned,3>{255,255,255},"foreground HUD text fell behind the movie");
 }
+// Left and right quarter points of a 32x32 readback's middle row.
+static std::array<std::array<unsigned,3>,2> sides(const std::string &path) {
+    std::ifstream in(path,std::ios::binary);std::string magic;unsigned w,h,maximum;
+    in>>magic>>w>>h>>maximum;in.get();
+    require(in&&magic=="P6"&&w==32&&h==32&&maximum==255,"missing depth readback");
+    std::vector<unsigned char> rgb(size_t(w)*h*3);in.read(reinterpret_cast<char *>(rgb.data()),rgb.size());
+    auto at=[&](unsigned x){const auto *q=&rgb[3*(16*32+x)];return std::array<unsigned,3>{q[0],q[1],q[2]};};
+    return {at(8),at(24)};
+}
 // The centre texel of a size x size readback.
 static std::array<unsigned,3> centre(const std::string &path,unsigned size) {
     std::ifstream in(path,std::ios::binary);std::string magic;unsigned w,h,maximum;
@@ -183,9 +192,51 @@ int main() {
             }
             lvk_bind_drawable(0);lvk_destroy_drawable(target);glDeleteTextures(2,tex);++g_frame;
         }
+        {
+            // Frame-local depth: a target that clears its depth at the start of
+            // every frame keeps none after its frame's last depth pass - never
+            // after an earlier one a later pass reads, whatever the frame's
+            // shape. The near red half moves every frame, so depth left from an
+            // earlier frame would show. A frame that loads its depth without
+            // clearing it reads depth that was not kept: that frame alone may
+            // be wrong, and from then on the depth is kept for good.
+            const auto target=lvk_create_drawable(32,32),other=lvk_create_drawable(16,16);
+            glEnable(GL_DEPTH_TEST);glDepthFunc(GL_LEQUAL);glDepthMask(GL_TRUE);
+            auto quad=[](float x0,float x1,float z){glBegin(GL_QUADS);glVertex3f(x0,-1,z);glVertex3f(x1,-1,z);glVertex3f(x1,1,z);glVertex3f(x0,1,z);glEnd();};
+            auto pass_break=[&]{lvk_bind_drawable(other);glDisable(GL_DEPTH_TEST);triangle(16);glEnable(GL_DEPTH_TEST);lvk_bind_drawable(target);glViewport(0,0,32,32);};
+            const std::array<unsigned,3> red{255,0,0},green{0,255,0},black{0,0,0};
+            for(unsigned frame=0;frame<257;++frame) {
+                const bool left=frame%2==0,third=frame>=125&&frame<128,unclear=frame==128||frame==256;
+                lvk_bind_drawable(target);glViewport(0,0,32,32);glClearColor(0,0,0,1);glClearDepth(1);
+                if(unclear) {
+                    // Depth from the frame before: 0.2 or 0.5 everywhere, so a
+                    // quad at 0.7 shows nowhere - if that depth was kept.
+                    glClear(GL_COLOR_BUFFER_BIT);glColor4f(1,1,0,1);quad(-1,1,.4f);
+                } else {
+                    glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
+                    glColor4f(1,0,0,1);quad(left?-1:0,left?0:1,-.6f);         // window depth 0.2
+                    pass_break();glColor4f(0,1,0,1);quad(-1,1,0);               // 0.5: behind the red half
+                    if(third){pass_break();glColor4f(1,1,0,1);quad(-1,1,.4f);} // 0.7: behind both
+                }
+                const bool shot=frame>=120&&frame!=128;
+                if(shot) {
+                    std::filesystem::remove(directory+"/frame.ppm");std::filesystem::remove(directory+"/frame.right.ppm");
+                    SDL_setenv("LINDBERGH_SHOT_FRAME",std::to_string(g_frame).c_str(),1);
+                    SDL_setenv("LINDBERGH_VULKAN_SHOT_DRAWABLE",std::to_string(target).c_str(),1);
+                } else SDL_setenv("LINDBERGH_SHOT_FRAME","0",1);
+                lvk_host_present();
+                if(shot) for(const char *eye:{"/frame.ppm","/frame.right.ppm"}) {
+                    const auto got=sides(directory+eye);
+                    if(unclear)require(got[0]==black&&got[1]==black,"depth was not kept again after a frame read it unkept");
+                    else require(got[0]==(left?red:green)&&got[1]==(left?green:red),"a frame-local depth pass lost depth a later pass needed");
+                }
+                lvk_bind_drawable(0);++g_frame;
+            }
+            glDisable(GL_DEPTH_TEST);lvk_destroy_drawable(target);lvk_destroy_drawable(other);
+        }
         const auto unfinished=lvk_create_drawable(32,32);lvk_bind_drawable(unfinished);
         triangle(32);lvk_destroy_drawable(unfinished);lvk_bind_drawable(0);
-        std::puts("ok: real guest ABI pbuffer lifetime, perspective HUD bounds, on-screen layered movie/text depth, clamped GL_COMBINE results, stereo readback and unfinished shutdown");
+        std::puts("ok: real guest ABI pbuffer lifetime, perspective HUD bounds, on-screen layered movie/text depth, clamped GL_COMBINE results, frame-local depth, stereo readback and unfinished shutdown");
         return 0; // production atexit drain runs before fixture cleanup
     } catch(const std::exception &error) {std::cerr<<error.what()<<'\n';return 1;}
 }
