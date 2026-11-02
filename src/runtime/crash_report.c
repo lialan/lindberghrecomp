@@ -276,8 +276,12 @@ void guest_install_crash_handler(void)
      * kernel handles directly: no vectored handler, no atexit, no output, and
      * an exit code of 0xC0000409 that says only "something gave up". Clearing
      * _CALL_REPORTFAULT makes it an ordinary abort again, which SIGABRT can
-     * catch and report like anything else. */
+     * catch and report like anything else. msvcrt.dll (an MSYS2 MINGW64
+     * build) predates both the __fastfail and _set_abort_behavior: its abort
+     * already raises SIGABRT, and the import does not exist to link. */
+#if defined(_UCRT) || __MSVCRT_VERSION__ >= 0x800
     _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+#endif
     signal(SIGABRT, on_abort_signal);
     AddVectoredExceptionHandler(1, on_exception);
 }
