@@ -1186,6 +1186,25 @@ static void test_live_stereo_scene()
     auto zoom=camera;zoom[0]=9;
     for(unsigned i=0;i<6;++i) {require(!scene.zoomed(zoom),"transient camera zoom was treated as a scope");scene.observe(zoom,LG_STEREO_WORLD);scene.finish_frame();}
     require(scene.zoomed(zoom),"held scope lens was not recognized");
+    // The held scope is the arcade's picture: every world-camera draw of the
+    // frame goes on the screen, which takes the arcade monitor's lens.
+    require(scene.flat()&&scene.zoomed(camera),"a scope frame left normal-lens 3D in the world");
+    require(std::fabs(scene.screen_lens()[0]-1.732f)<1e-4f&&std::fabs(scene.screen_lens()[1]-2.3093f)<1e-3f,"a scope frame's screen kept the game camera's lens");
+    scene.observe(camera,LG_STEREO_WORLD);scene.finish_frame();
+    require(!scene.flat()&&!scene.zoomed(zoom)&&scene.screen_lens()[0]==camera[0],"the scope did not end with its lens");
+    // Sniping zooms in steps below the zoom limit: past 3.2, held, it is the
+    // scope while the game's sniping event runs - and only then.
+    auto step=camera;step[0]=4;step[5]=5.3333f;
+    for(unsigned i=0;i<8;++i){scene.observe(step,LG_STEREO_WORLD);scene.finish_frame();}
+    require(!scene.flat(),"a held mid-length lens was taken for a scope outside a sniping event");
+    scene.observe(camera,LG_STEREO_WORLD);scene.finish_frame();
+    for(unsigned i=0;i<6;++i){require(!scene.flat(),"a sniping step was flattened before it was held");scene.observe(step,LG_STEREO_WORLD);scene.finish_frame(true);}
+    require(scene.flat(),"a held sniping step was not taken for the scope");
+    scene.observe(camera,LG_STEREO_WORLD);scene.finish_frame();
+    require(!scene.cqc(),"close quarters without the game's event");
+    scene.finish_frame(false,true); // the event ran in the frame just finished: it counts for the two after
+    for(unsigned i=0;i<2;++i){require(scene.cqc(),"close quarters ended while its event ran");scene.finish_frame();}
+    require(!scene.cqc(),"close quarters outlived its event");
     LgStereoDrawFacts f{};f.perspective=1;
     require(lg_stereo_classify_draw(&f)==LG_STEREO_WORLD,"world class changed");
     f.menu=1;require(lg_stereo_classify_draw(&f)==LG_STEREO_HUD,"menu model escaped HUD plane");

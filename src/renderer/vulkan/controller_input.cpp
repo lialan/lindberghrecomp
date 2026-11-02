@@ -24,10 +24,14 @@ std::array<ControllerHaptic,2> ControllerInput::update(const StereoScene &scene,
     if(focused) {
         auto frame=sample.buttons;frame.time=time;frame.dual=settings_.dual;frame.auto_coins=settings_.auto_coins;
         const int main=select_hand?lg_xr_controls_select(&controls_,frame.trigger,frame.dual):controls_.gun_hand;
+        // A flat frame (a scope) is a picture on the screen, and the close-
+        // quarters markers are 2D on it: aimed where the laser meets the
+        // screen, as stereo.c's host does.
+        const bool screen_aim=scene.flat()||scene.cqc(),on_hud=settings_.aim_on_hud||screen_aim;
         for(int pl=0;pl<(frame.dual?2:1);++pl) {
             const int hand=pl?1-main:main;
             if(sample.valid[hand]) {
-                frame.aimed[pl]=scene.aim(sample.pose[hand],settings_.width,settings_.height,settings_.aim_on_hud,settings_.aim_distance,next.ray[pl]);
+                frame.aimed[pl]=scene.aim(sample.pose[hand],settings_.width,settings_.height,on_hud,settings_.aim_distance,next.ray[pl]);
                 next.valid[pl]=1;
                 for(float v:next.ray[pl].origin)if(!std::isfinite(v))next.valid[pl]=0;
                 for(float v:next.ray[pl].direction)if(!std::isfinite(v))next.valid[pl]=0;
@@ -47,7 +51,7 @@ std::array<ControllerHaptic,2> ControllerInput::update(const StereoScene &scene,
                 float reach=5;
                 if(frame.aimed[pl]) {
                     StereoRay world;
-                    reach=settings_.aim_on_hud&&scene.aim(sample.pose[hand],settings_.width,settings_.height,false,settings_.aim_distance,world)?world.reach:next.ray[pl].reach;
+                    reach=settings_.aim_on_hud&&!screen_aim&&scene.aim(sample.pose[hand],settings_.width,settings_.height,false,settings_.aim_distance,world)?world.reach:next.ray[pl].reach;
                 }
                 for(int i=0;i<3;++i){f.muzzle[i]=f.gun_p[i]+muzzle[i];f.end[i]=f.gun_p[i]+next.ray[pl].direction[i]*reach;}
                 f.beam=settings_.laser==LASER_ON;f.dot=frame.aimed[pl]&&settings_.laser!=LASER_OFF;

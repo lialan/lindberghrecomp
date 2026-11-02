@@ -149,6 +149,9 @@ struct Attributes {
   GLenum matrix_mode, active_texture;
   std::array<GLuint, 8> textures;
 };
+// The game's sniping / close-quarters events, from the game thread
+// (hle_sega.c): what stereo.c's flat frames and screen aiming follow.
+std::atomic<unsigned> g_snipe_events{0},g_cqc_events{0};
 struct DrawPacket {
   Renderer *renderer;
   Target *target;
@@ -363,8 +366,17 @@ struct State {
     return picture_size(w,h) || (w>=game_width&&h>=game_height&&w<2*game_width&&h<2*game_height);
   }
   std::array<int,2> logical_size() const {return drawable?drawable_sizes.at(drawable):std::array<int,2>{game_width,game_height};}
+  // Ghost Squad Evolution's sniping and close-quarters events (hle_sega.c),
+  // counted on the game thread: a count that moved since the last frame
+  // means the event ran.
+  unsigned snipe_seen=0,cqc_seen=0;
   void scene_end() {
-    if(stereo)stereo->finish_frame();
+    if(stereo) {
+      const unsigned snipe=g_snipe_events.load(std::memory_order_relaxed),cqc=g_cqc_events.load(std::memory_order_relaxed);
+      const bool was=stereo->flat();
+      stereo->finish_frame(snipe!=snipe_seen,cqc!=cqc_seen);snipe_seen=snipe;cqc_seen=cqc;
+      if(stereo->flat()!=was)std::fprintf(stderr,"[vulkan-xr] frame %u: scope %s\n",g_frame,was?"put down":"held: the frame is the arcade's picture on the screen");
+    }
     world_draws=hud_sequence=0;hud_target=hud_target_next;hud_target_next=~0u;
   }
 #ifdef LINDBERGH_VULKAN_XR
@@ -958,6 +970,9 @@ extern "C" int stereo_gun_ray(int player,float origin[3],float direction[3])
   std::copy(state.game_input.ray[player].origin.begin(),state.game_input.ray[player].origin.end(),origin);
   std::copy(state.game_input.ray[player].direction.begin(),state.game_input.ray[player].direction.end(),direction);return 1;
 }
+extern "C" void stereo_snipe_running(void) {g_snipe_events.fetch_add(1,std::memory_order_relaxed);}
+extern "C" void stereo_cqc_running(void) {g_cqc_events.fetch_add(1,std::memory_order_relaxed);}
+extern "C" int stereo_cqc_active(void) {return state.stereo&&state.stereo->cqc();}
 extern "C" int lvk_host_can_thread(void) { return state.ready; }
 extern "C" int lvk_host_thread_enter(void) {
 #ifdef LINDBERGH_VULKAN_XR

@@ -71,7 +71,7 @@ bool StereoScene::aim(const StereoPose &controller,int width,int height,bool on_
         for(unsigned i=0;i<3;++i)d[i]=o[i]+t*d[i];o={0,0,0};
     }
     float x,y,reach;
-    if(!lg_stereo_ray_to_plane(o.data(),d.data(),lens_.data(),settings_.screen*settings_.scale,width,height,&x,&y,&reach) ||
+    if(!lg_stereo_ray_to_plane(o.data(),d.data(),screen_lens().data(),settings_.screen*settings_.scale,width,height,&x,&y,&reach) ||
        !std::isfinite(x)||!std::isfinite(y)||x<0||y<0||x>=width||y>=height)return false;
     ray.x=int(x);ray.y=int(y);ray.reach=on_hud?reach/settings_.scale:world_reach;return true;
 }
@@ -79,7 +79,7 @@ bool StereoScene::world_camera(const Matrix &p) const
 {
     return lg_stereo_is_perspective(p.data()) && !(settings_.hud_lens>0 && std::fabs(p[0]-settings_.hud_lens)<.002f);
 }
-bool StereoScene::zoomed(const Matrix &p) const {return world_camera(p)&&p[0]>settings_.zoom_lens&&zoom_frames_>=6;}
+bool StereoScene::zoomed(const Matrix &p) const {return world_camera(p)&&flat_;}
 const Matrices &StereoScene::transforms(const Matrix &p,int kind)
 {
     if(!valid_ || kind==LG_STEREO_PASS || (kind==LG_STEREO_WORLD&&!lg_stereo_is_perspective(p.data()))) return identity_;
@@ -92,7 +92,7 @@ const Matrices &StereoScene::transforms(const Matrix &p,int kind)
     for(unsigned eye=0;eye<2;++eye) {
         auto &out=e.matrices.view_projection[eye];
         if(kind==LG_STEREO_FILL) {std::memcpy(out,unit.data(),64);out[10]=0;out[14]=-.999f;continue;}
-        LgStereoProjection policy{view_[eye].data(),hud_view_[eye].data(),tangents_[eye].data(),lens_.data(),settings_.screen*settings_.scale};
+        LgStereoProjection policy{view_[eye].data(),hud_view_[eye].data(),tangents_[eye].data(),screen_lens().data(),settings_.screen*settings_.scale};
         Matrix effective;
         // HUD maps guest clip space straight onto its screen plane. It is
         // independent of the original lens, so needs one transform per frame.
@@ -111,12 +111,19 @@ void StereoScene::observe(const Matrix &p,int kind)
     for(auto &l:tally_)if(l.draws && std::fabs(l.projection[0]-p[0])<.002f && std::fabs(l.projection[5]-p[5])<.002f) {++l.draws;return;}
     for(auto &l:tally_)if(!l.draws) {l.projection=p;l.draws=1;return;}
 }
-void StereoScene::finish_frame()
+void StereoScene::finish_frame(bool sniping,bool cqc)
 {
+    if(sniping)snipe_=3;
+    if(cqc)cqc_=3;
+    const float limit=zoom_limit();
     const auto best=std::max_element(tally_.begin(),tally_.end(),[](const auto &a,const auto &b){return a.draws<b.draws;});
-    if(best->draws && best->projection[0]>.3f && best->projection[0]<settings_.zoom_lens) lens_={best->projection[0],best->projection[5]};
+    if(!flat_ && best->draws && best->projection[0]>.3f && best->projection[0]<limit) lens_={best->projection[0],best->projection[5]};
     for(auto &l:tally_)l.draws=0;
-    zoom_frames_=longest_>settings_.zoom_lens?zoom_frames_+1:0;longest_=0;
+    // a scope is held; a lens passing through on a camera move is not one
+    zoom_frames_=longest_>limit?zoom_frames_+1:0;longest_=0;
+    flat_=zoom_frames_>=6;
+    if(snipe_)--snipe_;
+    if(cqc_)--cqc_;
     cache_.clear();last_=0;
 }
 } // namespace lindbergh::vk
