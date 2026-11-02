@@ -134,6 +134,11 @@ PipelineRecipes::PipelineRecipes(Device &d, PipelineCache &cache, std::vector<co
     std::fprintf(stderr, "[vulkan-recipes] %zu portable pipeline recipes loaded\n", recipes_.size());
 }
 PipelineRecipes::~PipelineRecipes() { lifetime_.reset(); }
+void PipelineRecipes::add(const ShaderRecord &r) {
+    const auto id = identity(r);
+    shaders_.emplace(id, &r);
+    identities_[&r] = id;
+}
 void PipelineRecipes::validate(const Recipe &r) const {
     const auto &limits = device_.capabilities.properties.limits;
     if (r.bindings.size() > limits.maxVertexInputBindings ||

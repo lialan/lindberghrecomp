@@ -1,5 +1,6 @@
 #include "shader_pack.hpp"
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -167,6 +168,41 @@ ShaderPack::ShaderPack(const std::string &path)
         programs_.push_back(std::move(p));
     }
     if (!r.done()) throw std::runtime_error("Trailing Vulkan shader pack data");
+}
+
+void write_shader_pack(const std::string &path, const std::vector<const ShaderRecord *> &records)
+{
+    std::string data("LVSPV001", 8);
+    auto u32 = [&](uint32_t v) { for (unsigned i = 0; i < 4; ++i) data.push_back(char(v >> (8 * i))); };
+    auto string = [&](const std::string &s) { u32(uint32_t(s.size())); data += s; };
+    auto bytes = [&](const SourceDigest &d) { data.append(reinterpret_cast<const char *>(d.data()), d.size()); };
+    auto module = [&](const std::vector<uint32_t> &m) { u32(uint32_t(m.size())); for (auto w : m) u32(w); };
+    u32(1); u32(uint32_t(records.size()));
+    for (const auto *p : records) {
+        bytes(p->key);
+        bytes(p->vertex_source); module(p->vertex);
+        bytes(p->fragment_source); module(p->fragment);
+        u32(uint32_t(p->attributes.size()));
+        for (const auto &a : p->attributes) { string(a.name); u32(a.location); }
+        u32(uint32_t(p->inputs.size()));
+        for (const auto &i : p->inputs) { u32(i.location); string(i.type); }
+        u32(uint32_t(p->uniforms.size()));
+        for (const auto &b : p->uniforms) {
+            u32(b.set); u32(b.binding); u32(b.bytes); u32(uint32_t(b.fields.size()));
+            for (const auto &f : b.fields) {
+                string(f.name);
+                for (auto v : {f.offset, f.scalar, f.columns, f.rows, f.count, f.array_stride, f.matrix_stride}) u32(v);
+            }
+        }
+        u32(uint32_t(p->samplers.size()));
+        for (const auto &s : p->samplers) { u32(s.binding); string(s.name); string(s.type); u32(s.count); }
+    }
+    const auto temporary = path + ".tmp";
+    {
+        std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+        if (!out.write(data.data(), std::streamsize(data.size()))) throw std::runtime_error("Cannot write Vulkan shader pack: " + temporary);
+    }
+    if (std::rename(temporary.c_str(), path.c_str()) != 0) throw std::runtime_error("Cannot replace Vulkan shader pack: " + path);
 }
 
 const ShaderRecord *ShaderPack::find(const SourceDigest &vertex, const SourceDigest &fragment,

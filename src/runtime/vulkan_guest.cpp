@@ -8,6 +8,9 @@
 #include "../renderer/vulkan/settings_panel.hpp"
 #include "../renderer/vulkan/shader_pack.hpp"
 #include "../renderer/vulkan/pipeline_recipes.hpp"
+#ifdef LINDBERGH_RUNTIME_SHADERS
+#include "../renderer/vulkan/runtime_shaders.hpp"
+#endif
 #include "../renderer/vulkan/guest_indices.hpp"
 #include "../renderer/vulkan/window.hpp"
 #include "../renderer/vulkan/resources.hpp"
@@ -35,6 +38,7 @@ extern "C" {
 }
 #include <algorithm>
 #include <atomic>
+#include <deque>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -390,6 +394,12 @@ struct State {
   std::unique_ptr<PipelineRecipes> recipes;
   std::unique_ptr<FrameRing> ring;
   std::unique_ptr<ShaderPack> pack, fixed_pack;
+  // Programs the pack lacks, compiled on the device: those saved by earlier
+  // runs (runtime_shader_path, next to the pipeline cache) and this run's.
+  // Program records point into both, so neither moves an entry.
+  std::unique_ptr<ShaderPack> saved_runtime_shaders;
+  std::deque<ShaderRecord> runtime_shaders;
+  std::string runtime_shader_path;
   Program fixed_program;
   std::array<bool,8> texture_enabled{}, rect_enabled{}; // fixed-function GL_TEXTURE_2D / GL_TEXTURE_RECTANGLE
   bool unit_textured(unsigned i) const {return texture_enabled[i]||rect_enabled[i];}
@@ -885,6 +895,23 @@ struct State {
   }
 };
 State state;
+#ifdef LINDBERGH_RUNTIME_SHADERS
+// Programs compiled on this device by earlier runs (see runtime_shader), loaded once.
+void load_saved_runtime_shaders() {
+  static bool loaded=false;
+  if(loaded)return;
+  loaded=true;
+  std::error_code ec;
+  if(state.runtime_shader_path.empty()||!std::filesystem::exists(state.runtime_shader_path,ec))return;
+  try {
+    state.saved_runtime_shaders=std::make_unique<ShaderPack>(state.runtime_shader_path);
+    std::fprintf(stderr,"[vulkan] %zu programs compiled on this device by earlier runs loaded\n",state.saved_runtime_shaders->programs().size());
+  } catch(const std::exception &e) {
+    std::fprintf(stderr,"[vulkan] saved device-compiled programs unreadable (%s); compiled again as needed\n",e.what());
+    std::filesystem::remove(state.runtime_shader_path,ec);
+  }
+}
+#endif
 void watch_game_states(); // the menu-state watch (below)
 void State::fake_controllers()
 {
@@ -1138,6 +1165,10 @@ extern "C" int lvk_host_init(SDL_Window *window, int w, int h) {
         SDL_free(directory);
       }
     }
+#ifdef LINDBERGH_RUNTIME_SHADERS
+    if(!cache_path.empty())
+      state.runtime_shader_path=(std::filesystem::path(cache_path).parent_path()/("runtime-shaders-"+runtime_shader_generation()+".lvsp")).string();
+#endif
     // A fresh install starts from the driver cache packaged for its headset
     // (vulkan/pipelines.bin, harvested on that GPU and driver): the startup
     // precompile then finds every pipeline already built. PipelineCache checks
@@ -1188,8 +1219,13 @@ extern "C" int lvk_host_init(SDL_Window *window, int w, int h) {
         state.pack=std::make_unique<ShaderPack>(game);
         const auto *fixed=std::getenv("LINDBERGH_VULKAN_FIXED_SHADERS");
         state.fixed_pack=std::make_unique<ShaderPack>(fixed&&*fixed?fixed:LINDBERGH_VULKAN_FIXED_ARCHIVE);
+#ifdef LINDBERGH_RUNTIME_SHADERS
+        // Before the catalogue: its recipes for these programs are kept.
+        load_saved_runtime_shaders();
+#endif
         state.recipes=std::make_unique<PipelineRecipes>(*state.device,*state.cache,
-          std::vector<const ShaderPack *>{state.pack.get(),state.fixed_pack.get()},recipe_file,seed?seed:"");
+          std::vector<const ShaderPack *>{state.pack.get(),state.fixed_pack.get(),state.saved_runtime_shaders.get()},
+          recipe_file,seed?seed:"");
       }
     }
     if(state.controllers) {
@@ -2129,11 +2165,12 @@ std::string fixed_vertex_stage(const std::string &fragment) {
 // written there as a compile_shaders.py manifest (programs.jsonl), and draws
 // with them are skipped, so one run collects every missing program.
 const char *harvest_directory() {static const char *d=[]{const auto *v=std::getenv("LINDBERGH_VULKAN_SHADER_HARVEST");return v&&*v?v:nullptr;}();return d;}
-void harvest_program(GLuint id,const Program &p,const std::string &vertex,const std::string &fragment) {
+void harvest_program(GLuint id,const Program &p,const std::string &vertex,const std::string &fragment,
+                     const std::filesystem::path &directory=harvest_directory()) {
   static std::set<std::string> seen;
-  std::string key=vertex+'\0'+fragment;for(const auto &a:p.attributes)key+=a.name+'='+std::to_string(a.location)+';';
+  std::string key=directory.string()+'\0'+vertex+'\0'+fragment;for(const auto &a:p.attributes)key+=a.name+'='+std::to_string(a.location)+';';
   if(!seen.insert(key).second)return;
-  const std::filesystem::path directory=harvest_directory();std::filesystem::create_directories(directory);
+  std::filesystem::create_directories(directory);
   // Named by content (FNV-1a), so runs appending to one directory agree.
   uint32_t hash=2166136261u;for(unsigned char c:key)hash=(hash^c)*16777619u;
   if(std::filesystem::exists(directory/("fs_h"+std::to_string(hash)+".glsl")))return;
@@ -2147,6 +2184,49 @@ void harvest_program(GLuint id,const Program &p,const std::string &vertex,const 
   rows<<"]}\n";
   std::fprintf(stderr,"[vulkan-harvest] program %u recorded as %s/vs_h%s.glsl + fs_h%s.glsl\n",id,directory.c_str(),n.c_str(),n.c_str());
 }
+#ifdef LINDBERGH_RUNTIME_SHADERS
+// A program the offline pack lacks is compiled here, once: the game builds its
+// shaders at run time from pieces, so a pack never holds every pair, and
+// without this its draws would be skipped (missing polygons). The record is
+// saved next to the pipeline cache for later runs, and its sources beside it
+// (runtime-harvest/, a compile_shaders.py manifest) for the next pack.
+const ShaderRecord *runtime_shader(GLuint id,const Program &p,const std::string &vertex,const std::string &fragment,
+                                   const SourceDigest &vs,const SourceDigest &fs) {
+  load_saved_runtime_shaders();
+  std::vector<AttributeBinding> bindings;
+  for(const auto &a:p.attributes)if(a.name.rfind("gl_",0)!=0)bindings.push_back(a);
+  std::sort(bindings.begin(),bindings.end(),[](const auto &a,const auto &b){return a.name<b.name;});
+  auto matches=[&](const ShaderRecord &r) {
+    if(r.vertex_source!=vs||r.fragment_source!=fs||r.attributes.size()!=bindings.size())return false;
+    for(size_t i=0;i<bindings.size();++i)if(r.attributes[i].name!=bindings[i].name||r.attributes[i].location!=bindings[i].location)return false;
+    return true;
+  };
+  if(state.saved_runtime_shaders)for(const auto &r:state.saved_runtime_shaders->programs())if(matches(r))return &r;
+  for(const auto &r:state.runtime_shaders)if(matches(r))return &r;
+  static std::set<std::pair<SourceDigest,SourceDigest>> failed;
+  if(failed.count({vs,fs}))return nullptr;
+  ShaderRecord record;std::string error;
+  const auto start=std::chrono::steady_clock::now();
+  if(!compile_guest_program(vertex,fragment,bindings,record,error)) {
+    failed.insert({vs,fs});
+    std::fprintf(stderr,"[vulkan] guest program %u is not in the offline pack and did not compile on the device: %s\n",id,error.substr(0,400).c_str());
+    return nullptr;
+  }
+  const double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
+  state.runtime_shaders.push_back(std::move(record));
+  if(state.recipes)state.recipes->add(state.runtime_shaders.back());
+  std::fprintf(stderr,"[vulkan] guest program %u is not in the offline pack: compiled on the device in %.1f ms\n",id,ms);
+  if(!state.runtime_shader_path.empty()) {
+    std::vector<const ShaderRecord *> all;
+    if(state.saved_runtime_shaders)for(const auto &r:state.saved_runtime_shaders->programs())all.push_back(&r);
+    for(const auto &r:state.runtime_shaders)all.push_back(&r);
+    try {write_shader_pack(state.runtime_shader_path,all);}
+    catch(const std::exception &e) {std::fprintf(stderr,"[vulkan] device-compiled programs not saved: %s\n",e.what());}
+    harvest_program(id,p,vertex,fragment,std::filesystem::path(state.runtime_shader_path).parent_path()/"runtime-harvest");
+  }
+  return &state.runtime_shaders.back();
+}
+#endif
 }
 extern "C" void lvk_glLinkProgram(GLuint id) {
   if (!state.pack) {
@@ -2194,6 +2274,12 @@ extern "C" void lvk_glLinkProgram(GLuint id) {
       break;
     }
   }
+  const bool in_pack = p.record != nullptr;
+#ifdef LINDBERGH_RUNTIME_SHADERS
+  if (!p.record) p.record = runtime_shader(id, p, vertex_source, fragment_source, vs, fs);
+#endif
+  // A harvest records every program the pack lacks, compiled here or not.
+  if (!in_pack && harvest_directory()) harvest_program(id, p, vertex_source, fragment_source);
   if (p.record) {
     static unsigned linked = 0;
     if (!linked++)
@@ -2222,10 +2308,8 @@ extern "C" void lvk_glLinkProgram(GLuint id) {
         out.write(s.source.data(), s.source.size());
       }
     }
-    if (harvest_directory()) {
-      harvest_program(id, p, vertex_source, fragment_source);
-      return; // its draws are skipped
-    }
+    if (harvest_directory())
+      return; // recorded above; its draws are skipped
     // A player's game keeps running without this program's draws; diagnostics
     // can insist on a complete pack with LINDBERGH_VULKAN_STRICT_SHADERS=1.
     static const bool strict=[]{const auto *v=std::getenv("LINDBERGH_VULKAN_STRICT_SHADERS");return v&&*v=='1';}();

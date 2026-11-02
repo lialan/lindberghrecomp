@@ -27,6 +27,9 @@ class PipelineRecipes {
     // pipeline. A foveated class is skipped when `density` is null.
     void precompile(const std::vector<Target *> &ready, VkImageView density,
                     const std::function<void(size_t, size_t)> &progress);
+    // A program compiled after construction (one the pack lacked) joins the
+    // catalogue; the record must outlive this object and never move.
+    void add(const ShaderRecord &);
     std::shared_ptr<Renderer> renderer(Target &, const ShaderRecord &,
                                        const std::vector<VkVertexInputBindingDescription> &,
                                        const std::vector<VkVertexInputAttributeDescription> &);

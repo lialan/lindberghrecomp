@@ -32,6 +32,67 @@ target_include_directories(lindbergh_vulkan PRIVATE "${CMAKE_CURRENT_BINARY_DIR}
 target_link_libraries(lindbergh_vulkan PUBLIC Vulkan::Vulkan)
 target_compile_options(lindbergh_vulkan PRIVATE -Wall -Wextra -Wno-missing-field-initializers)
 
+# Runtime GLSL -> SPIR-V, for guest programs missing from a game's offline
+# pack (its draws would otherwise be skipped). glslang is compiled from the
+# copy the Android NDK ships (shaderc's third_party), on Quest and on the Mac
+# alike; without it the runtime keeps skipping such draws.
+set(LINDBERGH_GLSLANG_SOURCE "" CACHE PATH "glslang source tree (default: the Android NDK's shaderc copy)")
+set(glslang_source "${LINDBERGH_GLSLANG_SOURCE}")
+if(NOT glslang_source)
+    set(ndk_roots "${CMAKE_ANDROID_NDK}" "${ANDROID_NDK}" "$ENV{ANDROID_NDK_HOME}")
+    file(GLOB sdk_ndks "$ENV{HOME}/Library/Android/sdk/ndk/*")
+    list(SORT sdk_ndks COMPARE NATURAL ORDER DESCENDING)
+    foreach(root IN LISTS ndk_roots sdk_ndks)
+        if(root AND EXISTS "${root}/sources/third_party/shaderc/third_party/glslang/glslang/Public/ShaderLang.h")
+            set(glslang_source "${root}/sources/third_party/shaderc/third_party/glslang")
+            break()
+        endif()
+    endforeach()
+endif()
+if(glslang_source AND EXISTS "${glslang_source}/glslang/Public/ShaderLang.h")
+    file(GLOB glslang_sources
+        "${glslang_source}/glslang/MachineIndependent/*.cpp"
+        "${glslang_source}/glslang/MachineIndependent/preprocessor/*.cpp"
+        "${glslang_source}/glslang/GenericCodeGen/*.cpp")
+    list(APPEND glslang_sources "${glslang_source}/glslang/OSDependent/Unix/ossource.cpp"
+        "${glslang_source}/OGLCompilersDLL/InitializeDll.cpp"
+        "${glslang_source}/SPIRV/GlslangToSpv.cpp" "${glslang_source}/SPIRV/InReadableOrder.cpp"
+        "${glslang_source}/SPIRV/Logger.cpp" "${glslang_source}/SPIRV/SpvBuilder.cpp"
+        "${glslang_source}/SPIRV/SpvPostProcess.cpp" "${glslang_source}/SPIRV/doc.cpp")
+    file(STRINGS "${glslang_source}/CHANGES.md" glslang_release REGEX "^## [0-9]+\\.[0-9]+\\.[0-9]+" LIMIT_COUNT 1)
+    string(REGEX MATCH "([0-9]+)\\.([0-9]+)\\.([0-9]+)" glslang_version "${glslang_release}")
+    set(glslang_info "${CMAKE_CURRENT_BINARY_DIR}/glslang-generated/glslang/build_info.h")
+    file(READ "${glslang_source}/build_info.h.tmpl" glslang_template)
+    string(REPLACE "@major@" "${CMAKE_MATCH_1}" glslang_template "${glslang_template}")
+    string(REPLACE "@minor@" "${CMAKE_MATCH_2}" glslang_template "${glslang_template}")
+    string(REPLACE "@patch@" "${CMAKE_MATCH_3}" glslang_template "${glslang_template}")
+    string(REPLACE "@flavor@" "" glslang_template "${glslang_template}")
+    file(WRITE "${glslang_info}" "${glslang_template}")
+    add_library(lindbergh_glslang STATIC ${glslang_sources})
+    target_include_directories(lindbergh_glslang PUBLIC "${glslang_source}" "${CMAKE_CURRENT_BINARY_DIR}/glslang-generated")
+    target_compile_definitions(lindbergh_glslang PUBLIC GLSLANG_OSINCLUDE_UNIX)
+    target_compile_options(lindbergh_glslang PRIVATE -w)
+    set_target_properties(lindbergh_glslang PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    # The lowering's GLSL prelude, the same text compile_shaders.py prepends.
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/../../../tools/vulkan/legacy.glsl" LVK_LEGACY_GLSL)
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/../../../tools/vulkan/sampling.glsl" LVK_SAMPLING_GLSL)
+    file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/runtime_shader_text.h"
+        CONTENT "static const char lvk_legacy_glsl[] = R\"lvkglsl(@LVK_LEGACY_GLSL@)lvkglsl\";\nstatic const char lvk_sampling_glsl[] = R\"lvkglsl(@LVK_SAMPLING_GLSL@)lvkglsl\";\n" @ONLY)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../../tools/vulkan/legacy.glsl" "${CMAKE_CURRENT_SOURCE_DIR}/../../../tools/vulkan/sampling.glsl")
+    target_sources(lindbergh_vulkan PRIVATE runtime_shaders.cpp)
+    target_link_libraries(lindbergh_vulkan PUBLIC lindbergh_glslang)
+    target_compile_definitions(lindbergh_vulkan PUBLIC LINDBERGH_RUNTIME_SHADERS=1)
+    message(STATUS "Vulkan: runtime shader compiler from ${glslang_source} (glslang ${glslang_version})")
+    if(NOT ANDROID)
+        # Local check against a game's offline pack (game shaders: not in CI).
+        add_executable(lindbergh_runtime_shader_check ../../../tests/vulkan/runtime_shaders_check.cpp)
+        target_link_libraries(lindbergh_runtime_shader_check PRIVATE lindbergh_vulkan)
+    endif()
+else()
+    message(STATUS "Vulkan: no glslang source; guest programs missing from the offline pack skip their draws")
+endif()
+
 include(CTest)
 if(BUILD_TESTING)
     find_program(SPIRV_CROSS spirv-cross REQUIRED)

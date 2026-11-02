@@ -43,6 +43,11 @@ private:
     std::vector<ShaderRecord> programs_;
 };
 
+// Write records in the archive format ShaderPack reads (pack_shaders.py's),
+// replacing path atomically: programs compiled on the device, kept for later
+// runs.
+void write_shader_pack(const std::string &path, const std::vector<const ShaderRecord *> &records);
+
 // std140 backing storage for one reflected UBO. Locations are resolved once
 // by HLE; writes preserve padding, array/matrix strides and transpose semantics.
 class UniformData {

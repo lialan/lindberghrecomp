@@ -16,6 +16,9 @@
 #include "resources.hpp"
 #include "shader_pack.hpp"
 #include "pipeline_recipes.hpp"
+#ifdef LINDBERGH_RUNTIME_SHADERS
+#include "runtime_shaders.hpp"
+#endif
 #include <array>
 #include <algorithm>
 #include <chrono>
@@ -809,6 +812,36 @@ static void render_stereo(Device &device)
         std::filesystem::remove(path);
     }
     std::puts("ok: portable pipeline seeds preload retained stereo pipelines; destination sRGB/FDM rendering, descriptors, resolution reuse and stale/corrupt rejection");
+#ifdef LINDBERGH_RUNTIME_SHADERS
+    // A program compiled on the device after the catalogue exists draws through
+    // it (add), and its recipes survive a restart once its saved record is one
+    // of the catalogue's packs.
+    {
+        ShaderRecord runtime;std::string error;
+        require(compile_guest_program(vertex_source,source(fixture_path("LV_TEST_SOURCE_DIR", LV_TEST_SOURCE_DIR, "legacy.frag")),{},runtime,error),
+                ("runtime shader compile failed: "+error).c_str());
+        const auto stamp=std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+        const auto path=(std::filesystem::temp_directory_path()/("lindbergh-runtime-recipes-"+stamp)).string();
+        const auto saved=path+".lvsp";
+        PipelineCache no_disk(device,"");
+        {
+            PipelineRecipes capture(device,no_disk,{},path);
+            capture.add(runtime);
+            capture.renderer(target,runtime,legacy.bindings,legacy.attributes)->prepare(state);
+            require(capture.recipe_count()==1,"device-compiled program's recipe not recorded");
+            capture.save();
+        }
+        write_shader_pack(saved,{&runtime});
+        ShaderPack reloaded(saved);
+        PipelineRecipes loaded(device,no_disk,{&reloaded},path);
+        require(loaded.recipe_count()==1,"device-compiled program's recipe dropped on restart");
+        loaded.prepare(target);
+        loaded.renderer(target,reloaded.programs().front(),legacy.bindings,legacy.attributes)->prepare(state);
+        require(loaded.first_use_count()==0,"device-compiled program's pipeline did not preload");
+        std::filesystem::remove(path);std::filesystem::remove(saved);
+    }
+    std::puts("ok: device-compiled programs join the pipeline catalogue and preload after a restart");
+#endif
 
     // Game loading uses packed BGRA8888_REV and RGB565. Sample the original
     // guest byte order directly; checking channels catches a mistaken swizzle.
@@ -1281,8 +1314,71 @@ static void test_shared_projection()
     std::puts("ok: shared world/HUD/pass/fill projection and deep-scene clip reprojection");
 }
 
+#ifdef LINDBERGH_RUNTIME_SHADERS
+// A program the offline pack lacks is compiled on the device: the fixture's
+// legacy GLSL compiled on the fly gives the record its offline conversion did.
+static void test_runtime_shaders()
+{
+    ShaderPack pack(fixture_path("LV_TEST_SHADER_DIR", LV_TEST_SHADER_DIR, "fixture.lvsp"));
+    const auto vertex=source(fixture_path("LV_TEST_SOURCE_DIR", LV_TEST_SOURCE_DIR, "legacy.vert"));
+    const auto fragment=source(fixture_path("LV_TEST_SOURCE_DIR", LV_TEST_SOURCE_DIR, "legacy.frag"));
+    const auto *offline=pack.find(shader_source_digest(vertex),shader_source_digest(fragment),{});
+    require(offline,"offline fixture record missing");
+    ShaderRecord runtime;std::string error;
+    require(compile_guest_program(vertex,fragment,{},runtime,error),("runtime shader compile failed: "+error).c_str());
+    require(runtime.vertex_source==offline->vertex_source&&runtime.fragment_source==offline->fragment_source,"runtime record has another source identity");
+    require(runtime.inputs.size()==offline->inputs.size(),"runtime record's vertex inputs differ");
+    for(size_t i=0;i<runtime.inputs.size();++i)
+        require(runtime.inputs[i].location==offline->inputs[i].location&&runtime.inputs[i].type==offline->inputs[i].type,"runtime vertex input differs");
+    require(runtime.samplers.size()==offline->samplers.size(),"runtime record's samplers differ");
+    for(size_t i=0;i<runtime.samplers.size();++i)
+        require(runtime.samplers[i].binding==offline->samplers[i].binding&&runtime.samplers[i].name==offline->samplers[i].name&&
+                runtime.samplers[i].type==offline->samplers[i].type&&runtime.samplers[i].count==offline->samplers[i].count,"runtime sampler differs");
+    for(const auto &layout:offline->uniforms) {
+        const auto mine=std::find_if(runtime.uniforms.begin(),runtime.uniforms.end(),[&](const auto &l){return l.set==layout.set&&l.binding==layout.binding;});
+        require(mine!=runtime.uniforms.end()&&mine->bytes>=layout.bytes,"runtime uniform block missing or smaller");
+        for(const auto &f:layout.fields) {
+            const auto g=std::find_if(mine->fields.begin(),mine->fields.end(),[&](const auto &x){return x.name==f.name;});
+            require(g!=mine->fields.end()&&g->offset==f.offset&&g->scalar==f.scalar&&g->columns==f.columns&&g->rows==f.rows&&
+                    g->count==f.count&&g->array_stride==f.array_stride&&g->matrix_stride==f.matrix_stride,("runtime uniform field differs: "+f.name).c_str());
+        }
+    }
+    require(runtime.vertex.size()>5&&runtime.vertex[0]==0x07230203u&&runtime.fragment.size()>5&&runtime.fragment[0]==0x07230203u,"runtime SPIR-V missing");
+    // An attribute the program declares but never reads is not in the vertex
+    // module's interface (as in the optimized offline modules): a pipeline
+    // gives attributes for the record's inputs only.
+    {
+        ShaderRecord unread;
+        require(compile_guest_program("#version 120\nattribute vec4 va_1;\nattribute vec4 va_6;\nvoid main() { gl_Position = va_1; }\n",
+                                      "#version 120\nvoid main() { gl_FragColor = vec4(1.0); }\n",
+                                      {{"va_1",1},{"va_6",6}},unread,error),("unread-attribute program did not compile: "+error).c_str());
+        require(unread.inputs.size()==1&&unread.inputs[0].location==1,"unread attribute listed as a vertex input");
+        std::set<uint32_t> variables,interface;bool location_6=false,location_1=false;
+        for(size_t at=5;at<unread.vertex.size();at+=unread.vertex[at]>>16) {
+            const uint32_t count=unread.vertex[at]>>16,op=unread.vertex[at]&0xffff,*w=&unread.vertex[at];
+            if(op==71&&count>3&&w[2]==30){location_6|=w[3]==6;location_1|=w[3]==1;} // OpDecorate Location
+            if(op==59&&count>2)variables.insert(w[2]);                                     // OpVariable
+            if(op==15) { // OpEntryPoint: model, id, name, interface ids
+                size_t i=3;while(i<count){const uint32_t word=w[i++];if(!(word>>24)||!(word&0xff0000u)||!(word&0xff00u)||!(word&0xffu))break;}
+                interface.insert(w+i,w+count);
+            }
+        }
+        require(!location_6&&location_1,"unread attribute's input still in the vertex module (or the read one gone)");
+        require(!interface.empty()&&std::includes(variables.begin(),variables.end(),interface.begin(),interface.end()),
+                "vertex entry point names a variable the module no longer has");
+    }
+    // A pair that cannot be lowered fails cleanly (its draws are then skipped).
+    require(!compile_guest_program("#version 120\nvoid main() { gl_Position = undefined_thing; }\n",fragment,{},runtime,error)&&!error.empty(),
+            "an invalid guest program compiled");
+    std::puts("ok: runtime shader compile matches the offline record");
+}
+#endif
+
 int main(int argc, char **argv)
 try {
+#ifdef LINDBERGH_RUNTIME_SHADERS
+    test_runtime_shaders();
+#endif
     test_shared_projection();
     test_live_stereo_scene();
     test_controller_input();
