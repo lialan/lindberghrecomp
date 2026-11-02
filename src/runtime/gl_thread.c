@@ -100,7 +100,7 @@ enum {
 };
 /* ok: classified; sh: a call the game thread keeps a shadow of (viewport,
  * scissor) or may answer from it (glGetIntegerv), so the rest skip that check */
-typedef struct { uint8_t kind, a, b, c, ok, sh, words, inv, st, sinv; } Cls;
+typedef struct { uint8_t kind, a, b, c, ok, sh, words, inv, st, sinv, mirror; } Cls;
 static Cls g_cls[HLE_ID_MAX];
 
 /* the client arrays as the game set them: on, and whether in client memory */
@@ -158,6 +158,7 @@ static void dedup_verify(void *arg)
     }
 }
 uint32_t glq_job(void (*job)(void *), void *arg);
+void glq_wait(uint32_t seq);
 /* a call found redundant: dropped, or (checking) a check in its place */
 static int drop(unsigned what, unsigned on, unsigned v)
 {
@@ -213,7 +214,7 @@ static const struct { const char *name; uint8_t kind, a, b, c; } T[] = {
     { "glFramebufferTexture2DEXT", C_VAL }, { "glFramebufferTexture2D", C_VAL },
     { "glBlendEquationSeparateEXT", C_VAL }, { "glBlendEquationSeparate", C_VAL },
     { "glMaterialfv", C_BLOB, 2, 16 }, { "glLightfv", C_BLOB, 2, 16 }, { "glFogfv", C_BLOB, 1, 16 },
-    { "glLightModelfv", C_BLOB, 1, 16 }, { "glColor4fv", C_BLOB, 0, 16 }, { "glColor3fv", C_BLOB, 0, 12 },
+    { "glLightModelfv", C_BLOB, 1, 16 }, { "glColor4fv", C_BLOB, 0, 16 }, { "glColor3fv", C_BLOB, 0, 12 }, { "glColor4ubv", C_BLOB, 0, 4 },
     { "glSecondaryColor3fv", C_BLOB, 0, 12 }, { "glSecondaryColor3fvEXT", C_BLOB, 0, 12 },
     { "glVertex3fv", C_BLOB, 0, 12 }, { "glVertex2fv", C_BLOB, 0, 8 }, { "glNormal3fv", C_BLOB, 0, 12 },
     { "glTexCoord2fv", C_BLOB, 0, 8 }, { "glLoadMatrixf", C_BLOB, 0, 64 }, { "glMultMatrixf", C_BLOB, 0, 64 },
@@ -420,6 +421,8 @@ static const Cls *cls(HleId id)
                                      !strcmp(n, "glPopAttrib") || !strcmp(n, "glGetIntegerv") ||
                                      !strcmp(n, "glGetFloatv"));
     }
+    k.mirror = !strncmp(n, "glMapBuffer", 11) || !strncmp(n, "glUnmapBuffer", 13) || !strncmp(n, "glBufferData", 12) ||
+               !strncmp(n, "glBufferSubData", 15) || !strncmp(n, "glDeleteBuffers", 15);
     g_cls[id] = k;
     return &g_cls[id];
 }
@@ -605,6 +608,7 @@ static uint32_t put_sync(CPU *c, HleId id, HleHandler fn)
 
 /* the viewport and scissor box the game last set (shadow_state, below) */
 static HleId g_id_viewport, g_id_scissor, g_id_popattrib, g_id_getint, g_id_getfloat, g_id_makecurrent;
+static HleId g_id_map[2], g_id_unmap[2], g_id_bufdata[2], g_id_bufsub[2], g_id_bufdel[2];
 static HleId g_id_getctx, g_id_getdraw;
 /* the drawable the game last made current, for glXGetCurrentDrawable without
  * waiting (hle_glx_posix.c says what that call answers for it) */
@@ -667,6 +671,16 @@ static void shadow_ids(void)
         else if (!strcmp(n, "glPopAttrib")) g_id_popattrib = (HleId)i;
         else if (!strcmp(n, "glGetIntegerv")) g_id_getint = (HleId)i;
         else if (!strcmp(n, "glGetFloatv")) g_id_getfloat = (HleId)i;
+        else if (!strcmp(n, "glMapBufferARB")) g_id_map[0] = (HleId)i;
+        else if (!strcmp(n, "glMapBuffer")) g_id_map[1] = (HleId)i;
+        else if (!strcmp(n, "glUnmapBufferARB")) g_id_unmap[0] = (HleId)i;
+        else if (!strcmp(n, "glUnmapBuffer")) g_id_unmap[1] = (HleId)i;
+        else if (!strcmp(n, "glBufferDataARB")) g_id_bufdata[0] = (HleId)i;
+        else if (!strcmp(n, "glBufferData")) g_id_bufdata[1] = (HleId)i;
+        else if (!strcmp(n, "glBufferSubDataARB")) g_id_bufsub[0] = (HleId)i;
+        else if (!strcmp(n, "glBufferSubData")) g_id_bufsub[1] = (HleId)i;
+        else if (!strcmp(n, "glDeleteBuffersARB")) g_id_bufdel[0] = (HleId)i;
+        else if (!strcmp(n, "glDeleteBuffers")) g_id_bufdel[1] = (HleId)i;
         else if (!strcmp(n, "glXMakeCurrent")) g_id_makecurrent = (HleId)i;
         else if (!strcmp(n, "glXGetCurrentContext")) g_id_getctx = (HleId)i;
         else if (!strcmp(n, "glXGetCurrentDrawable")) g_id_getdraw = (HleId)i;
@@ -855,11 +869,116 @@ static void srv_verify(void *arg)
     }
 }
 
+
+/* ---- mapped buffers, mirrored on the game thread ----
+ * glMapBufferARB answers a pointer, so it waited for the worker, and so did
+ * the unmap after it (7 of each a frame in Ghost Squad Evolution). The game
+ * thread keeps a mirror of each buffer it maps, in guest memory: the first
+ * map fills it (one wait), later maps hand it straight back, and an unmap
+ * sends a snapshot of it to the worker, which writes it into the buffer.
+ * The mirror follows glBufferData/glBufferSubData of that buffer and is
+ * dropped by a delete. A partial write keeps the rest, as GSE's smoke needs
+ * (hle_gl_posix.c, h_glMapBufferARB). LINDBERGH_GLQ_NOMIRROR=1: maps wait. */
+static struct { uint32_t buffer, size, va, target; uint8_t *host; int valid, mapped; } g_mirror[64];
+static unsigned g_n_mirrored;
+static int mirror_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *v = getenv("LINDBERGH_GLQ_NOMIRROR"); on = !(v && *v == '1') && copy_on(); }
+    return on;
+}
+static int is_id(HleId id, const HleId *ids) { return id && (id == ids[0] || id == ids[1]); }
+static uint32_t bound_buffer(uint32_t target)
+{
+    if (target == 0x8892 && g_buf_known[0]) return g_array_buf;
+    if (target == 0x8893 && g_buf_known[1]) return g_element_buf;
+    return 0;
+}
+static int mirror_of(uint32_t buffer)
+{
+    for (int i = 0; i < 64; i++) if (g_mirror[i].buffer == buffer && buffer) return i;
+    return -1;
+}
+struct MirrorIo { uint32_t target, size; uint8_t *host; int32_t got; };
+static void mirror_size_job(void *a) { struct MirrorIo *io = a; GLint n = 0; glGetBufferParameteriv(io->target, 0x8764 /* GL_BUFFER_SIZE */, &n); io->got = n; }
+static void mirror_read_job(void *a) { struct MirrorIo *io = a; glGetBufferSubData(io->target, 0, io->size, io->host); }
+static void mirror_write_job(void *a) { struct MirrorIo *io = a; glBufferSubData(io->target, 0, io->size, io->host); }
+/* 1: the call was handled here (its answer in eax) */
+static int mirror_call(CPU *c, HleId id)
+{
+    if (!mirror_on()) return 0;
+    if (is_id(id, g_id_map)) {
+        uint32_t target = A32(0), buffer = bound_buffer(target);
+        if (!buffer) return 0;
+        int i = mirror_of(buffer);
+        if (i < 0 || !g_mirror[i].valid) {
+            struct MirrorIo io = { target, 0, NULL, 0 };
+            glq_wait(glq_job(mirror_size_job, &io));
+            if (io.got <= 0 || io.got > (16 << 20)) return 0;
+            if (i < 0) { for (i = 0; i < 64 && g_mirror[i].buffer; i++) ; if (i == 64) return 0; }
+            if (!g_mirror[i].host || g_mirror[i].size < (uint32_t)io.got) {
+                uint8_t *h = guest_alloc((size_t)io.got, 64);    /* an outgrown one is left behind */
+                if (!h) return 0;
+                g_mirror[i].host = h; g_mirror[i].va = H2G(h);
+            }
+            g_mirror[i].buffer = buffer; g_mirror[i].size = (uint32_t)io.got;
+            io.size = (uint32_t)io.got; io.host = g_mirror[i].host;
+            glq_wait(glq_job(mirror_read_job, &io));
+            g_mirror[i].valid = 1;
+        }
+        g_mirror[i].mapped = 1; g_mirror[i].target = target;
+        c->eax = g_mirror[i].va; g_n_mirrored++;
+        return 1;
+    }
+    if (is_id(id, g_id_unmap)) {
+        int i = mirror_of(bound_buffer(A32(0)));
+        if (i < 0 || !g_mirror[i].mapped) return 0;
+        g_mirror[i].mapped = 0;
+        struct MirrorIo *io = (struct MirrorIo *)arena_take(sizeof *io);
+        uint8_t *snap = io ? arena_take(g_mirror[i].size) : NULL;
+        if (io && snap) {
+            memcpy(snap, g_mirror[i].host, g_mirror[i].size);
+            io->target = A32(0); io->size = g_mirror[i].size; io->host = snap;
+            glq_job(mirror_write_job, io);
+        } else {                                   /* no room this frame: write it and wait */
+            struct MirrorIo w = { A32(0), g_mirror[i].size, g_mirror[i].host, 0 };
+            glq_wait(glq_job(mirror_write_job, &w));
+        }
+        c->eax = 1; g_n_mirrored++;
+        return 1;
+    }
+    if (is_id(id, g_id_bufdata)) {               /* (target, size, data, usage): goes on, the mirror follows */
+        int i = mirror_of(bound_buffer(A32(0)));
+        if (i >= 0) {
+            if (A32(2) && A32(1) == g_mirror[i].size) memcpy(g_mirror[i].host, GP(A32(2)), A32(1));
+            else g_mirror[i].valid = 0;
+        }
+        return 0;
+    }
+    if (is_id(id, g_id_bufsub)) {                /* (target, offset, size, data) */
+        int i = mirror_of(bound_buffer(A32(0)));
+        if (i >= 0 && g_mirror[i].valid) {
+            if (A32(3) && (uint64_t)A32(1) + A32(2) <= g_mirror[i].size) memcpy(g_mirror[i].host + A32(1), GP(A32(3)), A32(2));
+            else g_mirror[i].valid = 0;
+        }
+        return 0;
+    }
+    if (is_id(id, g_id_bufdel)) {                /* (n, names) */
+        for (uint32_t k = 0; k < A32(0) && k < 4096; k++) {
+            int i = mirror_of(rd32(A32(1) + 4u * k));
+            if (i >= 0) { g_mirror[i].buffer = 0; g_mirror[i].valid = g_mirror[i].mapped = 0; }
+        }
+        return 0;
+    }
+    return 0;
+}
+
 static void glq_hook(CPU *c, HleId id, HleHandler fn)
 {
     const Cls *k = cls(id);
     uint32_t a0 = A32(0);
     if (__builtin_expect(k->sh, 0) && shadow_state(c, id)) return;
+    if (__builtin_expect(k->mirror, 0) && mirror_call(c, id)) return;
     if (__builtin_expect(k->inv, 0)) client_state_unknown();
     if (__builtin_expect(k->sinv, 0)) srv_unknown();
     if (k->st && srv_redundant(c, k->st)) return;
@@ -1041,7 +1160,7 @@ void glq_report(unsigned frames)
     fprintf(stderr, "[glq] ms per frame: game thread %.1f (waiting %.1f), GL thread %.1f; ",
             game0 ? (game - game0) / frames : 0, g_wait_ms / frames, work0 ? (work - work0) / frames : 0);
     game0 = game; work0 = work; g_wait_ms = 0;
-    fprintf(stderr, "per frame: %u queued, %u dropped as redundant, %u reads answered here, %u draws copied, %u waited for", g_n_async / frames, g_n_dropped / frames, g_n_answered / frames, g_n_draw_copies / frames, g_n_sync / frames);
+    fprintf(stderr, "per frame: %u queued, %u dropped as redundant, %u reads answered here, %u draws copied, %u maps mirrored, %u waited for", g_n_async / frames, g_n_dropped / frames, g_n_answered / frames, g_n_draw_copies / frames, g_n_mirrored / frames, g_n_sync / frames);
     if (dedup_check()) fprintf(stderr, " (dedup check: %u wrong so far)", atomic_load(&g_dedup_wrong));
     for (int k = 0; k < 10; k++) {
         unsigned best = 0;
@@ -1052,7 +1171,7 @@ void glq_report(unsigned frames)
     }
     fputc('\n', stderr);
     memset(g_sync_by_id, 0, sizeof g_sync_by_id);
-    g_n_async = g_n_sync = g_n_dropped = g_n_answered = g_n_draw_copies = 0;
+    g_n_async = g_n_sync = g_n_dropped = g_n_answered = g_n_draw_copies = g_n_mirrored = 0;
 }
 
 /* Start, from the game thread at its first swap. release() lets go of the GL
