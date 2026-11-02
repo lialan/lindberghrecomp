@@ -34,6 +34,7 @@ extern "C" {
 #include "xr_sight.h"
 }
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -491,7 +492,7 @@ struct State {
   std::optional<Submission> last_submission;
   Target *screen = nullptr;
   Renderer *active = nullptr;
-  unsigned drawable = 0, next_drawable = 1, next_object = 1;
+  unsigned drawable = 0, next_drawable = 1;
   GLuint array_buffer = 0, element_buffer = 0, pack_buffer = 0,
          unpack_buffer = 0, program = 0;
   GLenum matrix_mode = GL_MODELVIEW, active_texture = GL_TEXTURE0,
@@ -931,7 +932,11 @@ ControllerSettings controller_settings(const LgXrSettings &settings,int width,in
 
 void shutdown_vulkan() { state.shutdown(); }
 void queue_clear(GLbitfield mask);
-GLuint object() { return state.next_object++; }
+// GL object names: one counter for every kind, never handed out twice. The
+// game thread takes names from it too (lvk_reserve_names, for gl_thread.c's
+// glGen*), so it is atomic.
+std::atomic<GLuint> g_next_object{1};
+GLuint object() { return g_next_object.fetch_add(1,std::memory_order_relaxed); }
 void check_range(size_t size, GLintptr offset, GLsizeiptr bytes) {
   if (offset < 0 || bytes < 0 || size_t(offset) > size ||
       size_t(bytes) > size - size_t(offset))
@@ -1961,6 +1966,13 @@ extern "C" void lvk_glGenBuffers(GLsizei n, GLuint *out) {
     out[i] = object();
     state.buffers[out[i]] = {};
   }
+}
+// gl_thread.c's glGen* on the game thread: n names in a row, and (on the
+// worker, in queue order) the buffer objects its glGenBuffers would have made.
+extern "C" uint32_t lvk_reserve_names(uint32_t n) { return g_next_object.fetch_add(n,std::memory_order_relaxed); }
+extern "C" void lvk_adopt_buffer_names(uint32_t n, const uint32_t *names) {
+  for (uint32_t i = 0; i < n; ++i)
+    state.buffers.try_emplace(names[i]);
 }
 extern "C" void lvk_glBindBuffer(GLenum target, GLuint name) {
   state.binding(target) = name;

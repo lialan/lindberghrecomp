@@ -94,6 +94,8 @@ enum {
     C_LOCK,         /* glLockArraysEXT: reads the arrays now */
     C_UNLOCK,       /* glUnlockArraysEXT */
     C_TEXIMG,       /* glTex(Sub)Image2D: the pixels at arg a, width at arg b, height after it */
+    C_BYTES,        /* arg a points at arg b bytes (none if null); c: pixels, moved by unpacking */
+    C_GEN,          /* glGen*(n, names): named here when the host can; b: buffers (the worker adopts them) */
     C_PSTORE,       /* glPixelStorei: watched for unpacking that moves the pixels */
     C_DIRECT,       /* glXSwapBuffers: here, on the game thread (host_swap queues its GL) */
     C_RAW,          /* the rest of GLX: on the worker, waited for, past stereo.c's hook */
@@ -242,7 +244,22 @@ static const struct { const char *name; uint8_t kind, a, b, c; } T[] = {
     /* texture uploads: the pixels go along (movie frames, 3 waits a frame in
      * The House of the Dead 4 Special, 2-3 ms of the game thread) */
     { "glTexSubImage2D", C_TEXIMG, 8, 4 }, { "glTexImage2D", C_TEXIMG, 8, 3 },
+    /* a level's loading: buffer contents and compressed textures go along,
+     * and new names are handed out here (lvk_reserve_names) - each waited,
+     * about 60 times a frame for the 5 s Ghost Squad Evolution takes to load
+     * a mission, and a wait is for the whole queue ahead of it */
+    { "glBufferDataARB", C_BYTES, 2, 1 }, { "glBufferData", C_BYTES, 2, 1 },
+    { "glBufferSubDataARB", C_BYTES, 3, 2 }, { "glBufferSubData", C_BYTES, 3, 2 },
+    { "glCompressedTexImage2DARB", C_BYTES, 7, 6, 1 }, { "glCompressedTexImage2D", C_BYTES, 7, 6, 1 },
+    { "glGenBuffersARB", C_GEN, 0, 1 }, { "glGenBuffers", C_GEN, 0, 1 }, { "glGenTextures", C_GEN },
 };
+/* Names for glGen*, from a host whose names are never handed out twice (the
+ * native Vulkan one): taken here, so the call needs no answer from the worker.
+ * A buffer's name is then adopted on the worker, in queue order, as its glGen
+ * would have made it. Absent (weak), glGen* waits as before. */
+__attribute__((weak)) uint32_t lvk_reserve_names(uint32_t n);
+__attribute__((weak)) void lvk_adopt_buffer_names(uint32_t n, const uint32_t *names);
+static void adopt_buffers(CPU *c) { lvk_adopt_buffer_names(A32(0), (const uint32_t *)GP(A32(1))); }
 
 /* bytes of the pixels a glTex(Sub)Image2D reads, 0 if not sure. Unpack row
  * length and skips are taken as 0 unless the game ever set them otherwise,
@@ -309,7 +326,7 @@ static int srv_same(uint64_t key, uint64_t val)
     return 0;
 }
 /* 1: the record holds key's value (put in *val) */
-static unsigned g_n_answered, g_n_draw_copies;
+static unsigned g_n_answered, g_n_draw_copies, g_n_named;
 static int srv_get(uint64_t key, uint64_t *val)
 {
     uint32_t i = srv_slot(key);
@@ -1054,6 +1071,25 @@ static void glq_hook(CPU *c, HleId id, HleHandler fn)
     case C_PSTORE:
         if ((a0 == 0x0CF2 || a0 == 0x0CF3 || a0 == 0x0CF4 || a0 == 0x806D || a0 == 0x806E) && A32(1)) g_unpack_odd = 1;
         break;
+    case C_BYTES:
+        if (!A32(k->a)) break;                      /* no contents: storage only */
+        if ((k->c && g_unpack_odd) || A32(k->b) > (4u << 20)) async = 0; else extra = A32(k->b);
+        break;
+    case C_GEN: {
+        int32_t n = (int32_t)A32(0);
+        if (!lvk_reserve_names || (k->b && !lvk_adopt_buffer_names) || n <= 0 || n > 4096 || !A32(1)) { async = 0; break; }
+        uint32_t first = lvk_reserve_names((uint32_t)n);
+        for (int32_t i = 0; i < n; i++) wr32(A32(1) + 4u * (uint32_t)i, first + (uint32_t)i);
+        g_n_named += (unsigned)n;
+        if (!k->b) return;                          /* a texture's name is all its glGen made */
+        Rec *r = ring_take(HDR_A + 16 + 4u * (uint32_t)n);
+        r->kind = R_ASYNC; r->id = (uint32_t)id; r->fn = adopt_buffers;
+        uint32_t *args = (uint32_t *)((uint8_t *)r + HDR_A), *names = args + 4;
+        args[0] = (uint32_t)n; args[1] = va_of(names);
+        for (int32_t i = 0; i < n; i++) names[i] = first + (uint32_t)i;
+        ring_put();
+        g_n_async++;
+        return; }
     case C_TEXIMG:
         if (!A32(k->a)) break;                      /* no pixels: storage only */
         if (g_unpack_odd || !(extra = pixel_bytes(A32(k->b), A32(k->b + 1u), A32(6), A32(7)))) async = 0;
@@ -1082,7 +1118,7 @@ static void glq_hook(CPU *c, HleId id, HleHandler fn)
     if (k->kind == C_BLOB) {
         memcpy(blob, GP(A32(k->a)), extra);
         args[k->a] = va_of(blob);
-    } else if ((k->kind == C_VEC || k->kind == C_TEXIMG) && extra) {
+    } else if ((k->kind == C_VEC || k->kind == C_TEXIMG || k->kind == C_BYTES) && extra) {
         memcpy(blob, GP(A32(k->a)), extra);
         args[k->a] = va_of(blob);
     } else if (k->kind == C_MULTI_EL) {
@@ -1135,7 +1171,7 @@ void glq_report(unsigned frames)
     fprintf(stderr, "[glq] ms per frame: game thread %.1f (waiting %.1f), GL thread %.1f; ",
             game0 ? (game - game0) / frames : 0, g_wait_ms / frames, work0 ? (work - work0) / frames : 0);
     game0 = game; work0 = work; g_wait_ms = 0;
-    fprintf(stderr, "per frame: %u queued, %u dropped as redundant, %u reads answered here, %u draws copied, %u maps mirrored, %u waited for", g_n_async / frames, g_n_dropped / frames, g_n_answered / frames, g_n_draw_copies / frames, g_n_mirrored / frames, g_n_sync / frames);
+    fprintf(stderr, "per frame: %u queued, %u dropped as redundant, %u reads answered here, %u names given here, %u draws copied, %u maps mirrored, %u waited for", g_n_async / frames, g_n_dropped / frames, g_n_answered / frames, g_n_named / frames, g_n_draw_copies / frames, g_n_mirrored / frames, g_n_sync / frames);
     if (dedup_check()) fprintf(stderr, " (dedup check: %u wrong so far)", atomic_load(&g_dedup_wrong));
     for (int k = 0; k < 10; k++) {
         unsigned best = 0;
@@ -1146,7 +1182,7 @@ void glq_report(unsigned frames)
     }
     fputc('\n', stderr);
     memset(g_sync_by_id, 0, sizeof g_sync_by_id);
-    g_n_async = g_n_sync = g_n_dropped = g_n_answered = g_n_draw_copies = g_n_mirrored = 0;
+    g_n_async = g_n_sync = g_n_dropped = g_n_answered = g_n_named = g_n_draw_copies = g_n_mirrored = 0;
 }
 
 /* Start, from the game thread at its first swap. release() lets go of the GL

@@ -21,6 +21,9 @@ void host_vr_input2(int,int,int) {}
 // No guest code: no state functions to watch.
 uint32_t stereo_state_lo=~0u,stereo_state_hi=0;
 uint32_t guest_symbol(const char *) {return 0;}
+// gl_thread.c's glGen* on the game thread
+uint32_t lvk_reserve_names(uint32_t n);
+void lvk_adopt_buffer_names(uint32_t n,const uint32_t *names);
 }
 #include <chrono>
 #include <filesystem>
@@ -101,6 +104,20 @@ int main() {
         SDL_setenv("LINDBERGH_VULKAN_SHADERS",pack?pack:LV_TEST_SHADER_PACK,1);
         require(lvk_host_init(nullptr,64,64),"guest Vulkan host initialization failed");
         glMatrixMode(GL_PROJECTION);glLoadIdentity();glMatrixMode(GL_MODELVIEW);glLoadIdentity();
+        {
+            // Names taken on the game thread (gl_thread.c's glGen*) are never
+            // handed out again by the host's own glGen*, and an adopted buffer
+            // name is the empty buffer glGenBuffers would have made.
+            const auto first=lvk_reserve_names(3);
+            GLuint buffer=0,texture=0;glGenBuffers(1,&buffer);glGenTextures(1,&texture);
+            for(const GLuint name:{buffer,texture})require(name<first||name>=first+3,"a reserved name was handed out again");
+            const std::array<uint32_t,3> names{first,first+1,first+2};lvk_adopt_buffer_names(3,names.data());
+            GLint size=-1;glBindBuffer(GL_ARRAY_BUFFER,first+1);glGetBufferParameteriv(GL_ARRAY_BUFFER,GL_BUFFER_SIZE,&size);
+            require(size==0,"an adopted buffer name is not an empty buffer");
+            const float data[4]{};glBufferData(GL_ARRAY_BUFFER,sizeof data,data,GL_STATIC_DRAW);
+            glGetBufferParameteriv(GL_ARRAY_BUFFER,GL_BUFFER_SIZE,&size);require(size==sizeof data,"an adopted buffer took no data");
+            glBindBuffer(GL_ARRAY_BUFFER,0);GLuint gone[]={first,first+1,first+2,buffer};glDeleteBuffers(4,gone);glDeleteTextures(1,&texture);
+        }
         for(unsigned cycle=0;cycle<18;++cycle) {
             const auto size=32+16*(cycle%3);const auto id=lvk_create_drawable(size,size);
             lvk_bind_drawable(id);
@@ -236,7 +253,7 @@ int main() {
         }
         const auto unfinished=lvk_create_drawable(32,32);lvk_bind_drawable(unfinished);
         triangle(32);lvk_destroy_drawable(unfinished);lvk_bind_drawable(0);
-        std::puts("ok: real guest ABI pbuffer lifetime, perspective HUD bounds, on-screen layered movie/text depth, clamped GL_COMBINE results, frame-local depth, stereo readback and unfinished shutdown");
+        std::puts("ok: real guest ABI pbuffer lifetime, perspective HUD bounds, on-screen layered movie/text depth, clamped GL_COMBINE results, frame-local depth, game-thread names, stereo readback and unfinished shutdown");
         return 0; // production atexit drain runs before fixture cleanup
     } catch(const std::exception &error) {std::cerr<<error.what()<<'\n';return 1;}
 }
