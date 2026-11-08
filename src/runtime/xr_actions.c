@@ -12,7 +12,7 @@ XrResult lg_xr_actions_create(LgXrActions *a,XrInstance instance,XrSession sessi
         {"aim","Aim",XR_ACTION_TYPE_POSE_INPUT},{"trigger","Trigger",XR_ACTION_TYPE_FLOAT_INPUT},
         {"grip","Grip",XR_ACTION_TYPE_FLOAT_INPUT},{"lower","A / X",XR_ACTION_TYPE_BOOLEAN_INPUT},
         {"upper","B / Y",XR_ACTION_TYPE_BOOLEAN_INPUT},{"stick","Thumbstick click",XR_ACTION_TYPE_BOOLEAN_INPUT},
-        {"menu","Menu",XR_ACTION_TYPE_BOOLEAN_INPUT},{"recoil","Recoil",XR_ACTION_TYPE_VIBRATION_OUTPUT}};
+        {"menu","Menu",XR_ACTION_TYPE_BOOLEAN_INPUT},{"thumb","Thumbstick",XR_ACTION_TYPE_VECTOR2F_INPUT},{"recoil","Recoil",XR_ACTION_TYPE_VIBRATION_OUTPUT}};
     for(unsigned i=0;i<LG_XR_ACTION_COUNT;++i) {
         XrActionCreateInfo create={XR_TYPE_ACTION_CREATE_INFO};create.actionType=spec[i].type;
         strcpy(create.actionName,spec[i].name);strcpy(create.localizedActionName,spec[i].label);
@@ -27,6 +27,7 @@ XrResult lg_xr_actions_create(LgXrActions *a,XrInstance instance,XrSession sessi
         {LG_XR_UPPER,"/user/hand/left/input/y/click"},{LG_XR_UPPER,"/user/hand/right/input/b/click"},
         {LG_XR_STICK,"/user/hand/left/input/thumbstick/click"},{LG_XR_STICK,"/user/hand/right/input/thumbstick/click"},
         {LG_XR_MENU,"/user/hand/left/input/menu/click"},
+        {LG_XR_THUMB,"/user/hand/left/input/thumbstick"},{LG_XR_THUMB,"/user/hand/right/input/thumbstick"},
         {LG_XR_HAPTIC,"/user/hand/left/output/haptic"},{LG_XR_HAPTIC,"/user/hand/right/output/haptic"}};
     XrActionSuggestedBinding suggested[sizeof bindings/sizeof bindings[0]];
     for(unsigned i=0;i<sizeof bindings/sizeof bindings[0];++i) {
@@ -68,6 +69,13 @@ int lg_xr_action_bool(const LgXrActions *a,XrAction action,int hand)
     XrActionStateBoolean state={XR_TYPE_ACTION_STATE_BOOLEAN};
     return XR_SUCCEEDED(xrGetActionStateBoolean(a->session,&get,&state))&&state.isActive&&state.currentState;
 }
+int lg_xr_action_vec2(const LgXrActions *a,XrAction action,int hand,float *x,float *y)
+{
+    XrActionStateGetInfo get={XR_TYPE_ACTION_STATE_GET_INFO};get.action=action;get.subactionPath=a->hand_path[hand];
+    XrActionStateVector2f state={XR_TYPE_ACTION_STATE_VECTOR2F};
+    const int ok=XR_SUCCEEDED(xrGetActionStateVector2f(a->session,&get,&state))&&state.isActive;
+    *x=ok?state.currentState.x:0;*y=ok?state.currentState.y:0;return ok;
+}
 XrResult lg_xr_actions_sample(const LgXrActions *a,XrSpace space,XrTime time,LgXrActionSample *sample)
 {
     memset(sample,0,sizeof *sample);const XrResult synced=lg_xr_actions_sync(a);
@@ -78,6 +86,7 @@ XrResult lg_xr_actions_sample(const LgXrActions *a,XrSpace space,XrTime time,LgX
         sample->lower[h]=lg_xr_action_bool(a,a->action[LG_XR_LOWER],h);
         sample->upper[h]=lg_xr_action_bool(a,a->action[LG_XR_UPPER],h);
         sample->stick[h]=lg_xr_action_bool(a,a->action[LG_XR_STICK],h);
+        lg_xr_action_vec2(a,a->action[LG_XR_THUMB],h,&sample->thumb_x[h],&sample->thumb_y[h]);
         XrActionStateGetInfo get={XR_TYPE_ACTION_STATE_GET_INFO};get.action=a->action[LG_XR_AIM];get.subactionPath=a->hand_path[h];
         XrActionStatePose pose={XR_TYPE_ACTION_STATE_POSE};XrSpaceLocation located={XR_TYPE_SPACE_LOCATION};
         const XrSpaceLocationFlags valid=XR_SPACE_LOCATION_ORIENTATION_VALID_BIT|XR_SPACE_LOCATION_POSITION_VALID_BIT;

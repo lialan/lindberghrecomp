@@ -312,6 +312,8 @@ void       hle_register_glx_posix(void);
 int        solib_dlopen(CPU *c, const char *path);
 uint32_t   solib_dlsym(const char *name);
 uint32_t   solib_export(const char *name);
+int        hle_libc_data_import(const char *name, uint32_t *value);
+FILE      *guest_fopen(const char *path, const char *mode);   /* hle_libc.c: fopen, retried under TEA_DIR */   /* hle_libc.c: a lifted library's data import */
 int        solib_call(CPU *c, const char *name);
 
 /* A callable address for a GL entry point the game asks for by name but does

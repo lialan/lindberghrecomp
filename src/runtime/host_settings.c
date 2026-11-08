@@ -32,6 +32,14 @@ static const struct { const char *key, *name; int dflt; } ACTIONS[ACT_COUNT] = {
     [ACT_TEST]    = { "test",    "Test (operator)",   't' },
     [ACT_SERVICE] = { "service", "Service (operator)", 's' },
     [ACT_MUTE]    = { "mute",    "Mute",              'm' },
+    /* a lever cabinet's (Virtua Tennis 3): the stick and three buttons */
+    [ACT_UP]      = { "up",      "Lever up",          SDLK_UP },
+    [ACT_DOWN]    = { "down",    "Lever down",        SDLK_DOWN },
+    [ACT_LEFT]    = { "left",    "Lever left",        SDLK_LEFT },
+    [ACT_RIGHT]   = { "right",   "Lever right",       SDLK_RIGHT },
+    [ACT_BUTTON1] = { "button1", "Button 1 (topspin)", 'z' },
+    [ACT_BUTTON2] = { "button2", "Button 2 (lob)",    'x' },
+    [ACT_BUTTON3] = { "button3", "Button 3 (slice)",  'c' },
 };
 
 const char *settings_action_name(HostAction a) { return ACTIONS[a].name; }

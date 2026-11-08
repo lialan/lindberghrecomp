@@ -43,6 +43,10 @@ typedef struct {
     int   sysdata_region;       /* the game reads its region (and language) from the EEPROM's system data */
     const char *ride_board;     /* the serial device a large attraction cabinet's ride board is on (hle_rideboard.c) */
     float cull_fov;             /* the angle, degrees, the game culls its models to, when wide (0: the game's) */
+    int   glx_sgix_pbuffer;     /* render targets through GLX_SGIX_pbuffer (Virtua Tennis 3), answered as framebuffer
+                                 * objects; 0 reports no SGIX configs, the path Let's Go Jungle takes */
+    int   joystick;             /* a lever and buttons, not a gun (Virtua Tennis 3): no reload on leaving the
+                                 * window, and in the headset the thumbsticks are the lever */
 
     /* in the headset */
     struct {

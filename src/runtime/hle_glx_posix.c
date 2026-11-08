@@ -23,6 +23,7 @@
 
 #include "gl_posix.h"
 #include "stereo.h"
+#include "game_profile.h"
 #ifdef LINDBERGH_VULKAN
 #include "vulkan_host.h"
 #endif
@@ -113,18 +114,20 @@ static uint32_t glx_attrib(uint32_t list, uint32_t key, uint32_t dflt)
     return dflt;
 }
 
-/* glXCreatePbuffer(dpy, config, attribs): GLX_PBUFFER_WIDTH 0x8041, HEIGHT 0x8040 */
-static void h_glXCreatePbuffer(CPU *c)
+/* the colour bits per channel the last SGIX config search asked for: more
+ * than 8 is a floating-point target */
+static unsigned g_pb_color_bits = 8;
+
+/* A pbuffer of w x h: its token, or 0 */
+static uint32_t pb_create(int w, int h)
 {
-    if (!ensure_window()) { RET(0); return; }
+    if (!ensure_window()) return 0;
     int i = 1;
     while (i < MAX_PB && g_pb[i].fb) i++;
-    if (i == MAX_PB) { fprintf(stderr, "[glX] out of pbuffers\n"); RET(0); return; }
-    int w = (int)glx_attrib(A32(2), 0x8041, 256), h = (int)glx_attrib(A32(2), 0x8040, 256);
+    if (i == MAX_PB) { fprintf(stderr, "[glX] out of pbuffers\n"); return 0; }
 #ifdef LINDBERGH_VULKAN
     g_pb[i].fb = lvk_create_drawable(w, h); g_pb[i].w = w; g_pb[i].h = h;
-    RET(TOK_PBUFFER | (uint32_t)i);
-    return;
+    return TOK_PBUFFER | (uint32_t)i;
 #endif
     if (stereo_enabled()) {
         /* in the headset a pbuffer is drawn as the eyes (h_glXMakeCurrent):
@@ -133,8 +136,7 @@ static void h_glXCreatePbuffer(CPU *c)
         g_pb[i].fb = ~0u; g_pb[i].w = w; g_pb[i].h = h;
         stereo_pbuffer_made();
         fprintf(stderr, "[glX] pbuffer %d: %dx%d, drawn as the eyes\n", i, w, h);
-        RET(TOK_PBUFFER | (uint32_t)i);
-        return;
+        return TOK_PBUFFER | (uint32_t)i;
     }
 
     GLint prev_fb = 0, prev_tex = 0, prev_rb = 0;
@@ -145,7 +147,10 @@ static void h_glXCreatePbuffer(CPU *c)
     glGenTextures(1, &g_pb[i].color);
     glBindTexture(GL_TEXTURE_2D, g_pb[i].color);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    if (g_pb_color_bits > 8)
+        glTexImage2D(GL_TEXTURE_2D, 0, g_pb_color_bits > 16 ? 0x8814 /* GL_RGBA32F */ : 0x881A /* GL_RGBA16F */, w, h, 0, GL_RGBA, GL_FLOAT, NULL);
+    else
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
     glBindFramebuffer(GL_FRAMEBUFFER, g_pb[i].fb);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_pb[i].color, 0);
 #ifdef LINDBERGH_GL4ES
@@ -171,14 +176,20 @@ static void h_glXCreatePbuffer(CPU *c)
     glBindTexture(GL_TEXTURE_2D, (GLuint)prev_tex);
     glBindRenderbuffer(GL_RENDERBUFFER, (GLuint)prev_rb);
     g_pb[i].w = w; g_pb[i].h = h;
-    fprintf(stderr, "[glX] pbuffer %d: %dx%d%s\n", i, w, h,
+    fprintf(stderr, "[glX] pbuffer %d: %dx%d%s%s\n", i, w, h, g_pb_color_bits > 8 ? ", float" : "",
             st == GL_FRAMEBUFFER_COMPLETE ? "" : " (incomplete framebuffer)");
-    RET(TOK_PBUFFER | (uint32_t)i);
+    return TOK_PBUFFER | (uint32_t)i;
 }
 
-static void h_glXDestroyPbuffer(CPU *c)
+/* glXCreatePbuffer(dpy, config, attribs): GLX_PBUFFER_WIDTH 0x8041, HEIGHT 0x8040 */
+static void h_glXCreatePbuffer(CPU *c)
 {
-    int i = pb_index(A32(1));
+    RET(pb_create((int)glx_attrib(A32(2), 0x8041, 256), (int)glx_attrib(A32(2), 0x8040, 256)));
+}
+
+static void pb_destroy(uint32_t tok)
+{
+    int i = pb_index(tok);
     if (i < 0) return;
 #ifdef LINDBERGH_VULKAN
     lvk_destroy_drawable(g_pb[i].fb); memset(&g_pb[i], 0, sizeof g_pb[i]); return;
@@ -190,6 +201,8 @@ static void h_glXDestroyPbuffer(CPU *c)
     else glDeleteRenderbuffers(1, &g_pb[i].depth);
     memset(&g_pb[i], 0, sizeof g_pb[i]);
 }
+
+static void h_glXDestroyPbuffer(CPU *c) { pb_destroy(A32(1)); }
 
 /* ---- GLX ---- */
 static int g_drawable_pb;            /* which pbuffer is current, 0 = the window */
@@ -281,10 +294,75 @@ static void h_glXQueryExtensionsString(CPU *c) { RET(guest_strdup_static("")); }
 static void h_glXQueryServerString(CPU *c)     { RET(guest_strdup_static("lindberghrecomp")); }
 static void h_glXGetClientString(CPU *c)       { RET(guest_strdup_static("lindberghrecomp")); }
 
-/* SGIX framebuffer configs and pbuffers (Let's Go Jungle asks about them):
- * reporting none sends the game down the path that does without. */
-static void h_glXChooseFBConfigSGIX(CPU *c)   { if (A32(3)) wr32(A32(3), 0); RET(0); }
-static void h_glXGetFBConfigAttribSGIX(CPU *c) { RET((uint32_t)-1); }
+/* SGIX framebuffer configs and pbuffers. Let's Go Jungle asks about them and
+ * takes the path that does without when there are none; Virtua Tennis 3 makes
+ * every render target one (_sSceneFrameBuffer::createPBuffer) and exits
+ * without, so its profile turns them on: one config, which has whatever the
+ * search asked for, and a pbuffer that is a framebuffer object like
+ * glXCreatePbuffer's. */
+static uint32_t g_sgix_want[16];     /* the last search's GLX_RED_SIZE (8) .. GLX_STENCIL_SIZE (13) etc. */
+
+static void h_glXChooseFBConfigSGIX(CPU *c)
+{
+    if (!game_profile()->glx_sgix_pbuffer || !ensure_window()) { if (A32(3)) wr32(A32(3), 0); RET(0); return; }
+    uint32_t list = A32(2);
+    memset(g_sgix_want, 0, sizeof g_sgix_want);
+    for (int i = 0; list && i < 64; i += 2) {
+        uint32_t k = rd32(list + 4u * i), v = rd32(list + 4u * (i + 1));
+        if (!k) break;
+        if (k < 16) g_sgix_want[k] = v;
+    }
+    uint32_t arr = galloc_zero(8);
+    wr32(arr, TOK_FBCONFIG);
+    if (A32(3)) wr32(A32(3), 1);
+    c->eax = arr;
+}
+
+/* glXGetFBConfigAttribSGIX(dpy, config, attribute, int *value) -> Success (0) */
+static void h_glXGetFBConfigAttribSGIX(CPU *c)
+{
+    if (!game_profile()->glx_sgix_pbuffer) { RET((uint32_t)-1); return; }
+    uint32_t a = A32(2), v;
+    switch (a) {
+    case 8: case 9: case 10: case 11:                  /* RED .. ALPHA_SIZE */
+        v = g_sgix_want[a] ? g_sgix_want[a] : 8; break;
+    case 12: v = g_sgix_want[12] ? g_sgix_want[12] : 24; break;   /* DEPTH_SIZE */
+    case 13: v = g_sgix_want[13]; break;                           /* STENCIL_SIZE */
+    case 2:  v = 32; break;                                        /* BUFFER_SIZE */
+    case 5:  v = 0; break;                                         /* DOUBLEBUFFER */
+    case 0x8010: v = 7; break;                                     /* DRAWABLE_TYPE_SGIX: window|pixmap|pbuffer */
+    case 0x8011: v = 1; break;                                     /* RENDER_TYPE_SGIX: RGBA */
+    case 0x8012: v = 1; break;                                     /* X_RENDERABLE_SGIX */
+    case 0x8013: v = 1; break;                                     /* FBCONFIG_ID_SGIX */
+    case 0x8016: case 0x8017: v = 4096; break;                     /* MAX_PBUFFER_WIDTH/HEIGHT */
+    case 0x8018: v = 4096u * 4096u; break;                         /* MAX_PBUFFER_PIXELS */
+    default: v = 0; break;
+    }
+    if (A32(3)) wr32(A32(3), v);
+    RET(0);
+}
+
+static void h_glXCreateContextWithConfigSGIX(CPU *c) { c->eax = ensure_window() ? TOK_CONTEXT : 0; }
+
+/* glXCreateGLXPbufferSGIX(dpy, config, width, height, attribs) */
+static void h_glXCreateGLXPbufferSGIX(CPU *c)
+{
+    unsigned r = g_sgix_want[8];
+    g_pb_color_bits = r > 8 ? r : 8;
+    RET(pb_create((int)A32(2), (int)A32(3)));
+    g_pb_color_bits = 8;
+}
+static void h_glXDestroyGLXPbufferSGIX(CPU *c) { pb_destroy(A32(1)); }
+
+/* glXQueryGLXPbufferSGIX(dpy, pbuf, attribute, unsigned *value): WIDTH_SGIX 0x801D, HEIGHT_SGIX 0x801E */
+static void h_glXQueryGLXPbufferSGIX(CPU *c)
+{
+    int i = pb_index(A32(1));
+    uint32_t v = 0;
+    if (i > 0) v = A32(2) == 0x801Du ? (uint32_t)g_pb[i].w : A32(2) == 0x801Eu ? (uint32_t)g_pb[i].h : 0;
+    if (A32(3)) wr32(A32(3), v);
+    RET(0);
+}
 
 /* vsync: the host's swap already waits for the display */
 static void h_glXSwapIntervalSGI(CPU *c) { RET(0); }
@@ -397,9 +475,10 @@ void hle_register_glx_posix(void)
     hle_bind("glXGetClientString", h_glXGetClientString);
     hle_bind("glXChooseFBConfigSGIX", h_glXChooseFBConfigSGIX);
     hle_bind("glXGetFBConfigAttribSGIX", h_glXGetFBConfigAttribSGIX);
-    hle_bind("glXCreateContextWithConfigSGIX", h_x_zero);
-    hle_bind("glXCreateGLXPbufferSGIX", h_x_zero);
-    hle_bind("glXDestroyGLXPbufferSGIX", h_x_zero);
+    hle_bind("glXCreateContextWithConfigSGIX", h_glXCreateContextWithConfigSGIX);
+    hle_bind("glXCreateGLXPbufferSGIX", h_glXCreateGLXPbufferSGIX);
+    hle_bind("glXDestroyGLXPbufferSGIX", h_glXDestroyGLXPbufferSGIX);
+    hle_bind("glXQueryGLXPbufferSGIX", h_glXQueryGLXPbufferSGIX);
     hle_bind("glXSwapIntervalSGI", h_glXSwapIntervalSGI);
 
     hle_bind("XOpenDisplay", h_XOpenDisplay);
@@ -425,7 +504,7 @@ void hle_register_glx_posix(void)
         "XextAddDisplay", "XextRemoveDisplay", "XextFindDisplay", "XextCreateExtension",
         "XUngrabPointer", "XSetErrorHandler", "XGrabKeyboard", "XUngrabKeyboard",
         "XSetWMProperties", "XSetWMProtocols", "XStringListToTextProperty",
-        "XSetCloseDownMode", "XParseColor", "XFreeCursor", "XLockDisplay", "XUnlockDisplay",
+        "XSetCloseDownMode", "XParseColor", "XFreeCursor", "XLockDisplay", "XUnlockDisplay", "XGetErrorText",
     };
     for (unsigned i = 0; i < sizeof zero / sizeof *zero; i++) hle_bind(zero[i], h_x_zero);
     hle_bind("XCreateBitmapFromData", h_x_cursor);

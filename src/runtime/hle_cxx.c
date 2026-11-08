@@ -292,6 +292,13 @@ static void h_rb_erase(CPU *c)
  *
  * None of these tries to implement C++ exceptions. They say what happened,
  * which is the part that was missing. */
+static void h_throw_error(CPU *c)
+{
+    fprintf(stderr, "\n[c++] exception thrown: %s\n", A32(0) ? ASTR(0) : "");
+    guest_backtrace(c);
+    abort();
+}
+
 static void h_cxa_pure_virtual(CPU *c)
 {
     fprintf(stderr, "\n[c++] pure virtual function called - a vtable is wrong\n");
@@ -383,11 +390,17 @@ static uint32_t str_from(uint32_t data, uint32_t n) { return str_new((const char
 
 /* Replace what `self` points at, freeing the old rep if this held the last
  * reference - the same test _M_dispose makes. */
+static int is_heap_rep(uint32_t rep)
+{
+    return rep >= 0x20000000u && rep < 0xB0000000u;
+}
+
 static void str_set(uint32_t self, uint32_t newdata)
 {
     uint32_t old = rd32(self);
     wr32(self, newdata);
-    if (old && (int32_t)REP_REF(old) <= 0) CXX_FREE(GP(old - 12));
+    if (old && is_heap_rep(old - 12) && (int32_t)REP_REF(old) <= 0)
+        CXX_FREE(GP(old - 12));
 }
 
 /* basic_string(const char *s, const allocator &) */
@@ -489,14 +502,14 @@ static void h_str_replace(CPU *c)
 
 /* _Rep::_M_destroy(const allocator &) - `this` is the rep, twelve bytes
  * before the characters, and that is what was allocated. */
-static void h_rep_destroy(CPU *c) { if (A32(0)) CXX_FREE(GP(A32(0))); RET(0); }
+static void h_rep_destroy(CPU *c) { if (is_heap_rep(A32(0))) CXX_FREE(GP(A32(0))); RET(0); }
 
 /* _Rep::_M_dispose(const allocator &) - the library decrements first and
  * destroys when the old value was already at or below zero. */
 static void h_rep_dispose(CPU *c)
 {
     uint32_t rep = A32(0);
-    if (!rep) { RET(0); return; }
+    if (!rep || !is_heap_rep(rep)) { RET(0); return; }
     int32_t before = (int32_t)rd32(rep + 8);      /* refcount is the third word */
     wr32(rep + 8, (uint32_t)(before - 1));
     if (before <= 0) CXX_FREE(GP(rep));
@@ -579,6 +592,306 @@ static void h_vec_delete2(CPU *c)
     guest_call(c, dealloc, &base, 1);
 }
 
+
+/* _M_mutate(size_type pos, size_type len1, size_type len2) */
+static void h_str_mutate(CPU *c)
+{
+    uint32_t self = A32(0), pos = A32(1), len1 = A32(2), len2 = A32(3);
+    uint32_t cur = rd32(self), old_len = cur ? REP_LEN(cur) : 0;
+    if (pos > old_len) pos = old_len;
+    if (len1 > old_len - pos) len1 = old_len - pos;
+    uint32_t new_len = old_len - len1 + len2;
+    uint32_t how_much = old_len - pos - len1;
+    uint32_t out = str_new(NULL, new_len);
+    if (out) {
+        if (pos && cur)
+            memcpy((void *)GP(out), (void *)GP(cur), pos);
+        if (how_much && cur)
+            memcpy((void *)GP(out + pos + len2), (void *)GP(cur + pos + len1), how_much);
+        ((char *)GP(out))[new_len] = 0;
+    }
+    str_set(self, out);
+    RET(0);
+}
+
+/* find(const char *s, size_type pos, size_type n) const */
+static void h_str_find_cstr(CPU *c)
+{
+    uint32_t cur = rd32(A32(0)), s = A32(1), pos = A32(2), n = A32(3);
+    uint32_t len = cur ? REP_LEN(cur) : 0;
+    if (n == 0) { RET(pos <= len ? pos : 0xFFFFFFFFu); return; }
+    if (!s || pos >= len || n > len - pos) { RET(0xFFFFFFFFu); return; }
+    const char *hay = (const char *)GP(cur);
+    const char *ndl = (const char *)GP(s);
+    for (uint32_t i = pos; i <= len - n; i++) {
+        if (memcmp(hay + i, ndl, n) == 0) { RET(i); return; }
+    }
+    RET(0xFFFFFFFFu);
+}
+
+/* find(char ch, size_type pos) const */
+static void h_str_find_char(CPU *c)
+{
+    uint32_t cur = rd32(A32(0));
+    char ch = (char)(A32(1) & 0xFF);
+    uint32_t pos = A32(2);
+    uint32_t len = cur ? REP_LEN(cur) : 0;
+    if (pos >= len) { RET(0xFFFFFFFFu); return; }
+    const char *hay = (const char *)GP(cur);
+    const char *p = (const char *)memchr(hay + pos, (unsigned char)ch, len - pos);
+    RET(p ? (uint32_t)(p - hay) : 0xFFFFFFFFu);
+}
+
+/* rfind(const char *s, size_type pos, size_type n) const */
+static void h_str_rfind_cstr(CPU *c)
+{
+    uint32_t cur = rd32(A32(0)), s = A32(1), pos = A32(2), n = A32(3);
+    uint32_t len = cur ? REP_LEN(cur) : 0;
+    if (n > len || !s) { RET(0xFFFFFFFFu); return; }
+    uint32_t start = len - n;
+    if (pos < start) start = pos;
+    if (n == 0) { RET(start); return; }
+    const char *hay = (const char *)GP(cur);
+    const char *ndl = (const char *)GP(s);
+    for (uint32_t i = start + 1; i > 0; i--) {
+        if (memcmp(hay + (i - 1), ndl, n) == 0) { RET(i - 1); return; }
+    }
+    RET(0xFFFFFFFFu);
+}
+
+/* compare(const char *s) const */
+static void h_str_compare_cstr(CPU *c)
+{
+    uint32_t cur = rd32(A32(0));
+    const char *a = cur ? (const char *)GP(cur) : "";
+    const char *b = A32(1) ? (const char *)GP(A32(1)) : "";
+    RET((uint32_t)strcmp(a, b));
+}
+
+/* ---- iostreams (GCC 3.3 libstdc++.so.5 i386 ABI) ---- */
+static void h_ios_base_ctor(CPU *c)
+{
+    if (A32(0)) memset(GP(A32(0)), 0, 0x20);
+    RET(0);
+}
+static void h_ios_base_dtor(CPU *c) { (void)c; RET(0); }
+static void h_locale_ctor(CPU *c)   { if (A32(0)) wr32(A32(0), 0); RET(0); }
+static void h_locale_dtor(CPU *c)   { (void)c; RET(0); }
+
+static void h_basic_ios_init(CPU *c)
+{
+    uint32_t ios = A32(0), sb = A32(1);
+    if (ios) {
+        wr32(ios + 0x14, sb ? 0u : 1u);   /* _M_streambuf_state: goodbit(0) or badbit(1) */
+        wr32(ios + 0x18, sb);
+    }
+    RET(0);
+}
+
+static void h_basic_ios_clear(CPU *c)
+{
+    uint32_t ios = A32(0), state = A32(1);
+    if (ios) {
+        uint32_t sb = rd32(ios + 0x18);
+        wr32(ios + 0x14, sb ? state : (state | 1u));
+    }
+    RET(0);
+}
+
+static void h_basic_ios_widen(CPU *c)
+{
+    RET(A32(1) & 0xFFu);
+}
+
+static void h_stringbuf_init(CPU *c)
+{
+    uint32_t sb = A32(0), mode = A32(1);
+    uint32_t s = rd32(sb + 0x50);
+    uint32_t len = s ? REP_LEN(s) : 0;
+    wr32(sb + 0x04, s);
+    wr32(sb + 0x08, len);
+    wr32(sb + 0x14, s);
+    wr32(sb + 0x18, s);
+    wr32(sb + 0x1c, s + len);
+    wr32(sb + 0x20, s);
+    wr32(sb + 0x24, s);
+    wr32(sb + 0x28, s + len);
+    wr32(sb + 0x2c, mode);
+    RET(0);
+}
+
+static void h_filebuf_ctor(CPU *c)
+{
+    uint32_t fb = A32(0);
+    if (fb) memset(GP(fb), 0, 0x88);
+    RET(0);
+}
+
+static int cxx_trace(void)
+{
+    static int t = -1;
+    if (t < 0) { const char *v = getenv("LINDBERGH_CXX_TRACE"); t = v && *v == '1'; }
+    return t;
+}
+
+static void h_filebuf_open(CPU *c)
+{
+    uint32_t fb = A32(0);
+    const char *path = A32(1) ? ASTR(1) : NULL;
+    uint32_t mode = A32(2);
+    if (!fb || !path) { RET(0); return; }
+    FILE *f = guest_fopen(path, (mode & 0x10u) ? "wb" : "rb");
+    if (cxx_trace()) fprintf(stderr, "[c++] filebuf(%#x).open(%s, %#x) -> %s\n", fb, path, mode, f ? "ok" : "FAILED");
+    if (!f) { RET(0); return; }
+    wr32(fb + 0x68, guest_file_wrap(f));
+    wr8(fb + 0x81, 1);
+    RET(fb);
+}
+
+static void h_filebuf_close(CPU *c)
+{
+    uint32_t fb = A32(0);
+    if (!fb) { RET(0); return; }
+    uint32_t h = rd32(fb + 0x68);
+    if (!h) { RET(0); return; }
+    FILE *f = guest_file(h);
+    if (f) fclose(f);
+    guest_file_release(h);
+    wr32(fb + 0x68, 0);
+    wr8(fb + 0x81, 0);
+    RET(fb);
+}
+
+static void h_basic_file_dtor(CPU *c)
+{
+    uint32_t bf = A32(0);
+    if (bf) {
+        uint32_t h = rd32(bf);
+        if (h) {
+            FILE *f = guest_file(h);
+            if (f) fclose(f);
+            guest_file_release(h);
+            wr32(bf, 0);
+        }
+    }
+    RET(0);
+}
+
+/* Where an istream's basic_ios (its virtual base) is: the offset sits at
+ * vptr[-3]. The libstdc++ vtables are data the game imports, copied into its
+ * .bss, and nothing fills them in - so the offset can read as 0, which a
+ * virtual base never is. Then it is the layout's: istream (8) + stringbuf
+ * (0x54) for an istringstream (VT3's parseAsm adds 0x5c itself), + filebuf
+ * for an ifstream. */
+static uint32_t istream_ios_of(uint32_t is, int stringstream)
+{
+    uint32_t vptr = rd32(is);
+    uint32_t off = (vptr && vptr >= 0x08048000u) ? rd32(vptr - 0xc) : 0;
+    if (!off || off > 0x400u) off = stringstream ? 0x5cu : 0x90u;
+    return is + off;
+}
+static uint32_t istream_ios(uint32_t is) { return istream_ios_of(is, 0); }
+
+static void h_istream_seekg(CPU *c)
+{
+    uint32_t is = A32(0);
+    int32_t off = AI32(1);
+    int32_t dir = AI32(2);
+    uint32_t h = rd32(is + 8 + 0x68);
+    FILE *f = h ? guest_file(h) : NULL;
+    if (f) {
+        int whence = (dir == 1) ? SEEK_CUR : ((dir == 2) ? SEEK_END : SEEK_SET);
+        fseek(f, (long)off, whence);
+    }
+    RET(is);
+}
+
+/* std::istream::tellg() returns std::streampos by value (sret at A32(0), this at A32(1), ret 4) */
+static void h_istream_tellg(CPU *c)
+{
+    uint32_t sret = A32(0), is = A32(1);
+    uint32_t h = rd32(is + 8 + 0x68);
+    FILE *f = h ? guest_file(h) : NULL;
+    long pos = f ? ftell(f) : -1L;
+    if (sret) {
+        wr32(sret, (uint32_t)pos);
+        wr32(sret + 4, 0);
+    }
+    c->eax = sret;
+    c->esp += 4;
+}
+
+static void h_istream_read(CPU *c)
+{
+    uint32_t is = A32(0), dst = A32(1), n = A32(2);
+    uint32_t h = rd32(is + 8 + 0x68);
+    FILE *f = h ? guest_file(h) : NULL;
+    size_t got = (f && dst && n) ? fread(GP(dst), 1, n, f) : 0;
+    if (cxx_trace()) fprintf(stderr, "[c++] istream(%#x).read(%u) handle %#x -> %zu\n", is, n, h, got);
+    wr32(is + 4, (uint32_t)got);
+    if (got < n) {
+        uint32_t ios = istream_ios(is);
+        wr32(ios + 0x14, rd32(ios + 0x14) | 6u); /* eofbit(2) | failbit(4) */
+    }
+    RET(is);
+}
+
+static void h_std_getline(CPU *c)
+{
+    uint32_t is = A32(0), str = A32(1);
+    char delim = (char)(A32(2) & 0xFF);
+    uint32_t sb = is + 8;
+    uint32_t cur = rd32(sb + 0x18), end = rd32(sb + 0x1c);
+    uint32_t ios = istream_ios_of(is, end || rd32(sb + 0x14));
+    {   /* LINDBERGH_CXX_TRACE=1: the first getlines, where they read from */
+        static int trace = -1, n;
+        if (trace < 0) { const char *v = getenv("LINDBERGH_CXX_TRACE"); trace = v && *v == '1'; }
+        if (trace && n++ < 12)
+            fprintf(stderr, "[c++] getline(is %#x) ios %#x (+%#x) state %#x, get %#x..%#x, base %#x, file %#x\n",
+                    is, ios, ios - is, rd32(ios + 0x14), cur, end, rd32(sb + 0x14), rd32(sb + 0x68));
+    }
+    if (end || rd32(sb + 0x14)) {
+        if (cur >= end) {
+            wr32(ios + 0x14, rd32(ios + 0x14) | 6u);
+            RET(is);
+            return;
+        }
+        uint32_t p = cur;
+        while (p < end && *(const char *)GP(p) != delim) p++;
+        str_set(str, str_from(cur, p - cur));
+        if (p < end) {
+            wr32(sb + 0x18, p + 1);
+        } else {
+            wr32(sb + 0x18, end);
+            wr32(ios + 0x14, rd32(ios + 0x14) | 2u); /* eofbit(2) */
+        }
+        RET(is);
+        return;
+    }
+    uint32_t h = rd32(sb + 0x68);
+    FILE *f = h ? guest_file(h) : NULL;
+    if (!f) {
+        wr32(ios + 0x14, rd32(ios + 0x14) | 6u);
+        RET(is);
+        return;
+    }
+    char buf[4096];
+    uint32_t len = 0;
+    int ch = EOF;
+    while (len < sizeof(buf) - 1 && (ch = fgetc(f)) != EOF) {
+        if ((char)ch == delim) break;
+        buf[len++] = (char)ch;
+    }
+    if (len == 0 && ch == EOF) {
+        wr32(ios + 0x14, rd32(ios + 0x14) | 6u);
+        RET(is);
+        return;
+    }
+    str_set(str, str_new(buf, len));
+    if (ch == EOF) wr32(ios + 0x14, rd32(ios + 0x14) | 2u);
+    RET(is);
+}
+
 void hle_register_cxx(void)
 {
     int n = 0;
@@ -621,5 +934,28 @@ void hle_register_cxx(void)
     n += hle_bind("_ZNSt24__default_alloc_templateILb1ELi0EE10deallocateEPvj", h_sgi_deallocate);
     n += hle_bind("_ZNSt8ios_base4InitC1Ev", h_ios_init);
     n += hle_bind("_ZNSt8ios_base4InitD1Ev", h_ios_init);
+    n += hle_bind("_ZSt20__throw_length_errorPKc", h_throw_error);
+    n += hle_bind("_ZSt20__throw_out_of_rangePKc", h_throw_error);
+    n += hle_bind("_ZNSs9_M_mutateEjjj", h_str_mutate);
+    n += hle_bind("_ZNKSs4findEPKcjj", h_str_find_cstr);
+    n += hle_bind("_ZNKSs4findEcj", h_str_find_char);
+    n += hle_bind("_ZNKSs5rfindEPKcjj", h_str_rfind_cstr);
+    n += hle_bind("_ZNKSs7compareEPKc", h_str_compare_cstr);
+    n += hle_bind("_ZNSt8ios_baseC2Ev", h_ios_base_ctor);
+    n += hle_bind("_ZNSt8ios_baseD2Ev", h_ios_base_dtor);
+    n += hle_bind("_ZNSt6localeC1Ev", h_locale_ctor);
+    n += hle_bind("_ZNSt6localeD1Ev", h_locale_dtor);
+    n += hle_bind("_ZNSt9basic_iosIcSt11char_traitsIcEE4initEPSt15basic_streambufIcS1_E", h_basic_ios_init);
+    n += hle_bind("_ZNSt9basic_iosIcSt11char_traitsIcEE5clearESt12_Ios_Iostate", h_basic_ios_clear);
+    n += hle_bind("_ZNKSt9basic_iosIcSt11char_traitsIcEE5widenEc", h_basic_ios_widen);
+    n += hle_bind("_ZNSt15basic_stringbufIcSt11char_traitsIcESaIcEE17_M_stringbuf_initESt13_Ios_Openmode", h_stringbuf_init);
+    n += hle_bind("_ZNSt13basic_filebufIcSt11char_traitsIcEEC1Ev", h_filebuf_ctor);
+    n += hle_bind("_ZNSt13basic_filebufIcSt11char_traitsIcEE4openEPKcSt13_Ios_Openmode", h_filebuf_open);
+    n += hle_bind("_ZNSt13basic_filebufIcSt11char_traitsIcEE5closeEv", h_filebuf_close);
+    n += hle_bind("_ZNSt12__basic_fileIcED1Ev", h_basic_file_dtor);
+    n += hle_bind("_ZNSi5seekgElSt12_Ios_Seekdir", h_istream_seekg);
+    n += hle_bind("_ZNSi5tellgEv", h_istream_tellg);
+    n += hle_bind("_ZNSi4readEPci", h_istream_read);
+    n += hle_bind("_ZSt7getlineIcSt11char_traitsIcESaIcEERSt13basic_istreamIT_T0_ES7_RSbIS4_S5_T1_ES4_", h_std_getline);
     fprintf(stderr, "[c++] %d tree entry points bound\n", n);
 }

@@ -392,8 +392,21 @@ static void h_cgGetProgramString(CPU *c)
     RET(copy[i]);
 }
 
+static void h_cgGLGetLatestProfile(CPU *c)
+{
+    uint32_t cls = A32(0);
+    /* CG_GL_VERTEX (8) -> CG_PROFILE_VP40 (7001 / 0x1b59)
+     * CG_GL_FRAGMENT (9) -> CG_PROFILE_FP40 (6151 / 0x1807) */
+    RET(cls == 8 ? 0x1b59u : (cls == 9 ? 0x1807u : 0u));
+}
+static void h_cgGLSetOptimalOptions(CPU *c) { (void)c; RET(0); }
+
 void hle_register_cg(void)
 {
+    hle_bind("cgGLIsProfileSupported", h_cgGLIsProfileSupported);
+    hle_bind("cgGLGetLatestProfile", h_cgGLGetLatestProfile);
+    hle_bind("cgGLSetOptimalOptions", h_cgGLSetOptimalOptions);
+    if (solib_export("cgCreateProgram")) return;
     hle_bind("cgCreateContext", h_cgCreateContext);
     hle_bind("cgIsContext", h_cgIsContext);
     hle_bind("cgDestroyContext", h_cgDestroyContext);

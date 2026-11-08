@@ -51,7 +51,11 @@ extern int gl4es_mv_trace;
 
 #define MAX_IDS   4096
 #define MAX_ENV   256
-#define MAX_LOCAL 96
+/* NV_vertex_program3 programs address far more than ARB's 96 locals: VT3's
+ * skinning keeps its bone palette in program.local up to c[225]. At 96 every
+ * bone above row 95 was dropped and read as zeros - the players' arms and
+ * hands, the last bones of the skeleton, collapsed to nothing. */
+#define MAX_LOCAL 1024
 
 /* which generic attribute arrays the game has enabled (u_gen) */
 static float g_gen_on[16];
@@ -256,7 +260,24 @@ static int binding_expr(Tr *t, const char *b, char *out, size_t n)
     if (!strcmp(b, "state.fog.params")) {
         snprintf(out, n, "vec4(gl_Fog.density, gl_Fog.start, gl_Fog.end, gl_Fog.scale)"); return 1;
     }
+    char aliased[24];
     if (t->stage == 0) {
+        /* Under NVIDIA's ARB_vertex_program the classic names ARE generic
+         * attributes (normal 2, colour 3, secondary 4, fog 5, texcoord[i]
+         * 8+i): Virtua Tennis 3 feeds Cg's vertex.color and vertex.texcoord[0]
+         * through glVertexAttribPointerARB(3 / 8). Read as gl_Color and
+         * gl_MultiTexCoord0 alone, every vertex got the current texcoord and
+         * its logos sampled one texel. They take the vertex.attrib[N] path
+         * below, which picks the generic array while it is enabled. */
+        static const struct { const char *nm; int at; } al[] = {
+            { "vertex.weight", 1 }, { "vertex.weight[0]", 1 },   /* skinning's BLENDWEIGHT */
+            { "vertex.normal", 2 }, { "vertex.color", 3 }, { "vertex.color.primary", 3 },
+            { "vertex.color.secondary", 4 }, { "vertex.fogcoord", 5 }, { "vertex.texcoord", 8 },
+        };
+        int at = -1;
+        for (unsigned k = 0; k < sizeof al / sizeof al[0]; k++) if (!strcmp(b, al[k].nm)) at = al[k].at;
+        if (sscanf(b, "vertex.texcoord[%d%c", &i, &c) == 2 && c == ']' && i >= 0 && i < 8) at = 8 + i;
+        if (at > 0) { snprintf(aliased, sizeof aliased, "vertex.attrib[%d]", at); b = aliased; }
         if (!strcmp(b, "vertex.position")) { snprintf(out, n, "gl_Vertex"); return 1; }
         if (!strcmp(b, "vertex.normal"))   { snprintf(out, n, "vec4(gl_Normal, 1.0)"); return 1; }
         if (!strcmp(b, "vertex.color") || !strcmp(b, "vertex.color.primary")) { snprintf(out, n, "gl_Color"); return 1; }
@@ -303,6 +324,9 @@ static int binding_expr(Tr *t, const char *b, char *out, size_t n)
         if (!strcmp(b, "fragment.color") || !strcmp(b, "fragment.color.primary")) { snprintf(out, n, "gl_Color"); return 1; }
         if (!strcmp(b, "fragment.color.secondary")) { snprintf(out, n, "gl_SecondaryColor"); return 1; }
         if (!strcmp(b, "fragment.fogcoord")) { snprintf(out, n, "vec4(gl_FogFragCoord, 0.0, 0.0, 1.0)"); return 1; }
+        /* NV_fragment_program2: +1 in x for a front face, -1 for a back one
+         * (VT3's two-sided cloth, the players' shirts) */
+        if (!strcmp(b, "fragment.facing")) { snprintf(out, n, "vec4(gl_FrontFacing ? 1.0 : -1.0, 0.0, 0.0, 1.0)"); return 1; }
         if (!strcmp(b, "fragment.position")) { snprintf(out, n, "gl_FragCoord"); return 1; }
         if (!strcmp(b, "fragment.texcoord")) { snprintf(out, n, "gl_TexCoord[0]"); return 1; }
         if (sscanf(b, "fragment.texcoord[%d%c", &i, &c) == 2 && c == ']' && i < 8) {
@@ -588,7 +612,18 @@ static int src_expr(Tr *t, const char *src_in, char *out, size_t n)
             if (!idx) return fail(t, "array %s without index", nm);
             char ie[128];
             if (!index_expr(t, idx, y->base, ie, sizeof ie)) return 0;
-            snprintf(base, sizeof base, "%s[%s]", y->expr, ie);
+            static int noclamp = -1;    /* LINDBERGH_ARB_NOCLAMP=1: relative reads unclamped, as before */
+            if (noclamp < 0) { const char *v = getenv("LINDBERGH_ARB_NOCLAMP"); noclamp = v && *v == '1'; }
+            if (noclamp || isdigit((unsigned char)ie[0]) || ie[0] == '-')
+                snprintf(base, sizeof base, "%s[%s]", y->expr, ie);
+            else
+                /* c[A0.w + 9] past the array: NVIDIA reads zeros, GLSL reads
+                 * whatever is there (NaN on Apple), and NaN times a zero
+                 * weight is still NaN. VT3's skinning always reads four
+                 * bones, the unused ones at any index - the players' shirts
+                 * came out as spikes. Kept inside the array, a finite value
+                 * times the zero weight is nothing, as on the cabinet. */
+                snprintf(base, sizeof base, "%s[int(clamp(float(%s), 0.0, float(%s.length() - 1)))]", y->expr, ie, y->expr);   /* GLSL 1.20: no integer clamp */
         } else if (y->kind == SYM_TEMP) {
             snprintf(base, sizeof base, "t_%s", y->name);
         } else if (y->kind == SYM_EXPR || y->kind == SYM_OUT) {
@@ -2133,6 +2168,111 @@ static void before_draw(void)
             GLint fb = 0, vp[4] = {0}; glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb); glGetIntegerv(GL_VIEWPORT, vp);
             fprintf(stderr, "[draw] %u v%u f%u fb %d viewport %dx%d depth %d %s\n", g_frame, vid, fid, fb, vp[2], vp[3],
                     glIsEnabled(GL_DEPTH_TEST), l && l->ok ? "" : "(not linked)");
+            {   /* what unit 0 holds: a texture that is missing or incomplete samples black */
+                GLint act = 0, tex = 0, w = 0, h = 0, fmt = 0, minf = 0, w1 = 0, maxl = 0;
+                glGetIntegerv(GL_ACTIVE_TEXTURE, &act);
+                glActiveTexture(GL_TEXTURE0);
+                glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
+                if (tex) {
+                    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
+                    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &h);
+                    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_INTERNAL_FORMAT, &fmt);
+                    glGetTexLevelParameteriv(GL_TEXTURE_2D, 1, GL_TEXTURE_WIDTH, &w1);
+                    glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, &minf);
+                    glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, &maxl);
+                }
+                unsigned nzA = 0, n = 0; unsigned long sr = 0, sg = 0, sb = 0;
+                if (tex && w > 0 && h > 0 && w * h <= 2048 * 2048) {
+                    unsigned char *px = malloc((size_t)w * h * 4);
+                    if (px) {
+                        glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+                        n = (unsigned)(w * h);
+                        for (unsigned i = 0; i < n; i++) {
+                            if (px[4 * i + 3]) nzA++;
+                            sr += px[4 * i]; sg += px[4 * i + 1]; sb += px[4 * i + 2];
+                        }
+                        free(px);
+                    }
+                }
+                glActiveTexture((GLenum)act);
+                if (l && l->ok) {   /* the vertex program's c[4], c[5]; the arrays that feed it */
+                    GLfloat c4[4] = {0}, c5[4] = {0}, cur[4] = {0};
+                    GLint lc4 = glGetUniformLocation(l->prog, "v_loc[4]"), lc5 = glGetUniformLocation(l->prog, "v_loc[5]");
+                    GLint prevp = 0; glGetIntegerv(GL_CURRENT_PROGRAM, &prevp);
+                    glUseProgram(l->prog); upload(l);
+                    if (lc4 >= 0) glGetUniformfv(l->prog, lc4, c4);
+                    if (lc5 >= 0) glGetUniformfv(l->prog, lc5, c5);
+                    glUseProgram((GLuint)prevp);
+                    glGetFloatv(GL_CURRENT_COLOR, cur);
+                    char en[64] = ""; int o = 0;
+                    for (int ai = 0; ai < 16; ai++) {
+                        GLint on = 0; glGetVertexAttribiv((GLuint)ai, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &on);
+                        if (on) o += snprintf(en + o, sizeof en - (size_t)o, "%d,", ai);
+                    }
+                    fprintf(stderr, "[draw]   c4 %g %g %g %g  c5 %g %g %g %g  color array %d  attribs %s  current color %g %g %g %g\n",
+                            c4[0], c4[1], c4[2], c4[3], c5[0], c5[1], c5[2], c5[3], glIsEnabled(GL_COLOR_ARRAY), en,
+                            cur[0], cur[1], cur[2], cur[3]);
+                }
+                {   /* skinning inputs (generic 1 = weights/indices, 7 = more of both):
+                     * what GL was given, and the bone rows the shader will read */
+                    GLint e1 = 0, e7 = 0;
+                    glGetVertexAttribiv(1, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &e1);
+                    glGetVertexAttribiv(7, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &e7);
+                    if (e1 && e7 && l && l->ok) {
+                        GLint pal = 0; GLenum ty = 0; char unm[32];
+                        GLint nu = 0; glGetProgramiv(l->prog, GL_ACTIVE_UNIFORMS, &nu);
+                        for (GLint u = 0; u < nu; u++) {
+                            GLint sz; glGetActiveUniform(l->prog, (GLuint)u, sizeof unm, NULL, &sz, &ty, unm);
+                            if (!strncmp(unm, "v_loc", 5) || !strncmp(unm, "v_env", 5)) if (sz > pal) pal = sz;
+                        }
+                        GLint sz_[2], ty_[2], nm_[2], st_[2], bf_[2]; void *pt_[2]; int at_[2] = { 1, 7 };
+                        unsigned char *data[2] = { NULL, NULL }; GLint blen[2] = { 0, 0 };
+                        GLint prevab = 0; glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &prevab);
+                        for (int k = 0; k < 2; k++) {
+                            glGetVertexAttribiv((GLuint)at_[k], GL_VERTEX_ATTRIB_ARRAY_SIZE, &sz_[k]);
+                            glGetVertexAttribiv((GLuint)at_[k], GL_VERTEX_ATTRIB_ARRAY_TYPE, &ty_[k]);
+                            glGetVertexAttribiv((GLuint)at_[k], GL_VERTEX_ATTRIB_ARRAY_NORMALIZED, &nm_[k]);
+                            glGetVertexAttribiv((GLuint)at_[k], GL_VERTEX_ATTRIB_ARRAY_STRIDE, &st_[k]);
+                            glGetVertexAttribiv((GLuint)at_[k], GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &bf_[k]);
+                            glGetVertexAttribPointerv((GLuint)at_[k], GL_VERTEX_ATTRIB_ARRAY_POINTER, &pt_[k]);
+                            if (bf_[k]) {
+                                glBindBuffer(GL_ARRAY_BUFFER, (GLuint)bf_[k]);
+                                glGetBufferParameteriv(GL_ARRAY_BUFFER, GL_BUFFER_SIZE, &blen[k]);
+                                data[k] = malloc((size_t)blen[k]);
+                                if (data[k]) glGetBufferSubData(GL_ARRAY_BUFFER, 0, blen[k], data[k]);
+                            }
+                            fprintf(stderr, "[skin]   attrib %d: size %d type %#x normalized %d stride %d buffer %d offset %p (%d bytes)\n",
+                                    at_[k], sz_[k], ty_[k], nm_[k], st_[k], bf_[k], pt_[k], blen[k]);
+                        }
+                        glBindBuffer(GL_ARRAY_BUFFER, (GLuint)prevab);
+                        if (data[0] && data[1] && ty_[0] == GL_UNSIGNED_BYTE && ty_[1] == GL_UNSIGNED_BYTE && st_[0] > 0 && st_[1] > 0) {
+                            size_t o0 = (size_t)(uintptr_t)pt_[0], o1 = (size_t)(uintptr_t)pt_[1];
+                            unsigned nv = (unsigned)((blen[0] - (GLint)o0) / st_[0]);
+                            unsigned bad = 0, used = 0, maxrow = 0, shown2 = 0;
+                            for (unsigned v = 0; v < nv && o1 + (size_t)v * st_[1] + 4 <= (size_t)blen[1]; v++) {
+                                const unsigned char *w = data[0] + o0 + (size_t)v * st_[0], *a7 = data[1] + o1 + (size_t)v * st_[1];
+                                float s = nm_[0] ? 1.0f / 255.0f : 1.0f;
+                                unsigned char wt[4] = { w[0], w[2], a7[2], a7[0] }, ix[4] = { w[1], w[3], a7[1], a7[3] };
+                                for (int j = 0; j < 4; j++) {
+                                    unsigned row = (unsigned)floorf(ix[j] * s * 765.03f) + 11;
+                                    if (wt[j]) { used++; if (row > maxrow) maxrow = row; if ((GLint)row >= pal) bad++; }
+                                }
+                                if (shown2 < 3) {
+                                    shown2++;
+                                    fprintf(stderr, "[skin]   v%u w %u %u %u %u  a7 %u %u %u %u\n", v,
+                                            w[0], w[1], w[2], w[3], a7[0], a7[1], a7[2], a7[3]);
+                                }
+                            }
+                            fprintf(stderr, "[skin]   %u vertices, %u weighted bones, highest row %u, palette %d, %u past it\n",
+                                    nv, used, maxrow, pal, bad);
+                        }
+                        free(data[0]); free(data[1]);
+                    }
+                }
+                fprintf(stderr, "[draw]   unit0 tex %d %dx%d fmt %#x min %#x level1 w %d maxlevel %d; "
+                        "alpha>0 %u of %u, mean rgb %lu %lu %lu\n", tex, w, h, fmt, minf, w1, maxl,
+                        nzA, n, n ? sr / n : 0, n ? sg / n : 0, n ? sb / n : 0);
+            }
         }
     }
     static int probed;

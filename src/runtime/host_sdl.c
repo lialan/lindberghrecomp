@@ -39,6 +39,7 @@ static void mac_activate(void)
 #endif
 #include "gl_posix.h"
 #include "host_settings.h"
+#include "game_profile.h"
 #ifdef LINDBERGH_VULKAN
 #include "vulkan_host.h"
 #include "host_stats.h"
@@ -200,7 +201,88 @@ static const unsigned CAB_OF[ACT_COUNT] = {
     [ACT_TRIGGER] = CAB_P1_TRIGGER, [ACT_RELOAD] = CAB_P1_RELOAD, [ACT_ACTION] = CAB_P1_ACTION,
     [ACT_FIREMODE] = CAB_P1_FIREMODE,
     [ACT_TEST] = CAB_TEST, [ACT_SERVICE] = CAB_SERVICE,
+    [ACT_UP] = CAB_P1_UP, [ACT_DOWN] = CAB_P1_DOWN, [ACT_LEFT] = CAB_P1_LEFT, [ACT_RIGHT] = CAB_P1_RIGHT,
+    [ACT_BUTTON1] = CAB_P1_TRIGGER, [ACT_BUTTON2] = CAB_P1_BUTTON2, [ACT_BUTTON3] = CAB_P1_BUTTON3,
 };
+
+/* ---- game controllers: the first one is player 1, the second player 2 ----
+ * For a lever cabinet (Virtua Tennis 3): the d-pad or left stick is the
+ * 8-way lever, A/B/X are buttons 1-3, Y is button 4, Start is start and Back
+ * a coin. A gun game reads the same switches, so they do no harm there. */
+static SDL_GameController *g_pad[2];
+static unsigned g_pad_held;   /* both pads, as cabinet bits */
+
+static unsigned pad_bits(SDL_GameController *p, int *coin)
+{
+    unsigned b = 0;
+    int ax = SDL_GameControllerGetAxis(p, SDL_CONTROLLER_AXIS_LEFTX);
+    int ay = SDL_GameControllerGetAxis(p, SDL_CONTROLLER_AXIS_LEFTY);
+    /* 8 sectors past a dead zone: an axis counts once it is over
+     * tan(22.5 deg) of the other, so diagonals are as wide as the rest */
+    if ((long)ax * ax + (long)ay * ay > 9000L * 9000L) {
+        int fx = abs(ax) * 1000 > abs(ay) * 414, fy = abs(ay) * 1000 > abs(ax) * 414;
+        if (fx) b |= ax < 0 ? CAB_P1_LEFT : CAB_P1_RIGHT;
+        if (fy) b |= ay < 0 ? CAB_P1_UP : CAB_P1_DOWN;
+    }
+    if (SDL_GameControllerGetButton(p, SDL_CONTROLLER_BUTTON_DPAD_UP))    b |= CAB_P1_UP;
+    if (SDL_GameControllerGetButton(p, SDL_CONTROLLER_BUTTON_DPAD_DOWN))  b |= CAB_P1_DOWN;
+    if (SDL_GameControllerGetButton(p, SDL_CONTROLLER_BUTTON_DPAD_LEFT))  b |= CAB_P1_LEFT;
+    if (SDL_GameControllerGetButton(p, SDL_CONTROLLER_BUTTON_DPAD_RIGHT)) b |= CAB_P1_RIGHT;
+    if (SDL_GameControllerGetButton(p, SDL_CONTROLLER_BUTTON_A)) b |= CAB_P1_TRIGGER;
+    if (SDL_GameControllerGetButton(p, SDL_CONTROLLER_BUTTON_B)) b |= CAB_P1_BUTTON2;
+    if (SDL_GameControllerGetButton(p, SDL_CONTROLLER_BUTTON_X)) b |= CAB_P1_BUTTON3;
+    if (SDL_GameControllerGetButton(p, SDL_CONTROLLER_BUTTON_Y)) b |= CAB_P1_FIREMODE;
+    if (SDL_GameControllerGetButton(p, SDL_CONTROLLER_BUTTON_START)) b |= CAB_P1_START;
+    *coin = SDL_GameControllerGetButton(p, SDL_CONTROLLER_BUTTON_BACK);
+    return b;
+}
+
+/* player 1's bits -> the same switches of player 2 */
+static unsigned as_p2(unsigned b)
+{
+    const unsigned gun = CAB_P1_TRIGGER | CAB_P1_RELOAD | CAB_P1_ACTION | CAB_P1_FIREMODE;
+    const unsigned joy = CAB_P1_UP | CAB_P1_DOWN | CAB_P1_LEFT | CAB_P1_RIGHT | CAB_P1_BUTTON2 | CAB_P1_BUTTON3;
+    return (b & CAB_P1_START ? CAB_P2_START : 0) | (b & gun) << CAB_P2_SHIFT | (b & joy) << CAB_P2_JOY_SHIFT;
+}
+
+static void pad_event(const SDL_Event *e)
+{
+    if (e->type == SDL_CONTROLLERDEVICEADDED) {
+        for (int i = 0; i < 2; i++) {
+            if (g_pad[i]) continue;
+            g_pad[i] = SDL_GameControllerOpen(e->cdevice.which);
+            if (g_pad[i]) fprintf(stderr, "[pad] player %d: %s\n", i + 1, SDL_GameControllerName(g_pad[i]));
+            return;
+        }
+    } else if (e->type == SDL_CONTROLLERDEVICEREMOVED) {
+        for (int i = 0; i < 2; i++) {
+            if (!g_pad[i]) continue;
+            SDL_Joystick *j = SDL_GameControllerGetJoystick(g_pad[i]);
+            if (j && SDL_JoystickInstanceID(j) == e->cdevice.which) {
+                fprintf(stderr, "[pad] player %d's controller removed\n", i + 1);
+                SDL_GameControllerClose(g_pad[i]);
+                g_pad[i] = NULL;
+            }
+        }
+    }
+}
+
+static void pad_poll(void)
+{
+    static int coin_was[2];
+    unsigned held = 0;
+    for (int i = 0; i < 2; i++) {
+        int coin = 0;
+        if (g_pad[i]) {
+            unsigned b = pad_bits(g_pad[i], &coin);
+            held |= i ? as_p2(b) : b;
+        }
+        if (coin && !coin_was[i]) g_cab.coins[i]++;
+        coin_was[i] = coin;
+    }
+    g_cab_latch |= held & ~g_pad_held;
+    g_pad_held = held;
+}
 
 static void set_title(const char *msg);
 static int g_capture_or_calib(void);
@@ -483,7 +565,7 @@ void host_cabinet_input(CabinetInput *out)
 #endif
     g_cab.screen_w = (int)w;
     g_cab.screen_h = (int)h;
-    g_cab.buttons = g_auto | (g_scripted ? 0 : g_held);
+    g_cab.buttons = g_auto | (g_scripted ? 0 : g_held | g_pad_held);
     *out = g_cab;
     if (!g_scripted) out->buttons |= g_cab_latch;
     {   /* What the board reports, whenever it changes - and the gun, at most
@@ -505,7 +587,7 @@ void host_cabinet_input(CabinetInput *out)
  * for a game hook that needs one switch (a gun's reload) between reads. */
 unsigned host_cabinet_buttons(void)
 {
-    return g_auto | (g_scripted ? 0 : g_held | g_cab_latch);
+    return g_auto | (g_scripted ? 0 : g_held | g_pad_held | g_cab_latch);
 }
 
 /* A headset's controllers (host_xr.c): where the gun points, in the game's
@@ -623,6 +705,10 @@ static void pump(void)
     fake_keys();
     while (SDL_PollEvent(&e)) {
         switch (e.type) {
+        case SDL_CONTROLLERDEVICEADDED:
+        case SDL_CONTROLLERDEVICEREMOVED:
+            pad_event(&e);
+            break;
         case SDL_QUIT:
             fprintf(stderr, "[window] closed by the user\n");
             host_quit();
@@ -642,7 +728,7 @@ static void pump(void)
                 fprintf(stderr, "[window] pointer left\n");
                 /* Pointing a real gun off the screen is the reload; the
                  * nearest thing a mouse can do is leave the window. */
-                if (g_pointer_in && settings()->leave_reload && !g_capture_or_calib()) g_cab_latch |= CAB_P1_RELOAD;
+                if (g_pointer_in && settings()->leave_reload && !game_profile()->joystick && !g_capture_or_calib()) g_cab_latch |= CAB_P1_RELOAD;
                 g_pointer_in = 0;
             }
             break;
@@ -696,6 +782,7 @@ static void pump(void)
         }
         }
     }
+    pad_poll();
 }
 
 
@@ -730,7 +817,11 @@ int host_window_open(const char *title)
      * pause. OpenXR session state remains responsible for XR frame delivery. */
     SDL_SetHint(SDL_HINT_ANDROID_BLOCK_ON_PAUSE, "0");
 #endif
+#if defined(LINDBERGH_OPENXR)
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0) {
+#else
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMECONTROLLER) != 0) {
+#endif
         fprintf(stderr, "[window] SDL_Init: %s\n", SDL_GetError());
         return 0;
     }

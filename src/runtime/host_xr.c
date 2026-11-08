@@ -589,7 +589,8 @@ static void input_frame(XrTime t)
         grip[h] = get_float(a_grip, h) > 0.6f;
         btn_a[h] = get_bool(a_a, h); btn_b[h] = get_bool(a_b, h); stick[h] = get_bool(a_stick, h);
     }
-    lg_xr_controls_select(&controls,trig,dual);
+    const int lever_cab = game_profile()->joystick;   /* the right hand holds the buttons; nothing is a gun */
+    if (lever_cab) controls.gun_hand = HAND_R; else lg_xr_controls_select(&controls,trig,dual);
     int menu_btn = get_bool(a_menu, HAND_L);
     if (fake_menu < 0) { const char *v = getenv("LINDBERGH_XR_FAKE_MENU"); fake_menu = v && *v == '1'; }
     if (fake_menu && !menu.open && views_ok) { menu.open = 1; menu_place(); menu.hover = -1; menu.dirty = 1; }
@@ -658,6 +659,8 @@ static void input_frame(XrTime t)
         frame.trigger[h]=trig[h];frame.grip[h]=grip[h];frame.lower[h]=btn_a[h];frame.upper[h]=btn_b[h];frame.stick[h]=stick[h];
     }
     frame.aimed[0]=aimed;frame.aimed[1]=aimed2;
+    frame.joystick=lever_cab;
+    for(int h=0;h<2;++h)lg_xr_action_vec2(&actions,actions.action[LG_XR_THUMB],h,&frame.thumb_x[h],&frame.thumb_y[h]);
     frame.fire_supplied=1;frame.firing[0]=firing;frame.firing[1]=firing2;
     frame.start_override[0]=fake_gun()&&fmod((double)t/1e9,10.0)<.2;
     frame.start_override[1]=dual&&fake_gun()>1&&fmod((double)t/1e9+5.0,10.0)<.2;

@@ -118,12 +118,21 @@ unsigned char jvs_switch_byte(unsigned buttons, unsigned player, unsigned byte)
 {
     if (player >= 2 || byte >= 2) return 0;
     unsigned g = player ? buttons >> CAB_P2_SHIFT : buttons;
+    unsigned j = player ? buttons >> CAB_P2_JOY_SHIFT : buttons;   /* the lever and buttons 2, 3 */
     unsigned char b = 0;
     if (!byte) {
         if (buttons & (player ? CAB_P2_START : CAB_P1_START)) b |= 0x80;
         if (!player && (buttons & CAB_SERVICE)) b |= 0x40;
         if (g & CAB_P1_TRIGGER) b |= 0x02;
-    } else if (g & CAB_P1_FIREMODE) b |= 0x40;
+        if (j & CAB_P1_UP)      b |= 0x20;
+        if (j & CAB_P1_DOWN)    b |= 0x10;
+        if (j & CAB_P1_LEFT)    b |= 0x08;
+        if (j & CAB_P1_RIGHT)   b |= 0x04;
+        if (j & CAB_P1_BUTTON2) b |= 0x01;
+    } else {
+        if (g & CAB_P1_FIREMODE) b |= 0x40;
+        if (j & CAB_P1_BUTTON3)  b |= 0x80;
+    }
     if ((g & CAB_P1_RELOAD) && byte == g_reload_byte) b |= (unsigned char)g_reload_mask;
     for (unsigned i = 0; i < 2; i++) {
         const unsigned char *s = g_action_switch[i];

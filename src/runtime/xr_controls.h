@@ -18,6 +18,8 @@ typedef struct {
     int aimed[2],start_override[2];
     /* GL evaluates recoil/firing before panel callbacks can toggle it. */
     int firing[2],fire_supplied;
+    /* a lever cabinet (game_profile()->joystick): the thumbsticks, -1..1, up positive */
+    int joystick;float thumb_x[2],thumb_y[2];
 } LgXrControlFrame;
 typedef struct { unsigned held;int coins; } LgXrCabinet;
 int lg_xr_controls_select(LgXrControls *state,const int trigger[2],int dual);

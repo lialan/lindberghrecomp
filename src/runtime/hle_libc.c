@@ -613,9 +613,27 @@ static void h_snprintf(CPU *c)
 
 /* ---- stdio ---- */
 static int host_device_refused(const char *path);   /* below, with open() */
+
+/* fopen, and for a relative path that is not there, the same path under
+ * TEA_DIR - the game's disk0 folder. Virtua Tennis 3 runs from vt3_Lindbergh/
+ * and opens its scene shaders as "shader/main_v.fx", which the cabinet's disk
+ * found beside it; in an extracted copy shader/ is only in disk0. */
+FILE *guest_fopen(const char *path, const char *mode)
+{
+    FILE *f = fopen(path, mode);
+    const char *tea = getenv("TEA_DIR");
+    if (!f && path[0] != '/' && tea && *tea && mode[0] == 'r') {
+        char alt[1024];
+        snprintf(alt, sizeof alt, "%s/%s", tea, path);
+        f = fopen(alt, mode);
+        if (f && getenv("LINDBERGH_OPENS")) fprintf(stderr, "[open] %s found as %s\n", path, alt);
+    }
+    return f;
+}
+
 static void h_fopen (CPU *c)
 {
-    FILE *f = host_device_refused(ASTR(0)) ? NULL : fopen(ASTR(0), ASTR(1));
+    FILE *f = host_device_refused(ASTR(0)) ? NULL : guest_fopen(ASTR(0), ASTR(1));
     if (getenv("LINDBERGH_OPENS") || !f)
         fprintf(stderr, "[open] fopen(%s, %s) -> %s\n", ASTR(0), ASTR(1), f ? "ok" : "FAILED");
     RET(guest_file_wrap(f));
@@ -824,6 +842,18 @@ static void ctype_init(void)
         g_ctype_lower[i + 128] = (i < 0) ? i : tolower(ch);
         g_ctype_upper[i + 128] = (i < 0) ? i : toupper(ch);
     }
+}
+
+/* A library built against an older glibc reads the same three pointers as
+ * data symbols (__ctype_b, __ctype_tolower, __ctype_toupper): solib.c fills
+ * its slots for them from here. */
+int hle_libc_data_import(const char *name, uint32_t *value)
+{
+    static const char *const names[3] = { "__ctype_b", "__ctype_tolower", "__ctype_toupper" };
+    if (!g_ctype_ptrs) ctype_init();
+    for (int i = 0; i < 3; i++)
+        if (!strcmp(name, names[i])) { *value = g_ctype_ptrs[i]; return 1; }
+    return 0;
 }
 
 static void h_ctype_b_loc      (CPU *c) { RET(&g_ctype_ptrs[0]); }
@@ -1842,8 +1872,23 @@ static double ad(CPU *c, int n) { uint64_t b = (uint64_t)A32(n) | (uint64_t)A32(
 static void h_sinhf(CPU *c) { RETF(sinhf(af(c, 0))); }
 static void h_coshf(CPU *c) { RETF(coshf(af(c, 0))); }
 static void h_tanhf(CPU *c) { RETF(tanhf(af(c, 0))); }
+static void h_log10f(CPU *c) { RETF(log10f(af(c, 0))); }
 static void h_hypot(CPU *c) { RETF(hypot(ad(c, 0), ad(c, 2))); }
+static void h_finite(CPU *c) { RET(isfinite(ad(c, 0)) ? 1 : 0); }
+static void h_isinf(CPU *c)  { double d = ad(c, 0); RET(isinf(d) ? (d < 0 ? -1 : 1) : 0); }
+static void h_isnan(CPU *c)  { RET(isnan(ad(c, 0)) ? 1 : 0); }
 static void h_IO_putc(CPU *c) { RET(fputc(AI32(0), AFILE(1))); }
+static void h_getc(CPU *c)    { RET(AFILE(0) ? fgetc(AFILE(0)) : -1); }
+static void h_creat(CPU *c)
+{
+    int fd = _open(ASTR(0), guest_open_flags(0x241), 0666);
+    RET(fd);
+}
+static void h_unsetenv(CPU *c)   { RET(0); }
+static void h_raise(CPU *c)      { RET(0); }
+static void h_cfsetspeed(CPU *c) { RET(0); }
+static void h_setjmp(CPU *c)     { RET(0); }
+static void h_longjmp(CPU *c)    { fprintf(stderr, "[libc] longjmp called\n"); abort(); }
 static void h_fsync(CPU *c)  { RET(0); }
 static void h_fcntl(CPU *c)  { RET(0); }
 static void h_sched_yield(CPU *c) { RET(0); }
@@ -1948,7 +1993,17 @@ void hle_register_libc4(void)
     hle_bind("strpbrk", h_strpbrk);   hle_bind("strtok", h_strtok);
     hle_bind("sinhf", h_sinhf);       hle_bind("coshf", h_coshf);
     hle_bind("tanhf", h_tanhf);       hle_bind("hypot", h_hypot);
-    hle_bind("_IO_putc", h_IO_putc);
+    hle_bind("log10f", h_log10f);
+    hle_bind("finite", h_finite);     hle_bind("isinf", h_isinf);
+    hle_bind("isnan", h_isnan);
+    hle_bind("_IO_putc", h_IO_putc);  hle_bind("_IO_getc", h_getc);
+    hle_bind("getc", h_getc);         hle_bind("creat", h_creat);
+    hle_bind("unsetenv", h_unsetenv); hle_bind("raise", h_raise);
+    hle_bind("cfsetspeed", h_cfsetspeed);
+    hle_bind("_setjmp", h_setjmp);    hle_bind("longjmp", h_longjmp);
+    hle_bind("__write", h_write);
+    hle_bind("fputs_unlocked", h_fputs);
+    hle_bind("ferror_unlocked", h_ferror);
     hle_bind("open64", h_open);       hle_bind("fopen64", h_fopen);
     hle_bind("lseek64", h_lseek64);   hle_bind("fsync", h_fsync);
     hle_bind("fcntl", h_fcntl);       hle_bind("sched_yield", h_sched_yield);
