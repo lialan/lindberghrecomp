@@ -687,6 +687,28 @@ static void gl_end_watch(CPU *c)
         trace_at = (v && *v) ? (unsigned)atoi(v) : 0u - 2u;
     }
     if (e) gl_dispatch(c, e);
+    {   /* LINDBERGH_FB_PROBE=<game fbo>: what that target holds right after
+         * each primitive drawn into it (the first 40) */
+        static long want = -2; static int said;
+        if (want == -2) { const char *v = getenv("LINDBERGH_FB_PROBE"); want = v && *v ? atol(v) : -1; }
+        GLint bound = -1;
+        if (want >= 0 && said < 40) glGetIntegerv(GL_FRAMEBUFFER_BINDING, &bound);
+        if (want >= 0 && bound == want && said < 40) {
+            said++;
+            GLint vp[4] = {0}; glGetIntegerv(GL_VIEWPORT, vp);
+            int w = vp[2], h = vp[3];
+            unsigned char *px = (w > 0 && h > 0 && w * h <= 4096 * 4096) ? malloc((size_t)w * h * 4) : NULL;
+            unsigned long nz = 0, sr = 0;
+            if (px) {
+                glReadPixels(vp[0], vp[1], w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+                for (int i = 0; i < w * h; i++) { if (px[4*i] | px[4*i+1] | px[4*i+2]) nz++; sr += px[4*i]; }
+                free(px);
+            }
+            GLenum err = glGetError();
+            fprintf(stderr, "[fbprobe] frame %u fbo %d (runtime thinks %u) after glEnd: viewport %d,%d %dx%d, rgb>0 %lu, mean r %lu, err %#x\n",
+                    g_frame, bound, g_cur_fbo, vp[0], vp[1], w, h, nz, w * h ? sr / (unsigned long)(w * h) : 0, err);
+        }
+    }
     if (g_frame != trace_at) return;
 
     nth++;
@@ -996,6 +1018,23 @@ static void gl_vertex_watch(CPU *c)
         float v[3];
         for (int i = 0; i < 3; i++) { uint32_t b = A32(i); memcpy(&v[i], &b, 4); }
         fprintf(stderr, "[gl] vertex %g %g %g\n", v[0], v[1], v[2]);
+    }
+    {   /* LINDBERGH_FB_PROBE=<fbo>: the vertices sent while it is bound (the first 32) */
+        static long want = -2; static int n;
+        if (want == -2) { const char *pv = getenv("LINDBERGH_FB_PROBE"); want = pv && *pv ? atol(pv) : -1; }
+        if (want >= 0 && n < 32) {
+            GLint bound = -1; glGetIntegerv(GL_FRAMEBUFFER_BINDING, &bound);
+            if (bound == want) {
+                n++;
+                float v[3], tc[4];
+                for (int i = 0; i < 3; i++) { uint32_t b = A32(i); memcpy(&v[i], &b, 4); }
+                glGetFloatv(GL_CURRENT_TEXTURE_COORDS, tc);
+                GLfloat mv[16], pj[16]; glGetFloatv(GL_MODELVIEW_MATRIX, mv); glGetFloatv(GL_PROJECTION_MATRIX, pj);
+                fprintf(stderr, "[fbprobe] frame %u fbo %d vertex %g %g %g  texcoord %g %g  mv diag %g %g %g t %g %g %g  proj diag %g %g %g t %g %g %g\n",
+                        g_frame, bound, v[0], v[1], v[2], tc[0], tc[1], mv[0], mv[5], mv[10], mv[12], mv[13], mv[14],
+                        pj[0], pj[5], pj[10], pj[12], pj[13], pj[14]);
+            }
+        }
     }
     if (e) gl_dispatch(c, e);
 }

@@ -60,8 +60,10 @@ const void *gl_ptr_or_offset(unsigned target, uint32_t va);
 /* LINDBERGH_GL_TRACE=1: name each GL call as it is made, so the last line
  * before a fault is the GL call that faulted. */
 extern int g_gl_trace;
+/* LINDBERGH_LIST_LOG=1: the calls recorded into each display list */
+extern int g_list_log;
 void gl_trace_call(const char *name);
-#define gl_trace(name) do { if (g_gl_trace) gl_trace_call(name); } while (0)
+#define gl_trace(name) do { if (g_gl_trace || g_list_log) gl_trace_call(name); } while (0)
 
 /* LINDBERGH_GLERR=1: glGetError after every call; the first call to raise each
  * distinct error is named. */

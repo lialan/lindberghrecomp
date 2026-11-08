@@ -1771,7 +1771,21 @@ void arb_attrib_array(unsigned index, int on)
 
 static void upload(Linked *l)
 {
-    if (l->u_gen >= 0) glUniform1fv(l->u_gen, 16, g_gen_on);
+    if (l->u_gen >= 0) {
+        /* Which generic arrays are on, asked of GL rather than remembered:
+         * glPopClientAttrib (VT3 calls it every pass) and entry points
+         * fetched with glXGetProcAddress change them without passing through
+         * arb_attrib_array, and a stale "on" made the shader read a generic
+         * array instead of glTexCoord - VT3's replay and intro blur quads
+         * sampled one texel and the screen went one flat colour. */
+        float on[16] = { 0 };
+        for (GLuint a = 1; a < 16; a++) {
+            GLint e = 0;
+            glGetVertexAttribiv(a, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &e);
+            on[a] = e ? 1.0f : 0.0f;
+        }
+        glUniform1fv(l->u_gen, 16, on);
+    }
 #ifdef LINDBERGH_GL4ES
     if (l->u_reproj >= 0 && gl4es_mv_shaders) {
         float m[32];
@@ -2164,10 +2178,87 @@ static void before_draw(void)
         /* LINDBERGH_DRAWLOG=1: every 500th frame's draws, whatever it shows */
         static int dl = -1;
         if (dl < 0) { const char *v = getenv("LINDBERGH_DRAWLOG"); dl = v && *v == '1'; }
-        if ((tf > 1 && g_frame == (unsigned)tf) || (dl && g_frame % 500 == 0)) {
+        /* LINDBERGH_TRACE_VP=26,51: the first 60 draws with those vertex programs, whenever */
+        static int tvp[8], ntvp = -1, tvn;
+        if (ntvp < 0) {
+            ntvp = 0;
+            const char *v = getenv("LINDBERGH_TRACE_VP");
+            while (v && *v && ntvp < 8) { tvp[ntvp++] = atoi(v); v = strchr(v, ','); if (v) v++; }
+        }
+        static long tfrom = -1;
+        if (tfrom < 0) { const char *v = getenv("LINDBERGH_TRACE_FROM"); tfrom = v ? atol(v) : 0; }
+        int by_vp = 0;
+        for (int k = 0; k < ntvp; k++) if ((int)vid == tvp[k] && tvn < 60 && (long)g_frame >= tfrom) by_vp = 1;
+        if (by_vp) { extern int g_arg_trace_draw; tvn++; g_arg_trace_draw = 1; }   /* its vertices too */
+        if ((tf > 1 && g_frame == (unsigned)tf) || (dl && g_frame % 500 == 0) || by_vp) {
             GLint fb = 0, vp[4] = {0}; glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb); glGetIntegerv(GL_VIEWPORT, vp);
-            fprintf(stderr, "[draw] %u v%u f%u fb %d viewport %dx%d depth %d %s\n", g_frame, vid, fid, fb, vp[2], vp[3],
+            fprintf(stderr, "[draw] %u v%u f%u fb %d viewport %dx%d at %d,%d depth %d %s\n", g_frame, vid, fid, fb, vp[2], vp[3], vp[0], vp[1],
                     glIsEnabled(GL_DEPTH_TEST), l && l->ok ? "" : "(not linked)");
+            if (fb) {   /* the target this draw goes to: complete? what is attached? */
+                GLint ty = 0, nm = 0, w = 0, h = 0, fmt = 0, dty = 0, dnm = 0;
+                GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+                glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &ty);
+                glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &nm);
+                glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &dty);
+                glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &dnm);
+                if (ty == GL_TEXTURE && nm) {
+                    GLint prev = 0; glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev);
+                    glBindTexture(GL_TEXTURE_2D, (GLuint)nm);
+                    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
+                    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &h);
+                    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_INTERNAL_FORMAT, &fmt);
+                    glBindTexture(GL_TEXTURE_2D, (GLuint)prev);
+                }
+                GLboolean cm[4]; glGetBooleanv(GL_COLOR_WRITEMASK, cm);
+                fprintf(stderr, "[draw]   target fb %d status %#x color %#x #%d %dx%d fmt %#x depth %#x #%d blend %d mask %d%d%d%d alphatest %d\n",
+                        fb, st, ty, nm, w, h, fmt, dty, dnm, glIsEnabled(GL_BLEND), cm[0], cm[1], cm[2], cm[3],
+                        glIsEnabled(GL_ALPHA_TEST));
+                GLint sb[4] = {0};
+                glGetIntegerv(GL_SCISSOR_BOX, sb);
+                GLint db = 0, rb = 0; glGetIntegerv(GL_DRAW_BUFFER, &db); glGetIntegerv(GL_READ_BUFFER, &rb);
+                GLint cull = glIsEnabled(GL_CULL_FACE), cf = 0, ff = 0; glGetIntegerv(GL_CULL_FACE_MODE, &cf); glGetIntegerv(GL_FRONT_FACE, &ff);
+                GLint pm[2] = {0}; glGetIntegerv(GL_POLYGON_MODE, pm);
+                fprintf(stderr, "[draw]   scissor %d box %d,%d %dx%d  stencil %d  drawbuf %#x readbuf %#x  cull %d %#x front %#x  polymode %#x  clip0 %d\n",
+                        glIsEnabled(GL_SCISSOR_TEST), sb[0], sb[1], sb[2], sb[3], glIsEnabled(GL_STENCIL_TEST), db, rb,
+                        cull, cf, ff, pm[0], glIsEnabled(GL_CLIP_PLANE0));
+            }
+            {   /* LINDBERGH_TEX_WATCH=<texture>: its content at every traced draw */
+                static long tw = -2;
+                if (tw == -2) { const char *v = getenv("LINDBERGH_TEX_WATCH"); tw = v && *v ? atol(v) : -1; }
+                if (tw > 0) {
+                    GLint prev = 0, w = 0, h = 0; glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev);
+                    glBindTexture(GL_TEXTURE_2D, (GLuint)tw);
+                    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
+                    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &h);
+                    unsigned long nz = 0, sr = 0;
+                    unsigned char *px = (w > 0 && h > 0) ? malloc((size_t)w * h * 4) : NULL;
+                    if (px) {
+                        glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+                        for (int i = 0; i < w * h; i++) { if (px[4*i] | px[4*i+1] | px[4*i+2]) nz++; sr += px[4*i]; }
+                        free(px);
+                    }
+                    glBindTexture(GL_TEXTURE_2D, (GLuint)prev);
+                    fprintf(stderr, "[draw]   watch tex %ld %dx%d: rgb>0 %lu, mean r %lu\n", tw, w, h, nz,
+                            w * h ? sr / (unsigned long)(w * h) : 0);
+                }
+            }
+            {   /* units 1-3 as well, briefly: a composite reads several */
+                GLint act0 = 0; glGetIntegerv(GL_ACTIVE_TEXTURE, &act0);
+                char ub[160]; int uo = 0;
+                for (int u = 1; u < 4; u++) {
+                    GLint t2 = 0, w2 = 0, h2 = 0, f2 = 0;
+                    glActiveTexture(GL_TEXTURE0 + (GLenum)u);
+                    glGetIntegerv(GL_TEXTURE_BINDING_2D, &t2);
+                    if (t2) {
+                        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w2);
+                        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &h2);
+                        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_INTERNAL_FORMAT, &f2);
+                    }
+                    uo += snprintf(ub + uo, sizeof ub - (size_t)uo, " u%d tex %d %dx%d fmt %#x;", u, t2, w2, h2, f2);
+                }
+                glActiveTexture((GLenum)act0);
+                fprintf(stderr, "[draw]  %s\n", ub);
+            }
             {   /* what unit 0 holds: a texture that is missing or incomplete samples black */
                 GLint act = 0, tex = 0, w = 0, h = 0, fmt = 0, minf = 0, w1 = 0, maxl = 0;
                 glGetIntegerv(GL_ACTIVE_TEXTURE, &act);
@@ -2208,6 +2299,67 @@ static void before_draw(void)
                     for (int ai = 0; ai < 16; ai++) {
                         GLint on = 0; glGetVertexAttribiv((GLuint)ai, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &on);
                         if (on) o += snprintf(en + o, sizeof en - (size_t)o, "%d,", ai);
+                    }
+                    {
+                        GLfloat tc[4] = {0}, c0[4] = {0}, c1[4] = {0};
+                        GLint prevp2 = 0; glGetIntegerv(GL_CURRENT_PROGRAM, &prevp2);
+                        GLint l0 = glGetUniformLocation(l->prog, "v_loc[0]"), l1 = glGetUniformLocation(l->prog, "v_loc[1]");
+                        glUseProgram(l->prog); upload(l);
+                        if (l0 >= 0) glGetUniformfv(l->prog, l0, c0);
+                        if (l1 >= 0) glGetUniformfv(l->prog, l1, c1);
+                        glUseProgram((GLuint)prevp2);
+                        glGetFloatv(GL_CURRENT_TEXTURE_COORDS, tc);
+                        fprintf(stderr, "[draw]   last texcoord %g %g %g %g  c0 %g %g %g %g  c1 %g %g %g %g\n",
+                                tc[0], tc[1], tc[2], tc[3], c0[0], c0[1], c0[2], c0[3], c1[0], c1[1], c1[2], c1[3]);
+                        GLfloat f0[4] = {0}, f1[4] = {0};
+                        GLint lf0 = glGetUniformLocation(l->prog, "f_loc[0]"), lf1 = glGetUniformLocation(l->prog, "f_loc[1]");
+                        glUseProgram(l->prog); upload(l);
+                        if (lf0 >= 0) glGetUniformfv(l->prog, lf0, f0);
+                        if (lf1 >= 0) glGetUniformfv(l->prog, lf1, f1);
+                        glUseProgram((GLuint)prevp2);
+                        GLint act4 = 0, t4 = 0; glGetIntegerv(GL_ACTIVE_TEXTURE, &act4);
+                        glActiveTexture(GL_TEXTURE4); glGetIntegerv(GL_TEXTURE_BINDING_2D, &t4); glActiveTexture((GLenum)act4);
+                        fprintf(stderr, "[draw]   f_loc0 %g %g %g %g  f_loc1 %g %g %g %g  u4 tex %d\n",
+                                f0[0], f0[1], f0[2], f0[3], f1[0], f1[1], f1[2], f1[3], t4);
+                        if (by_vp) {   /* what each unit 1-4 holds, read back */
+                            GLint actx = 0; glGetIntegerv(GL_ACTIVE_TEXTURE, &actx);
+                            for (int u = 1; u <= 4; u++) {
+                                GLint t = 0, w = 0, h = 0, f = 0;
+                                glActiveTexture(GL_TEXTURE0 + (GLenum)u);
+                                glGetIntegerv(GL_TEXTURE_BINDING_2D, &t);
+                                if (!t) continue;
+                                glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
+                                glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &h);
+                                glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_INTERNAL_FORMAT, &f);
+                                if (w <= 0 || h <= 0 || w * h > 4096 * 4096) continue;
+                                if (f == 0x81a5 || f == 0x81a6 || f == 0x81a7 || f == 0x88f0) {   /* depth */
+                                    float *d = malloc((size_t)w * h * 4);
+                                    if (!d) continue;
+                                    glGetTexImage(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT, GL_FLOAT, d);
+                                    float mn = 9, mx = -9; double sm = 0;
+                                    for (int i = 0; i < w * h; i++) { if (d[i] < mn) mn = d[i]; if (d[i] > mx) mx = d[i]; sm += d[i]; }
+                                    GLint cmp = 0; glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, &cmp);
+                                    fprintf(stderr, "[draw]   u%d depth tex %d %dx%d: min %g max %g mean %g compare %#x\n",
+                                            u, t, w, h, mn, mx, sm / (w * h), cmp);
+                                    free(d);
+                                } else {
+                                    unsigned char *px = malloc((size_t)w * h * 4);
+                                    if (!px) continue;
+                                    glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+                                    unsigned long sr = 0, sg = 0, sb = 0, na = 0, nz = 0;
+                                    for (int i = 0; i < w * h; i++) {
+                                        sr += px[4*i]; sg += px[4*i+1]; sb += px[4*i+2];
+                                        if (px[4*i+3]) na++;
+                                        if (px[4*i] | px[4*i+1] | px[4*i+2]) nz++;
+                                    }
+                                    unsigned long n = (unsigned long)w * h;
+                                    fprintf(stderr, "[draw]   u%d tex %d %dx%d fmt %#x: rgb>0 %lu alpha>0 %lu of %lu, mean rgb %lu %lu %lu\n",
+                                            u, t, w, h, f, nz, na, n, sr / n, sg / n, sb / n);
+                                    free(px);
+                                }
+                            }
+                            glActiveTexture((GLenum)actx);
+                        }
                     }
                     fprintf(stderr, "[draw]   c4 %g %g %g %g  c5 %g %g %g %g  color array %d  attribs %s  current color %g %g %g %g\n",
                             c4[0], c4[1], c4[2], c4[3], c5[0], c5[1], c5[2], c5[3], glIsEnabled(GL_COLOR_ARRAY), en,

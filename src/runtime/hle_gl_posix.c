@@ -21,6 +21,7 @@
 #include "stereo.h"
 
 int g_gl_trace;
+int g_list_log;
 int g_gl_errcheck;
 
 static const char *arb_source(GLenum target, GLuint id) { return arb_get_source(target, id); }
@@ -127,6 +128,13 @@ void gl_check_error(const char *name)
 void gl_trace_call(const char *name)
 {
     extern unsigned g_frame;
+    if (g_list_log) {
+        static int compiling, lists, calls;
+        if (!strcmp(name, "glNewList")) { compiling = 1; calls = 0; lists++; fprintf(stderr, "[list] #%d compiled at frame %u:", lists, g_frame); }
+        else if (!strcmp(name, "glEndList")) { compiling = 0; fprintf(stderr, " | %d calls\n", calls); }
+        else if (compiling) { calls++; if (calls <= 40) fprintf(stderr, " %s", name + 2); }
+        if (!g_gl_trace) return;
+    }
     if (g_gl_trace > 1 && g_frame != (unsigned)g_gl_trace) return;
     fprintf(stderr, "[gl] %s\n", name);
     fflush(stderr);
@@ -858,14 +866,21 @@ static void h_gluErrorString(CPU *c)
  * ignoring it. */
 static void h_glLockArraysEXT(CPU *c) { (void)c; }
 
+void gl_alias_generic_attribs(void);   /* below, with the token table */
+
+void gl_alias_generic_attribs(void);   /* below: glVertexAttrib*ARB aliased as on NVIDIA */
+
 void hle_register_gl(void)
 {
     const char *t = getenv("LINDBERGH_GL_TRACE");
     g_gl_trace = t && *t ? atoi(t) : 0;
+    t = getenv("LINDBERGH_LIST_LOG");
+    g_list_log = t && *t == '1';
     t = getenv("LINDBERGH_GLERR");
     g_gl_errcheck = t && *t && *t != '0';
 
     gl_register_generated();
+    gl_alias_generic_attribs();     /* after the generated thunks, whose names they replace */
     hle_bind("glBindBufferARB", h_glBindBufferARB); gl_bind_named("glBindBufferARB", h_glBindBufferARB);
     /* the core names reach the same bookkeeping, or a buffer bound through
      * glBindBuffer leaves every pointer argument after it misread */
@@ -972,6 +987,162 @@ static struct { const char *name; HleHandler fn; } g_named[GL_NAMED_MAX];
 static struct { const char *name; HleHandler fn; HleId id; } g_tok[GL_TOKEN_MAX];
 static int g_named_n, g_tok_n;
 
+
+/* ---- immediate generic attributes, aliased as NVIDIA does ----
+ *
+ * Under NVIDIA's ARB_vertex_program the generic attributes ARE the classic
+ * ones: 0 position, 2 normal, 3 colour, 4 secondary colour, 5 fog, 8-15 the
+ * texture coordinates. Virtua Tennis 3 draws its post-processing quads (the
+ * replay's depth of field, the pre-match intro) in display lists with
+ * glVertexAttrib*ARB(8, s, t): kept generic, the translated programs read
+ * gl_MultiTexCoord0 as 0, every pixel sampled one texel, and the replay was a
+ * flat colour. Routed to the classic call here, a display list records that
+ * instead. Attributes with no classic twin (1, 6, 7: skinning's weights and
+ * indices) stay generic. */
+static void va_route(GLuint i, const float *v)
+{
+    if (i == 0) glVertex4f(v[0], v[1], v[2], v[3]);
+    else if (i == 2) glNormal3f(v[0], v[1], v[2]);
+    else if (i == 3) glColor4f(v[0], v[1], v[2], v[3]);
+    else if (i == 4) glSecondaryColor3f(v[0], v[1], v[2]);
+    else if (i == 5) glFogCoordf(v[0]);
+    else if (i >= 8 && i < 16) glMultiTexCoord4f(GL_TEXTURE0 + (i - 8), v[0], v[1], v[2], v[3]);
+    else glVertexAttrib4f(i, v[0], v[1], v[2], v[3]);
+}
+
+/* spec: the entry point's name, which says how its arguments are laid out */
+static void va_alias(CPU *c, const char *spec)
+{
+    const char *p = spec + strlen("glVertexAttrib");
+    int n = *p++ - '0', norm = 0, vec;
+    if (*p == 'N') { norm = 1; p++; }
+    char ty[3] = { 0 };
+    ty[0] = *p++;
+    if (ty[0] == 'u') ty[1] = *p++;             /* ub us ui */
+    vec = *p == 'v';
+    float v[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    GLuint idx = A32(0);
+    int arg = 1;
+    for (int k = 0; k < n; k++) {
+        double x = 0;
+        if (vec) {
+            uint32_t a = A32(1);
+            if (!a) break;
+            if (!strcmp(ty, "f")) { float f; memcpy(&f, GP(a + 4u * k), 4); x = f; }
+            else if (!strcmp(ty, "d")) { double d; memcpy(&d, GP(a + 8u * k), 8); x = d; }
+            else if (!strcmp(ty, "s")) { int16_t q; memcpy(&q, GP(a + 2u * k), 2); x = norm ? q / 32767.0 : q; }
+            else if (!strcmp(ty, "b")) { int8_t q = *(const int8_t *)GP(a + k); x = norm ? q / 127.0 : q; }
+            else if (!strcmp(ty, "i")) { int32_t q; memcpy(&q, GP(a + 4u * k), 4); x = norm ? q / 2147483647.0 : q; }
+            else if (!strcmp(ty, "ub")) { uint8_t q = *(const uint8_t *)GP(a + k); x = norm ? q / 255.0 : q; }
+            else if (!strcmp(ty, "us")) { uint16_t q; memcpy(&q, GP(a + 2u * k), 2); x = norm ? q / 65535.0 : q; }
+            else if (!strcmp(ty, "ui")) { uint32_t q; memcpy(&q, GP(a + 4u * k), 4); x = norm ? q / 4294967295.0 : q; }
+        } else if (!strcmp(ty, "d")) {
+            uint64_t b = (uint64_t)A32(arg) | (uint64_t)A32(arg + 1) << 32; double d; memcpy(&d, &b, 8); x = d; arg += 2;
+        } else if (!strcmp(ty, "f")) {
+            uint32_t b = A32(arg++); float f; memcpy(&f, &b, 4); x = f;
+        } else if (!strcmp(ty, "s")) {
+            x = (int16_t)(A32(arg++) & 0xFFFF);
+        } else if (!strcmp(ty, "ub")) {                 /* 4NubARB */
+            x = (A32(arg++) & 0xFF) / 255.0;
+        }
+        v[k] = (float)x;
+    }
+    {   /* once per entry point and index class, to prove the path is reached */
+        static int said[2];
+        int cls = idx >= 8 && idx < 16;
+        if (!said[cls]) {
+            said[cls] = 1;
+            fprintf(stderr, "[gl] %s(%u, %g, %g, ...) aliased to the classic attribute\n",
+                    spec, idx, v[0], v[1]);
+        }
+    }
+    {   /* LINDBERGH_VA_LOG=1: the first 40 immediate generic attributes */
+        static int on = -1, n;
+        if (on < 0) { const char *e = getenv("LINDBERGH_VA_LOG"); on = e && *e == '1'; }
+        if (on && n++ < 40) {
+            GLint lst = 0; glGetIntegerv(GL_LIST_INDEX, &lst);
+            fprintf(stderr, "[va] %s(%u) %g %g %g %g%s\n", spec, idx, v[0], v[1], v[2], v[3], lst ? " (compiling a list)" : "");
+        }
+    }
+    va_route(idx, v);
+}
+static void va_1s(CPU *c) { va_alias(c, "glVertexAttrib1sARB"); }
+static void va_1f(CPU *c) { va_alias(c, "glVertexAttrib1fARB"); }
+static void va_1d(CPU *c) { va_alias(c, "glVertexAttrib1dARB"); }
+static void va_2s(CPU *c) { va_alias(c, "glVertexAttrib2sARB"); }
+static void va_2f(CPU *c) { va_alias(c, "glVertexAttrib2fARB"); }
+static void va_2d(CPU *c) { va_alias(c, "glVertexAttrib2dARB"); }
+static void va_3s(CPU *c) { va_alias(c, "glVertexAttrib3sARB"); }
+static void va_3f(CPU *c) { va_alias(c, "glVertexAttrib3fARB"); }
+static void va_3d(CPU *c) { va_alias(c, "glVertexAttrib3dARB"); }
+static void va_4s(CPU *c) { va_alias(c, "glVertexAttrib4sARB"); }
+static void va_4f(CPU *c) { va_alias(c, "glVertexAttrib4fARB"); }
+static void va_4d(CPU *c) { va_alias(c, "glVertexAttrib4dARB"); }
+static void va_4Nub(CPU *c) { va_alias(c, "glVertexAttrib4NubARB"); }
+static void va_1sv(CPU *c) { va_alias(c, "glVertexAttrib1svARB"); }
+static void va_1fv(CPU *c) { va_alias(c, "glVertexAttrib1fvARB"); }
+static void va_1dv(CPU *c) { va_alias(c, "glVertexAttrib1dvARB"); }
+static void va_2sv(CPU *c) { va_alias(c, "glVertexAttrib2svARB"); }
+static void va_2fv(CPU *c) { va_alias(c, "glVertexAttrib2fvARB"); }
+static void va_2dv(CPU *c) { va_alias(c, "glVertexAttrib2dvARB"); }
+static void va_3sv(CPU *c) { va_alias(c, "glVertexAttrib3svARB"); }
+static void va_3fv(CPU *c) { va_alias(c, "glVertexAttrib3fvARB"); }
+static void va_3dv(CPU *c) { va_alias(c, "glVertexAttrib3dvARB"); }
+static void va_4bv(CPU *c) { va_alias(c, "glVertexAttrib4bvARB"); }
+static void va_4sv(CPU *c) { va_alias(c, "glVertexAttrib4svARB"); }
+static void va_4iv(CPU *c) { va_alias(c, "glVertexAttrib4ivARB"); }
+static void va_4ubv(CPU *c) { va_alias(c, "glVertexAttrib4ubvARB"); }
+static void va_4usv(CPU *c) { va_alias(c, "glVertexAttrib4usvARB"); }
+static void va_4uiv(CPU *c) { va_alias(c, "glVertexAttrib4uivARB"); }
+static void va_4fv(CPU *c) { va_alias(c, "glVertexAttrib4fvARB"); }
+static void va_4dv(CPU *c) { va_alias(c, "glVertexAttrib4dvARB"); }
+static void va_4Nbv(CPU *c) { va_alias(c, "glVertexAttrib4NbvARB"); }
+static void va_4Nsv(CPU *c) { va_alias(c, "glVertexAttrib4NsvARB"); }
+static void va_4Niv(CPU *c) { va_alias(c, "glVertexAttrib4NivARB"); }
+static void va_4Nubv(CPU *c) { va_alias(c, "glVertexAttrib4NubvARB"); }
+static void va_4Nusv(CPU *c) { va_alias(c, "glVertexAttrib4NusvARB"); }
+static void va_4Nuiv(CPU *c) { va_alias(c, "glVertexAttrib4NuivARB"); }
+
+void gl_alias_generic_attribs(void)
+{
+    gl_bind_named("glVertexAttrib1sARB", va_1s);
+    gl_bind_named("glVertexAttrib1fARB", va_1f);
+    gl_bind_named("glVertexAttrib1dARB", va_1d);
+    gl_bind_named("glVertexAttrib2sARB", va_2s);
+    gl_bind_named("glVertexAttrib2fARB", va_2f);
+    gl_bind_named("glVertexAttrib2dARB", va_2d);
+    gl_bind_named("glVertexAttrib3sARB", va_3s);
+    gl_bind_named("glVertexAttrib3fARB", va_3f);
+    gl_bind_named("glVertexAttrib3dARB", va_3d);
+    gl_bind_named("glVertexAttrib4sARB", va_4s);
+    gl_bind_named("glVertexAttrib4fARB", va_4f);
+    gl_bind_named("glVertexAttrib4dARB", va_4d);
+    gl_bind_named("glVertexAttrib4NubARB", va_4Nub);
+    gl_bind_named("glVertexAttrib1svARB", va_1sv);
+    gl_bind_named("glVertexAttrib1fvARB", va_1fv);
+    gl_bind_named("glVertexAttrib1dvARB", va_1dv);
+    gl_bind_named("glVertexAttrib2svARB", va_2sv);
+    gl_bind_named("glVertexAttrib2fvARB", va_2fv);
+    gl_bind_named("glVertexAttrib2dvARB", va_2dv);
+    gl_bind_named("glVertexAttrib3svARB", va_3sv);
+    gl_bind_named("glVertexAttrib3fvARB", va_3fv);
+    gl_bind_named("glVertexAttrib3dvARB", va_3dv);
+    gl_bind_named("glVertexAttrib4bvARB", va_4bv);
+    gl_bind_named("glVertexAttrib4svARB", va_4sv);
+    gl_bind_named("glVertexAttrib4ivARB", va_4iv);
+    gl_bind_named("glVertexAttrib4ubvARB", va_4ubv);
+    gl_bind_named("glVertexAttrib4usvARB", va_4usv);
+    gl_bind_named("glVertexAttrib4uivARB", va_4uiv);
+    gl_bind_named("glVertexAttrib4fvARB", va_4fv);
+    gl_bind_named("glVertexAttrib4dvARB", va_4dv);
+    gl_bind_named("glVertexAttrib4NbvARB", va_4Nbv);
+    gl_bind_named("glVertexAttrib4NsvARB", va_4Nsv);
+    gl_bind_named("glVertexAttrib4NivARB", va_4Niv);
+    gl_bind_named("glVertexAttrib4NubvARB", va_4Nubv);
+    gl_bind_named("glVertexAttrib4NusvARB", va_4Nusv);
+    gl_bind_named("glVertexAttrib4NuivARB", va_4Nuiv);
+}
+
 void gl_bind_named(const char *name, HleHandler fn)
 {
     for (int i = 0; i < g_named_n; i++)
@@ -1019,7 +1190,9 @@ __attribute__((weak)) void gl_register_generated(void) { }
  * the handler already bound. */
 static float targf(CPU *c, int i) { uint32_t b = A32(i); float f; memcpy(&f, &b, 4); return f; }
 static double targd(CPU *c, int i) { uint64_t b = (uint64_t)A32(i) | (uint64_t)A32(i + 1) << 32; double d; memcpy(&d, &b, 8); return d; }
-static int trace_now(void) { extern unsigned g_frame; return g_gl_trace > 1 && g_frame == (unsigned)g_gl_trace; }
+/* armed by arbprog.c for one traced draw (LINDBERGH_TRACE_VP), until its glEnd */
+int g_arg_trace_draw;
+static int trace_now(void) { extern unsigned g_frame; return g_arg_trace_draw || (g_gl_trace > 1 && g_frame == (unsigned)g_gl_trace); }
 #define WRAP(nm, body) \
     static HleHandler o_##nm; \
     static void w_##nm(CPU *c) { if (trace_now()) { body; } o_##nm(c); }
@@ -1034,6 +1207,9 @@ WRAP(glScissor, fprintf(stderr, "[gla] glScissor %d %d %d %d\n", (int)A32(0), (i
 WRAP(glOrtho, fprintf(stderr, "[gla] glOrtho %g %g %g %g %g %g\n", targd(c,0), targd(c,2), targd(c,4), targd(c,6), targd(c,8), targd(c,10)))
 WRAP(glVertex3f, fprintf(stderr, "[gla] glVertex3f %g %g %g\n", targf(c,0), targf(c,1), targf(c,2)))
 WRAP(glBegin, fprintf(stderr, "[gla] glBegin %#x\n", A32(0)))
+WRAP(glTexCoord2f, fprintf(stderr, "[gla] glTexCoord2f %g %g\n", targf(c,0), targf(c,1)))
+static HleHandler o_glEnd;
+static void w_glEnd(CPU *c) { if (trace_now()) fprintf(stderr, "[gla] glEnd\n"); g_arg_trace_draw = 0; o_glEnd(c); }
 WRAP(glBindFramebufferEXT, fprintf(stderr, "[gla] glBindFramebufferEXT %#x %u\n", A32(0), A32(1)))
 WRAP(glBindTexture, fprintf(stderr, "[gla] glBindTexture %#x %u\n", A32(0), A32(1)))
 WRAP(glClearColor, fprintf(stderr, "[gla] glClearColor %g %g %g %g\n", targf(c,0), targf(c,1), targf(c,2), targf(c,3)))
@@ -1045,12 +1221,12 @@ WRAP(glMultMatrixf, { const float *m = (const float *)APTR(0);
 
 void gl_arg_trace_install(void)
 {
-    if (g_gl_trace <= 1) return;
+    if (g_gl_trace <= 1 && !getenv("LINDBERGH_TRACE_VP")) return;
     for (unsigned i = 0; i < HLE_COUNT; i++) {
         const char *n = hle_name((HleId)i);
 #define HOOK(nm) if (!strcmp(n, #nm) && g_hle_handlers[i]) { o_##nm = g_hle_handlers[i]; g_hle_handlers[i] = w_##nm; }
         HOOK(glMatrixMode) HOOK(glLoadIdentity) HOOK(glPushMatrix) HOOK(glPopMatrix) HOOK(glScalef)
-        HOOK(glTranslatef) HOOK(glViewport) HOOK(glScissor) HOOK(glOrtho) HOOK(glVertex3f) HOOK(glBegin)
+        HOOK(glTranslatef) HOOK(glViewport) HOOK(glScissor) HOOK(glOrtho) HOOK(glVertex3f) HOOK(glBegin) HOOK(glTexCoord2f) HOOK(glEnd)
         HOOK(glVertex3fv) HOOK(glLoadMatrixf) HOOK(glMultMatrixf)
         HOOK(glBindFramebufferEXT) HOOK(glBindTexture) HOOK(glClearColor)
 #undef HOOK
