@@ -590,7 +590,7 @@ static void input_frame(XrTime t)
         btn_a[h] = get_bool(a_a, h); btn_b[h] = get_bool(a_b, h); stick[h] = get_bool(a_stick, h);
     }
     const int lever_cab = game_profile()->joystick;   /* the right hand holds the buttons; nothing is a gun */
-    if (lever_cab) controls.gun_hand = HAND_R; else lg_xr_controls_select(&controls,trig,dual);
+    if (lever_cab) gun_hand = HAND_R; else lg_xr_controls_select(&controls,trig,dual);   /* gun_hand is controls.gun_hand */
     int menu_btn = get_bool(a_menu, HAND_L);
     if (fake_menu < 0) { const char *v = getenv("LINDBERGH_XR_FAKE_MENU"); fake_menu = v && *v == '1'; }
     if (fake_menu && !menu.open && views_ok) { menu.open = 1; menu_place(); menu.hover = -1; menu.dirty = 1; }
