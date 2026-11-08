@@ -27,6 +27,7 @@ import sys
 import argparse
 
 from elftools.elf.elffile import ELFFile
+from capstone.x86 import X86_REG_EBX
 
 from .driver import load_lifter, make_lifter_class, _ident
 
@@ -57,6 +58,7 @@ class Lib:
         dyn = self.f.get_section_by_name(".dynamic")
         tags = {t.entry.d_tag: t.entry.d_val for t in dyn.iter_tags()}
         self.init = tags.get("DT_INIT")
+        self.pic_tables = []          # (lo, hi): switch tables inside .text
         self.fini = tags.get("DT_FINI")
         self.init_array = (tags.get("DT_INIT_ARRAY"), tags.get("DT_INIT_ARRAYSZ", 0))
         self.exports = {}
@@ -75,7 +77,7 @@ class Lib:
                 if x["sh_addr"] <= v < x["sh_addr"] + x["sh_size"]:
                     return x["sh_addr"] + x["sh_size"]
             return None
-        starts, named = set(), {}
+        starts, named, reach = set(), {}, {}
         for sec in (self.f.get_section_by_name(".symtab"), self.dynsym):
             if not sec:
                 continue
@@ -92,11 +94,154 @@ class Lib:
             if v:
                 named.setdefault(v, (0, nm))
                 starts.add(v)
+        if True:
+            import importlib.util
+            _dis_py = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "pcrecomp", "tools", "disasm", "disasm32.py")
+            _spec = importlib.util.spec_from_file_location("disasm32", _dis_py)
+            _mod = importlib.util.module_from_spec(_spec)
+            _spec.loader.exec_module(_mod)
+            Disassembler = _mod.Disassembler
+            text = self.f.get_section_by_name(".text")
+            if text:
+                t_lo = self.base + text["sh_addr"]
+                t_hi = t_lo + text["sh_size"]
+                seeds = {t_lo}
+                for v in starts:
+                    if t_lo <= self.base + v < t_hi:
+                        seeds.add(self.base + v)
+                for sec_name in (".ctors", ".dtors", ".init_array", ".fini_array", ".data.rel.ro", ".data", ".rodata"):
+                    sec = self.f.get_section_by_name(sec_name)
+                    if not sec:
+                        continue
+                    s_off, s_sz = sec["sh_addr"], sec["sh_size"]
+                    for off in range(s_off, s_off + s_sz - 3, 4):
+                        val = self.rd32(off)
+                        if t_lo <= val < t_hi:
+                            seeds.add(val)
+                for sec_name in (".init", ".fini"):
+                    sec = self.f.get_section_by_name(sec_name)
+                    if not sec:
+                        continue
+                    s_off, s_sz = sec["sh_addr"], sec["sh_size"]
+                    for off in range(s_off, s_off + s_sz - 4):
+                        if self.img[off] == 0xE8:
+                            rel = struct.unpack_from("<i", self.img, off + 1)[0]
+                            tgt = (self.base + off + 5 + rel) & 0xFFFFFFFF
+                            if t_lo <= tgt < t_hi:
+                                seeds.add(tgt)
+                import types
+                dis_secs = [types.SimpleNamespace(
+                    name=sec.name,
+                    is_code=(sec.name == ".text"),
+                    virtual_address=sec["sh_addr"],
+                    virtual_size=sec["sh_size"],
+                    raw_offset=sec["sh_addr"],
+                    raw_size=sec["sh_size"],
+                ) for sec in self.f.iter_sections() if sec["sh_addr"] and sec["sh_size"]]
+                dis = Disassembler(bytes(self.img), self.base, dis_secs)
+                # PIC code holds the GOT in ebx: its switch tables are GOT-relative
+                got = self.f.get_section_by_name(".got")
+                if got is not None:
+                    dis.pic_base = self.base + got["sh_addr"]
+                found = dis.find_functions(t_lo, t_hi, dict(self.plt_stubs()), seeds)
+                # The call scan reads every E8 byte as a call, so some
+                # candidates start inside another instruction (the e8 of
+                # `mov [edx+0xe8], 0`). Each start ends the function before it,
+                # so one of those cut libCg's 0x1467dc short mid-body. Keep a
+                # start only if no kept function, walking upward, decoded an
+                # instruction across it. Symbols are always kept.
+                inside = bytearray(t_hi - t_lo)
+                kept, dropped = [], 0
+                for va in sorted(found):
+                    if va - self.base not in named and inside[va - t_lo]:
+                        dropped += 1
+                        continue
+                    kept.append(va)
+                    for lo_, hi_ in getattr(found[va], "pic_tables", ()):
+                        for k in range(max(lo_, t_lo), min(hi_, t_hi)):
+                            inside[k - t_lo] = 1
+                    for b in found[va].blocks.values():
+                        for ins in b.instructions:
+                            for k in range(ins.address + 1, ins.address + ins.size):
+                                if t_lo <= k < t_hi:
+                                    inside[k - t_lo] = 1
+                if dropped:
+                    print("[solib] %s: %d candidate starts inside another instruction dropped"
+                          % (self.name, dropped), file=sys.stderr)
+                # Switch arms: `jmp eax` is dispatched at run time, so each arm
+                # needs an entry of its own (overlapping the switch's function,
+                # as alias entries do).
+                arms = set()
+                for va in kept:
+                    arms |= found[va].jump_targets
+                arms -= set(kept)
+                for a in sorted(arms):
+                    fa = found.get(a) or dis.disassemble_function(a, dict(self.plt_stubs()))
+                    if fa and fa.blocks:
+                        found[a] = fa
+                        kept.append(a)
+                if arms:
+                    print("[solib] %s: %d switch arms made entries" % (self.name, len(arms)), file=sys.stderr)
+                # A branch out of a body's own range (an arm's loop back to the
+                # switch above it, libCg 0xf7a12 -> 0xf7854) is dispatched, so
+                # its target needs an entry too; those bodies can branch out
+                # again, hence the fixpoint.
+                have = set(kept)
+                todo = list(kept)
+                extra = 0
+                while todo:
+                    va = todo.pop()
+                    f = found[va]
+                    end = max(i.address + i.size for b in f.blocks.values() for i in b.instructions)
+                    for b in f.blocks.values():
+                        for ins in b.instructions:
+                            if ins.is_cond_jump or ins.is_uncond_jump:
+                                tgt = ins.get_branch_target()
+                                if tgt is None or va <= tgt < end:
+                                    continue
+                            elif (dis.pic_base is not None and ins.mnemonic == "lea"
+                                  and len(ins.operands or ()) == 2
+                                  and ins.operands[1].mem.base == X86_REG_EBX
+                                  and not ins.operands[1].mem.index):
+                                # a callback's address: `lea eax, [ebx + f@GOTOFF]`
+                                # (libCg 0xe5905 -> 0xe5f48, which opens with no
+                                # standard prologue)
+                                tgt = (dis.pic_base + ins.operands[1].mem.disp) & 0xFFFFFFFF
+                            else:
+                                continue
+                            if tgt in have or not (t_lo <= tgt < t_hi):
+                                continue
+                            ft = found.get(tgt) or dis.disassemble_function(tgt, dict(self.plt_stubs()))
+                            have.add(tgt)
+                            if ft and ft.blocks:
+                                found[tgt] = ft
+                                kept.append(tgt)
+                                todo.append(tgt)
+                                extra += 1
+                if extra:
+                    print("[solib] %s: %d branch and callback targets outside their body made entries" % (self.name, extra),
+                          file=sys.stderr)
+                for va in kept:
+                    self.pic_tables += getattr(found[va], "pic_tables", [])
+                for va in kept:
+                    rva = va - self.base
+                    starts.add(rva)
+                    named.setdefault(rva, (0, "sub_%08X" % va))
+                    # how far its own control flow reaches. Entries into the
+                    # middle of a function (shared tails, loop heads) are
+                    # starts too, and ending a body at the next start left a
+                    # branch past it (libCg 0xfd60c) with nowhere to go. The
+                    # bodies overlap instead, as alias entries are meant to.
+                    reach[rva] = max(ins.address + ins.size
+                                     for b in found[va].blocks.values()
+                                     for ins in b.instructions) - self.base
         order = sorted(starts)
         out = {}
         for v, (size, name) in named.items():
+            end = section_end(v)
+            if not size and v in reach:
+                size = min(reach[v], end) - v
             if not size:
-                end = section_end(v)
                 later = [x for x in order if v < x < end]
                 size = (later[0] if later else end) - v
             out[self.base + v] = (size, name)
@@ -247,6 +392,20 @@ def main():
     funcs = {}
     for lib in libs:
         funcs.update(lib.functions())
+
+    # The lifter decodes a body linearly, so a switch table inside it (GCC
+    # PIC puts them right after the jmp) decodes as junk, falls out of step
+    # with the real instructions after it, and their labels are lost (libCg
+    # 0xd8978's je 0xdb178). It gets the tables as nops instead; the image
+    # the game runs keeps them.
+    tables = sorted({t for lib in libs for t in lib.pic_tables})
+    def code_bytes(va, n):
+        b = bytearray(read_va(va, n))
+        for lo_, hi_ in tables:
+            if lo_ < va + n and hi_ > va:
+                for k in range(max(lo_, va), min(hi_, va + n)):
+                    b[k - va] = 0x90
+        return bytes(b)
     header = ["/* AUTO-GENERATED by lindberghrecomp tools/recomp/solib.py - do not edit */",
               '#define RECOMP_LIFTED 1   /* cpu.h: the guest window is fixed by now */',
               '#include "lindbergh_rt.h"', ""]
@@ -254,7 +413,7 @@ def main():
     for va in sorted(funcs):
         size, name = funcs[va]
         cur.append("/* %s */" % name)
-        cur.append(lifter.lift_function(read_va(va, size), va))
+        cur.append(lifter.lift_function(code_bytes(va, size), va))
         cur.append("")
         done.append(va)
         if len(done) % 400 == 0:
@@ -300,6 +459,11 @@ def main():
                 (" \\\n".join("    X(0x%08Xu, 0x%08Xu)" % (s, t) for s, t in sorted(alias.items())) or "") + "\n")
         f.write("#define SOLIB_EXPORTS(X) \\\n" +
                 " \\\n".join('    X("%s", 0x%08Xu)' % (n, a) for n, a in sorted(exports.items())) + "\n")
+        # the data imports no library defines, each a zeroed slot: the
+        # runtime fills the ones it knows (libCg's __ctype_b and friends,
+        # the pointers an old glibc exported in place of __ctype_b_loc)
+        f.write("#define SOLIB_DATA(X) \\\n" +
+                (" \\\n".join('    X("%s", 0x%08Xu)' % (n, a) for n, a in sorted(data_objs.items())) or "") + "\n")
         f.write("#define SOLIB_DATA_BASE 0x%08Xu\n#define SOLIB_DATA_SIZE 0x%Xu\n"
                 % (data_base, max(DATA_ALIGN, 64 * len(data_objs))))
     with open(os.path.join(outdir, "recomp_solib_img.c"), "w") as f:

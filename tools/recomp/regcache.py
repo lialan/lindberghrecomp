@@ -28,7 +28,7 @@ SAFE = {
     "flags_logicz", "flags_sub", "flags_add", "flags_adc", "flags_sbb", "flags_incs",
     "flags_decs", "op_shl", "op_shr", "op_sar", "op_rol", "op_ror", "op_shld", "op_shrd",
     "sse_compare", "fst", "fpop", "fpush", "fcompare", "fprem_op", "do_sahf",
-    "bit_string_op",
+    "bit_string_op", "fpu_round", "fpu_cw", "fpu_set_cw",
 }
 
 _func = re.compile(r"^void (L_[0-9A-F]{8})\(CPU \*c\)\n\{\n(.*?)\n\}$", re.S | re.M)

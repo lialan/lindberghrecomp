@@ -33,7 +33,7 @@ ALL = frozenset(FLAGS)
 NONE = frozenset()
 
 # Calls that take the CPU and leave the status flags alone.
-NEUTRAL = {"push32", "pop32", "fst", "fpush", "fpop"}
+NEUTRAL = {"push32", "pop32", "fst", "fpush", "fpop", "fpu_round", "fpu_cw", "fpu_set_cw"}
 # The three this rewrites; each writes all six flags and reads none.
 REWRITE = {"flags_add": "nf_add", "flags_sub": "nf_sub", "flags_logicz": "nf_logicz"}
 
