@@ -1767,9 +1767,14 @@ static int transform_call(CPU *c, HleId id, const char *n)
                       }
                   }
               }
-              fprintf(stderr, "[draw] f%u %s fb %u tex %u persp %d ident %d hud %d lens %.3f,%.3f vp %d,%d %dx%d mv-t %.3f,%.3f,%.3f gun %.3f,%.3f\n", g_frame, hle_name(g_cur_id), (unsigned)g_game_fb,
+              GLboolean cm_[4] = { 0 }; glGetBooleanv(GL_COLOR_WRITEMASK, cm_);
+              GLint st_ = glIsEnabled(GL_STENCIL_TEST), sf_ = 0, sr_ = 0, sm_ = 0, sw_ = 0, so_[3] = { 0 };
+              glGetIntegerv(GL_STENCIL_FUNC, &sf_); glGetIntegerv(GL_STENCIL_REF, &sr_); glGetIntegerv(GL_STENCIL_VALUE_MASK, &sm_);
+              glGetIntegerv(GL_STENCIL_WRITEMASK, &sw_); glGetIntegerv(GL_STENCIL_FAIL, &so_[0]);
+              glGetIntegerv(GL_STENCIL_PASS_DEPTH_FAIL, &so_[1]); glGetIntegerv(GL_STENCIL_PASS_DEPTH_PASS, &so_[2]);
+              fprintf(stderr, "[draw] f%u %s fb %u tex %u persp %d ident %d hud %d lens %.3f,%.3f vp %d,%d %dx%d mv-t %.3f,%.3f,%.3f gun %.3f,%.3f cm %d%d%d%d st %d %#x ref %d mask %#x op %#x/%#x/%#x wmask %#x\n", g_frame, hle_name(g_cur_id), (unsigned)g_game_fb,
                       g_tex2d_bound, persp, g_mv_ident, hud, g_proj[g_proj_top][0], g_proj[g_proj_top][5], g_vp[0], g_vp[1], g_vp[2], g_vp[3],
-                      mv[12], mv[13], mv[14], g_gun_ndc[0], g_gun_ndc[1]);
+                      mv[12], mv[13], mv[14], g_gun_ndc[0], g_gun_ndc[1], cm_[0], cm_[1], cm_[2], cm_[3], st_, sf_, sr_, sm_, so_[0], so_[1], so_[2], sw_);
           } }
         g_fill_track = hud == 1 && !persp && g_mv && k == K_BEGIN;    /* glBegin: measured until glEnd */
         if (g_fill_track) { g_fill_box[0] = g_fill_box[1] = 1e9f; g_fill_box[2] = g_fill_box[3] = -1e9f; }

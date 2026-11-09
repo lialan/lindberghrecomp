@@ -873,7 +873,13 @@ static int watch_route(void)
  *   LINDBERGH_VT3_SPLIT=1   every point ends on the split-screen camera:
  *                           camera::initWinlose picks it when its first
  *                           getRandMT_U32() % 10 is 0 (singles), so that one
- *                           number comes back 0 - 1 point in 10 otherwise */
+ *                           number comes back 0 - 1 point in 10 otherwise
+ *   LINDBERGH_VT3_WIN=1     1P wins every point (the point's winner, match
+ *                           +0x61, is set to player 0 before match::calcPoint
+ *                           scores it): matches won in a few rallies
+ *   LINDBERGH_VT3_PRIZE_TRACE=N  LINDBERGH_TRACE_VP starts N frames after the
+ *                           result slate's first prize coin sound (its
+ *                           counter rolling), whatever frame that lands on */
 #define VT3_G_PTENNIS 0x085061a4u
 static void (*g_vt3_set_matching)(CPU *), (*g_vt3_next_round)(CPU *), (*g_vt3_match_init)(CPU *), (*g_vt3_calc_game)(CPU *);
 static int g_vt3_round = -1, g_vt3_pts[2] = { -1, -1 }, g_vt3_log;
@@ -943,6 +949,27 @@ static void h_vt3_rand(CPU *c)
     push32(c, 0xDEADBEEFu);
     g_vt3_rand(c);
 }
+static void (*g_vt3_calc_point)(CPU *);
+static void h_vt3_calc_point(CPU *c)
+{
+    wr8(A32(0) + 0x61, 0);                  /* the point goes to 1P */
+    push32(c, 0xDEADBEEFu);
+    g_vt3_calc_point(c);
+}
+static void (*g_vt3_prize_coin)(CPU *);
+static long g_vt3_prize_trace = -1;
+static void h_vt3_prize_coin(CPU *c)
+{
+    extern unsigned g_frame;
+    extern long g_arb_trace_from;
+    if (g_vt3_prize_trace >= 0) {
+        g_arb_trace_from = (long)g_frame + g_vt3_prize_trace;
+        fprintf(stderr, "[vt3] frame %u: prize counter rolling, program trace from frame %ld\n", g_frame, g_arb_trace_from);
+        g_vt3_prize_trace = -1;             /* the first coin only */
+    }
+    push32(c, 0xDEADBEEFu);
+    g_vt3_prize_coin(c);
+}
 static int vt3_wrap(const char *sym, void (**orig)(CPU *), HleHandler h)
 {
     extern void (*dispatch_lifted(uint32_t va))(CPU *);
@@ -959,6 +986,16 @@ static void vt3_jumps(void)
         fprintf(stderr, "[sega] Virtua Tennis 3: %s%d\n", g_vt3_round >= 0 ? "the run starts at round " : "rounds logged ", g_vt3_round);
     if (g_vt3_log) vt3_wrap("_ZN5match13setNext_roundEv", &g_vt3_next_round, h_vt3_next_round);
     {
+        const char *pt = getenv("LINDBERGH_VT3_PRIZE_TRACE");
+        if (pt && *pt) {
+            extern long g_arb_trace_from;
+            g_vt3_prize_trace = atol(pt);
+            g_arb_trace_from = 0x7fffffffL;     /* nothing traced before the slate */
+            if (!vt3_wrap("_ZN5sound17playSe_prize_coinEv", &g_vt3_prize_coin, h_vt3_prize_coin)) g_arb_trace_from = -1;
+        }
+        const char *w = getenv("LINDBERGH_VT3_WIN");
+        if (w && *w == '1' && vt3_wrap("_ZN5match9calcPointEv", &g_vt3_calc_point, h_vt3_calc_point))
+            fprintf(stderr, "[sega] Virtua Tennis 3: 1P wins every point\n");
         const char *sp = getenv("LINDBERGH_VT3_SPLIT");
         g_vt3_split = sp && *sp == '1';
         if (g_vt3_split && vt3_wrap("_ZN6camera11initWinloseEv", &g_vt3_init_winlose, h_vt3_init_winlose) &&

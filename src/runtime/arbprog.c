@@ -29,6 +29,8 @@
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <unistd.h>
+#include <pthread.h>
 #include <time.h>
 #include <sys/stat.h>
 #include <stdlib.h>
@@ -1999,6 +2001,18 @@ static void upload(Linked *l)
             l->up_env[st] = g_env_gen[st];
         }
         ArbProg *p = prog_get(st, id, 0);
+        {   /* LINDBERGH_ARB_LOCAL_LOG=<index>:<program>: what each draw of that program sends for the local */
+            static long li = -2, lp = -1; static unsigned nlog;
+            if (li == -2) { const char *e = getenv("LINDBERGH_ARB_LOCAL_LOG"); li = e && *e ? atol(e) : -1; if (e && strchr(e, ':')) lp = atol(strchr(e, ':') + 1); }
+            extern long g_arb_trace_from; extern unsigned g_frame;
+            if (li >= 0 && li < MAX_LOCAL && p && !st && (long)id == lp && g_arb_trace_from >= 0 && (long)g_frame + 120 >= g_arb_trace_from && nlog < 200) {
+                nlog++;
+                fprintf(stderr, "[upload] frame %u thread %ld linked %p prog %u u_loc %d local[%ld] = %g %g %g %g, %s (gen %u, sent %u)\n", g_frame,
+                        (long)(uintptr_t)pthread_self() & 0xffffff, (void *)l, (unsigned)l->prog, l->u_loc[st], li,
+                        p->local[li][0], p->local[li][1], p->local[li][2], p->local[li][3],
+                        l->up_loc[st] != p->local_gen ? "sent" : "already sent", (unsigned)p->local_gen, (unsigned)l->up_loc[st]);
+            }
+        }
         if (p && l->u_loc[st] >= 0 && l->up_loc[st] != p->local_gen) {
             int any = 0;
             for (int i = 0; i < l->nlit[st]; i++) any |= l->lit_loc[st][i];
@@ -2083,6 +2097,17 @@ void arb_local(GLenum target, GLuint index, const float *v)
     int st = stage_of(target);
     if (st < 0 || index >= MAX_LOCAL) return;
     ArbProg *p = prog_get(st, g_bound[st], 1);
+    {   /* LINDBERGH_ARB_LOCAL_LOG=<index>: each write of that local while a trace window
+         * (LINDBERGH_TRACE_FROM / a game's trigger) is open - frame, thread, program, value */
+        static long li = -2, lp = -1;           /* LINDBERGH_ARB_LOCAL_LOG=<index>[:<program>] */
+        if (li == -2) { const char *e = getenv("LINDBERGH_ARB_LOCAL_LOG"); li = e && *e ? atol(e) : -1; if (e && strchr(e, ':')) lp = atol(strchr(e, ':') + 1); }
+        extern long g_arb_trace_from; extern unsigned g_frame; static unsigned nlog;
+        if (li >= 0 && (long)index == li && (lp < 0 || (long)g_bound[st] == lp) && g_arb_trace_from >= 0 && (long)g_frame + 120 >= g_arb_trace_from && nlog < 400) {
+            nlog++;
+            fprintf(stderr, "[local] frame %u thread %ld %s program %u local[%u] = %g %g %g %g%s\n", g_frame, (long)(uintptr_t)pthread_self() & 0xffffff,
+                    st ? "fp" : "vp", g_bound[st], index, v[0], v[1], v[2], v[3], p && !memcmp(p->local[index], v, 16) ? " (same)" : "");
+        }
+    }
     if (!p || !memcmp(p->local[index], v, 16)) return;
     memcpy(p->local[index], v, 16);
     p->local_gen++;
@@ -2344,8 +2369,10 @@ static void before_draw(void)
         }
         static long tfrom = -1;
         if (tfrom < 0) { const char *v = getenv("LINDBERGH_TRACE_FROM"); tfrom = v ? atol(v) : 0; }
+        extern long g_arb_trace_from;           /* a game's own trigger (hle_sega.c), when set: wins */
+        long from = g_arb_trace_from >= 0 ? g_arb_trace_from : tfrom;
         int by_vp = 0;
-        for (int k = 0; k < ntvp; k++) if ((int)vid == tvp[k] && tvn < 60 && (long)g_frame >= tfrom) by_vp = 1;
+        for (int k = 0; k < ntvp; k++) if ((int)vid == tvp[k] && tvn < 60 && (long)g_frame >= from) by_vp = 1;
         if (by_vp) { extern int g_arg_trace_draw; tvn++; g_arg_trace_draw = 1; }   /* its vertices too */
         if ((tf > 1 && g_frame == (unsigned)tf) || (dl && g_frame % 500 == 0) || by_vp) {
             GLint fb = 0, vp[4] = {0}; glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb); glGetIntegerv(GL_VIEWPORT, vp);
@@ -2444,12 +2471,15 @@ static void before_draw(void)
                 }
                 glActiveTexture((GLenum)act);
                 if (l && l->ok) {   /* the vertex program's c[4], c[5]; the arrays that feed it */
-                    GLfloat c4[4] = {0}, c5[4] = {0}, cur[4] = {0};
+                    GLfloat c4[4] = {0}, c5[4] = {0}, c6[4] = {0}, c7[4] = {0}, cur[4] = {0};
                     GLint lc4 = glGetUniformLocation(l->prog, "v_loc[4]"), lc5 = glGetUniformLocation(l->prog, "v_loc[5]");
+                    GLint lc6 = glGetUniformLocation(l->prog, "v_loc[6]"), lc7 = glGetUniformLocation(l->prog, "v_loc[7]");
                     GLint prevp = 0; glGetIntegerv(GL_CURRENT_PROGRAM, &prevp);
                     glUseProgram(l->prog); upload(l);
                     if (lc4 >= 0) glGetUniformfv(l->prog, lc4, c4);
                     if (lc5 >= 0) glGetUniformfv(l->prog, lc5, c5);
+                    if (lc6 >= 0) glGetUniformfv(l->prog, lc6, c6);
+                    if (lc7 >= 0) glGetUniformfv(l->prog, lc7, c7);
                     glUseProgram((GLuint)prevp);
                     glGetFloatv(GL_CURRENT_COLOR, cur);
                     char en[64] = ""; int o = 0;
@@ -2518,9 +2548,32 @@ static void before_draw(void)
                             glActiveTexture((GLenum)actx);
                         }
                     }
-                    fprintf(stderr, "[draw]   c4 %g %g %g %g  c5 %g %g %g %g  color array %d  attribs %s  current color %g %g %g %g\n",
-                            c4[0], c4[1], c4[2], c4[3], c5[0], c5[1], c5[2], c5[3], glIsEnabled(GL_COLOR_ARRAY), en,
-                            cur[0], cur[1], cur[2], cur[3]);
+                    fprintf(stderr, "[draw]   c4 %g %g %g %g  c5 %g %g %g %g  c6 %g %g %g %g  c7 %g %g %g %g  color array %d  attribs %s  current color %g %g %g %g\n",
+                            c4[0], c4[1], c4[2], c4[3], c5[0], c5[1], c5[2], c5[3], c6[0], c6[1], c6[2], c6[3], c7[0], c7[1], c7[2], c7[3],
+                            glIsEnabled(GL_COLOR_ARRAY), en, cur[0], cur[1], cur[2], cur[3]);
+                    {   /* the texture coordinates it starts from: generic attribute 8 (what NVIDIA reads)
+                         * and the classic texcoord array of unit 0 (what gl_MultiTexCoord0 is) */
+                        GLint on = 0, buf = 0, stride = 0, size = 0, type = 0; void *ptr = NULL;
+                        glGetVertexAttribiv(8, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &on);
+                        glGetVertexAttribiv(8, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &buf);
+                        glGetVertexAttribiv(8, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &stride);
+                        glGetVertexAttribiv(8, GL_VERTEX_ATTRIB_ARRAY_SIZE, &size);
+                        glGetVertexAttribiv(8, GL_VERTEX_ATTRIB_ARRAY_TYPE, &type);
+                        glGetVertexAttribPointerv(8, GL_VERTEX_ATTRIB_ARRAY_POINTER, &ptr);
+                        float uv[4][2] = {{0}};
+                        int st = stride ? stride : size * 4;
+                        if (on && type == GL_FLOAT) for (int k = 0; k < 4; k++) {
+                            if (buf) { GLint was = 0; glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &was); glBindBuffer(GL_ARRAY_BUFFER, (GLuint)buf);
+                                       glGetBufferSubData(GL_ARRAY_BUFFER, (GLintptr)(uintptr_t)ptr + st * k, 8, uv[k]); glBindBuffer(GL_ARRAY_BUFFER, (GLuint)was); }
+                            else if (ptr) memcpy(uv[k], (const char *)ptr + st * k, 8);
+                        }
+                        GLint cta = 0, ccl = 0; glGetIntegerv(GL_CLIENT_ACTIVE_TEXTURE, &ccl); glClientActiveTexture(GL_TEXTURE0);
+                        cta = glIsEnabled(GL_TEXTURE_COORD_ARRAY); glClientActiveTexture((GLenum)ccl);
+                        GLfloat ctc[4] = {0}; glGetFloatv(GL_CURRENT_TEXTURE_COORDS, ctc);
+                        fprintf(stderr, "[draw]   attrib8 on %d buf %d stride %d size %d type %#x ptr %p uv %g,%g %g,%g %g,%g %g,%g; texcoord0 array %d current %g,%g\n",
+                                on, buf, stride, size, type, ptr, uv[0][0], uv[0][1], uv[1][0], uv[1][1], uv[2][0], uv[2][1], uv[3][0], uv[3][1],
+                                cta, ctc[0], ctc[1]);
+                    }
                 }
                 {   /* skinning inputs (generic 1 = weights/indices, 7 = more of both):
                      * what GL was given, and the bone rows the shader will read */
@@ -2823,3 +2876,6 @@ int arb_camera_basis(float right[3], float up[3], float fwd[3])
 /* the programs a draw now would use (0: none), for the frame map */
 unsigned arb_bound_vp(void) { return g_enabled[0] ? g_bound[0] : 0; }
 unsigned arb_bound_fp(void) { return g_enabled[1] ? g_bound[1] : 0; }
+
+/* set by a game's trigger (hle_sega.c, LINDBERGH_VT3_PRIZE_TRACE): LINDBERGH_TRACE_VP starts at this frame */
+long g_arb_trace_from = -1;
