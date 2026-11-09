@@ -36,6 +36,7 @@
 
 #include "gl_posix.h"
 #include "arbprog.h"
+#include "game_profile.h"
 #ifdef LINDBERGH_GL4ES
 extern int gl4es_mv_shaders;      /* gl4es' multiview (multiview.c in quest/gl4es.patch) */
 extern int gl4es_mv_trace;
@@ -76,7 +77,10 @@ typedef struct {
 static ArbProg *g_prog[2][MAX_IDS];       /* [0] vertex, [1] fragment */
 static GLuint   g_bound[2];
 static unsigned g_tr_layered;      /* fragment units to read per view (target 7) */
+static unsigned g_tr_cmp2d;        /* fragment units read as 2D whose texture compares depth (target 6) */
 void gl4es_multiview_layered(unsigned texture);
+unsigned gl4es_compare_units(void);
+void gl4es_mark_shadow(int unit);
 int stereo_is_picture_texture(unsigned tex);
 static int      g_enabled[2];
 static float    g_env[2][MAX_ENV][4];
@@ -156,6 +160,7 @@ typedef struct {
     int     nlit;
     int     lit_idx[16];
     float   lit[16][4];
+    int     lit_loc[16];               /* 1: into program.local, not env */
 } Tr;
 
 static int fail(Tr *t, const char *fmt, ...)
@@ -436,17 +441,21 @@ static int declare_param_array(Tr *t, const char *name, const char *init)
         char tmp2[8192];
         snprintf(tmp2, sizeof tmp2, "%s", s);
         char *cur2 = tmp2;
-        int k2 = 0, ok2 = 1, nl = 0, li[16];
+        int k2 = 0, ok2 = 1, nl = 0, li[16], kind = -1;   /* 0 env, 1 local */
         float lv[16][4];
         for (char *item; ok2 && (item = next_item(&cur2)); ) {
             item = trim(item);
-            if (sscanf(item, "program.env[%d..%d%c", &lo, &hi, &c) == 3 && c == ']') {
+            int ik = !strncmp(item, "program.env[", 12) ? 0 : !strncmp(item, "program.local[", 14) ? 1 : -1;
+            const char *ix = ik == 0 ? item + 12 : ik == 1 ? item + 14 : NULL;
+            if (ix && kind >= 0 && ik != kind) ok2 = 0;
+            else if (ix && sscanf(ix, "%d..%d%c", &lo, &hi, &c) == 3 && c == ']') {
                 if (lo != k2) ok2 = 0;
-                k2 = hi + 1;
-            } else if (sscanf(item, "program.env[%d%c", &lo, &c) == 2 && c == ']') {
+                k2 = hi + 1; kind = ik;
+            } else if (ix && sscanf(ix, "%d%c", &lo, &c) == 2 && c == ']') {
                 if (lo != k2) ok2 = 0;
-                k2++;
-            } else if (nl < 16 && (*item == '{' || *item == '-' || *item == '.' || isdigit((unsigned char)*item))) {
+                k2++; kind = ik;
+            } else if (ix) ok2 = 0;
+            else if (nl < 16 && (*item == '{' || *item == '-' || *item == '.' || isdigit((unsigned char)*item))) {
                 float v[4] = { 0, 0, 0, 1 };
                 char *q = item + (*item == '{'), *end;
                 int nv = 0;
@@ -463,13 +472,15 @@ static int declare_param_array(Tr *t, const char *name, const char *init)
                 k2++;
             } else ok2 = 0;
         }
-        if (ok2 && nl && k2 > 16 && t->nlit + nl <= 16) {
+        if (ok2 && nl && kind >= 0 && k2 > 16 && t->nlit + nl <= 16) {
             Sym *y = sym_add(t, name, SYM_ARRAY);
             if (!y) return 0;
-            snprintf(y->expr, sizeof y->expr, "%s_env", t->stage ? "f" : "v");
+            snprintf(y->expr, sizeof y->expr, "%s_%s", t->stage ? "f" : "v", kind ? "loc" : "env");
             y->base = 0; y->len = k2;
-            if (k2 - 1 > t->env_hi) t->env_hi = k2 - 1;
+            if (kind) { if (k2 - 1 > t->local_hi) t->local_hi = k2 - 1; }
+            else if (k2 - 1 > t->env_hi) t->env_hi = k2 - 1;
             for (int i = 0; i < nl; i++) {
+                t->lit_loc[t->nlit] = kind;
                 t->lit_idx[t->nlit] = li[i];
                 memcpy(t->lit[t->nlit], lv[i], sizeof lv[i]);
                 t->nlit++;
@@ -931,6 +942,15 @@ static int emit_instr(Tr *t, char *stmt)
         int shadow_as_2d = target == 6 && t->tex_target[unit] == 2;
         if (shadow_as_2d) target = 2;
 #ifdef LINDBERGH_GL4ES
+        /* a depth texture with its compare on, read through a plain 2D target:
+         * NVIDIA compares (Virtua Tennis 3's player shadows); GLES leaves
+         * that undefined and the Quest returned 0 - the players black. A
+         * shadow map, then, compared in the shader. */
+        if (target == 2 && t->stage == 1 && (g_tr_cmp2d >> unit & 1)) target = 6;
+#else
+        if (target == 2 && t->stage == 1 && (g_tr_cmp2d >> unit & 1)) target = 6;
+#endif
+#ifdef LINDBERGH_GL4ES
         /* the world's picture, drawn in both views: this view's layer */
         if (target == 2 && t->stage == 1 && gl4es_mv_shaders && (g_tr_layered >> unit & 1)) target = 7;
 #endif
@@ -960,10 +980,16 @@ static int emit_instr(Tr *t, char *stmt)
         }
 #ifdef LINDBERGH_GL4ES
         /* the depth compare (LEQUAL) done here, on a plain sampler: see shadow_compare */
-        else if (target == 6 && proj)
-            snprintf(r, sizeof r, "vec4(step(%s.z / %s.w, texture2DProj(ss_%d, %s).x))", X(0), X(0), unit, X(0));
-        else if (target == 6)
-            snprintf(r, sizeof r, "vec4(step(%s.z, texture2D(ss_%d, %s.xy).x))", X(0), unit, X(0));
+        else if (target == 6) {
+            /* LINDBERGH_SHADOW_BIAS=<depth>: taken off the reference before
+             * the compare - the driver's filtered compare forgives surfaces
+             * their own depth; a nearest one, at the GLES texture's precision,
+             * shadows them (Virtua Tennis 3's players came out too dark) */
+            static float bias = -1;
+            if (bias < 0) { const char *v = getenv("LINDBERGH_SHADOW_BIAS"); bias = v && *v ? (float)atof(v) : game_profile()->vr.shadow_bias; }
+            if (proj) snprintf(r, sizeof r, "vec4(step(%s.z / %s.w - %.6f, texture2DProj(ss_%d, %s).x))", X(0), X(0), bias, unit, X(0));
+            else      snprintf(r, sizeof r, "vec4(step(%s.z - %.6f, texture2D(ss_%d, %s.xy).x))", X(0), bias, unit, X(0));
+        }
 #endif
         else if (proj && target != 4)
             snprintf(r, sizeof r, "%sProj(%s%d, %s)", fnb[target], sm[target], unit, X(0));
@@ -1332,7 +1358,7 @@ out:
 /* ------------------------------------------------------------------------ */
 
 typedef struct {
-    GLuint vid, fid; unsigned vgen, fgen;
+    GLuint vid, fid; unsigned vgen, fgen, cmp2d;
     GLuint prog;
     int    ok;
     MatRef mat[2][16]; int nmat[2];
@@ -1340,6 +1366,7 @@ typedef struct {
     GLint  u_env[2], u_loc[2], u_mat[2][16], u_rect, u_reproj, u_gen;
     int    nlit[2], lit_idx[2][16];         /* literals in the program's env (Tr) */
     float  lit[2][16][4];
+    int    lit_loc[2][16];
     GLint  n_rect;                          /* u_rect_norm's length as the driver keeps it */
     unsigned rect_units;                /* texture units sampled as rectangles */
     unsigned shadow_units;              /* and as shadow maps (a depth compare) */
@@ -1484,10 +1511,37 @@ static Linked *link_pair(GLuint vid, GLuint fid)
 {
     ArbProg *vp = vid ? prog_get(0, vid, 0) : NULL;
     ArbProg *fp = fid ? prog_get(1, fid, 0) : NULL;
-    unsigned vgen = vp ? vp->gen : 0, fgen = fp ? fp->gen : 0;
+    unsigned vgen = vp ? vp->gen : 0, fgen = fp ? fp->gen : 0, cmp2d = 0;
+#ifdef LINDBERGH_GL4ES
+    /* depth-compare textures bound now: a variant reading them as shadow maps */
+    if (fp) {
+        extern int gl4es_depth_is_shadow;
+        gl4es_depth_is_shadow = game_profile()->vr.depth_tex_shadow;
+        cmp2d = gl4es_compare_units();
+    }
+#else
+    /* LINDBERGH_FORCE_SHADOW=1: the same variant on the desktop (a
+     * sampler2DShadow, the driver comparing) - what the Quest's in-shader
+     * compare should look like, to check it against */
+    static int force_shadow = -1;
+    if (force_shadow < 0) { const char *v = getenv("LINDBERGH_FORCE_SHADOW"); force_shadow = v && *v == '1'; }
+    if (fp && force_shadow) {
+        GLint active = GL_TEXTURE0;
+        glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+        for (int u = 0; u < 16; u++) {
+            GLint tex = 0, f = 0;
+            glActiveTexture(GL_TEXTURE0 + u);
+            glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
+            if (!tex) continue;
+            glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_INTERNAL_FORMAT, &f);
+            if (f == 0x1902 || f == 0x81a5 || f == 0x81a6 || f == 0x81a7 || f == 0x88f0) cmp2d |= 1u << u;
+        }
+        glActiveTexture((GLenum)active);
+    }
+#endif
     for (int i = 0; i < g_nlinked; i++) {
         Linked *l = &g_linked[i];
-        if (l->vid == vid && l->fid == fid && l->vgen == vgen && l->fgen == fgen) return l;
+        if (l->vid == vid && l->fid == fid && l->vgen == vgen && l->fgen == fgen && l->cmp2d == cmp2d) return l;
     }
     clock_gettime(CLOCK_MONOTONIC, &g_link_t0);    /* translate, compile and link */
     if (g_nlinked >= MAX_LINKED) {          /* full: start over */
@@ -1496,7 +1550,7 @@ static Linked *link_pair(GLuint vid, GLuint fid)
     }
     Linked *l = &g_linked[g_nlinked++];
     memset(l, 0, sizeof *l);
-    l->vid = vid; l->fid = fid; l->vgen = vgen; l->fgen = fgen;
+    l->vid = vid; l->fid = fid; l->vgen = vgen; l->fgen = fgen; l->cmp2d = cmp2d;
     l->up_env[0] = l->up_env[1] = l->up_loc[0] = l->up_loc[1] = ~0u;
     if (g_dump < 0) { const char *d = getenv("LINDBERGH_ARB_DUMP"); g_dump = d && *d && *d != '0'; }
 
@@ -1512,6 +1566,10 @@ static Linked *link_pair(GLuint vid, GLuint fid)
 #ifdef LINDBERGH_GL4ES
         /* units holding the world's picture now are read per view (stereo.c) */
         g_tr_layered = 0;
+#endif
+        g_tr_cmp2d = st == 1 ? cmp2d : 0;
+#ifdef LINDBERGH_GL4ES
+        if (g_tr_cmp2d) fprintf(stderr, "[arb] fragment program %u: units %#x compare depth, read as shadow maps\n", fid, g_tr_cmp2d);
         if (st == 1 && gl4es_mv_shaders) {
             GLint active = GL_TEXTURE0;
             glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
@@ -1546,6 +1604,7 @@ static Linked *link_pair(GLuint vid, GLuint fid)
         l->nlit[st] = t.nlit;
         memcpy(l->lit_idx[st], t.lit_idx, sizeof t.lit_idx);
         memcpy(l->lit[st], t.lit, sizeof t.lit);
+        memcpy(l->lit_loc[st], t.lit_loc, sizeof t.lit_loc);
         l->local_hi[st] = t.local_hi;
         if (st == 0) {
             /* generic attributes at the indices the program named */
@@ -1859,7 +1918,7 @@ static void upload(Linked *l)
                 static float env[MAX_ENV][4];
                 memcpy(env, g_env[st], (size_t)(l->env_hi[st] + 1) * sizeof env[0]);
                 for (int i = 0; i < l->nlit[st]; i++)
-                    if (l->lit_idx[st][i] <= l->env_hi[st]) memcpy(env[l->lit_idx[st][i]], l->lit[st][i], sizeof env[0]);
+                    if (!l->lit_loc[st][i] && l->lit_idx[st][i] <= l->env_hi[st]) memcpy(env[l->lit_idx[st][i]], l->lit[st][i], sizeof env[0]);
                 glUniform4fv(l->u_env[st], l->env_hi[st] + 1, &env[0][0]);
             } else
                 glUniform4fv(l->u_env[st], l->env_hi[st] + 1, &g_env[st][0][0]);
@@ -1867,7 +1926,16 @@ static void upload(Linked *l)
         }
         ArbProg *p = prog_get(st, id, 0);
         if (p && l->u_loc[st] >= 0 && l->up_loc[st] != p->local_gen) {
-            glUniform4fv(l->u_loc[st], l->local_hi[st] + 1, &p->local[0][0]);
+            int any = 0;
+            for (int i = 0; i < l->nlit[st]; i++) any |= l->lit_loc[st][i];
+            if (any) {      /* the literals go into this program's copy only */
+                static float loc[MAX_LOCAL][4];
+                memcpy(loc, p->local, (size_t)(l->local_hi[st] + 1) * sizeof loc[0]);
+                for (int i = 0; i < l->nlit[st]; i++)
+                    if (l->lit_loc[st][i] && l->lit_idx[st][i] <= l->local_hi[st]) memcpy(loc[l->lit_idx[st][i]], l->lit[st][i], sizeof loc[0]);
+                glUniform4fv(l->u_loc[st], l->local_hi[st] + 1, &loc[0][0]);
+            } else
+                glUniform4fv(l->u_loc[st], l->local_hi[st] + 1, &p->local[0][0]);
             l->up_loc[st] = p->local_gen;
         }
         for (int i = 0; i < l->nmat[st]; i++) {
@@ -2037,13 +2105,14 @@ void arb_before_draw(void)
  * all shadowed, were gone - so the program reads it as a plain texture and
  * compares in the shader. That needs the texture's own compare off, and
  * nearest filtering: GLES 3 filters depth only when it compares. */
-static void shadow_compare(unsigned units)
+static void shadow_compare(unsigned units, unsigned from_2d)
 {
     GLint active = GL_TEXTURE0;
     glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
     for (int u = 0; u < 16; u++) {
         if (!(units & (1u << u))) continue;
         glActiveTexture(GL_TEXTURE0 + u);
+        if (from_2d >> u & 1) gl4es_mark_shadow(u);    /* stays a shadow map for the next draw's variant */
         glTexParameteri(GL_TEXTURE_2D, 0x884C /* COMPARE_MODE */, GL_NONE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
@@ -2446,7 +2515,7 @@ static void before_draw(void)
         upload(l);
 #ifdef LINDBERGH_GL4ES
         rect_enables(l->rect_units);
-        if (l->shadow_units) shadow_compare(l->shadow_units);
+        if (l->shadow_units) shadow_compare(l->shadow_units, l->cmp2d);
 #endif
         return;
     }
@@ -2526,7 +2595,11 @@ int arb_env_projection(float P[16])
     if (!p->pos_kind) p->pos_kind = passes_position(p->src) ? 2 : 1;
     for (int i = 0; i < 16; i++) P[i] = i % 5 ? 0.0f : 1.0f;
     if (p->pos_kind == 2) return 1;
-    const float (*c)[4] = (const float (*)[4])g_env[0];      /* the matrix's columns */
+    /* the matrix's columns: program.env[0..3], or the program's own
+     * program.local[0..3] where the game keeps it there (VT3) - read from
+     * env there, every draw looked 2D and its match was drawn as HUD */
+    const float (*c)[4] = game_profile()->vr.camera_in_locals ? (const float (*)[4])p->local
+                                                               : (const float (*)[4])g_env[0];
     float r0[3] = { c[0][0], c[1][0], c[2][0] }, r1[3] = { c[0][1], c[1][1], c[2][1] },
           r2[3] = { c[0][2], c[1][2], c[2][2] }, r3[3] = { c[0][3], c[1][3], c[2][3] };
 #define DOT3(a, b) ((a)[0] * (b)[0] + (a)[1] * (b)[1] + (a)[2] * (b)[2])

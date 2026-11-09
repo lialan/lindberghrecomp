@@ -115,6 +115,7 @@ static struct {
     GLenum (APIENTRY *GetError)(void);
     void (APIENTRY *BindTexture)(GLenum, GLuint);
     void (APIENTRY *GetTexLevelParameteriv)(GLenum, GLint, GLenum, GLint *);
+    void (APIENTRY *Finish)(void);
 } gl;
 
 static int gl_load(void)
@@ -130,7 +131,7 @@ static int gl_load(void)
     L(BindFramebuffer) L(GenFramebuffers) L(FramebufferTexture2D) L(CheckFramebufferStatus)
     L(BlitFramebuffer) L(GetIntegerv) L(IsEnabled) L(Enable) L(Disable) L(GetString)
     L(GenRenderbuffers) L(BindRenderbuffer) L(RenderbufferStorage) L(FramebufferRenderbuffer)
-    L(FramebufferTextureLayer) L(ReadPixels) L(GetError) L(BindTexture) L(GetTexLevelParameteriv)
+    L(FramebufferTextureLayer) L(ReadPixels) L(GetError) L(BindTexture) L(GetTexLevelParameteriv) L(Finish)
 #undef L
     return 1;
 }
@@ -1242,9 +1243,19 @@ static void aim_probe(void)
     }
 }
 
+/* LINDBERGH_XR_PROF=1: where the frame's end waits - the game's GPU work
+ * (a finish on entry), the copies into the headset's images, xrEndFrame.
+ * Each finish stalls the pipeline: a measurement, not a way to run. */
+static int xr_prof = -1;
+static double xp_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
+static double xp_t0, xp_game, xp_copy, xp_end; static unsigned xp_n;
+static void xp_mark(double *acc) { if (xr_prof > 0) { gl.Finish(); double t = xp_ms(); *acc += t - xp_t0; xp_t0 = t; } }
+
 void xr_frame_end(void)
 {
     if (!in_frame) return;
+    if (xr_prof < 0) { const char *v = getenv("LINDBERGH_XR_PROF"); xr_prof = v && *v == '1'; }
+    if (xr_prof > 0) { xp_t0 = xp_ms(); xp_mark(&xp_game); }
     XrCompositionLayerProjectionView pv[2];
     XrCompositionLayerDepthInfoKHR di[2];
     int ok = views_ok && frame.shouldRender;
@@ -1350,6 +1361,39 @@ void xr_frame_end(void)
                     if (xo2.gun_valid) xo_draw(&xo2, vp, eye_pos, (int)e->w, (int)e->h);
                 }
             }
+            {   /* LINDBERGH_XR_SHOT=<first>,<every>: the left eye exactly as handed to
+                 * the headset, a quarter the size, as xrshot_<frame>.ppm beside the
+                 * game - what the player sees, for runs nobody is watching */
+                static long first = -2, every = 0;
+                if (first == -2) {
+                    const char *v = getenv("LINDBERGH_XR_SHOT");
+                    first = v && *v ? atol(v) : -1;
+                    every = v && strchr(v, ',') ? atol(strchr(v, ',') + 1) : 0;
+                }
+                if (i == 0 && first >= 0 && (long)g_frame >= first &&
+                    (every > 0 ? ((long)g_frame - first) % every == 0 : (long)g_frame == first)) {
+                    int w = (int)e->w, h = (int)e->h;
+                    unsigned char *px = malloc((size_t)w * h * 4);
+                    if (px) {
+                        gl.BindFramebuffer(GL_READ_FRAMEBUFFER, e->fb[e->acquired]);
+                        gl.ReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+                        gl.BindFramebuffer(GL_READ_FRAMEBUFFER, read_fb);
+                        char name[64]; snprintf(name, sizeof name, "xrshot_%05u.ppm", g_frame);
+                        FILE *f = fopen(name, "wb");
+                        if (f) {
+                            static int full = -1;   /* LINDBERGH_XR_SHOT_FULL=1: the whole size */
+                            if (full < 0) { const char *fv = getenv("LINDBERGH_XR_SHOT_FULL"); full = fv && *fv == '1'; }
+                            int st = full ? 1 : 4, qw = w / st, qh = h / st;
+                            fprintf(f, "P6\n%d %d\n255\n", qw, qh);
+                            for (int y = qh - 1; y >= 0; y--)        /* GL rows run bottom up */
+                                for (int x = 0; x < qw; x++) fwrite(px + ((size_t)(y * st) * w + x * st) * 4, 1, 3, f);
+                            fclose(f);
+                            fprintf(stderr, "[xr] shot frame %u -> %s\n", g_frame, name);
+                        }
+                        free(px);
+                    }
+                }
+            }
             XrSwapchainImageReleaseInfo ri = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
             xrReleaseSwapchainImage(e->chain, &ri);
 
@@ -1403,7 +1447,16 @@ void xr_frame_end(void)
         fprintf(stderr, "[xr] frame %u: %s (views %d, should render %d, state %d)\n", g_frame,
                 ok ? "showing the game" : "nothing to show", views_ok, (int)frame.shouldRender, (int)state);
     last_ok = ok;
+    xp_mark(&xp_copy);
     XrResult er = xrEndFrame(session, &ei);
+    if (xr_prof > 0) {
+        xp_end += xp_ms() - xp_t0;
+        if (++xp_n == 60) {
+            fprintf(stderr, "[xrprof] frame %u: game's GPU work %.1f ms, eye copies %.1f ms, xrEndFrame %.1f ms (flat %d)\n",
+                    g_frame, xp_game / xp_n, xp_copy / xp_n, xp_end / xp_n, flat);
+            xp_game = xp_copy = xp_end = 0; xp_n = 0;
+        }
+    }
     static unsigned bad;
     if (XR_FAILED(er) && bad++ < 20) fprintf(stderr, "[xr] frame %u: xrEndFrame failed %d\n", g_frame, (int)er);
 }

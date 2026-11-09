@@ -139,6 +139,7 @@ static GLint    g_eye_vp[4];            /* the viewport GL has, in eye pixels */
 static int      g_side;                 /* inside a side pass */
 static GLint    g_game_scissor[4];      /* the game's scissor box, in its pixels */
 static unsigned g_scene_draws;          /* 3D draws in the world this frame */
+static unsigned g_eyes_copied_frame = ~0u;  /* the last frame a whole-screen copy was taken of a world */
 static float    g_lens_seen;            /* the longest lens (projection x scale) drawn with this frame */
 static float    g_zoom_lens = 8.0f;     /* a longer one is a zoomed view: the sniper scope is 11.4, the
                                          * game's own camera 1.7-2.4 and its zooms on a target up to ~6 */
@@ -1228,6 +1229,7 @@ static int copy_from_eyes(CPU *c, int k)
     int X0 = (int)lroundf(x * sx), Y0 = (int)lroundf(y * sy);
     int X1 = (int)lroundf((x + w) * sx), Y1 = (int)lroundf((y + h) * sy);
     gl4es_multiview_copy(g_side ? g_side_tex[0] : g_eye_tex[0], 0, X0, Y0, X1, Y1, (GLuint)tex, level, xo, yo, xo + w, yo + h);
+    if (!g_side && w >= GAME_W * 9 / 10 && h >= GAME_H * 9 / 10 && g_scene_draws) g_eyes_copied_frame = g_frame;
     if (!g_side && w >= GAME_W * 9 / 10 && h >= GAME_H * 9 / 10 && !screen_copy((GLuint)tex) && g_nscreen_copy < MAX_SCREEN_COPIES) {
         g_screen_copy[g_nscreen_copy++] = (GLuint)tex;
         fprintf(stderr, "[stereo] frame %u: texture %d is a copy of the whole screen\n", g_frame, tex);
@@ -1457,6 +1459,27 @@ static int transform_call(CPU *c, HleId id, const char *n)
          * sees, so outside it last frame's pixels stayed and dragged along
          * whenever the camera or the head moved. Clear the colour too. */
         GLbitfield mask = A32(0);
+        /* Virtua Tennis 3 draws its world, copies the screen, clears the
+         * colour and composites the copy back (depth of field, glare). The
+         * composite is left out below - it would flatten the world to one
+         * eye - so the clear before it must go too, or the eyes are left
+         * black with only the HUD drawn over them. Depth and stencil still
+         * clear. */
+        {   /* LINDBERGH_CLEAR_LOG=1: each colour clear of the eyes, the first 60 */
+            static int on = -1, n;
+            if (on < 0) { const char *v = getenv("LINDBERGH_CLEAR_LOG"); on = v && *v == '1'; }
+            if (on && (mask & GL_COLOR_BUFFER_BIT) && n < 60 && g_scene_draws) {
+                n++;
+                fprintf(stderr, "[clear] frame %u mask %#x fb %u side %d mv %d scene draws %u, copied frame %u, world fb %u\n",
+                        g_frame, mask, (unsigned)g_game_fb, g_side, g_mv, g_scene_draws, g_eyes_copied_frame, (unsigned)g_world_fb);
+            }
+        }
+        if (g_on && g_mv && !g_side && g_game_fb == 0 && (mask & GL_COLOR_BUFFER_BIT) &&
+            g_scene_draws && g_eyes_copied_frame == g_frame) {
+            mask &= ~(GLbitfield)GL_COLOR_BUFFER_BIT;
+            if (!mask) return 1;
+            wr32(c->esp, mask);
+        }
         if ((long)g_frame == g_cap_frame || (long)g_frame + 1 == g_cap_frame)
             fprintf(stderr, "[units] frame %u clear %#x fb %u vp %d,%d %dx%d side %d\n", g_frame, mask, (unsigned)g_game_fb, g_vp[0], g_vp[1], g_vp[2], g_vp[3], g_side);
         if (g_mv && g_pbuffers && (g_game_fb == 0 || g_side))
@@ -1589,6 +1612,18 @@ static int transform_call(CPU *c, HleId id, const char *n)
         if (skp > 0 && (is_draw(k) || k == K_BEGIN)) {
             GLint pr = 0; glGetIntegerv(GL_CURRENT_PROGRAM, &pr);
             if (pr == skp) { if (k == K_BEGIN) g_skip_begin = 1; return 1; }
+        }
+        /* LINDBERGH_SKIP_DRAWS=offscreen|main|all: whole groups of draws left
+         * out, finding where a GPU-bound frame's time goes */
+        static int skd = -1;
+        if (skd < 0) {
+            const char *v = getenv("LINDBERGH_SKIP_DRAWS");
+            skd = !v ? 0 : !strcmp(v, "offscreen") ? 1 : !strcmp(v, "main") ? 2 : !strcmp(v, "all") ? 3 : 0;
+        }
+        if (skd && (is_draw(k) || k == K_BEGIN) &&
+            (skd == 3 || (skd == 1 && g_game_fb) || (skd == 2 && !g_game_fb))) {
+            if (k == K_BEGIN) g_skip_begin = 1;
+            return 1;
         }
     }
     if (g_on && (is_draw(k) || k == K_BEGIN)) {
