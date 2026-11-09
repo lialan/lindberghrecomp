@@ -861,10 +861,93 @@ static int watch_route(void)
     return guest_override("_Z8GameLoopP8GAMEWORK", h_game_loop);
 }
 
+/* Virtua Tennis 3: jumps to a broken section, for reproducing bugs without
+ * playing up to them. The match object (g_pTennis + 0x1c) holds the round of
+ * a Road to the Championship run at +0x0c (match::setRound; setNext_round adds
+ * one per win; setMatching picks that round's opponent from +0xac), and the
+ * current game's points at +0x06 / +0x07 (0, 1, 2, 3 = 0, 15, 30, 40; zeroed by
+ * match::init and calcGame).
+ *   LINDBERGH_VT3_ROUND=N   the run's first match is round N (0-based)
+ *   LINDBERGH_VT3_POINTS=a,b every game starts at those points (3,0 = 40-0)
+ *   LINDBERGH_VT3_LOG=1     each matching, next round and new game logged */
+#define VT3_G_PTENNIS 0x085061a4u
+static void (*g_vt3_set_matching)(CPU *), (*g_vt3_next_round)(CPU *), (*g_vt3_match_init)(CPU *), (*g_vt3_calc_game)(CPU *);
+static int g_vt3_round = -1, g_vt3_pts[2] = { -1, -1 }, g_vt3_log;
+static void h_vt3_set_matching(CPU *c)
+{
+    extern unsigned g_frame;
+    uint32_t m = A32(0);
+    if (g_vt3_round >= 0) {
+        fprintf(stderr, "[vt3] frame %u: round %u -> %d (LINDBERGH_VT3_ROUND)\n", g_frame, rd32(m + 0x0c), g_vt3_round);
+        wr32(m + 0x0c, (uint32_t)g_vt3_round);
+        g_vt3_round = -1;                    /* once: later wins advance from there */
+    }
+    push32(c, 0xDEADBEEFu);
+    g_vt3_set_matching(c);
+    if (g_vt3_log)
+        fprintf(stderr, "[vt3] frame %u: setMatching, round %u, mode %u\n", g_frame, rd32(m + 0x0c), rd32(rd32(VT3_G_PTENNIS) + 0x24));
+}
+static void h_vt3_next_round(CPU *c)
+{
+    extern unsigned g_frame;
+    uint32_t m = A32(0), before = rd32(m + 0x0c);
+    push32(c, 0xDEADBEEFu);
+    g_vt3_next_round(c);
+    fprintf(stderr, "[vt3] frame %u: setNext_round, round %u -> %u\n", g_frame, before, rd32(m + 0x0c));
+}
+/* A new game: the points are 0-0 after match::init (the match's first) and
+ * after calcGame (each finished game; match::initGame is never called) */
+static void vt3_new_game(uint32_t m, const char *by)
+{
+    extern unsigned g_frame;
+    if (rd8(m + 0x06) || rd8(m + 0x07)) return;     /* calcGame without a finished game */
+    if (g_vt3_pts[0] >= 0) {
+        wr8(m + 0x06, (uint8_t)g_vt3_pts[0]);
+        wr8(m + 0x07, (uint8_t)g_vt3_pts[1]);
+    }
+    if (g_vt3_log)
+        fprintf(stderr, "[vt3] frame %u: new game (%s), points %u-%u, round %u\n", g_frame, by, rd8(m + 0x06), rd8(m + 0x07), rd32(m + 0x0c));
+}
+static void h_vt3_match_init(CPU *c)
+{
+    uint32_t m = A32(0);
+    push32(c, 0xDEADBEEFu);
+    g_vt3_match_init(c);
+    vt3_new_game(m, "match");
+}
+static void h_vt3_calc_game(CPU *c)
+{
+    uint32_t m = A32(0);
+    push32(c, 0xDEADBEEFu);
+    g_vt3_calc_game(c);
+    vt3_new_game(m, "game");
+}
+static int vt3_wrap(const char *sym, void (**orig)(CPU *), HleHandler h)
+{
+    extern void (*dispatch_lifted(uint32_t va))(CPU *);
+    uint32_t va = guest_symbol(sym);
+    return va && (*orig = dispatch_lifted(va)) && guest_override(sym, h);
+}
+static void vt3_jumps(void)
+{
+    const char *r = getenv("LINDBERGH_VT3_ROUND"), *p = getenv("LINDBERGH_VT3_POINTS"), *l = getenv("LINDBERGH_VT3_LOG");
+    g_vt3_log = l && *l == '1';
+    if (r && *r) g_vt3_round = atoi(r);
+    if (p && *p && sscanf(p, "%d,%d", &g_vt3_pts[0], &g_vt3_pts[1]) != 2) g_vt3_pts[0] = g_vt3_pts[1] = -1;
+    if ((g_vt3_round >= 0 || g_vt3_log) && vt3_wrap("_ZN5match11setMatchingEv", &g_vt3_set_matching, h_vt3_set_matching))
+        fprintf(stderr, "[sega] Virtua Tennis 3: %s%d\n", g_vt3_round >= 0 ? "the run starts at round " : "rounds logged ", g_vt3_round);
+    if (g_vt3_log) vt3_wrap("_ZN5match13setNext_roundEv", &g_vt3_next_round, h_vt3_next_round);
+    if ((g_vt3_pts[0] >= 0 || g_vt3_log) &&
+        vt3_wrap("_ZN5match4initEv", &g_vt3_match_init, h_vt3_match_init) &
+        vt3_wrap("_ZN5match8calcGameEv", &g_vt3_calc_game, h_vt3_calc_game) && g_vt3_pts[0] >= 0)
+        fprintf(stderr, "[sega] Virtua Tennis 3: every game starts at points %d-%d\n", g_vt3_pts[0], g_vt3_pts[1]);
+}
+
 void hle_register_sega(void)
 {
     int n = 0;
     if (watch_route()) fprintf(stderr, "[sega] route log/jump on\n");
+    vt3_jumps();
     if (watch_qte()) fprintf(stderr, "[sega] sniping events watched%s\n", g_qte_log ? ", CQC and sniping logged" : "");
     {
         const char *g = getenv("LINDBERGH_GOD");
