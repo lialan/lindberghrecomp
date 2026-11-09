@@ -171,6 +171,12 @@ static void client_state_unknown(void)
 static const struct { const char *name; uint8_t kind, a, b, c; } T[] = {
     /* values */
     { "glEnable", C_VAL }, { "glDisable", C_VAL }, { "glMatrixMode", C_VAL }, { "glLoadIdentity", C_VAL },
+    /* Virtua Tennis 3 calls these about 640 times a frame (its display
+     * lists hold texture state; every pass is bracketed by client-attrib
+     * push/pop). Unlisted, each waited for the GL thread and a match ran at
+     * 3-6 fps. They return nothing; what they change the game thread forgets
+     * by the inv/sinv flags (cls()). */
+    { "glCallList", C_VAL }, { "glPushClientAttrib", C_VAL }, { "glPopClientAttrib", C_VAL },
     { "glPushMatrix", C_VAL }, { "glPopMatrix", C_VAL }, { "glTranslatef", C_VAL }, { "glScalef", C_VAL },
     { "glRotatef", C_VAL }, { "glBindTexture", C_VAL }, { "glActiveTexture", C_VAL }, { "glActiveTextureARB", C_VAL },
     { "glTexParameteri", C_VAL }, { "glTexParameterf", C_VAL }, { "glTexEnvf", C_VAL }, { "glTexEnvi", C_VAL },

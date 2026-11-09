@@ -533,6 +533,13 @@ static void scale_target(GLenum textarget, GLuint tex, GLenum attachment)
     float kx,ky;
     const LgStereoTargetSize sizes={GAME_W,GAME_H,g_pic_w,g_pic_h,g_ew,g_eh};
     lg_stereo_target_scale(&sizes,w,h,tg!=GL_TEXTURE_2D,&kx,&ky);
+    {   /* LINDBERGH_XR_TARGET_K=<k>: at most k times the game's size - fewer
+         * pixels for a game that runs full-screen passes through its own
+         * targets (Virtua Tennis 3's depth of field and glare) */
+        static float cap = -1;
+        if (cap < 0) { const char *v = getenv("LINDBERGH_XR_TARGET_K"); cap = v && *v ? (float)atof(v) : 0; }
+        if (cap > 0) { if (kx > cap) kx = cap; if (ky > cap) ky = cap; }
+    }
     int nw = (int)lroundf(w * kx), nh = (int)lroundf(h * ky);
     g_scaled_w[g_nscaled - 1] = (short)w; g_scaled_h[g_nscaled - 1] = (short)h;
     g_scaled_k[g_nscaled - 1][0] = kx; g_scaled_k[g_nscaled - 1][1] = ky;

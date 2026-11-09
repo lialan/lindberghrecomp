@@ -411,7 +411,7 @@ static int menu_hit(const float p[3],const float d[3],float *u,float *v,float hi
 static void menu_choose(int item)
 {
     const unsigned effects=xp_choose(&menu,&cfg,&gun_hand,item,rates,nrates);
-    if(effects&XP_CROSSHAIR_CHANGED)stereo_show_game_sight(cfg.crosshair);
+    if(effects&XP_CROSSHAIR_CHANGED)stereo_show_game_sight(cfg.crosshair && !game_profile()->joystick);
     if(effects&XP_SCREEN_CHANGED)stereo_set_screen_distance(cfg.screen*cfg.scale);
     if(effects&XP_HUD_CHANGED)stereo_set_hud_pitch((float)cfg.hud_pitch);
     if((effects&XP_RATE_CHANGED)&&request_rate)request_rate(session,(float)cfg.refresh);
@@ -600,13 +600,17 @@ static void input_frame(XrTime t)
     }
     int g = gun_hand, off = 1 - g;
 
-    float gx, gy, g2x = -100000, g2y = -100000;
-    int aimed = aim_gun(g, 0, t, trig, &xo, &gx, &gy), aimed2 = 0;
-    if (dual) aimed2 = aim_gun(off, 1, t, trig, &xo2, &g2x, &g2y);
+    float gx = -100000, gy = -100000, g2x = -100000, g2y = -100000;
+    int aimed = 0, aimed2 = 0;
+    /* a lever cabinet (Virtua Tennis 3) has no gun: no aim ray (and no
+     * depth hit-test for it), no gun model, laser, flash or recoil */
+    if (lever_cab) { xo.gun_valid = xo.beam = xo.dot = xo.flash = 0; stereo_set_gun_ray(0, NULL, NULL, 0); }
+    else aimed = aim_gun(g, 0, t, trig, &xo, &gx, &gy);
+    if (dual && !lever_cab) aimed2 = aim_gun(off, 1, t, trig, &xo2, &g2x, &g2y);
     else { xo2.gun_valid = xo2.beam = xo2.dot = xo2.flash = 0; stereo_set_gun_ray(1, NULL, NULL, 0); }
     if (menu.open && menu.dirty) menu_paint();
 
-    int firing=gun_fire(0,g,t,trig[g],aimed,&xo);
+    int firing=lever_cab?0:gun_fire(0,g,t,trig[g],aimed,&xo);
     int firing2=dual&&gun_fire(1,off,t,trig[off],aimed2,&xo2);
 
     /* the other hand's upper button (Y for the right-handed), held for a
@@ -668,7 +672,9 @@ static void input_frame(XrTime t)
     unsigned held=cabinet.held;
     if(held&CAB_P1_RELOAD)reload_t=t;
     stereo_game_gun_reloading(reload_t&&t-reload_t<1500000000);
-    if(!dual&&btn_a[off]&&!prev[off][2]&&!menu.open){stereo_capture();rumble(off,.4f,30);}
+    /* the off hand's lower button saves the eyes (a debugging aid) - not
+     * for a lever cabinet, where it is a shot button */
+    if(!dual&&!lever_cab&&btn_a[off]&&!prev[off][2]&&!menu.open){stereo_capture();rumble(off,.4f,30);}
     if(menu.test_frames){--menu.test_frames;held|=CAB_TEST;}
     if(menu.service_frames){--menu.service_frames;held|=CAB_SERVICE;}
     int coin=menu.coin+cabinet.coins;menu.coin=0;
@@ -677,7 +683,7 @@ static void input_frame(XrTime t)
     host_vr_input((int)gx, (int)gy, held, coin);
     host_vr_input2(dual, (int)g2x, (int)g2y);
 
-    if (trig[g] && !aimed && !prev[g][0] && !menu.open) rumble(g, 0.3f, 40);
+    if (!lever_cab && trig[g] && !aimed && !prev[g][0] && !menu.open) rumble(g, 0.3f, 40);
     if (dual && trig[off] && !aimed2 && !prev[off][0] && !menu.open) rumble(off, 0.3f, 40);
     for (int h = 0; h < 2; h++) {
         prev[h][0] = trig[h]; prev[h][1] = grip[h]; prev[h][2] = btn_a[h];
@@ -741,7 +747,7 @@ int xr_init(void)
     host_display_timing_reset();
     if (!gl_load()) { fprintf(stderr, "[xr] cannot load GLES\n"); return 0; }
     cfg_load();
-    stereo_show_game_sight(cfg.crosshair);
+    stereo_show_game_sight(cfg.crosshair && !game_profile()->joystick);   /* no sight on a lever cabinet */
 
 #ifdef __ANDROID__
     JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
