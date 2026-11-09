@@ -869,7 +869,11 @@ static int watch_route(void)
  * match::init and calcGame).
  *   LINDBERGH_VT3_ROUND=N   the run's first match is round N (0-based)
  *   LINDBERGH_VT3_POINTS=a,b every game starts at those points (3,0 = 40-0)
- *   LINDBERGH_VT3_LOG=1     each matching, next round and new game logged */
+ *   LINDBERGH_VT3_LOG=1     each matching, next round and new game logged
+ *   LINDBERGH_VT3_SPLIT=1   every point ends on the split-screen camera:
+ *                           camera::initWinlose picks it when its first
+ *                           getRandMT_U32() % 10 is 0 (singles), so that one
+ *                           number comes back 0 - 1 point in 10 otherwise */
 #define VT3_G_PTENNIS 0x085061a4u
 static void (*g_vt3_set_matching)(CPU *), (*g_vt3_next_round)(CPU *), (*g_vt3_match_init)(CPU *), (*g_vt3_calc_game)(CPU *);
 static int g_vt3_round = -1, g_vt3_pts[2] = { -1, -1 }, g_vt3_log;
@@ -922,6 +926,23 @@ static void h_vt3_calc_game(CPU *c)
     g_vt3_calc_game(c);
     vt3_new_game(m, "game");
 }
+static void (*g_vt3_init_winlose)(CPU *), (*g_vt3_rand)(CPU *);
+static int g_vt3_split, g_vt3_split_next;
+static void h_vt3_init_winlose(CPU *c)
+{
+    extern unsigned g_frame;
+    g_vt3_split_next = 1;                   /* the next random number is the camera's pick */
+    push32(c, 0xDEADBEEFu);
+    g_vt3_init_winlose(c);
+    g_vt3_split_next = 0;
+    if (g_vt3_log) fprintf(stderr, "[vt3] frame %u: point over, split-screen camera forced\n", g_frame);
+}
+static void h_vt3_rand(CPU *c)
+{
+    if (g_vt3_split_next) { g_vt3_split_next = 0; RET(0); return; }
+    push32(c, 0xDEADBEEFu);
+    g_vt3_rand(c);
+}
 static int vt3_wrap(const char *sym, void (**orig)(CPU *), HleHandler h)
 {
     extern void (*dispatch_lifted(uint32_t va))(CPU *);
@@ -937,6 +958,13 @@ static void vt3_jumps(void)
     if ((g_vt3_round >= 0 || g_vt3_log) && vt3_wrap("_ZN5match11setMatchingEv", &g_vt3_set_matching, h_vt3_set_matching))
         fprintf(stderr, "[sega] Virtua Tennis 3: %s%d\n", g_vt3_round >= 0 ? "the run starts at round " : "rounds logged ", g_vt3_round);
     if (g_vt3_log) vt3_wrap("_ZN5match13setNext_roundEv", &g_vt3_next_round, h_vt3_next_round);
+    {
+        const char *sp = getenv("LINDBERGH_VT3_SPLIT");
+        g_vt3_split = sp && *sp == '1';
+        if (g_vt3_split && vt3_wrap("_ZN6camera11initWinloseEv", &g_vt3_init_winlose, h_vt3_init_winlose) &&
+            vt3_wrap("_ZN8_sRandom13getRandMT_U32Ev", &g_vt3_rand, h_vt3_rand))
+            fprintf(stderr, "[sega] Virtua Tennis 3: every point ends on the split-screen camera\n");
+    }
     if ((g_vt3_pts[0] >= 0 || g_vt3_log) &&
         vt3_wrap("_ZN5match4initEv", &g_vt3_match_init, h_vt3_match_init) &
         vt3_wrap("_ZN5match8calcGameEv", &g_vt3_calc_game, h_vt3_calc_game) && g_vt3_pts[0] >= 0)

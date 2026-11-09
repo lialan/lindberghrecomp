@@ -1515,10 +1515,25 @@ static int transform_call(CPU *c, HleId id, const char *n)
             if (!mask) return 1;
             wr32(c->esp, mask);
         }
-        if ((long)g_frame == g_cap_frame || (long)g_frame + 1 == g_cap_frame)
-            fprintf(stderr, "[units] frame %u clear %#x fb %u vp %d,%d %dx%d side %d\n", g_frame, mask, (unsigned)g_game_fb, g_vp[0], g_vp[1], g_vp[2], g_vp[3], g_side);
-        if (g_mv && g_pbuffers && (g_game_fb == 0 || g_side))
-            side_pass(!(g_vp[0] <= 0 && g_vp[1] <= 0 && g_vp[0] + g_vp[2] >= GAME_W && g_vp[1] + g_vp[3] >= GAME_H));
+        {   /* on a capture frame, or in LINDBERGH_DRAW_LOG's range: each clear, its viewport, and the side pass after it */
+            static long dl = -2, dl1;
+            if (dl == -2) { const char *v = getenv("LINDBERGH_DRAW_LOG"); dl = v ? atol(v) : -1; dl1 = v && strchr(v, '-') ? atol(strchr(v, '-') + 1) : dl; }
+            if ((long)g_frame == g_cap_frame || (long)g_frame + 1 == g_cap_frame || (dl >= 0 && (long)g_frame >= dl && (long)g_frame <= dl1))
+                fprintf(stderr, "[units] frame %u clear %#x fb %u vp %d,%d %dx%d side %d\n", g_frame, mask, (unsigned)g_game_fb, g_vp[0], g_vp[1], g_vp[2], g_vp[3], g_side);
+        }
+        if (g_mv && g_pbuffers && (g_game_fb == 0 || g_side)) {
+            /* Only a clear with colour starts a side pass: the passes above
+             * clear their colour first (that is what wiped the scene). A
+             * depth-only clear of part of the screen is the screen split -
+             * Virtua Tennis 3's two-player camera after a point clears each
+             * half's depth (0,0 680x768 then 680,0 680x768) and draws that
+             * player there; taken for side passes, both halves went off
+             * screen and the eyes kept black with the players squashed. A
+             * clear of the whole screen still ends a side pass. */
+            int whole = g_vp[0] <= 0 && g_vp[1] <= 0 && g_vp[0] + g_vp[2] >= GAME_W && g_vp[1] + g_vp[3] >= GAME_H;
+            if (mask & GL_COLOR_BUFFER_BIT) side_pass(!whole);
+            else if (g_side && whole) side_pass(0);
+        }
         if (g_side) return 0;
         /* Only the frame's first such clear, and not for a flat picture: the
          * game clears depth again to draw over its finished scene (the

@@ -1266,7 +1266,15 @@ static void xp_mark(double *acc) { if (xr_prof > 0) { gl.Finish(); double t = xp
  * it, read from the eyes' array at the frame's end - before the headset's
  * frame is even begun, so a sleeping display or a Guardian prompt does not
  * stop it (XR_SHOT needs the session shown). game_<frame>.ppm, a quarter the
- * size unless full. */
+ * size unless full. LINDBERGH_SHOT_BOTH=1 also saves the right eye,
+ * game_<frame>_r.ppm (and xrshot_<frame>_r.ppm for XR_SHOT): a picture that
+ * differs between the eyes shows only in the pair. */
+static int shot_both(void)
+{
+    static int both = -1;
+    if (both < 0) { const char *v = getenv("LINDBERGH_SHOT_BOTH"); both = v && *v == '1'; }
+    return both;
+}
 static void game_shot(void)
 {
     static long first = -2, every = 0; static int full;
@@ -1287,23 +1295,28 @@ static void game_shot(void)
     unsigned char *px = malloc((size_t)w * h * 4);
     if (!px) return;
     GLint read = 0;
+    GLenum st = 0, err = 0;
+    char name[64] = "";
     while (gl.GetError() != GL_NO_ERROR) {}     /* not ours: left by the game's frame */
     gl.GetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
-    gl.BindFramebuffer(GL_READ_FRAMEBUFFER, read_fb);
-    gl.FramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, arr, 0, 0);
-    GLenum st = gl.CheckFramebufferStatus(GL_READ_FRAMEBUFFER);
-    gl.ReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
-    GLenum err = gl.GetError();
-    gl.BindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
-    char name[64]; snprintf(name, sizeof name, "game_%05u.ppm", g_frame);
-    FILE *f = err ? NULL : fopen(name, "wb");
-    if (f) {
-        int st = full ? 1 : 4, qw = w / st, qh = h / st;
-        fprintf(f, "P6\n%d %d\n255\n", qw, qh);
-        for (int y = qh - 1; y >= 0; y--)
-            for (int x = 0; x < qw; x++) fwrite(px + ((size_t)(y * st) * w + x * st) * 4, 1, 3, f);
-        fclose(f);
+    for (int eye = 0; eye <= shot_both(); eye++) {
+        gl.BindFramebuffer(GL_READ_FRAMEBUFFER, read_fb);
+        gl.FramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, arr, 0, eye);
+        st = gl.CheckFramebufferStatus(GL_READ_FRAMEBUFFER);
+        gl.ReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        err = gl.GetError();
+        snprintf(name, sizeof name, eye ? "game_%05u_r.ppm" : "game_%05u.ppm", g_frame);
+        FILE *f = err ? NULL : fopen(name, "wb");
+        if (f) {
+            int sp = full ? 1 : 4, qw = w / sp, qh = h / sp;
+            fprintf(f, "P6\n%d %d\n255\n", qw, qh);
+            for (int y = qh - 1; y >= 0; y--)
+                for (int x = 0; x < qw; x++) fwrite(px + ((size_t)(y * sp) * w + x * sp) * 4, 1, 3, f);
+            fclose(f);
+        }
+        if (err) break;
     }
+    gl.BindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
     static int told;
     if (!told++ || (err && told < 6)) fprintf(stderr, "[xr] game shot frame %u: %s (error %#x, framebuffer %#x, array %u, %dx%d)\n",
                                              g_frame, err ? "read failed" : name, err, st, arr, w, h);
@@ -1430,7 +1443,7 @@ void xr_frame_end(void)
                     first = v && *v ? atol(v) : -1;
                     every = v && strchr(v, ',') ? atol(strchr(v, ',') + 1) : 0;
                 }
-                if (i == 0 && first >= 0 && (long)g_frame >= first &&
+                if ((i == 0 || shot_both()) && first >= 0 && (long)g_frame >= first &&
                     (every > 0 ? ((long)g_frame - first) % every == 0 : (long)g_frame == first)) {
                     int w = (int)e->w, h = (int)e->h;
                     unsigned char *px = malloc((size_t)w * h * 4);
@@ -1438,7 +1451,7 @@ void xr_frame_end(void)
                         gl.BindFramebuffer(GL_READ_FRAMEBUFFER, e->fb[e->acquired]);
                         gl.ReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
                         gl.BindFramebuffer(GL_READ_FRAMEBUFFER, read_fb);
-                        char name[64]; snprintf(name, sizeof name, "xrshot_%05u.ppm", g_frame);
+                        char name[64]; snprintf(name, sizeof name, i ? "xrshot_%05u_r.ppm" : "xrshot_%05u.ppm", g_frame);
                         FILE *f = fopen(name, "wb");
                         if (f) {
                             static int full = -1;   /* LINDBERGH_XR_SHOT_FULL=1: the whole size */
