@@ -548,6 +548,13 @@ static void h_glGetError(CPU *c)
 
 static void h_glTexImage2D(CPU *c)
 {
+    {   /* LINDBERGH_CUBE_LOG=1: uploads into a cube map's faces */
+        static int on = -1, n;
+        if (on < 0) { const char *v = getenv("LINDBERGH_CUBE_LOG"); on = v && *v == '1'; }
+        if (on && A32(0) >= 0x8515 && A32(0) <= 0x851A && n++ < 48)
+            fprintf(stderr, "[cube] glTexImage2D face %#x level %d internal %#x %dx%d format %#x type %#x pixels %s\n",
+                    A32(0), AI32(1), A32(2), AI32(3), AI32(4), A32(6), A32(7), A32(8) ? "yes" : "none");
+    }
     GLenum fmt = A32(6), type = A32(7);
     GLint ifmt = AI32(2);
     GLsizei w = AI32(3), h = AI32(4);

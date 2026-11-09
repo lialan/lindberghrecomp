@@ -1054,6 +1054,13 @@ static void gl_compressed_tex(CPU *c)
     while (glGetError() != GL_NO_ERROR) { }          /* start clean */
     if (e) gl_dispatch(c, e);
     GLenum err = glGetError();
+    {   /* LINDBERGH_CUBE_LOG=1: compressed uploads into a cube map's faces, and whether they took */
+        static int on = -1, n;
+        if (on < 0) { const char *v = getenv("LINDBERGH_CUBE_LOG"); on = v && *v == '1'; }
+        if (on && A32(0) >= 0x8515 && A32(0) <= 0x851A && n++ < 48)
+            fprintf(stderr, "[cube] glCompressedTexImage2D face %#x level %u format %#x %ux%u size %u -> error %#x\n",
+                    A32(0), A32(1), A32(2), A32(3), A32(4), A32(6), err);
+    }
     if (shown < 6 && getenv("LINDBERGH_FBSTATS")) {
         shown++;
         /* Is there anything IN the texture? A correct upload of an empty

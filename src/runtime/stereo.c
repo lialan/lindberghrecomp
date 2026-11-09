@@ -1210,6 +1210,18 @@ static void side_pass(int on)
 
 static int copy_from_eyes(CPU *c, int k)
 {
+    {   /* LINDBERGH_COPY_LOG=1: each distinct copy from the framebuffer into a texture */
+        static int on = -1, n; static unsigned seen[64];
+        if (on < 0) { const char *v = getenv("LINDBERGH_COPY_LOG"); on = v && *v == '1'; }
+        if (on && n < 64) {
+            int w = k == K_COPYTEXSUB ? AI32(6) : AI32(5), h = k == K_COPYTEXSUB ? AI32(7) : AI32(6);
+            unsigned key = A32(0) * 131u + (unsigned)w * 7u + (unsigned)h + g_game_fb * 977u;
+            int i = 0; while (i < n && seen[i] != key) i++;
+            if (i == n) { seen[n++] = key;
+                fprintf(stderr, "[copy] frame %u: %s target %#x level %d %dx%d from fb %u (side %d)\n", g_frame,
+                        k == K_COPYTEXSUB ? "glCopyTexSubImage2D" : "glCopyTexImage2D", A32(0), AI32(1), w, h, (unsigned)g_game_fb, g_side); }
+        }
+    }
 #ifdef LINDBERGH_GL4ES
     if (!g_mv || (g_game_fb != 0 && !g_side) || A32(0) != GL_TEXTURE_2D) return 0;
     GLint tex = 0;
@@ -1570,6 +1582,13 @@ static int transform_call(CPU *c, HleId id, const char *n)
         return 0;
     }
     if (k == K_FBTEX2D) {
+        {   /* LINDBERGH_CUBE_LOG=1: framebuffers drawing into a cube map's faces */
+            static int on = -1, n;
+            if (on < 0) { const char *v = getenv("LINDBERGH_CUBE_LOG"); on = v && *v == '1'; }
+            if (on && A32(2) >= 0x8515 && A32(2) <= 0x851A && n++ < 48)
+                fprintf(stderr, "[cube] frame %u: framebuffer %u attachment %#x <- cube texture %u face %#x level %d\n",
+                        g_frame, (unsigned)g_game_fb, A32(1), A32(3), A32(2), AI32(4));
+        }
         if (A32(1) == GL_COLOR_ATTACHMENT0) tex_hist(A32(3), "rendered into (attached)", 0, 0);
         scale_target(A32(2), A32(3), A32(1));
         note_fb_scale(g_game_fb, A32(3));
@@ -3113,6 +3132,7 @@ void stereo_rect_scale(float *x, float *y)
 }
 
 unsigned stereo_eye_texture(int eye) { return g_eye_tex[eye]; }
+void stereo_eye_dims(int *w, int *h) { *w = g_ew; *h = g_eh; }
 #ifdef LINDBERGH_GL4ES
 unsigned stereo_eye_array(void) { return g_mv ? gl4es_multiview_array(g_eye_tex[0]) : 0; }
 #else

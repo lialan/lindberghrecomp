@@ -51,6 +51,7 @@ void stereo_env_projection(int on);       /* the projection is in program.env[0.
 /* The game's own camera, as tangents of half its field of view. */
 void stereo_game_camera(float *tan_x, float *tan_y);
 unsigned stereo_eye_texture(int eye);
+void stereo_eye_dims(int *w, int *h);        /* the eyes' image size, pixels */
 /* multiview: both eyes' image as one two-layer array, as the driver knows it
  * (0 when the eyes are drawn one at a time) */
 unsigned stereo_eye_array(void);

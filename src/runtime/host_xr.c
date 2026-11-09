@@ -679,6 +679,17 @@ static void input_frame(XrTime t)
     if(menu.test_frames){--menu.test_frames;held|=CAB_TEST;}
     if(menu.service_frames){--menu.service_frames;held|=CAB_SERVICE;}
     int coin=menu.coin+cabinet.coins;menu.coin=0;
+    {   /* LINDBERGH_INPUT_LOG=1: each change of the cabinet's buttons, and why
+         * (the controllers' raw state), for inputs nobody remembers making */
+        static int on=-1;static unsigned last=~0u;
+        if(on<0){const char*v=getenv("LINDBERGH_INPUT_LOG");on=v&&*v=='1';}
+        if(on&&(held!=last||coin)){
+            fprintf(stderr,"[input] frame %u: held %#x coin %d | trig %d,%d grip %d,%d a %d,%d b %d,%d stick %d,%d thumb %.2f,%.2f %.2f,%.2f menu %d\n",
+                    g_frame,held,coin,trig[0],trig[1],grip[0],grip[1],btn_a[0],btn_a[1],btn_b[0],btn_b[1],stick[0],stick[1],
+                    frame.thumb_x[0],frame.thumb_y[0],frame.thumb_x[1],frame.thumb_y[1],menu.open);
+            last=held;
+        }
+    }
     stereo_set_gun((int)gx, (int)gy);
     stereo_set_gun2((int)g2x, (int)g2y);
     host_vr_input((int)gx, (int)gy, held, coin);
@@ -1251,8 +1262,57 @@ static double xp_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t
 static double xp_t0, xp_game, xp_copy, xp_end; static unsigned xp_n;
 static void xp_mark(double *acc) { if (xr_prof > 0) { gl.Finish(); double t = xp_ms(); *acc += t - xp_t0; xp_t0 = t; } }
 
+/* LINDBERGH_GAME_SHOT=<first>,<every>[,full]: the left eye as the game drew
+ * it, read from the eyes' array at the frame's end - before the headset's
+ * frame is even begun, so a sleeping display or a Guardian prompt does not
+ * stop it (XR_SHOT needs the session shown). game_<frame>.ppm, a quarter the
+ * size unless full. */
+static void game_shot(void)
+{
+    static long first = -2, every = 0; static int full;
+    if (first == -2) {
+        const char *v = getenv("LINDBERGH_GAME_SHOT");
+        first = v && *v ? atol(v) : -1;
+        const char *c1 = v ? strchr(v, ',') : NULL;
+        every = c1 ? atol(c1 + 1) : 0;
+        full = c1 && strchr(c1 + 1, ',') && atoi(strchr(c1 + 1, ',') + 1) == 1;
+    }
+    if (first < 0 || (long)g_frame < first) return;
+    if (every > 0 ? ((long)g_frame - first) % every : (long)g_frame != first) return;
+    unsigned arr = stereo_eye_array();
+    int w = 0, h = 0;
+    stereo_eye_dims(&w, &h);
+    if (!arr || w <= 0 || h <= 0) return;
+    if (!read_fb) gl.GenFramebuffers(1, &read_fb);
+    unsigned char *px = malloc((size_t)w * h * 4);
+    if (!px) return;
+    GLint read = 0;
+    while (gl.GetError() != GL_NO_ERROR) {}     /* not ours: left by the game's frame */
+    gl.GetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
+    gl.BindFramebuffer(GL_READ_FRAMEBUFFER, read_fb);
+    gl.FramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, arr, 0, 0);
+    GLenum st = gl.CheckFramebufferStatus(GL_READ_FRAMEBUFFER);
+    gl.ReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    GLenum err = gl.GetError();
+    gl.BindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
+    char name[64]; snprintf(name, sizeof name, "game_%05u.ppm", g_frame);
+    FILE *f = err ? NULL : fopen(name, "wb");
+    if (f) {
+        int st = full ? 1 : 4, qw = w / st, qh = h / st;
+        fprintf(f, "P6\n%d %d\n255\n", qw, qh);
+        for (int y = qh - 1; y >= 0; y--)
+            for (int x = 0; x < qw; x++) fwrite(px + ((size_t)(y * st) * w + x * st) * 4, 1, 3, f);
+        fclose(f);
+    }
+    static int told;
+    if (!told++ || (err && told < 6)) fprintf(stderr, "[xr] game shot frame %u: %s (error %#x, framebuffer %#x, array %u, %dx%d)\n",
+                                             g_frame, err ? "read failed" : name, err, st, arr, w, h);
+    free(px);
+}
+
 void xr_frame_end(void)
 {
+    game_shot();
     if (!in_frame) return;
     if (xr_prof < 0) { const char *v = getenv("LINDBERGH_XR_PROF"); xr_prof = v && *v == '1'; }
     if (xr_prof > 0) { xp_t0 = xp_ms(); xp_mark(&xp_game); }

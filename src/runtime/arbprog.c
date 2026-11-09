@@ -77,10 +77,34 @@ typedef struct {
 static ArbProg *g_prog[2][MAX_IDS];       /* [0] vertex, [1] fragment */
 static GLuint   g_bound[2];
 static unsigned g_tr_layered;      /* fragment units to read per view (target 7) */
+static int shadow_pcf(void)
+{   /* LINDBERGH_SHADOW_PCF=0/1: the in-shader compare filtered over 2x2 texels,
+     * as a driver does for a depth texture with linear filtering (default:
+     * with profile vr.depth_tex_shadow) */
+    static int on = -1;
+    if (on < 0) { const char *v = getenv("LINDBERGH_SHADOW_PCF"); on = v && *v ? *v == '1' : game_profile()->vr.depth_tex_shadow != 0; }
+    return on;
+}
+static int manual_compare(void)
+{   /* shadow maps compared in the shader, on a plain sampler: always on GLES
+     * (shadow_compare); LINDBERGH_SHADER_COMPARE=1 on the desktop reproduces
+     * the Quest's path, to debug it against the driver's compare */
+#ifdef LINDBERGH_GL4ES
+    return 1;
+#else
+    static int on = -1;
+    if (on < 0) { const char *v = getenv("LINDBERGH_SHADER_COMPARE"); on = v && *v == '1'; }
+    return on;
+#endif
+}
 static unsigned g_tr_cmp2d;        /* fragment units read as 2D whose texture compares depth (target 6) */
 void gl4es_multiview_layered(unsigned texture);
 unsigned gl4es_compare_units(void);
 void gl4es_mark_shadow(int unit);
+int gl4es_cube_probe(unsigned texture, float out[4]);
+void gl4es_cube_report(unsigned texture);
+void gl4es_realize_cubes(unsigned units);
+int gl4es_cube_binding(int unit, unsigned *raw, unsigned *ours);
 int stereo_is_picture_texture(unsigned tex);
 static int      g_enabled[2];
 static float    g_env[2][MAX_ENV][4];
@@ -946,9 +970,9 @@ static int emit_instr(Tr *t, char *stmt)
          * NVIDIA compares (Virtua Tennis 3's player shadows); GLES leaves
          * that undefined and the Quest returned 0 - the players black. A
          * shadow map, then, compared in the shader. */
-        if (target == 2 && t->stage == 1 && (g_tr_cmp2d >> unit & 1)) target = 6;
+        if (target == 2 && t->stage == 1 && !strcmp(op, "TXP") && (g_tr_cmp2d >> unit & 1)) target = 6;   /* a projective read: a shadow lookup; a plain one (the depth of field's) wants the depth */
 #else
-        if (target == 2 && t->stage == 1 && (g_tr_cmp2d >> unit & 1)) target = 6;
+        if (target == 2 && t->stage == 1 && !strcmp(op, "TXP") && (g_tr_cmp2d >> unit & 1)) target = 6;   /* a projective read: a shadow lookup; a plain one (the depth of field's) wants the depth */
 #endif
 #ifdef LINDBERGH_GL4ES
         /* the world's picture, drawn in both views: this view's layer */
@@ -978,19 +1002,26 @@ static int emit_instr(Tr *t, char *stmt)
             else      snprintf(r, sizeof r, "texture2DRect(sr_%d, %s.xy * u_rect_scale[%d])", unit, X(0), unit);
 #endif
         }
-#ifdef LINDBERGH_GL4ES
         /* the depth compare (LEQUAL) done here, on a plain sampler: see shadow_compare */
-        else if (target == 6) {
+        else if (target == 6 && manual_compare()) {
             /* LINDBERGH_SHADOW_BIAS=<depth>: taken off the reference before
              * the compare - the driver's filtered compare forgives surfaces
              * their own depth; a nearest one, at the GLES texture's precision,
              * shadows them (Virtua Tennis 3's players came out too dark) */
             static float bias = -1;
             if (bias < 0) { const char *v = getenv("LINDBERGH_SHADOW_BIAS"); bias = v && *v ? (float)atof(v) : game_profile()->vr.shadow_bias; }
-            if (proj) snprintf(r, sizeof r, "vec4(step(%s.z / %s.w - %.6f, texture2DProj(ss_%d, %s).x))", X(0), X(0), bias, unit, X(0));
+            static int lit = -1;    /* LINDBERGH_SHADOW_LIT=1: every shadow lookup lit (is the shadow what darkens?) */
+            if (lit < 0) { const char *v = getenv("LINDBERGH_SHADOW_LIT"); lit = v && *v == '1'; }
+            if (lit) snprintf(r, sizeof r, "vec4(1.0)");
+            else if (shadow_pcf() && proj)
+                snprintf(r, sizeof r, "vec4(lg_pcf(ss_%d, vec3(%s.xy / %s.w, %s.z / %s.w - %.6f), u_shadow_size[%d]))", unit, X(0), X(0), X(0), X(0), bias, unit);
+            else if (shadow_pcf())
+                snprintf(r, sizeof r, "vec4(lg_pcf(ss_%d, vec3(%s.xy, %s.z - %.6f), u_shadow_size[%d]))", unit, X(0), X(0), bias, unit);
+            else if (proj) snprintf(r, sizeof r, "vec4(step(%s.z / %s.w - %.6f, texture2DProj(ss_%d, %s).x))", X(0), X(0), bias, unit, X(0));
             else      snprintf(r, sizeof r, "vec4(step(%s.z - %.6f, texture2D(ss_%d, %s.xy).x))", X(0), bias, unit, X(0));
         }
-#endif
+        else if (target == 4 && getenv("LINDBERGH_CUBE_GREY") && *getenv("LINDBERGH_CUBE_GREY") == '1')
+            snprintf(r, sizeof r, "vec4(0.5, 0.5, 0.5, 1.0)");   /* LINDBERGH_CUBE_GREY=1: every cube map lookup a flat grey (is the cube map what is missing?) */
         else if (proj && target != 4)
             snprintf(r, sizeof r, "%sProj(%s%d, %s)", fnb[target], sm[target], unit, X(0));
         else if (bias)
@@ -1240,6 +1271,22 @@ static char *translate(int stage, const char *src_in, Tr *t)
         if (rect) bput(&g, "#extension GL_ARB_texture_rectangle : enable\n"
                            "uniform vec2 u_rect_scale[16];\n");    /* per unit: render targets drawn larger (stereo.c) */
 #endif
+        int shadow = 0;
+        for (int u = 0; u < 16; u++) if (t->tex_target[u] == 6) shadow = 1;
+        if (shadow && shadow_pcf() && manual_compare())     /* the four texels around the point, compared, blended by distance */
+            bput(&g, "uniform vec2 u_shadow_size[16];\n"
+                     "float lg_pcf(%ssampler2D s, vec3 c, vec2 sz) {\n"
+                     "  vec2 t = c.xy * sz - 0.5, f = fract(t), b = (floor(t) + 0.5) / sz, d = 1.0 / sz;\n"
+                     "  float a = step(c.z, texture2D(s, b).x), e = step(c.z, texture2D(s, b + vec2(d.x, 0.0)).x);\n"
+                     "  float g = step(c.z, texture2D(s, b + vec2(0.0, d.y)).x), h = step(c.z, texture2D(s, b + d).x);\n"
+                     "  return mix(mix(a, e, f.x), mix(g, h, f.x), f.y);\n"
+                     "}\n",
+#ifdef LINDBERGH_GL4ES
+                     "highp "
+#else
+                     ""
+#endif
+                     );
         const char *P = stage ? "f" : "v";
         if (t->env_hi >= 0) bput(&g, "uniform vec4 %s_env[%d];\n", P, t->env_hi + 1);
         if (t->local_hi >= 0) bput(&g, "uniform vec4 %s_loc[%d];\n", P, t->local_hi + 1);
@@ -1249,12 +1296,14 @@ static char *translate(int stage, const char *src_in, Tr *t)
         if (!stage && !t->nmat && !t->pos_invariant) bput(&g, gl4es_mv_shaders ? "uniform mat4 u_reproj[2];\n" : "uniform mat4 u_reproj;\n");
         const char *sty[] = { "", "sampler1D s1_", "sampler2D s2_", "sampler3D s3_",
                               "samplerCube sc_", gl4es_mv_shaders ? "sampler2DArray sr_" : "sampler2D sr_",
-                              "sampler2D ss_",      /* the compare done in the shader (shadow_compare) */
+                              "highp sampler2D ss_",   /* the compare done in the shader (shadow_compare); highp: a
+                                                         * GLES sampler defaults to lowp, and the depth read back at
+                                                         * that precision shadowed surfaces by their own depth */
                               "sampler2DArray sl_" };
 #else
         if (!stage && !t->nmat && !t->pos_invariant) bput(&g, "uniform mat4 u_reproj;\n");
-        static const char *const sty[] = { "", "sampler1D s1_", "sampler2D s2_", "sampler3D s3_",
-                                           "samplerCube sc_", "sampler2DRect sr_", "sampler2DShadow ss_", "sampler2D sl_" };
+        const char *sty[] = { "", "sampler1D s1_", "sampler2D s2_", "sampler3D s3_",
+                              "samplerCube sc_", "sampler2DRect sr_", manual_compare() ? "sampler2D ss_" : "sampler2DShadow ss_", "sampler2D sl_" };
 #endif
         for (int u = 0; u < 16; u++) if (t->tex_target[u]) bput(&g, "uniform %s%d;\n", sty[t->tex_target[u]], u);
         for (int a = 1; a < 16; a++) if (t->attrib_used[a]) bput(&g, "attribute vec4 va_%d;\n", a);
@@ -1367,9 +1416,11 @@ typedef struct {
     int    nlit[2], lit_idx[2][16];         /* literals in the program's env (Tr) */
     float  lit[2][16][4];
     int    lit_loc[2][16];
+    GLint  u_shadow, n_shadow;             /* u_shadow_size: shadow maps' sizes in texels, its kept length */
     GLint  n_rect;                          /* u_rect_norm's length as the driver keeps it */
     unsigned rect_units;                /* texture units sampled as rectangles */
     unsigned shadow_units;              /* and as shadow maps (a depth compare) */
+    unsigned cube_units;                /* read as cube maps */
     unsigned up_env[2], up_loc[2];      /* generations last uploaded */
 } Linked;
 
@@ -1569,7 +1620,11 @@ static Linked *link_pair(GLuint vid, GLuint fid)
 #endif
         g_tr_cmp2d = st == 1 ? cmp2d : 0;
 #ifdef LINDBERGH_GL4ES
-        if (g_tr_cmp2d) fprintf(stderr, "[arb] fragment program %u: units %#x compare depth, read as shadow maps\n", fid, g_tr_cmp2d);
+        {   /* LINDBERGH_CMP_LOG=1: every fragment link and its compare mask (a program flipping between variants) */
+            static int lg = -1;
+            if (lg < 0) { const char *v = getenv("LINDBERGH_CMP_LOG"); lg = v && *v == '1'; }
+            if (st == 1 && (g_tr_cmp2d || lg)) fprintf(stderr, "[arb] frame %u: fragment program %u (vertex %u) linked, units %#x compare depth\n", g_frame, fid, vid, g_tr_cmp2d);
+        }
         if (st == 1 && gl4es_mv_shaders) {
             GLint active = GL_TEXTURE0;
             glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
@@ -1599,6 +1654,7 @@ static Linked *link_pair(GLuint vid, GLuint fid)
         memcpy(l->mat[st], t.mat, sizeof t.mat);
         for (int u = 0; u < 16; u++) if (t.tex_target[u] == 5) l->rect_units |= 1u << u;
         for (int u = 0; u < 16; u++) if (t.tex_target[u] == 6) l->shadow_units |= 1u << u;
+        for (int u = 0; u < 16; u++) if (t.tex_target[u] == 4) l->cube_units |= 1u << u;
         l->nmat[st] = t.nmat;
         l->env_hi[st] = t.env_hi;
         l->nlit[st] = t.nlit;
@@ -1737,6 +1793,8 @@ static Linked *link_pair(GLuint vid, GLuint fid)
 #else
     l->u_rect = glGetUniformLocation(l->prog, "u_rect_scale");
 #endif
+    l->u_shadow = glGetUniformLocation(l->prog, "u_shadow_size");
+    l->n_shadow = l->u_shadow >= 0 ? array_len(l->prog, "u_shadow_size", 16) : 0;
     l->u_reproj = glGetUniformLocation(l->prog, "u_reproj");
     l->u_gen = glGetUniformLocation(l->prog, "u_gen");
 #ifdef LINDBERGH_GL4ES
@@ -1853,6 +1911,22 @@ static void upload(Linked *l)
     } else
 #endif
     if (l->u_reproj >= 0) { float m[16]; stereo_reproject(m); glUniformMatrix4fv(l->u_reproj, 1, GL_FALSE, m); }
+    if (l->u_shadow >= 0) {
+        float sz[16][2];
+        GLint active = GL_TEXTURE0;
+        glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+        for (int u = 0; u < 16; u++) {
+            sz[u][0] = sz[u][1] = 1024;
+            if (!(l->shadow_units & (1u << u))) continue;
+            GLint w = 0, h = 0;
+            glActiveTexture(GL_TEXTURE0 + u);
+            glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
+            glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &h);
+            if (w > 0 && h > 0) { sz[u][0] = (float)w; sz[u][1] = (float)h; }
+        }
+        glActiveTexture((GLenum)active);
+        glUniform2fv(l->u_shadow, l->n_shadow, &sz[0][0]);
+    }
 #ifdef LINDBERGH_GL4ES
     if (l->u_rect >= 0) {
         float rx, ry, norm[16][2];
@@ -2099,7 +2173,6 @@ void arb_before_draw(void)
     g_arb_draw_ns += (b.tv_sec - a.tv_sec) * 1e9 + (b.tv_nsec - a.tv_nsec);
 }
 
-#ifdef LINDBERGH_GL4ES
 /* A shadow map. The Quest's driver silently dropped every draw that read
  * one through a shadow sampler - Let's Go Jungle's ground, trees and leaves,
  * all shadowed, were gone - so the program reads it as a plain texture and
@@ -2112,14 +2185,29 @@ static void shadow_compare(unsigned units, unsigned from_2d)
     for (int u = 0; u < 16; u++) {
         if (!(units & (1u << u))) continue;
         glActiveTexture(GL_TEXTURE0 + u);
+        {   GLint tex = 0; glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
+            /* LINDBERGH_SHADOW_LOG=1: each program reading a shadow map, which texture and when */
+            static int lg = -1; static unsigned seen[256]; static int ns;
+            if (lg < 0) { const char *v = getenv("LINDBERGH_SHADOW_LOG"); lg = v && *v == '1'; }
+            if (lg && ns < 256) {
+                GLint pr = 0; glGetIntegerv(GL_CURRENT_PROGRAM, &pr);
+                unsigned key = (unsigned)pr * 4099u + (unsigned)tex * 17u + (unsigned)u;
+                int i = 0; while (i < ns && seen[i] != key) i++;
+                if (i == ns) { seen[ns++] = key; extern unsigned g_frame;
+                    fprintf(stderr, "[shadow] frame %u: GLSL program %d reads texture %d on unit %d as a shadow map\n", g_frame, pr, tex, u); }
+            }
+        }
+#ifdef LINDBERGH_GL4ES
         if (from_2d >> u & 1) gl4es_mark_shadow(u);    /* stays a shadow map for the next draw's variant */
+#else
+        (void)from_2d;
+#endif
         glTexParameteri(GL_TEXTURE_2D, 0x884C /* COMPARE_MODE */, GL_NONE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     }
     glActiveTexture((GLenum)active);
 }
-#endif
 
 static void before_draw(void)
 {
@@ -2515,8 +2603,57 @@ static void before_draw(void)
         upload(l);
 #ifdef LINDBERGH_GL4ES
         rect_enables(l->rect_units);
-        if (l->shadow_units) shadow_compare(l->shadow_units, l->cmp2d);
+        if (l->cube_units) gl4es_realize_cubes(l->cube_units);   /* their filters reach the driver (else black) */
+        if (l->cube_units) {    /* LINDBERGH_CUBE_BIND_LOG=1: the driver's cube binding against gl4es' (first 40 differences) */
+            static int on = -1, n;
+            if (on < 0) { const char *v = getenv("LINDBERGH_CUBE_BIND_LOG"); on = v && *v == '1'; }
+            for (int u = 0; on && n < 40 && u < 16; u++) {
+                if (!(l->cube_units >> u & 1)) continue;
+                unsigned raw = 0, ours = 0;
+                if (gl4es_cube_binding(u, &raw, &ours)) { n++; extern unsigned g_frame;
+                    fprintf(stderr, "[cube] frame %u: fragment program %u unit %d: driver has cube %u, gl4es %u\n", g_frame, l->fid, u, raw, ours); }
+            }
+        }
 #endif
+        if (l->shadow_units && manual_compare()) shadow_compare(l->shadow_units, l->cmp2d);
+        if (l->cube_units) {    /* LINDBERGH_CUBE_LOG=1: what a cube map unit holds at a draw */
+            static int on = -1, ns; static unsigned seen[128];
+            if (on < 0) { const char *v = getenv("LINDBERGH_CUBE_LOG"); on = v && *v == '1'; }
+            if (on && ns < 128) {
+                GLint act = GL_TEXTURE0; glGetIntegerv(GL_ACTIVE_TEXTURE, &act);
+                for (int u = 0; u < 16; u++) {
+                    if (!(l->cube_units >> u & 1)) continue;
+                    GLint cube = 0, t2 = 0, w = 0, f = 0;
+                    glActiveTexture(GL_TEXTURE0 + u);
+                    glGetIntegerv(0x8514 /* TEXTURE_BINDING_CUBE_MAP */, &cube);
+                    glGetIntegerv(GL_TEXTURE_BINDING_2D, &t2);
+                    if (cube) {
+                        glGetTexLevelParameteriv(0x8515, 0, GL_TEXTURE_WIDTH, &w);
+                        glGetTexLevelParameteriv(0x8515, 0, GL_TEXTURE_INTERNAL_FORMAT, &f);
+                    }
+                    unsigned key = (unsigned)cube * 131u + (unsigned)t2 * 7u + (unsigned)u;
+                    int i = 0; while (i < ns && seen[i] != key) i++;
+                    if (i == ns) { seen[ns++] = key; extern unsigned g_frame;
+                        fprintf(stderr, "[cube] frame %u: fragment program %u unit %d: cube texture %d (face +X %dpx, format %#x), 2D texture %d\n",
+                                g_frame, l->fid, u, cube, w, f, t2);
+#ifdef LINDBERGH_GL4ES
+                        static unsigned probed[16]; static int np;
+                        int k = 0; while (k < np && probed[k] != (unsigned)cube) k++;
+                        if (cube && k == np && np < 16) {
+                            probed[np++] = (unsigned)cube;
+                            float px[4] = {0, 0, 0, 0};
+                            int r = gl4es_cube_probe((unsigned)cube, px);
+                            fprintf(stderr, "[cube]   texture %d +X face centre: %s %.3f %.3f %.3f %.3f\n", cube,
+                                    r == 1 ? "bytes" : r == 2 ? "floats" : r == 0 ? "no texture" : "read error", px[0], px[1], px[2], px[3]);
+                            if (r < 0) fprintf(stderr, "[cube]   (error %#x)\n", -r);
+                            gl4es_cube_report((unsigned)cube);
+                        }
+#endif
+                    }
+                }
+                glActiveTexture((GLenum)act);
+            }
+        }
         return;
     }
     /* not translatable: the driver's own assembly path, as before */

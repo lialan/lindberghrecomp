@@ -873,6 +873,12 @@ void hle_register_sega(void)
             fprintf(stderr, "[sega] the player takes no damage (LINDBERGH_GOD)\n");
     }
     if (widen_culling()) fprintf(stderr, "[sega] model culling widened to %.0f degrees\n", g_cull_fov);
+    {   /* LINDBERGH_FORCE_REPLAY=1: every point earns a replay (Virtua Tennis 3) -
+         * the replay camera reached in seconds, for tests nobody watches */
+        const char *r = getenv("LINDBERGH_FORCE_REPLAY");
+        if (r && *r == '1' && guest_override("_ZN6replay14isReplay_pointEv", h_true))
+            fprintf(stderr, "[sega] every point is replayed (LINDBERGH_FORCE_REPLAY)\n");
+    }
 #if defined(__ANDROID__)
     if (pace_by_display()) fprintf(stderr, "[sega] idle_wait_func: paced by the headset, not the wall clock\n");
 #endif

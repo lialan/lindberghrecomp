@@ -682,7 +682,10 @@ static void fake_keys(void)
                 while (*p == ',') p++;
                 continue;
             }
-            e.type = SDL_KEYDOWN; e.key.keysym.sym = (SDL_Keycode)(k >= 'A' && k <= 'Z' ? k + 32 : k);
+            /* ^ _ < >: the arrow keys (the lever) */
+            SDL_Keycode sym = k == '^' ? SDLK_UP : k == '_' ? SDLK_DOWN : k == '<' ? SDLK_LEFT : k == '>' ? SDLK_RIGHT
+                            : (SDL_Keycode)(k >= 'A' && k <= 'Z' ? k + 32 : k);
+            e.type = SDL_KEYDOWN; e.key.keysym.sym = sym;
             SDL_PushEvent(&e);
             e.type = SDL_KEYUP; SDL_PushEvent(&e);
             fprintf(stderr, "[keys] tapped %c at frame %u\n", k, f);
