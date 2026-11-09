@@ -145,7 +145,13 @@ static const char *const SIGHT_NAME[] = { "none", "reddot", "holo" };
 
 static LgXrSettings cfg = LG_XR_SETTINGS_DEFAULT;
 static void cfg_save(void) { xr_settings_save(&cfg); }
-static void cfg_load(void) { xr_settings_load(&cfg); }
+static void cfg_load(void)
+{
+    xr_settings_load(&cfg);
+    const char *ov = getenv("LINDBERGH_ARCADE_OVERLAYS");     /* a run's own choice wins (tests) */
+    if (ov && *ov) cfg.arcade_overlays = *ov != '0';
+    g_arcade_overlays = cfg.arcade_overlays;
+}
 
 /* ---- the session ---- */
 static XrInstance  instance;
@@ -306,9 +312,26 @@ static XrTime reload_t;            /* when the player last reloaded */
 static void aim_probe(void);   /* the eye size this run was set up with */
 static int nrates;
 
+/* The rows this game's panel shows, as item numbers: a lever cabinet
+ * (Virtua Tennis 3) has no gun, so no sight, laser, crosshair, gun model,
+ * hand or dual wield; the arcade overlays only for a game that can hide them. */
+static int menu_ids[XP_COUNT], menu_n;
+static void menu_rows(void)
+{
+    const int lever = game_profile()->joystick;
+    menu_n = 0;
+    for (int i = 0; i < XP_COUNT; i++) {
+        if (lever && (i == XP_SIGHT || i == XP_LASER || i == XP_CROSSHAIR || i == XP_GUN || i == XP_HAND || i == XP_DUAL)) continue;
+        if (i == XP_OVERLAYS && !g_arcade_overlay_hooks) continue;
+        menu_ids[menu_n++] = i;
+    }
+}
 static void menu_items(XmItem *it)
 {
-    xp_items(&menu,&cfg,gun_hand,stereo_hud_is_head_locked(),running_resolution,running_width,it);
+    XmItem all[XP_COUNT];
+    xp_items(&menu,&cfg,gun_hand,stereo_hud_is_head_locked(),running_resolution,running_width,all);
+    menu_rows();
+    for (int r = 0; r < menu_n; r++) it[r] = all[menu_ids[r]];
 }
 
 /* The arcade's reset: the game starts again from its boot, as a new process
@@ -359,7 +382,7 @@ static void menu_paint(void)
     char title[80];
     menu_items(it);
     snprintf(title, sizeof title, "%s - settings", app_title());
-    xm_paint(img, title, it, XP_COUNT, menu.hover,
+    xm_paint(img, title, it, menu_n, menu.hover,
              "Point and pull the trigger. Menu button: close.");
     xo_panel_upload(img, XM_W, XM_H);
     menu.dirty = 0;
@@ -409,9 +432,13 @@ static void fps_update(XrTime now)
 static int menu_hit(const float p[3],const float d[3],float *u,float *v,float hit[3])
 {return xp_hit(&menu,p,d,u,v,hit);}
 
-static void menu_choose(int item)
+static void menu_choose(int row)
 {
+    menu_rows();
+    if (row < 0 || row >= menu_n) return;
+    const int item = menu_ids[row];
     const unsigned effects=xp_choose(&menu,&cfg,&gun_hand,item,rates,nrates);
+    if(effects&XP_OVERLAYS_CHANGED){g_arcade_overlays=cfg.arcade_overlays;fprintf(stderr,"[xr] arcade overlays %s\n",cfg.arcade_overlays?"shown":"hidden");}
     if(effects&XP_CROSSHAIR_CHANGED)stereo_show_game_sight(cfg.crosshair && !game_profile()->joystick);
     if(effects&XP_SCREEN_CHANGED)stereo_set_screen_distance(cfg.screen*cfg.scale);
     if(effects&XP_HUD_CHANGED)stereo_set_hud_pitch((float)cfg.hud_pitch);
@@ -541,7 +568,7 @@ static int aim_gun(int h, int pl, XrTime t, int *trig, XoFrame *x, float *gx_, f
         if (menu.open) {        /* the laser points at the panel; the game is not aimed at */
             float u, v, hit[3];
             int on = menu_hit(p, d, &u, &v, hit);
-            int row = on ? xm_row_at(u, v, XP_COUNT) : -1;
+            int row = on ? (menu_rows(), xm_row_at(u, v, menu_n)) : -1;
             /* the panel's highlight follows the gun last on it */
             if (on && row != menu.hover) { menu.hover = row; menu.dirty = 1; }
             if (!on && pl == 0 && !cfg.dual && menu.hover != -1) { menu.hover = -1; menu.dirty = 1; }
@@ -605,8 +632,13 @@ static void input_frame(XrTime t)
     int aimed = 0, aimed2 = 0;
     /* a lever cabinet (Virtua Tennis 3) has no gun: no aim ray (and no
      * depth hit-test for it), no gun model, laser, flash or recoil */
-    if (lever_cab) { xo.gun_valid = xo.beam = xo.dot = xo.flash = 0; stereo_set_gun_ray(0, NULL, NULL, 0); }
-    else aimed = aim_gun(g, 0, t, trig, &xo, &gx, &gy);
+    if (lever_cab && !menu.open) { xo.gun_valid = xo.beam = xo.dot = xo.flash = 0; stereo_set_gun_ray(0, NULL, NULL, 0); }
+    else {
+        aimed = aim_gun(g, 0, t, trig, &xo, &gx, &gy);
+        /* a lever cabinet's panel: the right hand points at it, a beam and
+         * nothing more (no gun model, sight or flash), the game not aimed at */
+        if (lever_cab) { aimed = 0; xo.show_gun = 0; xo.sight = XO_SIGHT_NONE; xo.flash = 0; stereo_set_gun_ray(0, NULL, NULL, 0); }
+    }
     if (dual && !lever_cab) aimed2 = aim_gun(off, 1, t, trig, &xo2, &g2x, &g2y);
     else { xo2.gun_valid = xo2.beam = xo2.dot = xo2.flash = 0; stereo_set_gun_ray(1, NULL, NULL, 0); }
     if (menu.open && menu.dirty) menu_paint();

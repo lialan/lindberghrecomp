@@ -213,6 +213,10 @@ void dispatch(CPU *c, uint32_t va);
  * frame on the Quest. */
 extern uint32_t g_ov_lo, g_ov_hi, stereo_state_lo, stereo_state_hi;
 extern int g_dispatch_always;
+/* The arcade's own overlays (credits, insert coin, card reader messages):
+ * shown while 1. A game that can hide them hooks its draws (hle_sega.c) and
+ * sets g_arcade_overlay_hooks; the headset menu toggles g_arcade_overlays. */
+extern int g_arcade_overlays, g_arcade_overlay_hooks;
 #define DISPATCH_TO(c, va, fn) do { uint32_t _dv = (va); \
     if (!g_dispatch_always && (_dv < g_ov_lo || _dv > g_ov_hi) && \
         (_dv < stereo_state_lo || _dv > stereo_state_hi)) fn(c); else dispatch((c), _dv); } while (0)

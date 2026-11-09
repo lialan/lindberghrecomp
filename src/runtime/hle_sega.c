@@ -970,6 +970,41 @@ static void h_vt3_prize_coin(CPU *c)
     push32(c, 0xDEADBEEFu);
     g_vt3_prize_coin(c);
 }
+int g_arcade_overlays = 1, g_arcade_overlay_hooks;
+/* Virtua Tennis 3's arcade overlays: credit::draw (CREDIT(S), INSERT COIN(S),
+ * PRESS START BUTTON), skipped while g_arcade_overlays is 0, and the card
+ * reader's message windows at the top (CCardSlotWindowManager::window_open,
+ * window_slot, window_slot_usecard), not opened while it is 0 - those come back
+ * with the next window the game opens. */
+static void (*g_vt3_credit_draw)(CPU *), (*g_vt3_slot_open)(CPU *), (*g_vt3_slot)(CPU *), (*g_vt3_slot_card)(CPU *);
+/* ...and the card information board's own credit line (ab_card_info: at
+ * +0x14 a table of 3 {font, text} entries it alternates, "CREDIT 0" and
+ * "INSERT COIN(S)"): the texts pointed at an empty string while hidden, the
+ * originals put back when shown. Applied from credit::draw, every frame on
+ * the game thread, when the setting changes. */
+static void (*g_vt3_card_init)(CPU *);
+static uint32_t g_vt3_card_table, g_vt3_card_text[3], g_vt3_empty;
+static int g_vt3_card_shown = -1;
+static void vt3_card_apply(void)
+{
+    if (!g_vt3_card_table || g_vt3_card_shown == g_arcade_overlays) return;
+    if (!g_vt3_empty) { char *e = guest_alloc(4, 4); if (!e) return; e[0] = 0; g_vt3_empty = H2G(e); }
+    for (int i = 0; i < 3; i++) wr32(g_vt3_card_table + 8u * (uint32_t)i + 4, g_arcade_overlays ? g_vt3_card_text[i] : g_vt3_empty);
+    g_vt3_card_shown = g_arcade_overlays;
+}
+static void h_vt3_card_init(CPU *c)
+{
+    uint32_t self = A32(0);
+    push32(c, 0xDEADBEEFu); g_vt3_card_init(c);
+    g_vt3_card_table = rd32(self + 0x14);
+    for (int i = 0; i < 3 && g_vt3_card_table; i++) g_vt3_card_text[i] = rd32(g_vt3_card_table + 8u * (uint32_t)i + 4);
+    g_vt3_card_shown = -1;
+    vt3_card_apply();
+}
+static void h_vt3_credit_draw(CPU *c) { vt3_card_apply(); if (!g_arcade_overlays) return; push32(c, 0xDEADBEEFu); g_vt3_credit_draw(c); }
+static void h_vt3_slot_open(CPU *c) { if (!g_arcade_overlays) return; push32(c, 0xDEADBEEFu); g_vt3_slot_open(c); }
+static void h_vt3_slot(CPU *c) { if (!g_arcade_overlays) return; push32(c, 0xDEADBEEFu); g_vt3_slot(c); }
+static void h_vt3_slot_card(CPU *c) { if (!g_arcade_overlays) return; push32(c, 0xDEADBEEFu); g_vt3_slot_card(c); }
 static int vt3_wrap(const char *sym, void (**orig)(CPU *), HleHandler h)
 {
     extern void (*dispatch_lifted(uint32_t va))(CPU *);
@@ -986,6 +1021,18 @@ static void vt3_jumps(void)
         fprintf(stderr, "[sega] Virtua Tennis 3: %s%d\n", g_vt3_round >= 0 ? "the run starts at round " : "rounds logged ", g_vt3_round);
     if (g_vt3_log) vt3_wrap("_ZN5match13setNext_roundEv", &g_vt3_next_round, h_vt3_next_round);
     {
+        const char *ov = getenv("LINDBERGH_ARCADE_OVERLAYS");
+        if (ov && *ov == '0') g_arcade_overlays = 0;
+        const char *only = getenv("LINDBERGH_VT3_OVERLAY_HOOK");   /* test: "credit" or "card" alone */
+        int nh = 0;
+        if (!only || !strcmp(only, "credit")) nh += vt3_wrap("_ZN6credit4drawEv", &g_vt3_credit_draw, h_vt3_credit_draw);
+        if (!only || !strcmp(only, "card")) {
+            nh += vt3_wrap("_ZN22CCardSlotWindowManager11window_openEl", &g_vt3_slot_open, h_vt3_slot_open);
+            nh += vt3_wrap("_ZN22CCardSlotWindowManager11window_slotElb", &g_vt3_slot, h_vt3_slot);
+            nh += vt3_wrap("_ZN22CCardSlotWindowManager19window_slot_usecardElb", &g_vt3_slot_card, h_vt3_slot_card);
+            nh += vt3_wrap("_ZN12ab_card_info4initEv", &g_vt3_card_init, h_vt3_card_init);
+        }
+        if (nh) { g_arcade_overlay_hooks = 1; fprintf(stderr, "[sega] Virtua Tennis 3: arcade overlays %s (%d draws hooked)\n", g_arcade_overlays ? "shown" : "hidden", nh); }
         const char *pt = getenv("LINDBERGH_VT3_PRIZE_TRACE");
         if (pt && *pt) {
             extern long g_arb_trace_from;
