@@ -58,6 +58,8 @@ typedef struct {
         int   camera_in_locals;     /* ...in program.local[0..3] (Virtua Tennis 3's g_transform_mat), not program.env[0..3] */
         int   depth_tex_shadow;     /* a depth texture a fragment program reads as 2D is a shadow map (NVIDIA compares; Virtua Tennis 3's players) */
         float shadow_bias;          /* taken off a shadow map's reference depth before the in-shader compare (LINDBERGH_SHADOW_BIAS) */
+        const char *const *menu_states;  /* the game's own menu state functions, full symbols, NULL-ended: their frames are flat menus */
+        const char *const *play_states;  /* ...and its play ones (a frame running one is not a menu) */
         int   depth_read;       /* LG_DEPTH_* */
         int   compositor_depth; /* LG_COMPOSITOR_DEPTH_* */
         int   face_swings;      /* when the game swings its camera hard, its view is put back in front of the

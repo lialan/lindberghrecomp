@@ -50,6 +50,7 @@
 #include <EGL/egl.h>
 #endif
 #include "arbprog.h"
+#include "game_profile.h"
 
 /* a debug switch, looked up once */
 #define ENV_ON(name) ({ static int _on = -1; if (_on < 0) _on = getenv(name) != NULL; _on; })
@@ -139,6 +140,7 @@ static GLint    g_eye_vp[4];            /* the viewport GL has, in eye pixels */
 static int      g_side;                 /* inside a side pass */
 static GLint    g_game_scissor[4];      /* the game's scissor box, in its pixels */
 static unsigned g_scene_draws;          /* 3D draws in the world this frame */
+static unsigned g_eye_draws;            /* any draws into the eyes this frame (a flat menu's count no world) */
 static unsigned g_eyes_copied_frame = ~0u;  /* the last frame a whole-screen copy was taken of a world */
 static float    g_lens_seen;            /* the longest lens (projection x scale) drawn with this frame */
 static float    g_zoom_lens = 8.0f;     /* a longer one is a zoomed view: the sniper scope is 11.4, the
@@ -870,7 +872,8 @@ static Cls g_cls[HLE_ID_MAX];
  * GameInstruction, GameWeaponSelect and so on while a menu is up. */
 #include "game_states.h"
 uint32_t stereo_state_lo = ~0u, stereo_state_hi;
-static uint32_t g_state_va[48];
+static uint32_t g_state_va[96];
+static const char *g_state_name[96];
 static unsigned g_nstate, g_nmenu;      /* the first g_nmenu are menus */
 static unsigned g_state_frame = ~0u;    /* the frame a menu state last ran */
 static uint32_t g_state_last;
@@ -882,11 +885,22 @@ static void watch_states(void)
     for (int pass = 0; pass < 2; pass++) {   /* play states: reported in LINDBERGH_HUD_LOG only */
         const char *const *l = pass ? lg_play_states : lg_menu_states;
         int n = pass ? (int)(sizeof lg_play_states / sizeof *lg_play_states) : (int)(sizeof lg_menu_states / sizeof *lg_menu_states);
-        for (int i = 0; i < n && g_nstate < 48; i++) {
+        for (int i = 0; i < n && g_nstate < 96; i++) {
             char name[64];
             snprintf(name, sizeof name, "_Z%zuGame%sP8GAMEWORK", strlen(l[i]) + 4, l[i]);
             uint32_t va = guest_symbol(name);
             if (!va) continue;
+            g_state_name[g_nstate] = l[i];
+            g_state_va[g_nstate++] = va;
+            if (va < stereo_state_lo) stereo_state_lo = va;
+            if (va > stereo_state_hi) stereo_state_hi = va;
+        }
+        /* a game's own, by full symbol (Virtua Tennis 3's usr...Loop::exec) */
+        const char *const *own = pass ? game_profile()->vr.play_states : game_profile()->vr.menu_states;
+        for (int i = 0; own && own[i] && g_nstate < 96; i++) {
+            uint32_t va = guest_symbol(own[i]);
+            if (!va) { fprintf(stderr, "[stereo] state %s: no such symbol\n", own[i]); continue; }
+            g_state_name[g_nstate] = own[i];
             g_state_va[g_nstate++] = va;
             if (va < stereo_state_lo) stereo_state_lo = va;
             if (va > stereo_state_hi) stereo_state_hi = va;
@@ -909,7 +923,7 @@ void stereo_guest_state(uint32_t va)
         }
         else g_state_frame = ~0u;
         if (va != g_state_last && ENV_ON("LINDBERGH_HUD_LOG"))
-            fprintf(stderr, "[state] frame %u: %#x (%s)\n", g_frame, va, i < g_nmenu ? "menu" : "play");
+            fprintf(stderr, "[state] frame %u: %#x %s (%s)\n", g_frame, va, g_state_name[i] ? g_state_name[i] : "", i < g_nmenu ? "menu" : "play");
         g_state_last = va;
         return;
     }
@@ -918,7 +932,11 @@ void stereo_guest_state(uint32_t va)
 /* a menu state ran this frame or the last (outside game mode, none runs) */
 static int menu_state(void)
 {
-    return g_state_frame != ~0u && g_frame - g_state_frame <= 1;
+    /* a few frames' grace: with the GL on its own thread this is asked a frame
+     * or two behind the game, and a gap of two flipped Virtua Tennis 3's menus
+     * between flat and world every few frames (black between). A play state
+     * ends it at once (g_state_frame = ~0u), so play is not held up. */
+    return g_state_frame != ~0u && g_frame - g_state_frame <= 8;
 }
 
 /* A menu frame is drawn flat - the arcade's own picture, every pass and
@@ -1241,7 +1259,7 @@ static int copy_from_eyes(CPU *c, int k)
     int X0 = (int)lroundf(x * sx), Y0 = (int)lroundf(y * sy);
     int X1 = (int)lroundf((x + w) * sx), Y1 = (int)lroundf((y + h) * sy);
     gl4es_multiview_copy(g_side ? g_side_tex[0] : g_eye_tex[0], 0, X0, Y0, X1, Y1, (GLuint)tex, level, xo, yo, xo + w, yo + h);
-    if (!g_side && w >= GAME_W * 9 / 10 && h >= GAME_H * 9 / 10 && g_scene_draws) g_eyes_copied_frame = g_frame;
+    if (!g_side && w >= GAME_W * 9 / 10 && h >= GAME_H * 9 / 10 && (g_scene_draws || (g_flat && g_eye_draws))) g_eyes_copied_frame = g_frame;
     if (!g_side && w >= GAME_W * 9 / 10 && h >= GAME_H * 9 / 10 && !screen_copy((GLuint)tex) && g_nscreen_copy < MAX_SCREEN_COPIES) {
         g_screen_copy[g_nscreen_copy++] = (GLuint)tex;
         fprintf(stderr, "[stereo] frame %u: texture %d is a copy of the whole screen\n", g_frame, tex);
@@ -1456,7 +1474,7 @@ static int transform_call(CPU *c, HleId id, const char *n)
      * effect) would flatten it to one eye's picture: left out. Over no world
      * it is the whole picture - a transition, last frame's view swept away -
      * and leaving it out left the eyes black: it goes over the whole view. */
-    if (g_on && g_mv && !g_side && (is_draw(k) || k == K_BEGIN) && g_tex2d_on && g_nscreen_copy && screen_copy(g_tex2d_bound) && g_scene_draws) {
+    if (g_on && g_mv && !g_side && (is_draw(k) || k == K_BEGIN) && g_tex2d_on && g_nscreen_copy && screen_copy(g_tex2d_bound) && (g_scene_draws || (g_flat && g_eye_draws))) {
         if (k == K_BEGIN) g_skip_begin = 1;
         return 1;
     }
@@ -1486,8 +1504,13 @@ static int transform_call(CPU *c, HleId id, const char *n)
                         g_frame, mask, (unsigned)g_game_fb, g_side, g_mv, g_scene_draws, g_eyes_copied_frame, (unsigned)g_world_fb);
             }
         }
+        /* A flat menu (Virtua Tennis 3's Road to the Championship, its versus
+         * card) draws its 3D panels, clears and only then copies the screen,
+         * for a composite that is left out here: once anything is drawn in a
+         * flat frame, a colour clear of the screen would leave only the HUD on
+         * black - it goes. */
         if (g_on && g_mv && !g_side && g_game_fb == 0 && (mask & GL_COLOR_BUFFER_BIT) &&
-            g_scene_draws && g_eyes_copied_frame == g_frame) {
+            ((g_scene_draws && g_eyes_copied_frame == g_frame) || (g_flat && g_eye_draws))) {
             mask &= ~(GLbitfield)GL_COLOR_BUFFER_BIT;
             if (!mask) return 1;
             wr32(c->esp, mask);
@@ -1645,6 +1668,7 @@ static int transform_call(CPU *c, HleId id, const char *n)
             return 1;
         }
     }
+    if (g_on && (is_draw(k) || k == K_BEGIN) && g_game_fb == 0 && !g_side) g_eye_draws++;
     if (g_on && (is_draw(k) || k == K_BEGIN)) {
         /* Screen content or not, decided per draw: 2D that is not a pass over
          * a render target, and 3D drawn into the HUD's target. */
@@ -2865,6 +2889,7 @@ void stereo_frame_begin(void)
     g_lens_seen = 0;
     g_near_seen = 0;
     g_scene_draws = 0;
+    g_eye_draws = 0;
     g_2d_seq = 0;
     g_3d_draws = 0;
     {
