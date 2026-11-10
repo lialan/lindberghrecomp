@@ -1638,6 +1638,13 @@ static Linked *link_pair(GLuint vid, GLuint fid)
                     g_tr_layered |= 1u << u;
                     gl4es_multiview_layered((GLuint)tex);
                 }
+                {   /* LINDBERGH_TXP_LOG=1: each fragment program's projective reads, which texture, read per view or not */
+                    static int lg = -1; if (lg < 0) { const char *v = getenv("LINDBERGH_TXP_LOG"); lg = v && *v == '1'; }
+                    char pat[24]; snprintf(pat, sizeof pat, "texture[%d]", u);
+                    if (lg && tex && pp[1] && pp[1]->src && strstr(pp[1]->src, "TXP") && strstr(pp[1]->src, pat))
+                        fprintf(stderr, "[txp] frame %u: fragment program %u (vertex %u) unit %d texture %d%s\n", g_frame, fid, vid, u, tex,
+                                stereo_is_picture_texture((unsigned)tex) ? " per view" : "");
+                }
             }
             glActiveTexture((GLenum)active);
         }
@@ -2204,6 +2211,12 @@ void arb_before_draw(void)
                 fprintf(stderr, "[mvp] frame %u prog %u:", g_frame, g_bound[0]);
                 for (int i = 0; i < 16; i++) fprintf(stderr, " %g", pp->local[i / 4][i % 4]);
                 fprintf(stderr, "\n");
+                static int all = -1; if (all < 0) { const char *v = getenv("LINDBERGH_MVP_DUMP_ALL"); all = v && *v == '1'; }
+                if (all) {      /* every local: the bone palette too */
+                    fprintf(stderr, "[loc] frame %u prog %u:", g_frame, g_bound[0]);
+                    for (int i = 0; i < MAX_LOCAL; i++) fprintf(stderr, " %g %g %g %g", pp->local[i][0], pp->local[i][1], pp->local[i][2], pp->local[i][3]);
+                    fprintf(stderr, "\n");
+                }
             }
         }
     }
@@ -2863,16 +2876,39 @@ int arb_env_projection(float P[16])
             return 1;
         }
         /* A draw made through the match camera's own projection, whatever
-         * its model did: MVP = P * E with E's last row (0 0 0 1), so its
-         * third row plus A times its fourth is (0 0 0 B). True of a ground
+         * its model did: MVP = P * E with E's last row (0 0 0 k), so its
+         * third row plus A times its fourth is (0 0 0 kB) - k is 1 for a
+         * placed model, the light's slant for a sun shadow flattened onto
+         * the ground (taken for 1, every shadow missed it). True of a ground
          * shadow too, whose flattened matrix the lens read below takes
          * apart wrong - its depth off, the eyes and the dolly put it
          * metres from the player's feet. Not of a render target's light
          * camera (handing those the match lens blacked the picture). */
         if (g_game_world_ok && use_cam != 3) {
-            float A = g_game_world_P[10], B = g_game_world_P[14], tol = 2e-3f * fabsf(B);
-            int same = fabsf(c[3][2] + A * c[3][3] - B) < tol;
-            for (int j = 0; j < 3 && same; j++) same = fabsf(c[j][2] + A * c[j][3]) < tol;
+            /* tried both ways round: a program that builds its position by
+             * rows through a temporary ("DP4 R1.x, ...; MOV result.position,
+             * R1") is not seen as one (position_by_rows) - the players'
+             * shadows, taken apart transposed, sat metres from their feet
+             * and slid with the head */
+            float A = g_game_world_P[10], B = g_game_world_P[14];
+            int same = 0;
+            for (int way = 0; way < 2 && !same; way++) {
+#define CE(i, j) (way ? c[j][i] : c[i][j])
+                float k = (CE(3, 2) + A * CE(3, 3)) / B;
+                same = fabsf(k) > 1e-6f;
+                for (int j = 0; j < 3 && same; j++)
+                    same = fabsf(CE(j, 2) + A * CE(j, 3)) < 1e-3f * (fabsf(CE(j, 2)) + fabsf(A * CE(j, 3)) + 1e-3f * fabsf(k * B));
+#undef CE
+            }
+            {   /* LINDBERGH_MVP_DUMP=<frame>: each draw's matrix as read, and whether it is the match camera's */
+                static long dump = -2; extern unsigned g_frame;
+                if (dump == -2) { const char *v = getenv("LINDBERGH_MVP_DUMP"); dump = v && *v ? atol(v) : -1; }
+                if (dump >= 0 && (long)g_frame == dump) {
+                    fprintf(stderr, "[envp] prog %u kind %d same %d lens %.3f:", g_bound[0], p->pos_kind, same, lx / s);
+                    for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) fprintf(stderr, " %g", c[i][j]);
+                    fprintf(stderr, "\n");
+                }
+            }
             if (same) {
                 for (int i = 0; i < 16; i++) P[i] = g_game_world_P[i];
                 memcpy(good, P, sizeof good); have_good = 1;
@@ -2968,8 +3004,9 @@ static int g_noted_n, g_noted_next;
  * so that its screen plane is the picture's pixels (1360x768 at 989 away,
  * no turn). The world camera's lens, GL's layout, and the pixel one's lens
  * across, for arb_env_projection to tell a draw's from. */
-volatile float g_game_world_P[16], g_game_layer_x;
+volatile float g_game_world_P[16], g_game_layer_x, g_game_up_eye[3];
 volatile int g_game_world_ok;
+extern volatile float g_game_up_eye[3];
 void arb_note_projection(const float *proj, const float *view)
 {
     {
@@ -2992,6 +3029,7 @@ void arb_note_projection(const float *proj, const float *view)
             float P[16] = { 0 };
             for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++) P[c * 4 + r] = proj[r * 4 + c];
             for (int i = 0; i < 16; i++) g_game_world_P[i] = P[i];
+            for (int i = 0; i < 3; i++) g_game_up_eye[i] = view[1 + 4 * i];   /* the world's up, in the camera's space */
             g_game_world_ok = 1;
         }
     }

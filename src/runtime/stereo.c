@@ -373,9 +373,23 @@ static void effective_projection(const float *p, int hud, float *out)
              * LINDBERGH_VT3_DOLLY game units (a tenth of a metre; default
              * 200 of its ~345 from the court): out * T(0, 0, +d), the
              * draw's eye space shifted before the headset's matrices. */
-            static float dolly = -1;
+            static float dolly = -1, back = -1;
             if (dolly < 0) { const char *v = getenv("LINDBERGH_VT3_DOLLY"); dolly = v && *v ? (float)atof(v) : 200.0f; }
-            for (int r = 0; r < 4; r++) out[12 + r] += dolly * out[8 + r];
+            /* ...then stepped back level with the ground, out of the court,
+             * as if walking backwards (LINDBERGH_VT3_BACK game units,
+             * default 60): along the camera's forward with the world's up
+             * (from the game's view, arb_note_projection) taken out. */
+            if (back < 0) { const char *v = getenv("LINDBERGH_VT3_BACK"); back = v && *v ? (float)atof(v) : 60.0f; }
+            extern volatile float g_game_up_eye[3]; extern volatile int g_game_world_ok;
+            float t[3] = { 0, 0, dolly };
+            float u[3] = { g_game_up_eye[0], g_game_up_eye[1], g_game_up_eye[2] };
+            float ul = sqrtf(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]);
+            if (g_game_world_ok && ul > 0.5f) {
+                float h[3] = { u[2] / ul * (u[0] / ul), u[2] / ul * (u[1] / ul), -1 + (u[2] / ul) * (u[2] / ul) };   /* (0,0,-1) less its up part */
+                float hl = sqrtf(h[0] * h[0] + h[1] * h[1] + h[2] * h[2]);
+                if (hl > 0.1f) for (int i = 0; i < 3; i++) t[i] += back * h[i] / hl;
+            }
+            for (int r = 0; r < 4; r++) out[12 + r] += t[0] * out[r] + t[1] * out[4 + r] + t[2] * out[8 + r];
             return;
         }
     }
