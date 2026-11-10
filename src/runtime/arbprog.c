@@ -2221,6 +2221,11 @@ void arb_before_draw(void)
         }
     }
     extern int stereo_glprof_on(void);
+    extern void stereo_draw_dump(void);
+    stereo_draw_dump();
+    {   static int nost = -1;   /* LINDBERGH_NO_STENCIL=1 (testing): every draw without its stencil test */
+        if (nost < 0) { const char *v = getenv("LINDBERGH_NO_STENCIL"); nost = v && *v == '1'; }
+        if (nost) glDisable(GL_STENCIL_TEST); }
     if (!stereo_glprof_on()) { before_draw(); return; }
     struct timespec a, b;
     clock_gettime(CLOCK_MONOTONIC, &a);
@@ -3006,6 +3011,15 @@ static int g_noted_n, g_noted_next;
  * across, for arb_env_projection to tell a draw's from. */
 volatile float g_game_world_P[16], g_game_layer_x, g_game_up_eye[3], g_game_view[12];
 volatile int g_game_world_ok;
+/* the bound vertex program's local i (0 if none) */
+int arb_vp_local(int i, float v[4])
+{
+    if (!g_enabled[0] || !g_bound[0] || i < 0 || i >= MAX_LOCAL) return 0;
+    ArbProg *pp = prog_get(0, g_bound[0], 0);
+    if (!pp) return 0;
+    for (int k = 0; k < 4; k++) v[k] = pp->local[i][k];
+    return 1;
+}
 /* the bound vertex program's local[0..3] (VT3's matrix, by rows); 0 if none */
 int arb_vp_matrix(float m[16])
 {

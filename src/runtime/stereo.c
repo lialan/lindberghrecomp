@@ -2102,11 +2102,35 @@ static Op *op_new(void);
 static void vert_dump(uint32_t lo, uint32_t hi, GLsizei count)
 {
     static long at = -2;
-    if (at == -2) { const char *v = getenv("LINDBERGH_VERT_DUMP"); at = v && *v ? atol(v) : -1; }
-    if (at < 0 || (long)g_frame < at || (long)g_frame > at + 1) return;
+    static long last; if (at == -2) { const char *v = getenv("LINDBERGH_VERT_DUMP"); at = v && *v ? atol(v) : -1; last = v && strchr(v, '-') ? atol(strchr(v, '-') + 1) : at + 1; }   /* =<frame>[-<last>] */
+    if (at < 0 || (long)g_frame < at || (long)g_frame > last) return;
     extern volatile float g_game_world_P[16], g_game_view[12]; extern volatile int g_game_world_ok;
     extern int arb_vp_matrix(float m[16]);
     float M[16]; Arr *a = g_arr[ARR_VERTEX].on ? &g_arr[ARR_VERTEX] : &g_arr[ARR_ATTR0];
+    {   /* the matrices: locals 0..3 (the position), and the light rows a shadow reader uses */
+        extern int arb_vp_local(int i, float v[4]);
+        static const int li[] = { 0, 1, 2, 3, 8, 9, 11, 15, 225 };
+        fprintf(stderr, "[vmat] frame %u fb %u vp %u fp %u:", g_frame, (unsigned)g_game_fb, arb_bound_vp(), arb_bound_fp());
+        for (unsigned j = 0; j < sizeof li / sizeof *li; j++) {
+            float v[4]; if (!arb_vp_local(li[j], v)) break;
+            fprintf(stderr, " L%d %g %g %g %g", li[j], v[0], v[1], v[2], v[3]);
+        }
+        float R0[16], R1[16]; stereo_reproject_view(0, R0); stereo_reproject_view(1, R1);
+        { GLint df = 0; GLboolean dm = 0; GLfloat po[2] = { 0, 0 };
+          glGetIntegerv(GL_DEPTH_FUNC, &df); glGetBooleanv(GL_DEPTH_WRITEMASK, &dm);
+          glGetFloatv(GL_POLYGON_OFFSET_FACTOR, &po[0]); glGetFloatv(GL_POLYGON_OFFSET_UNITS, &po[1]);
+          fprintf(stderr, " | depth %d %#x mask %d offset %d %g %g blend %d clip %d", glIsEnabled(GL_DEPTH_TEST), df, dm,
+                  glIsEnabled(GL_POLYGON_OFFSET_FILL), po[0], po[1], glIsEnabled(GL_BLEND), g_clipped);
+          GLboolean cm[4]; GLint sc[4], vpv[4], cf = 0, ff = 0; glGetBooleanv(GL_COLOR_WRITEMASK, cm); glGetIntegerv(GL_SCISSOR_BOX, sc);
+          glGetIntegerv(GL_VIEWPORT, vpv); glGetIntegerv(GL_CULL_FACE_MODE, &cf); glGetIntegerv(GL_FRONT_FACE, &ff);
+          fprintf(stderr, " cmask %d%d%d%d scissor %d %d,%d %dx%d vp %d,%d %dx%d cull %d %#x front %#x", cm[0], cm[1], cm[2], cm[3],
+                  glIsEnabled(GL_SCISSOR_TEST), sc[0], sc[1], sc[2], sc[3], vpv[0], vpv[1], vpv[2], vpv[3], glIsEnabled(GL_CULL_FACE), cf, ff); }
+        fprintf(stderr, " | hud %d persp %d R0", g_loaded_hud, is_perspective(g_proj[g_proj_top]));
+        for (int i = 0; i < 16; i++) fprintf(stderr, " %.3g", R0[i]);
+        fprintf(stderr, " R1");
+        for (int i = 0; i < 16; i++) fprintf(stderr, " %.3g", R1[i]);
+        fprintf(stderr, "\n");
+    }
     if (!g_game_world_ok || !arb_vp_matrix(M)) { static int said; if (said++ < 5) fprintf(stderr, "[vert] skipped: world %d vp %u\n", g_game_world_ok, arb_bound_vp()); return; }
     GLint stf = 0; GLboolean ston = glIsEnabled(GL_STENCIL_TEST); glGetIntegerv(GL_STENCIL_FUNC, &stf);
     fprintf(stderr, "[vert] frame %u vp %u fp %u st %d %#x tex %u count %d verts %u..%u size %d type %#x vbo %u:", g_frame, arb_bound_vp(), arb_bound_fp(),
@@ -2116,6 +2140,13 @@ static void vert_dump(uint32_t lo, uint32_t hi, GLsizei count)
     uint32_t stride = a->stride ? (uint32_t)a->stride : (uint32_t)a->size * 4;
     float mn[3] = { 1e9f, 1e9f, 1e9f }, mx[3] = { -1e9f, -1e9f, -1e9f }, rw[3] = { 0 }; int n = 0, shown = 0;
     float *buf = NULL;
+    if (a->vbo) {           /* the whole buffer: the index range read back is not to be trusted */
+        GLint was = 0, sz = 0; glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &was);
+        glBindBuffer(GL_ARRAY_BUFFER, a->vbo); glGetBufferParameteriv(GL_ARRAY_BUFFER, GL_BUFFER_SIZE, &sz);
+        glBindBuffer(GL_ARRAY_BUFFER, (GLuint)was);
+        if (sz > (GLint)a->ptr + 12) { lo = 0; hi = (uint32_t)((sz - (GLint)a->ptr - a->size * 4) / (GLint)stride); if (hi > 200000) hi = 200000; lo = 0; }
+        lo += a->ptr / stride * 0;  /* (ptr is the buffer offset; v * stride is added to it below) */
+    }
     if (a->vbo) {
         buf = (float *)malloc((size_t)(hi - lo) * stride + 16);
         if (!buf) return;
@@ -2143,12 +2174,22 @@ static void vert_dump(uint32_t lo, uint32_t hi, GLsizei count)
     fprintf(stderr, "\n");
 }
 
+void stereo_reproject_view(int v, float out[16]);
+static void vert_dump_live(CPU *c, int kind, const char *nm);
+/* the draw being executed, for the dump from inside it (after its class is decided) */
+static CPU *g_dump_c; static int g_dump_kind; static const char *g_dump_name;
+void stereo_draw_dump(void)
+{
+    if (!g_dump_c) return;
+    CPU *c = g_dump_c; g_dump_c = NULL;
+    vert_dump_live(c, g_dump_kind, g_dump_name);
+}
 /* vert_dump for a draw that is not recorded (multiview): its index range */
 static void vert_dump_live(CPU *c, int kind, const char *nm)
 {
     static long at = -2;
-    if (at == -2) { const char *v = getenv("LINDBERGH_VERT_DUMP"); at = v && *v ? atol(v) : -1; }
-    if (at < 0 || (long)g_frame < at || (long)g_frame > at + 1) return;
+    static long last; if (at == -2) { const char *v = getenv("LINDBERGH_VERT_DUMP"); at = v && *v ? atol(v) : -1; last = v && strchr(v, '-') ? atol(strchr(v, '-') + 1) : at + 1; }   /* =<frame>[-<last>] */
+    if (at < 0 || (long)g_frame < at || (long)g_frame > last) return;
     if (!strcmp(nm, "glDrawRangeElements")) { vert_dump(A32(1), A32(2), AI32(3)); return; }
     if (!strcmp(nm, "glMultiDrawElements") || !strcmp(nm, "glMultiDrawElementsEXT")) {
         const GLsizei *cnt = (const GLsizei *)GP(A32(1)); GLsizei n = AI32(4), tot = 0; int ib = type_bytes(A32(2));
@@ -2657,7 +2698,7 @@ static void stereo_gl_call_inner(CPU *c, HleId id, HleHandler fn)
     /* the client arrays' state, for telling what a 2D draw covers (with two
      * passes record() keeps it) */
     if ((g_mv || g_wide) && cls(id)->track) track_arrays(c, cls(id)->track);
-    if (g_mv || g_wide) vert_dump_live(c, cls(id)->kind, n);
+    if (g_mv || g_wide) { g_dump_c = c; g_dump_kind = cls(id)->kind; g_dump_name = n; }
     if (!g_mv && !g_wide) {
         if (g_glprof > 0) {
             double t0 = now_ns();
