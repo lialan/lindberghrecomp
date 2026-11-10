@@ -74,7 +74,7 @@ static GLuint prog_gun, prog_beam, vao_gun, vbo_gun, vao_beam, vbo_beam;
 static GLuint prog_depth, smp_depth;    /* the world's depth, copied for the headset */
 static GLint  u_depth_d, u_depth_layer, u_depth_size;
 static GLuint prog_screen[2], vao_screen, vbo_screen, smp_screen;   /* [0] a 2D texture, [1] a layer of an array */
-static GLint u_screen_mvp[2], u_screen_tex[2];
+static GLint u_screen_mvp[2], u_screen_tex[2], u_screen_layer[2];
 static GLuint prog_panel;
 static GLint u_panel_mvp, u_panel_tex;
 static GLint u_gun_mvp, u_gun_model, u_beam_mvp, u_beam_color, u_beam_shape;
@@ -161,13 +161,14 @@ int xo_init(void)
         prog_screen[a] = program(
             XO_GLSL "layout(location=0) in vec2 p; uniform mat4 mvp; out vec2 t;\n"
             "void main() { t = p * 0.5 + 0.5; gl_Position = mvp * vec4(p, 0.0, 1.0); }\n",
-            a ? XO_GLSL "precision highp float; precision highp sampler2DArray; in vec2 t; uniform sampler2DArray tex; out vec4 o;\n"
-                "void main() { o = vec4(texture(tex, vec3(t, 0.0)).rgb, 1.0); }\n"
+            a ? XO_GLSL "precision highp float; precision highp sampler2DArray; in vec2 t; uniform sampler2DArray tex; uniform float layer; out vec4 o;\n"
+                "void main() { o = vec4(texture(tex, vec3(t, layer)).rgb, 1.0); }\n"
               : XO_GLSL "precision highp float; in vec2 t; uniform sampler2D tex; out vec4 o;\n"
                 "void main() { o = vec4(texture(tex, t).rgb, 1.0); }\n",
             "p", NULL, NULL);
         u_screen_mvp[a] = gl.GetUniformLocation(prog_screen[a], "mvp");
         u_screen_tex[a] = gl.GetUniformLocation(prog_screen[a], "tex");
+        u_screen_layer[a] = gl.GetUniformLocation(prog_screen[a], "layer");
     }
     prog_panel = program(   /* the panel's picture: row 0 at the top */
         XO_GLSL "layout(location=0) in vec2 p; uniform mat4 mvp; out vec2 t;\n"
@@ -413,8 +414,10 @@ void xo_draw(const XoFrame *f, const float viewproj[16], const float eye_pos[3],
 }
 
 /* The game's own picture, drawn flat as on the arcade, on the screen in front
- * of the player: the quad -1..1 through mvp. The rest of the eye is black. */
-void xo_draw_screen(const float mvp[16], unsigned tex, int array_layer0, int w, int h)
+ * of the player: the quad -1..1 through mvp. The rest of the eye is black.
+ * From an array: its layer `layer` (each eye its own, for the stereoscopic
+ * screen; 0 for the flat one). */
+void xo_draw_screen(const float mvp[16], unsigned tex, int array_layer0, int layer, int w, int h)
 {
     if (!prog_screen[0]) return;
     Saved s;
@@ -437,6 +440,7 @@ void xo_draw_screen(const float mvp[16], unsigned tex, int array_layer0, int w, 
     gl.UseProgram(prog_screen[a]);
     gl.UniformMatrix4fv(u_screen_mvp[a], 1, GL_FALSE, mvp);
     gl.Uniform1i(u_screen_tex[a], 0);
+    if (u_screen_layer[a] >= 0) gl.Uniform1f(u_screen_layer[a], (float)layer);
     gl.BindTexture(target, tex);
     gl.BindSampler(0, smp_screen);
     gl.BindVertexArray(vao_screen);

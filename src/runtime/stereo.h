@@ -73,6 +73,9 @@ extern uint32_t stereo_state_lo, stereo_state_hi;
  * the eye image on the screen, whose half size and distance in game units
  * from the game camera stereo_screen gives. */
 int  stereo_flat_frame(void);
+/* The flat screen in stereo: each eye's world drawn from its own place
+ * (LINDBERGH_STEREO_DEPTH), each eye shown its own layer. */
+int  stereo_screen_3d(void);
 /* Points along a ray (game units, from the game camera) in the first eye's
  * view of the world: pixel, window depth, distance; and the world's depth
  * array to compare them with. 0: no such view this frame. */

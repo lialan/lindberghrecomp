@@ -277,8 +277,64 @@ int stereo_hud_is_head_locked(void)
     return g_hud_lock;
 }
 
+/* ---- the stereoscopic screen ----
+ * The match stays the arcade's picture on a screen ahead, framed and angled
+ * as the game's camera has it, but each eye's world is drawn from its own
+ * place: the camera moved sideways by e (game units, half to each side). In
+ * clip space that adds -P0 e to x, P0 the camera's horizontal lens (after the
+ * divide, P0 e / w: the near shifted more than the far) - a constant, so it
+ * goes in as u_eyex after u_reproj, the same for every 3D draw of the frame,
+ * right for the crowd and banners too, whose own matrices would not come
+ * apart into a camera. Without convergence infinity is on the screen and all
+ * else in front of it; a convergence distance C (game units, the depth
+ * shown on the screen) adds P0 e / C to x per unit of w, in u_reproj.
+ * LINDBERGH_STEREO_DEPTH=e, LINDBERGH_STEREO_CONVERGE=C. */
+static float g_world_persp[16];          /* (defined below) the frame's camera */
+static int g_flat_shown;                 /* (defined below) */
+static float g_ss_e = -1, g_ss_c;
+static int ss_on(void)
+{
+    if (g_ss_e < 0) {
+        const char *v = getenv("LINDBERGH_STEREO_DEPTH"), *c = getenv("LINDBERGH_STEREO_CONVERGE");
+        g_ss_e = v && *v ? (float)atof(v) : 0; g_ss_c = c && *c ? (float)atof(c) : 0;
+        if (g_ss_e > 0) fprintf(stderr, "[stereo] stereoscopic screen: eyes %.3f apart, converging at %.1f\n", g_ss_e, g_ss_c);
+    }
+    return g_ss_e > 0;
+}
+int stereo_screen_3d(void) { return g_flat_shown && ss_on() && g_mv; }
+static float ss_lens(const float *p) { return is_perspective(g_world_persp) ? g_world_persp[0] : p[0]; }
+static float ss_eye_e(int eye) { return (eye ? 0.5f : -0.5f) * g_ss_e; }   /* the left eye's camera to the left */
+static int ss_draw(const float *p, int hud) { return g_on && g_flat && hud != LG_STEREO_FILL && is_perspective(p) && ss_on(); }
+/* the depth put on the screen: LINDBERGH_STEREO_CONVERGE, else the middle of
+ * the camera's own depth range (Virtua Tennis 3's broadcast camera: about
+ * 800 to 1050, the court inside it - the near end in front of the screen,
+ * the far behind it) */
+static float ss_converge_at(const float *p)
+{
+    if (g_ss_c > 0) return g_ss_c;
+    const float *cam = is_perspective(g_world_persp) ? g_world_persp : p;
+    float n = cam[14] / (cam[10] - 1), f = cam[14] / (cam[10] + 1);
+    return isfinite(n) && isfinite(f) && n > 0 && f > n ? 0.5f * (n + f) : 0;
+}
+static void ss_converge(const float *p, float *out)
+{
+    float S[16]; mat_identity(S);
+    float c = ss_converge_at(p);
+    if (c > 0) S[12] = ss_lens(p) * ss_eye_e(g_eye) / c;   /* row x, column w */
+    mat_mul(out, S, p);
+}
+float stereo_eye_x(int view)
+{
+    const float *p = g_proj[g_proj_top];
+    if (!ss_draw(p, g_loaded_hud)) return 0;
+    return -ss_lens(p) * ss_eye_e(view);
+}
+
 static void effective_projection(const float *p, int hud, float *out)
 {
+    /* the stereoscopic screen: a flat frame's every perspective draw is its
+     * world (its HUD is 2D), whatever class the flat picture gave it */
+    if (ss_draw(p, hud)) { ss_converge(p, out); return; }
     if (!g_on || hud == LG_STEREO_PASS || hud == LG_STEREO_FILL) {
         lg_stereo_eye_projection(p,!g_on?LG_STEREO_PASS:hud,NULL,out);
         return;
@@ -296,6 +352,24 @@ static void effective_projection(const float *p, int hud, float *out)
     }
     if (is_perspective(p) && !hud) memcpy(g_last_persp,p,64);
     const LgStereoProjection eye={g_view[g_eye],hud?hud_view(g_eye):g_view[g_eye],g_tan[g_eye],g_screen_lens,g_screen_dist};
+    /* LINDBERGH_VT3_IMMERSIVE: the eyes' depth range far wider than the game
+     * camera's. Virtua Tennis 3's broadcast camera keeps its near and far
+     * planes tight round the court (about 800 to 1050); around the head that
+     * slab was all that showed - the stands, the sky and both ends of the
+     * court clipped away. The game's own depth is still undone with its own
+     * matrix (stereo_reproject's inverse); only the eyes' range changes. */
+    static int deep = -1;
+    if (deep < 0) { const char *v = getenv("LINDBERGH_VT3_IMMERSIVE"); deep = v && *v == '1'; }
+    if (deep && !hud && is_perspective(p)) {
+        float n = p[14] / (p[10] - 1), f = p[14] / (p[10] + 1);
+        if (isfinite(n) && isfinite(f) && n > 0 && f > n) {
+            float q[16]; memcpy(q, p, 64);
+            float n2 = 0.05f * n, f2 = 4.0f * f;
+            q[10] = -(f2 + n2) / (f2 - n2); q[14] = -2.0f * f2 * n2 / (f2 - n2);
+            lg_stereo_eye_projection(q,hud,&eye,out);
+            return;
+        }
+    }
     lg_stereo_eye_projection(p,hud,&eye,out);
 }
 

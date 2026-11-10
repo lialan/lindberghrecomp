@@ -73,7 +73,7 @@ typedef struct {
     float    local[MAX_LOCAL][4];
     unsigned local_gen;
     int      failed;             /* translation failed: use the driver */
-    int      pos_kind;           /* arb_env_projection: 0 not looked, 1 env[0..3], 2 passed through */
+    int      pos_kind;           /* arb_env_projection: 0 not looked, 1 env[0..3], 2 passed through, 3 the matrix by rows (DP4) */
 } ArbProg;
 
 static ArbProg *g_prog[2][MAX_IDS];       /* [0] vertex, [1] fragment */
@@ -1295,7 +1295,7 @@ static char *translate(int stage, const char *src_in, Tr *t)
         for (int m = 0; m < t->nmat; m++) bput(&g, "uniform vec4 %s_m%d[4];\n", P, m);
 #ifdef LINDBERGH_GL4ES
         /* multiview: one matrix per view, and render targets as two layers */
-        if (!stage && !t->nmat && !t->pos_invariant) bput(&g, gl4es_mv_shaders ? "uniform mat4 u_reproj[2];\n" : "uniform mat4 u_reproj;\n");
+        if (!stage && !t->nmat && !t->pos_invariant) bput(&g, gl4es_mv_shaders ? "uniform mat4 u_reproj[2];\nuniform float u_eyex[2];\n" : "uniform mat4 u_reproj;\n");
         const char *sty[] = { "", "sampler1D s1_", "sampler2D s2_", "sampler3D s3_",
                               "samplerCube sc_", gl4es_mv_shaders ? "sampler2DArray sr_" : "sampler2D sr_",
                               "highp sampler2D ss_",   /* the compare done in the shader (shadow_compare); highp: a
@@ -1339,7 +1339,7 @@ static char *translate(int stage, const char *src_in, Tr *t)
              * eye's (stereo.c; identity when not in stereo). */
 #ifdef LINDBERGH_GL4ES
             /* multiview: gl4es clips to the game's screen from gl4es_mvPre */
-            if (!t->nmat && !t->pos_invariant && gl4es_mv_shaders) bput(&g, "  gl4es_mvPre = gl_Position;\n  gl_Position = u_reproj[gl_ViewID_OVR] * gl_Position;\n");
+            if (!t->nmat && !t->pos_invariant && gl4es_mv_shaders) bput(&g, "  gl4es_mvPre = gl_Position;\n  gl_Position = u_reproj[gl_ViewID_OVR] * gl_Position;\n  gl_Position.x += u_eyex[gl_ViewID_OVR];\n");
             else
 #endif
             if (!t->nmat && !t->pos_invariant) bput(&g, "  gl_Position = u_reproj * gl_Position;\n");
@@ -1414,7 +1414,7 @@ typedef struct {
     int    ok;
     MatRef mat[2][16]; int nmat[2];
     int    env_hi[2], local_hi[2];
-    GLint  u_env[2], u_loc[2], u_mat[2][16], u_rect, u_reproj, u_gen;
+    GLint  u_env[2], u_loc[2], u_mat[2][16], u_rect, u_reproj, u_eyex, u_gen;
     int    nlit[2], lit_idx[2][16];         /* literals in the program's env (Tr) */
     float  lit[2][16][4];
     int    lit_loc[2][16];
@@ -1798,6 +1798,7 @@ static Linked *link_pair(GLuint vid, GLuint fid)
     l->u_shadow = glGetUniformLocation(l->prog, "u_shadow_size");
     l->n_shadow = l->u_shadow >= 0 ? array_len(l->prog, "u_shadow_size", 16) : 0;
     l->u_reproj = glGetUniformLocation(l->prog, "u_reproj");
+    l->u_eyex = glGetUniformLocation(l->prog, "u_eyex");
     l->u_gen = glGetUniformLocation(l->prog, "u_gen");
 #ifdef LINDBERGH_GL4ES
     if (gl4es_mv_shaders && l->u_reproj >= 0) {
@@ -1910,6 +1911,11 @@ static void upload(Linked *l)
         float m[32];
         stereo_reproject_view(0, m); stereo_reproject_view(1, m + 16);
         glUniformMatrix4fv(l->u_reproj, 2, GL_FALSE, m);
+        if (l->u_eyex >= 0) {           /* the stereoscopic screen: each eye's camera moved sideways */
+            extern float stereo_eye_x(int view);
+            float ex[2] = { stereo_eye_x(0), stereo_eye_x(1) };
+            glUniform1fv(l->u_eyex, 2, ex);
+        }
     } else
 #endif
     if (l->u_reproj >= 0) { float m[16]; stereo_reproject(m); glUniformMatrix4fv(l->u_reproj, 1, GL_FALSE, m); }
@@ -2189,6 +2195,18 @@ double g_arb_draw_ns;                   /* LINDBERGH_GLPROF: time in arb_before_
 static void before_draw(void);
 void arb_before_draw(void)
 {
+    {   /* LINDBERGH_MVP_DUMP=<frame>: each draw's program.local[0..3] (VT3's matrix) that frame */
+        static long dump = -2; extern unsigned g_frame;
+        if (dump == -2) { const char *v = getenv("LINDBERGH_MVP_DUMP"); dump = v && *v ? atol(v) : -1; }
+        if (dump >= 0 && (long)g_frame >= dump && (long)g_frame < dump + 2 && g_enabled[0] && g_bound[0]) {
+            ArbProg *pp = prog_get(0, g_bound[0], 0);
+            if (pp) {
+                fprintf(stderr, "[mvp] frame %u prog %u:", g_frame, g_bound[0]);
+                for (int i = 0; i < 16; i++) fprintf(stderr, " %g", pp->local[i / 4][i % 4]);
+                fprintf(stderr, "\n");
+            }
+        }
+    }
     extern int stereo_glprof_on(void);
     if (!stereo_glprof_on()) { before_draw(); return; }
     struct timespec a, b;
@@ -2741,6 +2759,20 @@ const char *arb_get_source(GLenum target, GLuint id)
  * last step of a transform, "MAD result.position, vertex.attrib[0].w, c[3],
  * R0;", reads the same up to its swizzle, and taking that for a pass-through
  * left Let's Go Jungle's terrain locked to the head. */
+/* The program makes its position a row at a time - "DP4 result.position.x,
+ * R0, c[0];" - so its constants hold the matrix by rows, not GL's columns
+ * (Virtua Tennis 3's match shaders; its HUD's multiply by columns). */
+static int position_by_rows(const char *src)
+{
+    for (const char *q = src; (q = strstr(q, "result.position")) != NULL; q++) {
+        const char *ln = q;
+        while (ln > src && ln[-1] != '\n') ln--;
+        while (*ln == ' ' || *ln == '\t') ln++;
+        if (!strncmp(ln, "DP4", 3)) return 1;
+    }
+    return 0;
+}
+
 static int passes_position(const char *src)
 {
     for (const char *q = src; (q = strstr(q, "result.position")) != NULL; q++) {
@@ -2782,7 +2814,7 @@ int arb_env_projection(float P[16])
     if (!g_enabled[0] || !g_bound[0]) return 0;
     ArbProg *p = prog_get(0, g_bound[0], 0);
     if (!p || !p->src) return 0;
-    if (!p->pos_kind) p->pos_kind = passes_position(p->src) ? 2 : 1;
+    if (!p->pos_kind) p->pos_kind = passes_position(p->src) ? 2 : position_by_rows(p->src) ? 3 : 1;
     for (int i = 0; i < 16; i++) P[i] = i % 5 ? 0.0f : 1.0f;
     if (p->pos_kind == 2) return 1;
     /* the matrix's columns: program.env[0..3], or the program's own
@@ -2790,6 +2822,12 @@ int arb_env_projection(float P[16])
      * env there, every draw looked 2D and its match was drawn as HUD */
     const float (*c)[4] = game_profile()->vr.camera_in_locals ? (const float (*)[4])p->local
                                                                : (const float (*)[4])g_env[0];
+    float ct[4][4];
+    if (p->pos_kind == 3 && game_profile()->vr.camera_in_locals) {   /* by rows: its columns */
+        for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) ct[i][j] = c[j][i];
+        c = (const float (*)[4])ct;
+    }
+    }
     float r0[3] = { c[0][0], c[1][0], c[2][0] }, r1[3] = { c[0][1], c[1][1], c[2][1] },
           r2[3] = { c[0][2], c[1][2], c[2][2] }, r3[3] = { c[0][3], c[1][3], c[2][3] };
 #define DOT3(a, b) ((a)[0] * (b)[0] + (a)[1] * (b)[1] + (a)[2] * (b)[2])
@@ -2816,16 +2854,50 @@ int arb_env_projection(float P[16])
      * game's own lens, locked to the head. */
     static float good[16];
     static int have_good;
+    {   /* the game's own cameras where it gives them (arb_note_projection) */
+        extern volatile float g_game_world_P[16], g_game_layer_x; extern volatile int g_game_world_ok;
+        float gx = lx / s;
+        static int use_cam = -1;
+        if (use_cam < 0) { const char *v = getenv("LINDBERGH_VT3_GAME_CAM"); use_cam = v && *v ? atoi(v) : 0; }   /* both blacked out the match on the Quest: tests only */
+        if (use_cam == 1 && g_game_layer_x > 0 && fabsf(gx - g_game_layer_x) < 0.01f * g_game_layer_x) {   /* the HUD's pixel camera: 2D */
+            for (int i = 0; i < 16; i++) P[i] = i % 5 ? 0.0f : 1.0f;
+            return 1;
+        }
+        /* The match camera's lens as the game has it, in place of the one
+         * read from the draw: test only (LINDBERGH_VT3_GAME_CAM=2) - every
+         * draw that took it, render targets' and shadows' too, and the
+         * picture went black. Read the right way round (by rows), the draws
+         * give it anyway. */
+        if (g_game_world_ok && use_cam == 2) {
+            for (int i = 0; i < 16; i++) P[i] = g_game_world_P[i];
+            memcpy(good, P, sizeof good); have_good = 1;
+            goto axes;
+        }
+    }
     if (lx / s < 0.05f || ly / s < 0.05f || skew > 0.02f) {
         if (!have_good) return 0;
         memcpy(P, good, sizeof good);
         return 1;
+    }
+    /* A camera keeps its proportions: zoomed or not, its vertical lens over
+     * its horizontal one is the screen's shape. A model whose matrix scales
+     * it unevenly takes them apart into a lens far off that (Virtua Tennis
+     * 3's crowd and banners: 100-320 across, the camera's 2.58 down) - read
+     * as a camera, a few of those a frame made every match frame a scope's
+     * zoom, and the match was shown on the flat screen. The frame's camera,
+     * as for a skewed matrix. */
+    static int keep_shape = -1;             /* LINDBERGH_VT3_IMMERSIVE=1 for now: the match as a world around the head */
+    if (keep_shape < 0) { const char *v = getenv("LINDBERGH_VT3_IMMERSIVE"); keep_shape = v && *v == '1'; }
+    if (keep_shape && game_profile()->vr.camera_in_locals && have_good && good[0] > 0) {
+        float want = good[5] / good[0], got = (ly / s) / (lx / s);
+        if (fabsf(got - want) > 0.15f * want) { memcpy(P, good, sizeof good); return 1; }
     }
     P[0] = lx / s;
     P[5] = ly / s;
     P[8] = cx; P[9] = cy; P[10] = A; P[11] = -1.0f;
     P[14] = c[3][2] + A * c[3][3]; P[15] = 0.0f;
     memcpy(good, P, sizeof good); have_good = 1;
+axes:
     {                                       /* the camera's axes, in the draw's own space */
         float *b = g_cam_last;
         for (int i = 0; i < 3; i++) { b[i] = ax[i] / lx; b[3 + i] = ay[i] / ly; b[6 + i] = r3[i] / s; }
@@ -2879,3 +2951,53 @@ unsigned arb_bound_fp(void) { return g_enabled[1] ? g_bound[1] : 0; }
 
 /* set by a game's trigger (hle_sega.c, LINDBERGH_VT3_PRIZE_TRACE): LINDBERGH_TRACE_VP starts at this frame */
 long g_arb_trace_from = -1;
+
+/* A game's camera projection as it has it, apart from the view (hle_sega.c,
+ * Virtua Tennis 3): the last few distinct ones (split screen, shadow passes),
+ * in the game's own layout. Logged once each, for the layout. */
+static float g_noted_proj[4][16];
+static int g_noted_n, g_noted_next;
+/* Virtua Tennis 3 draws its match through one camera (the broadcast one:
+ * pitched, n 1 / f 3000) and its HUD and sprites through another set back
+ * so that its screen plane is the picture's pixels (1360x768 at 989 away,
+ * no turn). The world camera's lens, GL's layout, and the pixel one's lens
+ * across, for arb_env_projection to tell a draw's from. */
+volatile float g_game_world_P[16], g_game_layer_x;
+volatile int g_game_world_ok;
+void arb_note_projection(const float *proj, const float *view)
+{
+    {
+        static long dump = -2; extern unsigned g_frame;
+        if (dump == -2) { const char *v = getenv("LINDBERGH_MVP_DUMP"); dump = v && *v ? atol(v) : -1; }
+        if (dump >= 0 && (long)g_frame + 3 >= dump && (long)g_frame < dump + 3) {
+            fprintf(stderr, "[cam] frame %u:", g_frame);
+            for (int i = 0; i < 16; i++) fprintf(stderr, " %g", proj[i]);
+            fprintf(stderr, " |");
+            for (int i = 0; i < 12; i++) fprintf(stderr, " %g", view[i]);
+            fprintf(stderr, "\n");
+        }
+    }
+    if (proj[14] < -0.5f && proj[0] > 0) {
+        int level = fabsf(view[0] - 1) < 1e-4f && fabsf(view[5] - 1) < 1e-4f && fabsf(view[10] - 1) < 1e-4f &&
+                    fabsf(view[3]) < 1e-3f && fabsf(view[7]) < 1e-3f;
+        float w = level && proj[5] > 0 ? -2.0f * view[11] / proj[5] : 0;     /* the screen plane's height, if pixels */
+        if (level && w >= 239.0f && fabsf(w - roundf(w)) < 0.02f) g_game_layer_x = proj[0];
+        else {
+            float P[16] = { 0 };
+            for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++) P[c * 4 + r] = proj[r * 4 + c];
+            for (int i = 0; i < 16; i++) g_game_world_P[i] = P[i];
+            g_game_world_ok = 1;
+        }
+    }
+    for (int i = 0; i < g_noted_n; i++) if (!memcmp(g_noted_proj[i], proj, 64)) return;
+    memcpy(g_noted_proj[g_noted_next], proj, 64);
+    g_noted_next = (g_noted_next + 1) % 4; if (g_noted_n < 4) g_noted_n++;
+    static int told;
+    if (told++ < 12) {
+        fprintf(stderr, "[arbprog] game projection:");
+        for (int i = 0; i < 16; i++) fprintf(stderr, " %g", proj[i]);
+        fprintf(stderr, "  view:");
+        for (int i = 0; i < 12; i++) fprintf(stderr, " %g", view[i]);
+        fprintf(stderr, "\n");
+    }
+}

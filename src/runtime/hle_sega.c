@@ -1005,6 +1005,26 @@ static void h_vt3_credit_draw(CPU *c) { vt3_card_apply(); if (!g_arcade_overlays
 static void h_vt3_slot_open(CPU *c) { if (!g_arcade_overlays) return; push32(c, 0xDEADBEEFu); g_vt3_slot_open(c); }
 static void h_vt3_slot(CPU *c) { if (!g_arcade_overlays) return; push32(c, 0xDEADBEEFu); g_vt3_slot(c); }
 static void h_vt3_slot_card(CPU *c) { if (!g_arcade_overlays) return; push32(c, 0xDEADBEEFu); g_vt3_slot_card(c); }
+/* Virtua Tennis 3's camera, as the game has it apart: _sRender::
+ * setProjectCameraMatrix multiplies the current scene manager's view (3x4
+ * at +0x2c) by its projection (4x4 at +0x5c) into the one matrix its shaders
+ * get - which the stereo path could only take apart again, and not its depth
+ * (the model's terms mix in). After it runs, the projection is handed to
+ * arbprog.c (arb_note_projection) for the world mode. */
+static void (*g_vt3_proj_cam)(CPU *);
+static void h_vt3_proj_cam(CPU *c)
+{
+    push32(c, 0xDEADBEEFu);
+    g_vt3_proj_cam(c);
+    uint32_t fn = guest_symbol("_ZN14_sSceneManager10getCurrentEv");
+    uint32_t sm = fn ? guest_call(c, fn, NULL, 0) : 0;
+    if (!sm) return;
+    float p[16], v[12];
+    for (int i = 0; i < 16; i++) { uint32_t b = rd32(sm + 0x5c + 4u * (uint32_t)i); memcpy(&p[i], &b, 4); }
+    for (int i = 0; i < 12; i++) { uint32_t b = rd32(sm + 0x2c + 4u * (uint32_t)i); memcpy(&v[i], &b, 4); }
+    extern void arb_note_projection(const float *proj, const float *view);
+    arb_note_projection(p, v);
+}
 static int vt3_wrap(const char *sym, void (**orig)(CPU *), HleHandler h)
 {
     extern void (*dispatch_lifted(uint32_t va))(CPU *);
@@ -1039,6 +1059,18 @@ static void vt3_jumps(void)
             g_vt3_prize_trace = atol(pt);
             g_arb_trace_from = 0x7fffffffL;     /* nothing traced before the slate */
             if (!vt3_wrap("_ZN5sound17playSe_prize_coinEv", &g_vt3_prize_coin, h_vt3_prize_coin)) g_arb_trace_from = -1;
+        }
+        {   /* LINDBERGH_VT3_IMMERSIVE=1: the match as a world around the head
+             * (arbprog.c keeps its camera whole). The game culls its scene to
+             * its own camera (_sCamera::isVisible, from _sTree::addScene: a
+             * bounding sphere against the frustum), and the headset sees far
+             * wider - outside the broadcast camera's view was black. Every
+             * node is visible, as House of the Dead 4's culling is widened. */
+            const char *im = getenv("LINDBERGH_VT3_IMMERSIVE");
+            if (im && *im == '1' && guest_override("_ZN8_sCamera9isVisibleEPKN8_sSerial10_sVector4dE", h_true))
+                fprintf(stderr, "[sega] Virtua Tennis 3: immersive - scene culling off\n");
+            if (im && *im == '1' && vt3_wrap("_ZN8_sRender22setProjectCameraMatrixEv", &g_vt3_proj_cam, h_vt3_proj_cam))
+                fprintf(stderr, "[sega] Virtua Tennis 3: immersive - the camera's own projection read\n");
         }
         const char *w = getenv("LINDBERGH_VT3_WIN");
         if (w && *w == '1' && vt3_wrap("_ZN5match9calcPointEv", &g_vt3_calc_point, h_vt3_calc_point))

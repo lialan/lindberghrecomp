@@ -1402,7 +1402,7 @@ void xr_frame_end(void)
                 proj[11] = -1; proj[14] = -2 * clip_far * n / (clip_far - n);
                 mat4_mul(m, view, place);
                 mat4_mul(m, proj, m);
-                xo_draw_screen(m, layers ? layers : stereo_eye_texture(0), layers != 0, (int)e->w, (int)e->h);
+                xo_draw_screen(m, layers ? layers : stereo_eye_texture(0), layers != 0, layers && stereo_screen_3d() ? i : 0, (int)e->w, (int)e->h);
             } else
                 gl.BlitFramebuffer(0, 0, (GLint)e->w, (GLint)e->h, 0, 0, (GLint)e->w, (GLint)e->h,
                                    GL_COLOR_BUFFER_BIT, GL_NEAREST);
