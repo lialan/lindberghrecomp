@@ -1031,6 +1031,15 @@ static int vt3_wrap(const char *sym, void (**orig)(CPU *), HleHandler h)
     uint32_t va = guest_symbol(sym);
     return va && (*orig = dispatch_lifted(va)) && guest_override(sym, h);
 }
+int g_replays = 1, g_replay_hook;
+static void (*g_vt3_is_replay)(CPU *);
+static void h_vt3_is_replay(CPU *c)
+{
+    extern unsigned g_frame; static unsigned told = ~0u;     /* asked every frame at a point's end: told once */
+    if (!g_replays) { if (g_vt3_log && g_frame - told > 120) fprintf(stderr, "[vt3] frame %u: point replay skipped (Replays off)\n", g_frame); told = g_frame; RET(0); return; }
+    push32(c, 0xDEADBEEFu); g_vt3_is_replay(c);
+    if (g_vt3_log && c->eax) fprintf(stderr, "[vt3] point replayed\n");
+}
 static void vt3_jumps(void)
 {
     const char *r = getenv("LINDBERGH_VT3_ROUND"), *p = getenv("LINDBERGH_VT3_POINTS"), *l = getenv("LINDBERGH_VT3_LOG");
@@ -1105,6 +1114,8 @@ void hle_register_sega(void)
         const char *r = getenv("LINDBERGH_FORCE_REPLAY");
         if (r && *r == '1' && guest_override("_ZN6replay14isReplay_pointEv", h_true))
             fprintf(stderr, "[sega] every point is replayed (LINDBERGH_FORCE_REPLAY)\n");
+        /* the headset menu's Replays switch: off, no point earns one */
+        else if (vt3_wrap("_ZN6replay14isReplay_pointEv", &g_vt3_is_replay, h_vt3_is_replay)) { g_replay_hook = 1; fprintf(stderr, "[sega] Virtua Tennis 3: replays %s (headset menu)\n", g_replays ? "on" : "off"); }
     }
 #if defined(__ANDROID__)
     if (pace_by_display()) fprintf(stderr, "[sega] idle_wait_func: paced by the headset, not the wall clock\n");

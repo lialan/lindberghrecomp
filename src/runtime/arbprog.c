@@ -2827,7 +2827,6 @@ int arb_env_projection(float P[16])
         for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) ct[i][j] = c[j][i];
         c = (const float (*)[4])ct;
     }
-    }
     float r0[3] = { c[0][0], c[1][0], c[2][0] }, r1[3] = { c[0][1], c[1][1], c[2][1] },
           r2[3] = { c[0][2], c[1][2], c[2][2] }, r3[3] = { c[0][3], c[1][3], c[2][3] };
 #define DOT3(a, b) ((a)[0] * (b)[0] + (a)[1] * (b)[1] + (a)[2] * (b)[2])
@@ -2858,20 +2857,27 @@ int arb_env_projection(float P[16])
         extern volatile float g_game_world_P[16], g_game_layer_x; extern volatile int g_game_world_ok;
         float gx = lx / s;
         static int use_cam = -1;
-        if (use_cam < 0) { const char *v = getenv("LINDBERGH_VT3_GAME_CAM"); use_cam = v && *v ? atoi(v) : 0; }   /* both blacked out the match on the Quest: tests only */
+        if (use_cam < 0) { const char *v = getenv("LINDBERGH_VT3_GAME_CAM"); use_cam = v && *v ? atoi(v) : 0; }   /* 1: pixel camera as HUD (blacked the match out: test only); 3: no exact match lens */
         if (use_cam == 1 && g_game_layer_x > 0 && fabsf(gx - g_game_layer_x) < 0.01f * g_game_layer_x) {   /* the HUD's pixel camera: 2D */
             for (int i = 0; i < 16; i++) P[i] = i % 5 ? 0.0f : 1.0f;
             return 1;
         }
-        /* The match camera's lens as the game has it, in place of the one
-         * read from the draw: test only (LINDBERGH_VT3_GAME_CAM=2) - every
-         * draw that took it, render targets' and shadows' too, and the
-         * picture went black. Read the right way round (by rows), the draws
-         * give it anyway. */
-        if (g_game_world_ok && use_cam == 2) {
-            for (int i = 0; i < 16; i++) P[i] = g_game_world_P[i];
-            memcpy(good, P, sizeof good); have_good = 1;
-            goto axes;
+        /* A draw made through the match camera's own projection, whatever
+         * its model did: MVP = P * E with E's last row (0 0 0 1), so its
+         * third row plus A times its fourth is (0 0 0 B). True of a ground
+         * shadow too, whose flattened matrix the lens read below takes
+         * apart wrong - its depth off, the eyes and the dolly put it
+         * metres from the player's feet. Not of a render target's light
+         * camera (handing those the match lens blacked the picture). */
+        if (g_game_world_ok && use_cam != 3) {
+            float A = g_game_world_P[10], B = g_game_world_P[14], tol = 2e-3f * fabsf(B);
+            int same = fabsf(c[3][2] + A * c[3][3] - B) < tol;
+            for (int j = 0; j < 3 && same; j++) same = fabsf(c[j][2] + A * c[j][3]) < tol;
+            if (same) {
+                for (int i = 0; i < 16; i++) P[i] = g_game_world_P[i];
+                memcpy(good, P, sizeof good); have_good = 1;
+                goto axes;
+            }
         }
     }
     if (lx / s < 0.05f || ly / s < 0.05f || skew > 0.02f) {

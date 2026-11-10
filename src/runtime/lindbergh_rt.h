@@ -217,6 +217,9 @@ extern int g_dispatch_always;
  * shown while 1. A game that can hide them hooks its draws (hle_sega.c) and
  * sets g_arcade_overlay_hooks; the headset menu toggles g_arcade_overlays. */
 extern int g_arcade_overlays, g_arcade_overlay_hooks;
+/* Replays of a point (Virtua Tennis 3): hle_sega.c sets g_replay_hook when
+ * it can skip them; the headset menu toggles g_replays. */
+extern int g_replays, g_replay_hook;
 #define DISPATCH_TO(c, va, fn) do { uint32_t _dv = (va); \
     if (!g_dispatch_always && (_dv < g_ov_lo || _dv > g_ov_hi) && \
         (_dv < stereo_state_lo || _dv > stereo_state_hi)) fn(c); else dispatch((c), _dv); } while (0)

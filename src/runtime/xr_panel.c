@@ -9,7 +9,7 @@ void xp_items(const XpPanel *menu,const LgXrSettings *cfg,int hand,int hud_locke
     static const char *const sight[] = { "Point shooting", "Red dot", "Holographic" };
     static const char *const laser[] = { "Laser and dot", "Dot only", "Off" };
     static const char *const labels[XP_COUNT] = {
-        "Sight", "Laser", "Game crosshair", "Gun model", "Gun hand", "Dual wield", "Frame rate counter", "Arcade overlays", "Screen distance", "HUD position", "Display rate", "Resolution per eye",
+        "Sight", "Laser", "Game crosshair", "Gun model", "Gun hand", "Dual wield", "Frame rate counter", "Arcade overlays", "Replays", "Screen distance", "HUD position", "Display rate", "Resolution per eye",
         "Foveation", "Coins", "Insert a coin", "Recentre view", "Arcade Test button (select)",
         "Arcade Service button (next)", "Reset game", "Close" };
     for (int i = 0; i < XP_COUNT; i++) { it[i].label = labels[i]; it[i].value[0] = 0; }
@@ -22,6 +22,7 @@ void xp_items(const XpPanel *menu,const LgXrSettings *cfg,int hand,int hud_locke
     snprintf(it[XP_DUAL].value, 40, "%s", !cfg->dual ? "Off" : hand == 0 ? "On (right hand P2)" : "On (left hand P2)");
     snprintf(it[XP_STATS].value, 40, "%s", cfg->show_stats ? "On" : "Off");
     snprintf(it[XP_OVERLAYS].value, 40, "%s", cfg->arcade_overlays ? "Shown" : "Hidden");
+    snprintf(it[XP_REPLAYS].value, 40, "%s", cfg->replays ? "On" : "Off");
     snprintf(it[XP_SCREEN].value, 40, "%.1f m", cfg->screen);
     if (!hud_locked) snprintf(it[XP_HUD].value, 40, "With the screen");
     else if (cfg->hud_pitch == 0) snprintf(it[XP_HUD].value, 40, "Centre");
@@ -53,6 +54,7 @@ unsigned xp_choose(XpPanel *p,LgXrSettings *cfg,int *hand,int item,const float *
     case XP_DUAL:cfg->dual=!cfg->dual;break;
     case XP_STATS:cfg->show_stats=!cfg->show_stats;break;
     case XP_OVERLAYS:cfg->arcade_overlays=!cfg->arcade_overlays;effects|=XP_OVERLAYS_CHANGED;break;
+    case XP_REPLAYS:cfg->replays=!cfg->replays;effects|=XP_REPLAYS_CHANGED;break;
     case XP_SCREEN:{int k=0;while(k<5&&screens[k]<=cfg->screen+.01f)++k;cfg->screen=screens[k%5];effects|=XP_SCREEN_CHANGED;break;}
     case XP_HUD:{static const int pitches[]={0,-10,-20,-30,10};int k=0;while(k<5&&pitches[k]!=cfg->hud_pitch)++k;cfg->hud_pitch=pitches[(k+1)%5];effects|=XP_HUD_CHANGED;break;}
     case XP_RATE:if(nrates){int k=0;while(k<nrates&&rates[k]<=cfg->refresh+.5f)++k;cfg->refresh=(int)(rates[k%nrates]+.5f);effects|=XP_RATE_CHANGED;}break;

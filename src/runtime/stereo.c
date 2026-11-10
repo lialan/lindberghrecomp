@@ -367,6 +367,15 @@ static void effective_projection(const float *p, int hud, float *out)
             float n2 = 0.05f * n, f2 = 4.0f * f;
             q[10] = -(f2 + n2) / (f2 - n2); q[14] = -2.0f * f2 * n2 / (f2 - n2);
             lg_stereo_eye_projection(q,hud,&eye,out);
+            /* The broadcast camera's lens is narrow (about 20 degrees down):
+             * around the head its stadium was a small model far off. The
+             * viewpoint moved in along the camera's own view by
+             * LINDBERGH_VT3_DOLLY game units (a tenth of a metre; default
+             * 200 of its ~345 from the court): out * T(0, 0, +d), the
+             * draw's eye space shifted before the headset's matrices. */
+            static float dolly = -1;
+            if (dolly < 0) { const char *v = getenv("LINDBERGH_VT3_DOLLY"); dolly = v && *v ? (float)atof(v) : 200.0f; }
+            for (int r = 0; r < 4; r++) out[12 + r] += dolly * out[8 + r];
             return;
         }
     }

@@ -151,6 +151,9 @@ static void cfg_load(void)
     const char *ov = getenv("LINDBERGH_ARCADE_OVERLAYS");     /* a run's own choice wins (tests) */
     if (ov && *ov) cfg.arcade_overlays = *ov != '0';
     g_arcade_overlays = cfg.arcade_overlays;
+    const char *rp = getenv("LINDBERGH_REPLAYS");
+    if (rp && *rp) cfg.replays = *rp != '0';
+    g_replays = cfg.replays;
 }
 
 /* ---- the session ---- */
@@ -323,6 +326,7 @@ static void menu_rows(void)
     for (int i = 0; i < XP_COUNT; i++) {
         if (lever && (i == XP_SIGHT || i == XP_LASER || i == XP_CROSSHAIR || i == XP_GUN || i == XP_HAND || i == XP_DUAL)) continue;
         if (i == XP_OVERLAYS && !g_arcade_overlay_hooks) continue;
+        if (i == XP_REPLAYS && !g_replay_hook) continue;
         menu_ids[menu_n++] = i;
     }
 }
@@ -439,6 +443,7 @@ static void menu_choose(int row)
     const int item = menu_ids[row];
     const unsigned effects=xp_choose(&menu,&cfg,&gun_hand,item,rates,nrates);
     if(effects&XP_OVERLAYS_CHANGED){g_arcade_overlays=cfg.arcade_overlays;fprintf(stderr,"[xr] arcade overlays %s\n",cfg.arcade_overlays?"shown":"hidden");}
+    if(effects&XP_REPLAYS_CHANGED){g_replays=cfg.replays;fprintf(stderr,"[xr] replays %s\n",cfg.replays?"on":"off");}
     if(effects&XP_CROSSHAIR_CHANGED)stereo_show_game_sight(cfg.crosshair && !game_profile()->joystick);
     if(effects&XP_SCREEN_CHANGED)stereo_set_screen_distance(cfg.screen*cfg.scale);
     if(effects&XP_HUD_CHANGED)stereo_set_hud_pitch((float)cfg.hud_pitch);
