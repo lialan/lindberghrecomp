@@ -361,10 +361,26 @@ static void effective_projection(const float *p, int hud, float *out)
     static int deep = -1;
     if (deep < 0) { const char *v = getenv("LINDBERGH_VT3_IMMERSIVE"); deep = v && *v == '1'; }
     if (deep && !hud && is_perspective(p)) {
+        static int same = -1;   /* LINDBERGH_VT3_SAMECAM=1 (testing): the eyes see through the game's camera exactly */
+        if (same < 0) { const char *v = getenv("LINDBERGH_VT3_SAMECAM"); same = v && *v ? atoi(v) : 0; }
+        if (same == 1) { memcpy(out, p, 64); return; }
+        if (same == 2) {        /* the eye's lens, no head pose */
+            float I[16]; mat_identity(I);
+            const LgStereoProjection e2 = { I, I, g_tan[g_eye], g_screen_lens, g_screen_dist };
+            lg_stereo_eye_projection(p, hud, &e2, out); return;
+        }
+        if (same == 3) {        /* the game's lens, moved with the head */
+            const float *V = g_view[g_eye];
+            for (int c = 0; c < 4; c++) for (int r = 0; r < 4; r++)
+                out[c * 4 + r] = p[r] * V[c * 4] + p[4 + r] * V[c * 4 + 1] + p[8 + r] * V[c * 4 + 2] + p[12 + r] * V[c * 4 + 3];
+            return;
+        }
         float n = p[14] / (p[10] - 1), f = p[14] / (p[10] + 1);
         if (isfinite(n) && isfinite(f) && n > 0 && f > n) {
             float q[16]; memcpy(q, p, 64);
-            float n2 = 0.05f * n, f2 = 4.0f * f;
+            static float nk = -1;   /* LINDBERGH_VT3_NEAR: the eyes' near plane, times the camera's */
+            if (nk < 0) { const char *v = getenv("LINDBERGH_VT3_NEAR"); nk = v && *v ? (float)atof(v) : 0.05f; }
+            float n2 = nk * n, f2 = 4.0f * f;
             q[10] = -(f2 + n2) / (f2 - n2); q[14] = -2.0f * f2 * n2 / (f2 - n2);
             lg_stereo_eye_projection(q,hud,&eye,out);
             /* The broadcast camera's lens is narrow (about 20 degrees down):
@@ -1767,6 +1783,15 @@ static int transform_call(CPU *c, HleId id, const char *n)
             GLint pr = 0; glGetIntegerv(GL_CURRENT_PROGRAM, &pr);
             if (pr == skp) { if (k == K_BEGIN) g_skip_begin = 1; return 1; }
         }
+        {   /* LINDBERGH_SKIP_FP=<id>[,<id>...]: draws with those ARB fragment programs left out */
+            static int nf = -1; static unsigned fps[16];
+            if (nf < 0) { nf = 0; const char *v = getenv("LINDBERGH_SKIP_FP");
+                          while (v && *v && nf < 16) { fps[nf++] = (unsigned)atol(v); v = strchr(v, ','); if (v) v++; } }
+            if (nf && (is_draw(k) || k == K_BEGIN)) {
+                unsigned f = arb_bound_fp();
+                for (int i = 0; i < nf; i++) if (f == fps[i]) { if (k == K_BEGIN) g_skip_begin = 1; return 1; }
+            }
+        }
         /* LINDBERGH_SKIP_DRAWS=offscreen|main|all: whole groups of draws left
          * out, finding where a GPU-bound frame's time goes */
         static int skd = -1;
@@ -2071,6 +2096,95 @@ static void track_arrays(CPU *c, int t)
 
 static Op *op_new(void);
 
+/* LINDBERGH_VERT_DUMP=<frame>: each world draw's vertices that frame, taken
+ * back to the world through the broadcast camera (inverse lens, inverse
+ * view): which plane the shadows lie on. */
+static void vert_dump(uint32_t lo, uint32_t hi, GLsizei count)
+{
+    static long at = -2;
+    if (at == -2) { const char *v = getenv("LINDBERGH_VERT_DUMP"); at = v && *v ? atol(v) : -1; }
+    if (at < 0 || (long)g_frame < at || (long)g_frame > at + 1) return;
+    extern volatile float g_game_world_P[16], g_game_view[12]; extern volatile int g_game_world_ok;
+    extern int arb_vp_matrix(float m[16]);
+    float M[16]; Arr *a = g_arr[ARR_VERTEX].on ? &g_arr[ARR_VERTEX] : &g_arr[ARR_ATTR0];
+    if (!g_game_world_ok || !arb_vp_matrix(M)) { static int said; if (said++ < 5) fprintf(stderr, "[vert] skipped: world %d vp %u\n", g_game_world_ok, arb_bound_vp()); return; }
+    GLint stf = 0; GLboolean ston = glIsEnabled(GL_STENCIL_TEST); glGetIntegerv(GL_STENCIL_FUNC, &stf);
+    fprintf(stderr, "[vert] frame %u vp %u fp %u st %d %#x tex %u count %d verts %u..%u size %d type %#x vbo %u:", g_frame, arb_bound_vp(), arb_bound_fp(),
+            ston, stf, g_tex2d_bound, (int)count, lo, hi, a->size, a->type, a->vbo);
+    if (!a->on || a->type != GL_FLOAT || a->size < 3 || hi < lo || hi - lo > 200000) { fprintf(stderr, " (not read)\n"); return; }
+    const volatile float *P = g_game_world_P, *V = g_game_view;
+    uint32_t stride = a->stride ? (uint32_t)a->stride : (uint32_t)a->size * 4;
+    float mn[3] = { 1e9f, 1e9f, 1e9f }, mx[3] = { -1e9f, -1e9f, -1e9f }, rw[3] = { 0 }; int n = 0, shown = 0;
+    float *buf = NULL;
+    if (a->vbo) {
+        buf = (float *)malloc((size_t)(hi - lo) * stride + 16);
+        if (!buf) return;
+        GLint was = 0; glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &was);
+        glBindBuffer(GL_ARRAY_BUFFER, a->vbo);
+        glGetBufferSubData(GL_ARRAY_BUFFER, (GLintptr)(a->ptr + lo * stride), (GLsizeiptr)((hi - lo) * stride + (uint32_t)a->size * 4), buf);
+        glBindBuffer(GL_ARRAY_BUFFER, (GLuint)was);
+    }
+    for (uint32_t v = lo; v <= hi; v++) {
+        const float *q = buf ? (const float *)((const char *)buf + (v - lo) * stride) : (const float *)GP(a->ptr + v * stride);
+        float x[4] = { q[0], q[1], q[2], a->size > 3 ? q[3] : 1 }, cl[4];
+        for (int r = 0; r < 4; r++) cl[r] = M[r * 4] * x[0] + M[r * 4 + 1] * x[1] + M[r * 4 + 2] * x[2] + M[r * 4 + 3] * x[3];
+        float z = -cl[3], w = (cl[2] - P[10] * z) / P[14];
+        if (fabsf(w) < 1e-9f) continue;
+        float e[3] = { (cl[0] - P[8] * z) / P[0] / w, (cl[1] - P[9] * z) / P[5] / w, z / w }, d[3], wo[3];
+        for (int r = 0; r < 3; r++) d[r] = e[r] - V[r * 4 + 3];
+        for (int c = 0; c < 3; c++) wo[c] = V[c] * d[0] + V[4 + c] * d[1] + V[8 + c] * d[2];
+        for (int c = 0; c < 3; c++) { if (wo[c] < mn[c]) mn[c] = wo[c]; if (wo[c] > mx[c]) mx[c] = wo[c]; }
+        if (shown < 12) { fprintf(stderr, " [%.2f %.2f %.2f -> %.2f %.2f %.2f]", x[0], x[1], x[2], wo[0], wo[1], wo[2]); shown++; }
+        for (int c = 0; c < 3; c++) rw[c] += wo[c];
+        n++;
+    }
+    free(buf);
+    if (n) fprintf(stderr, " world min %.2f %.2f %.2f max %.2f %.2f %.2f mean %.2f %.2f %.2f", mn[0], mn[1], mn[2], mx[0], mx[1], mx[2], rw[0] / n, rw[1] / n, rw[2] / n);
+    fprintf(stderr, "\n");
+}
+
+/* vert_dump for a draw that is not recorded (multiview): its index range */
+static void vert_dump_live(CPU *c, int kind, const char *nm)
+{
+    static long at = -2;
+    if (at == -2) { const char *v = getenv("LINDBERGH_VERT_DUMP"); at = v && *v ? atol(v) : -1; }
+    if (at < 0 || (long)g_frame < at || (long)g_frame > at + 1) return;
+    if (!strcmp(nm, "glDrawRangeElements")) { vert_dump(A32(1), A32(2), AI32(3)); return; }
+    if (!strcmp(nm, "glMultiDrawElements") || !strcmp(nm, "glMultiDrawElementsEXT")) {
+        const GLsizei *cnt = (const GLsizei *)GP(A32(1)); GLsizei n = AI32(4), tot = 0; int ib = type_bytes(A32(2));
+        uint32_t lo = 0xFFFFFFFFu, hi = 0;
+        if (gl_bound_buffer(GL_ELEMENT_ARRAY_BUFFER) || n <= 0) { fprintf(stderr, "[vert] %s (indices in a buffer)\n", nm); return; }
+        for (GLsizei j = 0; j < n; j++) {
+            const void *idx = GP(rd32(A32(3) + 4u * (uint32_t)j));
+            for (GLsizei i = 0; i < cnt[j]; i++) {
+                uint32_t v = ib == 1 ? ((const uint8_t *)idx)[i] : ib == 2 ? ((const uint16_t *)idx)[i] : ((const uint32_t *)idx)[i];
+                if (v < lo) lo = v; if (v > hi) hi = v;
+            }
+            tot += cnt[j];
+        }
+        if (tot) vert_dump(lo, hi, tot);
+        return;
+    }
+    if (kind == K_DRAWOTHER) { fprintf(stderr, "[vert] %s (not read)\n", nm); return; }
+    int elements = kind == K_DRAWELEMENTS;
+    if (!elements && kind != K_DRAWARRAYS) return;
+    GLsizei count = elements ? AI32(1) : AI32(2);
+    if (count <= 0) return;
+    if (!elements) { vert_dump(A32(1), A32(1) + (uint32_t)count - 1, count); return; }
+    int ib = type_bytes(A32(2));
+    void *tmp = malloc((size_t)count * ib); const void *idx = tmp;
+    if (!tmp) return;
+    if (gl_bound_buffer(GL_ELEMENT_ARRAY_BUFFER)) glGetBufferSubData(GL_ELEMENT_ARRAY_BUFFER, (GLintptr)A32(3), (GLsizeiptr)count * ib, tmp);
+    else memcpy(tmp, GP(A32(3)), (size_t)count * ib);
+    uint32_t lo = 0xFFFFFFFFu, hi = 0;
+    for (GLsizei i = 0; i < count; i++) {
+        uint32_t v = ib == 1 ? ((const uint8_t *)idx)[i] : ib == 2 ? ((const uint16_t *)idx)[i] : ((const uint32_t *)idx)[i];
+        if (v < lo) lo = v; if (v > hi) hi = v;
+    }
+    free(tmp);
+    vert_dump(lo, hi, count);
+}
+
 /* Before a draw is recorded: copy the client memory it reads. */
 static int snapshot_draw(CPU *c, int kind, uint32_t *args_va)
 {
@@ -2104,6 +2218,7 @@ static int snapshot_draw(CPU *c, int kind, uint32_t *args_va)
         }
         free(tmp);
     }
+    vert_dump(lo, hi, elements ? AI32(1) : AI32(2));
     for (int i = 0; i < ARR_COUNT; i++) {
         Arr *a = &g_arr[i];
         if (!a->on || a->vbo || !a->ptr) continue;
@@ -2542,6 +2657,7 @@ static void stereo_gl_call_inner(CPU *c, HleId id, HleHandler fn)
     /* the client arrays' state, for telling what a 2D draw covers (with two
      * passes record() keeps it) */
     if ((g_mv || g_wide) && cls(id)->track) track_arrays(c, cls(id)->track);
+    if (g_mv || g_wide) vert_dump_live(c, cls(id)->kind, n);
     if (!g_mv && !g_wide) {
         if (g_glprof > 0) {
             double t0 = now_ns();

@@ -3004,8 +3004,17 @@ static int g_noted_n, g_noted_next;
  * so that its screen plane is the picture's pixels (1360x768 at 989 away,
  * no turn). The world camera's lens, GL's layout, and the pixel one's lens
  * across, for arb_env_projection to tell a draw's from. */
-volatile float g_game_world_P[16], g_game_layer_x, g_game_up_eye[3];
+volatile float g_game_world_P[16], g_game_layer_x, g_game_up_eye[3], g_game_view[12];
 volatile int g_game_world_ok;
+/* the bound vertex program's local[0..3] (VT3's matrix, by rows); 0 if none */
+int arb_vp_matrix(float m[16])
+{
+    if (!g_enabled[0] || !g_bound[0]) return 0;
+    ArbProg *pp = prog_get(0, g_bound[0], 0);
+    if (!pp) return 0;
+    for (int i = 0; i < 16; i++) m[i] = pp->local[i / 4][i % 4];
+    return 1;
+}
 extern volatile float g_game_up_eye[3];
 void arb_note_projection(const float *proj, const float *view)
 {
@@ -3030,6 +3039,7 @@ void arb_note_projection(const float *proj, const float *view)
             for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++) P[c * 4 + r] = proj[r * 4 + c];
             for (int i = 0; i < 16; i++) g_game_world_P[i] = P[i];
             for (int i = 0; i < 3; i++) g_game_up_eye[i] = view[1 + 4 * i];   /* the world's up, in the camera's space */
+            for (int i = 0; i < 12; i++) g_game_view[i] = view[i];
             g_game_world_ok = 1;
         }
     }

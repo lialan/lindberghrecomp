@@ -1076,7 +1076,8 @@ static void vt3_jumps(void)
              * wider - outside the broadcast camera's view was black. Every
              * node is visible, as House of the Dead 4's culling is widened. */
             const char *im = getenv("LINDBERGH_VT3_IMMERSIVE");
-            if (im && *im == '1' && guest_override("_ZN8_sCamera9isVisibleEPKN8_sSerial10_sVector4dE", h_true))
+            const char *cull = getenv("LINDBERGH_VT3_CULL");    /* =1: culling kept (testing) */
+            if (im && *im == '1' && !(cull && *cull == '1') && guest_override("_ZN8_sCamera9isVisibleEPKN8_sSerial10_sVector4dE", h_true))
                 fprintf(stderr, "[sega] Virtua Tennis 3: immersive - scene culling off\n");
             if (im && *im == '1' && vt3_wrap("_ZN8_sRender22setProjectCameraMatrixEv", &g_vt3_proj_cam, h_vt3_proj_cam))
                 fprintf(stderr, "[sega] Virtua Tennis 3: immersive - the camera's own projection read\n");
